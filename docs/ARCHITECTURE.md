@@ -1,0 +1,138 @@
+# Architecture
+
+## Objective
+
+StarConverter converts between exFAT and NTFS while keeping compatible file payloads in their
+existing physical extents. It does not promise that every NTFS semantic can exist natively on
+exFAT. Instead, the planner assigns an explicit guarantee class before any mutation begins.
+
+## System boundaries
+
+```text
+frontends                 trusted core                         backends
+
+desktop ----+       +-----------------------+       +---------------------+
+            +------>| discovery + parser    |------>| image file          |
+CLI --------+       | capability classifier |       | physical block dev  |
+                    | extent graph           |       +---------------------+
+                    | geometry solver        |                 ^
+                    | transaction planner    |                 |
+                    | verifier + recovery    |       gated authorization
+                    +-----------------------+
+                                ^
+                                |
+                    Go lab / fault injector
+```
+
+The core is deterministic and independent from user interface state. Frontends never issue raw
+writes. They submit a signed or hashed transaction plan to an executor, and the executor revalidates
+device identity and geometry before accepting it.
+
+## Rust workspace
+
+### `starconverter-core`
+
+The initial crate contains the public capability model and a deterministic preflight planner. It has
+no operating-system or GUI dependency. Planned modules are:
+
+- `fs/exfat`: boot regions, allocation bitmap, FAT, directory entry sets, extent reconstruction;
+- `fs/ntfs`: boot sector, MFT attributes, runlists, metadata files, semantic feature discovery;
+- `extent`: normalized physical extent graph and overlap detector;
+- `geometry`: sector/cluster-grid compatibility and destination layout solver;
+- `capsule`: append-only metadata escrow and rollback records;
+- `transaction`: ordered mutations, flush barriers, activation point, replay, and rollback;
+- `verify`: structural checks and file-content sampling/full hashing;
+- `backend`: read-only and transactional traits implemented by image and physical backends.
+
+Unsafe Rust is forbidden at workspace level. Platform calls should live behind small, reviewed FFI
+crates only when a safe maintained crate cannot express the operation; that policy change requires a
+documented exception rather than weakening the entire workspace lint.
+
+### `starconverter-cli`
+
+The CLI is the automation and recovery frontend. It must expose every safety-relevant choice without
+requiring the GUI. Planned command surface:
+
+```text
+starconverter inspect <source>
+starconverter plan <source> --to ntfs --mode strict
+starconverter convert <plan> --confirm-device <stable-id>
+starconverter verify <journal>
+starconverter rollback <journal>
+starconverter finalize <journal>
+```
+
+Only `demo` and synthetic `plan` exist in the scaffold.
+
+### `starconverter-gui`
+
+The native desktop shell uses `eframe`/`egui`: one Rust codebase for Windows, macOS, and Linux. The
+GUI is a client of the same planner as the CLI. Raw-device elevation should use a narrow helper
+process, not elevate the entire interface.
+
+## Go lab
+
+`lab/` describes and executes a deterministic matrix of disposable filesystem images. Go is used for
+process orchestration, fixture naming, parallel runners, event logs, and crash-point campaigns. The
+lab never becomes the source of truth for parsing or mutation logic.
+
+Planned providers:
+
+- sparse image creation;
+- platform formatter adapters;
+- corpus population with adversarial names, sizes, fragmentation, and metadata;
+- process interruption at named transaction barriers;
+- remount/fsck/chkdsk validation;
+- manifest and content-hash comparison;
+- minimized failing-image retention.
+
+## Metadata pivot
+
+The proposed conversion transaction is:
+
+1. Discover the source without modifying it and require a clean supported filesystem.
+2. Build the complete object, semantic, and extent graph.
+3. Solve destination geometry and calculate exact reservation/relocation space.
+4. Create source-visible placeholder files for destination metadata, scratch, and the capsule.
+5. Relocate only extents that conflict with mandatory target structures.
+6. Lock and dismount; revalidate stable device identity, geometry, and source metadata digest.
+7. Preserve before-images for every sector that can be overwritten.
+8. Construct target metadata while leaving the primary target boot sector inactive.
+9. Validate the candidate target through an overlay view.
+10. Write backup boot information, flush, then write the primary boot record as the activation point.
+11. Mount read-only, validate structure and content, and retain rollback state.
+12. Remove rollback material only through an explicit finalize operation.
+
+## Metadata capsule
+
+Escrow mode needs an append-only, checksummed capsule containing:
+
+- duplicated headers with generation and transaction phase;
+- original boot and overwritten metadata sectors;
+- relocation before-images and extent maps;
+- stable object identifiers and path-independent relationships;
+- NTFS security descriptors, alternate streams, hard-link groups, sparse maps, reparse data, object
+  IDs, exact timestamps, and encrypted raw streams where supported;
+- content hashes and index root hashes.
+
+The exFAT side may store a compact object identifier in a benign vendor extension directory entry.
+Unknown benign entries are designed to be ignored by other exFAT implementations, while the global
+capsule holds the larger records.
+
+## Compatibility contract
+
+| NTFS feature | NTFS -> exFAT strict | Escrow policy |
+| --- | --- | --- |
+| Ordinary file bytes | Native | Native |
+| Basic timestamps/attributes | Normalized if representable | Exact values also escrowed |
+| ACL/owner | Refuse | Save; not enforced on exFAT |
+| Alternate streams | Refuse | Save in capsule |
+| Hard links | Refuse unless one link | Materialize or refuse based on exact space plan |
+| Sparse data | Refuse unless fully allocated | Materialize holes or refuse |
+| NTFS compression | Refuse | Decompress with exact capacity check |
+| EFS | Refuse | Raw encrypted escrow only; never silently decrypt |
+| Reparse points/symlinks | Refuse | Policy-controlled placeholder/materialization |
+| Case-colliding names | Refuse | Reversible rename policy only |
+
+The first image converter supports the native common subset only. Escrow is a later format with its
+own versioning and compatibility tests.

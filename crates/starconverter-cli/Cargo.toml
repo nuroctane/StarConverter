@@ -1,0 +1,19 @@
+[package]
+name = "starconverter-cli"
+description = "Analysis-only command-line frontend for StarConverter"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "starconverter"
+path = "src/main.rs"
+
+[dependencies]
+starconverter-core = { path = "../starconverter-core" }
+
+[lints]
+workspace = true

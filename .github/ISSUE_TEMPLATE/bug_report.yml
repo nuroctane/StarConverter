@@ -1,0 +1,43 @@
+name: Bug or data-integrity defect
+description: Report an analysis, planning, UI, or image-backed conversion defect.
+title: "[bug] "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Never attach a disk image containing personal data. Do not test unreleased write paths on valuable media.
+  - type: input
+    id: version
+    attributes:
+      label: StarConverter version or commit
+      placeholder: 0.1.0 / abc1234
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Surface
+      options:
+        - Core/planner
+        - CLI
+        - Desktop UI
+        - Go lab
+        - Image conversion
+        - Recovery/rollback
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment and filesystem geometry
+      description: OS, image/device type, source/target filesystem, sector size, cluster size, and capacity.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Exact steps, expected result, actual result, and anonymized planner/log output.
+    validations:
+      required: true

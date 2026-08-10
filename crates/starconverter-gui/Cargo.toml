@@ -1,0 +1,20 @@
+[package]
+name = "starconverter-gui"
+description = "Native cross-platform desktop shell for StarConverter"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "starconverter-gui"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.36.1"
+starconverter-core = { path = "../starconverter-core" }
+
+[lints]
+workspace = true

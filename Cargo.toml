@@ -1,0 +1,24 @@
+[workspace]
+members = [
+    "crates/starconverter-core",
+    "crates/starconverter-cli",
+    "crates/starconverter-gui",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["Nur Octane <nuroctane@gmail.com>"]
+license-file = "LICENSE"
+repository = "https://github.com/nuroctane/StarConverter"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
+nursery = "warn"

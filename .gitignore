@@ -1,0 +1,16 @@
+/target/
+/.nur/
+/.idea/
+/.vscode/
+*.swp
+*.tmp
+*.log
+*.img
+*.raw
+*.vhd
+*.vhdx
+*.qcow2
+/lab/out/
+/dist/
+.DS_Store
+Thumbs.db
