@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title description">
+  <title id="title">StarConverter mark</title>
+  <desc id="description">A pale star over a blue-white conversion prism on a near-black square.</desc>
+  <rect width="256" height="256" rx="28" fill="#050506"/>
+  <path d="M128 28v52M102 54h52" stroke="#f2f4f5" stroke-width="10" stroke-linecap="square"/>
+  <path d="M128 70 72 190h112L128 70Z" fill="none" stroke="#a8d8ff" stroke-width="10" stroke-linejoin="miter"/>
+  <path d="M94 145h68M70 204h116" stroke="#f2f4f5" stroke-width="10" stroke-linecap="square"/>
+  <path d="m92 127-18 18 18 18M164 127l18 18-18 18" fill="none" stroke="#7bffb2" stroke-width="8"/>
+</svg>

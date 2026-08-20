@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="assets/starconverter-mark.svg" width="112" alt="StarConverter mark">
+
 ```text
                  *
              .  /|\  .
@@ -22,9 +24,21 @@ file to another disk. The design keeps file-data extents in place where possible
 conflicts, constructs new filesystem metadata transactionally, and retains an explicit rollback
 record until the user finalizes the conversion.
 
-This repository is an engineering scaffold, not a drive-writing release. The current executables
-perform deterministic planning against synthetic volume descriptions. **They do not write raw
-devices.** That boundary is deliberate.
+This repository is an engineering pre-alpha, not a drive-writing release. The CLI can open a
+regular exFAT or NTFS image read-only, validate redundant boot metadata, reconstruct allocation and
+object evidence, and feed that evidence into the preflight planner. exFAT inspection recursively
+normalizes live objects, names, allocation ownership, extents, both TexFAT bitmap/FAT pairs, and the
+Up-case Table. NTFS inspection bootstraps `$MFT`, validates volume/allocation metadata, and performs
+a bounded object, stream, extent, and directory-index inventory. Both formats now normalize common
+semantics into the same object graph while retaining format-specific preservation evidence.
+Policy-bound adapters map the supported subset in both directions, including exact DOS fields,
+volume identity, canonical case tables, timestamp conversion, and schema-v4 escrow for source-only
+precision, semantics, and proven pinned NTFS security descriptors. Pure exFAT and NTFS serializers
+emit phase-separated metadata/backup-boot/primary-boot candidates and round-trip through independent
+readers. The CLI and desktop app can turn a supported source into a brand-new target image, persist
+required escrow, reinspect the result, compare its logical manifest, and prove the source hash
+unchanged. Existing outputs and device-like paths are refused. In-place activation remains blocked
+on explicit serializer/Windows gates, and no executable accesses raw devices.
 
 ## Product shape
 
@@ -104,15 +118,41 @@ StarConverter/
 
 Requirements:
 
-- Rust stable (the checked-in toolchain supplies `rustfmt` and Clippy)
+- Rust 1.85+ for the filesystem core and CLI
+- Rust 1.95+ for the native GUI (`eframe`/`wgpu` dependency floor)
 - Go 1.23+ for the lab harness
 
 ```powershell
 cargo build --workspace
 cargo test --workspace
 cargo run -p starconverter-cli -- demo
+cargo run -p starconverter-cli -- inspect "C:\path\to\volume.img"
+cargo run -p starconverter-cli -- preview "C:\path\to\volume.img" --mode escrow
+cargo run -p starconverter-cli -- convert-image "C:\path\source.img" "C:\path\new-target.img" --mode escrow
 cargo run -p starconverter-gui
 ```
+
+`inspect` accepts only a regular image file. It rejects raw-device namespaces and directories,
+opens the image read-only, validates bounded boot geometry plus the exFAT main/backup checksums or
+the NTFS final backup sector, recursively inventories and normalizes exFAT objects, and scans the
+initialized NTFS `$MFT` under explicit resource caps. It then explains which evidence remains
+insufficient for conversion. The target defaults to the opposite filesystem; `--to exfat|ntfs` and
+`--mode strict|escrow|content-only` can override the preflight request. Inspection never writes to
+the image.
+
+`preview` goes further without writing: it runs the preservation-bound cross-format adapter,
+constructs the exact destination candidate, classifies staging/backup/activation writes, and reads
+their exact rollback before-images into memory. It prints every remaining activation gap, and its
+result type cannot be submitted to the executor as activation authority.
+
+`convert-image` is the safe first conversion surface. It opens the source read-only, refuses any
+existing output or device-like path, copies the complete source into a newly created regular file,
+applies the active candidate only to that copy, reinspects and normalizes it, and requires its
+namespace/content manifest to match the plan. Escrow mode creates
+`<new-target>.starconverter-escrow` unless `--escrow` selects another new path. A failure removes
+only files created by that attempt. Inspection, planning, preimage capture, copying, and final
+source hashing share one pinned read-only file identity. The command hashes the source again before
+success and never uses the in-place activation-authority type.
 
 The Go toolchain is only required for `lab/`:
 
@@ -127,27 +167,69 @@ installed. CI always tests both language stacks.
 
 ## Current status
 
-`v0.1 scaffold`
+`v0.1 pre-alpha :: verified copy-based image conversion milestone`
 
 - [x] Buildable Rust workspace
 - [x] Shared conversion capability and safety model
-- [x] Analysis-only CLI
+- [x] Analysis plus create-new image conversion CLI
 - [x] Native ASCII-black desktop shell
-- [x] Go crash-test matrix scaffold
+- [x] Go crash/recovery state-machine matrix
 - [x] Cross-platform CI and repository shipping policy
-- [ ] Read-only exFAT parser
-- [ ] Read-only NTFS parser
-- [ ] Exact extent and metadata planner
-- [ ] Image-only exFAT -> NTFS strict converter
-- [ ] Injected-crash recovery suite
-- [ ] Image-only NTFS -> exFAT converter and semantic escrow
+- [x] Bounded read-only regular-image backend
+- [x] Read-only exFAT 1.00 boot-geometry parser
+- [x] Read-only NTFS boot-geometry parser
+- [x] exFAT main/backup boot checksums and NTFS backup-sector validation
+- [x] exFAT active bitmap, Up-case Table, root directory, and free-space discovery
+- [x] Recursive exFAT object/allocation/extent inventory
+- [x] Lossless exFAT-to-neutral object normalization
+- [x] NTFS FILE/attribute/runlist/index parsers and bounded `$MFT` bootstrap
+- [x] Bounded NTFS volume bitmap and object/stream/directory inventory
+- [x] `$ATTRIBUTE_LIST` continuation resolution and NTFS-to-neutral normalization
+- [x] Exact relocation geometry solver
+- [x] Redundant append-only recovery capsule format
+- [x] Immutable overlay view for candidate metadata validation
+- [x] Logical stream/content manifest verifier over regular images
+- [x] Pure resumable transaction coordinator with pre-activation overlay proof
+- [x] Phase-separated exFAT and NTFS structural destination serializers
+- [x] Exact regular-image preimage capture for every source-visible write phase
+- [x] Versioned capsule recovery bundle retaining exact phase before-images
+- [x] Bounded parser fuzz targets and CI smoke workflow
+- [x] Modeled crash campaign across every durable transaction barrier
+- [x] Every-byte capsule-tail and in-flight write-group recovery matrix
+- [x] Type-level serializer activation authorization (no public bypass)
+- [x] Exact-intent regular-image executor with locking, read-back, flush, rollback, and fault cuts
+- [x] Deterministic parser mutation suite
+- [x] Real-image `inspect` command with evidence-aware blocking
+- [x] Real-image read-only `preview` with exact candidate phases and rollback bytes
+- [x] Resolve and normalize supported NTFS continuations
+- [x] Fail-closed 24-field cross-format preservation policy with bounded versioned escrow
+- [x] Policy-bound exFAT→NTFS and NTFS→exFAT structural adapters with exact timestamp/identity evidence
+- [x] Pinned `$Secure` ordinary-object security-ID assignment in NTFS `$STANDARD_INFORMATION`
+- [x] Reproducible root/rich external fixtures, read-only exfatprogs/NTFS-3G checks, and exFAT/NTFS FUSE payload mounts
+- [x] Native desktop exact-candidate preview with in-memory rollback capture and no executor authority
+- [x] Create-new exFAT→NTFS and NTFS→exFAT export with reinspection, manifest equality, source re-hash, and escrow sidecar
+- [x] Independently mount both exported rich cross-format candidates read-only and verify exact payload hashes
+- [ ] Close serializer activation gaps and qualify the cross-filesystem metadata profiles
+- [ ] In-place image conversion with durable recovery/finalize workflow
+- [ ] Windows `chkdsk`/mount validation of generated and recovered images
 - [ ] Explicitly gated physical-volume support
 
-The staged implementation plan lives in [`docs/ROADMAP.md`](docs/ROADMAP.md).
+The staged implementation plan lives in [`docs/ROADMAP.md`](docs/ROADMAP.md); the evidence required
+before any readiness claim is tracked in [`docs/COMPLETION_MATRIX.md`](docs/COMPLETION_MATRIX.md).
+Independent regular-image validator evidence is logged in
+[`docs/EXTERNAL_VALIDATION.md`](docs/EXTERNAL_VALIDATION.md).
+
+Tagged releases are packaged by GitHub Actions as portable CLI + desktop bundles for Windows,
+Linux, and macOS. Each archive is accompanied by a SHA-256 checksum; StarConverter is not yet
+code-signed, so those packages remain pre-alpha validation builds rather than a drive-writing
+release.
 
 ## Safety and security
 
-- No raw-device write code exists in the initial scaffold.
+- No raw-device access or in-place activation-ready serializer exists in the current build. The
+  create-new exporter never opens a source for write; the in-place regular-image executor remains
+  reachable only through an activation-authorized transaction, which neither serializer can
+  currently produce.
 - Analysis must work without administrator/root privileges.
 - Every future write is represented in a transaction plan before execution.
 - Volume identity is pinned before lock/dismount and checked again afterward.

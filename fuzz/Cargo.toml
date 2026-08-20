@@ -1,0 +1,73 @@
+[package]
+name = "starconverter-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+starconverter-core = { path = "../crates/starconverter-core" }
+
+# Keep this cargo-fuzz package independent of the application workspace. This
+# lets the main workspace retain its Rust 1.85 MSRV while fuzzing on nightly.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "boot_sectors"
+path = "fuzz_targets/boot_sectors.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "boot_regions"
+path = "fuzz_targets/boot_regions.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "exfat_directory"
+path = "fuzz_targets/exfat_directory.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "exfat_upcase"
+path = "fuzz_targets/exfat_upcase.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ntfs_file_attributes"
+path = "fuzz_targets/ntfs_file_attributes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ntfs_attribute_list"
+path = "fuzz_targets/ntfs_attribute_list.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ntfs_runlist_bitmap"
+path = "fuzz_targets/ntfs_runlist_bitmap.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ntfs_index"
+path = "fuzz_targets/ntfs_index.rs"
+test = false
+doc = false
+bench = false

@@ -32,17 +32,40 @@ device identity and geometry before accepting it.
 
 ### `starconverter-core`
 
-The initial crate contains the public capability model and a deterministic preflight planner. It has
-no operating-system or GUI dependency. Planned modules are:
+The crate contains the public capability model and a deterministic preflight planner. It has no
+operating-system or GUI dependency. Implemented foundations include:
 
-- `fs/exfat`: boot regions, allocation bitmap, FAT, directory entry sets, extent reconstruction;
-- `fs/ntfs`: boot sector, MFT attributes, runlists, metadata files, semantic feature discovery;
-- `extent`: normalized physical extent graph and overlap detector;
-- `geometry`: sector/cluster-grid compatibility and destination layout solver;
-- `capsule`: append-only metadata escrow and rollback records;
-- `transaction`: ordered mutations, flush barriers, activation point, replay, and rollback;
-- `verify`: structural checks and file-content sampling/full hashing;
-- `backend`: read-only and transactional traits implemented by image and physical backends.
+- `fs/exfat_*`: boot regions, dual FAT/bitmap pairing, directory entry sets, allocation ownership,
+  recursive inventory, exact timestamp preservation, Up-case semantics, and neutral normalization;
+- `fs/ntfs_*`: boot sector, MFT records, attributes and continuation lists, runlists, `$Bitmap`,
+  `$Volume`, `$I30` indexes, system-file discovery, and bounded object inventory;
+- `object` and `extent`: normalized namespace/stream model plus physical ownership validation;
+- `geometry`: deterministic destination reservations and conflict relocation;
+- `capsule`: duplicated append-only generation headers, CRCs, SHA-256 payload identity, phase
+  monotonicity, and a versioned first-generation recovery bundle containing exact before-images;
+- `overlay`: immutable sector-aligned candidate writes over a read-only regular image;
+- `phase` and `preimage`: activation-gated serializer composition plus bounded capture of exact
+  regular-image before-images for every staged, backup-boot, and primary-boot replacement;
+- `verify`: deterministic UTF-16 namespace and logical stream SHA-256 manifests, including sparse
+  and uninitialized-zero semantics, over read-only regular images;
+- `executor`: fixed-size regular-image-only execution of exact prepared intents, with exclusive
+  locking, bounded positional relocation, read-after-write verification, durable flushes, rollback,
+  and deterministic fault injection. It exposes no raw-device or arbitrary-range write API.
+- `candidate_export`: create-new-only full image copy, exact preview application, independent target
+  reinspection, logical manifest equality, validated escrow persistence, and source SHA-256
+  stability proof. It cannot overwrite or authorize in-place activation.
+
+The pure transaction coordinator is implemented: it validates complete/clean/offline evidence,
+feature preservation, relocation geometry, opaque sector write containment, capsule resume state,
+candidate-overlay verification before backup boot, final verification, and rollback through the
+verified phase. Rollback selection is conservative across the checkpoint acknowledgement window:
+it restores the possibly in-flight next write group as well as every completed group. Pure
+structural destination serializers and read-only preimage capture now exist. A regular-image
+executor can apply only exact intents from an activation-authorized `PreparedConversion`, but neither
+serializer currently qualifies for that opaque authorization. There is intentionally no executable
+in-place conversion command and no physical-device backend. The separate copy-based exporter can
+produce a complete target only in a brand-new regular file, so it does not consume or weaken that
+authorization boundary.
 
 Unsafe Rust is forbidden at workspace level. Platform calls should live behind small, reviewed FFI
 crates only when a safe maintained crate cannot express the operation; that policy change requires a
@@ -51,18 +74,25 @@ documented exception rather than weakening the entire workspace lint.
 ### `starconverter-cli`
 
 The CLI is the automation and recovery frontend. It must expose every safety-relevant choice without
-requiring the GUI. Planned command surface:
+requiring the GUI. Current and planned command surface:
 
 ```text
 starconverter inspect <source>
-starconverter plan <source> --to ntfs --mode strict
+starconverter preview <source> --to ntfs --mode escrow
+starconverter convert-image <source> <new-output> --to ntfs --mode escrow
+starconverter plan [synthetic-options]
 starconverter convert <plan> --confirm-device <stable-id>
 starconverter verify <journal>
 starconverter rollback <journal>
 starconverter finalize <journal>
 ```
 
-Only `demo` and synthetic `plan` exist in the scaffold.
+`inspect` and `preview` open regular images read-only and validate exFAT/NTFS boot geometry,
+redundant boot structures, allocation evidence, bounded object inventories, preservation policy,
+and exact candidate phases. `convert-image` writes only a caller-selected new regular file and its
+new escrow sidecar; it refuses overwrite and devices, reinspects the result, verifies a logical
+manifest, and re-hashes the source. `plan` remains a synthetic capability-model command. No CLI
+command mutates a source image or accesses a raw device.
 
 ### `starconverter-gui`
 

@@ -1,0 +1,40 @@
+# Completion matrix
+
+This file is the release audit for StarConverter. A green unit-test suite is necessary but is not
+evidence that the converter is ready. Every row must have direct, current evidence before a release
+may claim image conversion or physical-volume support.
+
+| Requirement | Current evidence | Status / remaining proof |
+| --- | --- | --- |
+| Raw-device safety boundary | `image.rs` accepts regular files only and lexically refuses device namespaces; workspace forbids unsafe Rust | Proven for current read-only build; physical backend remains absent by design |
+| exFAT read/inventory | Boot-region checksums, FAT/bitmap pairing, directory/upcase parsing, recursive ownership inventory, mutation/fuzz tests | Implemented for bounded image files; external corpus differential testing remains |
+| NTFS read/inventory | Boot backup, MFT/MST, attributes/lists, runlists, volume bitmap, indexes, recursive inventory and normalization | Implemented for bounded image files; external corpus differential testing remains |
+| Neutral semantic model | `object.rs`, `extent.rs`, exFAT/NTFS normalization sidecars, 24-field preservation policy, and policy-bound bidirectional structural adapters | Common subset and escrow-bound metadata/identity mapping implemented; executable activation remains blocked by the serializer rows below |
+| Destination geometry | Deterministic reservations/relocations and overlap/cap tests | Implemented; serializer metadata must be regenerated if future plans allow payload relocation |
+| exFAT serializer | Complete boot/FAT/bitmap/upcase/directory candidate with exact metadata/profile inputs, exact Microsoft/exfatprogs recommended Up-case profile, parser round trips, clean `fsck.exfat -n`, and an independent read-only FUSE payload mount | Structural subset implemented; unsupported benign raw-entry/nonzero-padding and bad-cluster sources are refused, but activation remains blocked until per-candidate driver evidence is bound into authorization and Windows evidence passes |
+| NTFS serializer | Boot, MFT/bitmap, volume, bounded resident/one-level spilled `$I30`, system namespace, exact object metadata, pinned Windows-6.1 `$UpCase`, canonical `$AttrDef`, empty `$BadClus:$Bad`, pinned clean `$LogFile`, pinned `$Secure` plus explicit ordinary-object `0x101` security IDs, and typed `$Extend` bootstrap | Structural subset implemented; modern-native LogFile/Secure/Extend proof, `$Extend` case semantics, `$UsnJrnl`/`$RmMetadata`, multi-level indexes and >4 KiB-cluster sub-cluster VCNs, and Windows validation remain activation blockers |
+| Activation authorization | Opaque type produced only by filesystem-specific readiness adapters; public forgery compile-fails | Implemented; neither serializer currently qualifies |
+| Transaction capsule | Redundant headers, generation/phase validation, exact recovery bundle, torn-tail prefix recovery | Implemented and crash-cut tested |
+| Crash rollback | Exact before-images; conservative coverage of the possibly in-flight next write group; finalize is the rollback boundary | Deterministic image-file matrix and executor fault injection implemented; broader cross-platform fault execution remains |
+| Image mutation executor | Regular-image-only exact-intent executor with exclusive locking, fixed-size identity checks, bounded relocation, read-after-write verification, flush barriers, rollback, and deterministic fault injection | Implemented behind activation authorization; cross-platform executor fault matrix and full independent target validation remain before any image-conversion claim |
+| Copy-based image exporter | Create-new-only regular output, exact preview/source binding, full source copy, candidate writes, target reinspection, namespace/content manifest equality, validated schema-v4 escrow sidecar, and before/after source SHA-256 | Implemented and exercised in both directions; rich converted candidates pass independent read-only checkers and FUSE mounts; Windows validation and broader feature corpus remain |
+| Cross-format adapters | exFAT→NTFS exact DOS metadata, calendar/offset-to-FILETIME conversion, serial/label mapping; NTFS→exFAT bounded name/collision proof, FILETIME rounding, canonical Up-case profile, serial/label policy; exact source-only evidence and proven pinned `$Secure:$SDS` bytes retained in schema-v4 escrow; non-object source metadata becomes a staging exclusion rather than relocation scratch | Both pure structural directions implemented and current/Rust-1.85 tested; neither can authorize activation until its target serializer qualifies |
+| Independent verification | Overlay parser/normalizer plus namespace/content manifests; reproducible root and rich nested/payload fixture exporter; read-only external results in `EXTERNAL_VALIDATION.md` | Root and nested Unicode/fragmented-payload candidates pass `fsck.exfat -n`, NTFS-3G metadata/listing/`ntfsfix -n`, and independent exFAT/NTFS read-only FUSE mounts with exact payload hashes, all without image-byte changes; broader corpus, Windows disposable-VHD `chkdsk`, detach, and reinspection evidence remain |
+| CLI workflow | Read-only `inspect`, exact blocked `preview`, create-new `convert-image`, synthetic `plan`, explicit policy/serializer blockers | In-place convert/verify/rollback/finalize remain intentionally absent until a target serializer qualifies |
+| Desktop workflow | Native egui shell, dark ASCII system, regular-image picker/inspection, exact blocked preview, create-new image export, deterministic report export, in-place conversion disabled | Needs native visual/accessibility audit, persistent session/recovery views, and packaging |
+| Cross-platform gates | Current Rust + Rust 1.85 core/CLI, stable GUI, Go lab, parser-fuzz CI | CI exists; signed/reproducible release artifacts and SBOM remain |
+| Physical-volume support | None | Requires every gate in `SAFETY.md`, separate review, and later a uniquely identified sacrificial removable drive |
+| Ship contract | Repository policy requires commit, `origin/main`, and 7z backup | Run only after the selected release milestone passes this matrix |
+
+## Release labels
+
+- **Copy-conversion pre-alpha:** supported sources may become a brand-new verified regular target;
+  source mutation, overwrite, and devices remain unavailable.
+- **In-place image-conversion alpha:** activation-ready strict subset, regular-image executor, full crash cuts,
+  internal and external structural validation; no raw devices.
+- **Physical preview:** every physical gate in `SAFETY.md`, platform lock/dismount/flush review, and
+  sacrificial-media qualification.
+- **Ready:** signed cross-platform UX, recovery tooling, compatibility matrix, documentation, and no
+  unqualified losslessness claims.
+
+The current repository is a **copy-conversion pre-alpha**. In-place activation remains blocked.

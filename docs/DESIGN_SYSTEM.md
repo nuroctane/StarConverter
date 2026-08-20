@@ -59,6 +59,13 @@ signal: pair it with `[READY]`, `[WARN]`, `[BLOCKED]`, or `[ACTIVE]`.
 - ASCII frames may structure empty states and log output. They must not be individually announced by
   screen readers; accessible labels describe the contained state.
 
+### Product mark
+
+[`assets/starconverter-mark.svg`](../assets/starconverter-mark.svg) is the canonical scalable mark.
+It uses only design-system tokens and simple geometry so release packaging can render deterministic
+PNG/ICO/ICNS variants without font or generative-image dependencies. The desktop window icon is a
+small code-rendered version of the same star/prism grammar.
+
 ## Component-level rules
 
 ### Source picker

@@ -3,7 +3,7 @@ name = "starconverter-gui"
 description = "Native cross-platform desktop shell for StarConverter"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+rust-version = "1.95"
 authors.workspace = true
 license-file.workspace = true
 repository.workspace = true
@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 eframe = "0.36.1"
+rfd = "0.17.2"
 starconverter-core = { path = "../starconverter-core" }
 
 [lints]

@@ -1,6 +1,6 @@
 [package]
 name = "starconverter-cli"
-description = "Analysis-only command-line frontend for StarConverter"
+description = "Image inspection, preview, and copy-based conversion frontend for StarConverter"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

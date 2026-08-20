@@ -1,0 +1,71 @@
+name: Parser fuzz smoke
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/starconverter-core/**'
+      - 'fuzz/**'
+      - '.github/workflows/fuzz.yml'
+  pull_request:
+    paths:
+      - 'crates/starconverter-core/**'
+      - 'fuzz/**'
+      - '.github/workflows/fuzz.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  parser-fuzz-smoke:
+    name: cargo-fuzz / bounded parser smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Compile all fuzz targets
+        shell: bash
+        run: |
+          targets=(
+            boot_sectors
+            boot_regions
+            exfat_directory
+            exfat_upcase
+            ntfs_file_attributes
+            ntfs_attribute_list
+            ntfs_runlist_bitmap
+            ntfs_index
+          )
+          for target in "${targets[@]}"; do
+            cargo +nightly fuzz build "$target"
+          done
+      - name: Run bounded smoke iterations
+        shell: bash
+        run: |
+          targets=(
+            boot_sectors
+            boot_regions
+            exfat_directory
+            exfat_upcase
+            ntfs_file_attributes
+            ntfs_attribute_list
+            ntfs_runlist_bitmap
+            ntfs_index
+          )
+          for target in "${targets[@]}"; do
+            cargo +nightly fuzz run "$target" -- \
+              -runs=64 \
+              -max_len=131072 \
+              -timeout=10
+          done

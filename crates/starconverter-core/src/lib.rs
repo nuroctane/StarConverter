@@ -1,7 +1,27 @@
-//! Pure planning and safety vocabulary for `StarConverter`.
+//! Filesystem inspection, copy-based candidate export, and safety vocabulary for `StarConverter`.
 //!
-//! The scaffold intentionally contains no raw-device I/O. Frontends can use this crate to make the
-//! guarantee class and preflight blockers concrete before the filesystem parsers arrive.
+//! The crate intentionally contains no raw-device API. Source image access is read-only. The
+//! copy-based exporter can create one new regular target file, while the separate in-place executor
+//! remains unreachable without opaque activation authorization.
+
+pub mod candidate_export;
+pub mod capsule;
+pub mod conversion;
+pub mod cross_format;
+pub mod executor;
+pub mod extent;
+pub mod fs;
+pub mod geometry;
+pub mod image;
+pub mod inspect;
+pub mod object;
+pub mod overlay;
+pub mod phase;
+pub mod preimage;
+pub mod preservation;
+pub mod recovery;
+pub mod validation_vhd;
+pub mod verify;
 
 use std::fmt;
 use std::str::FromStr;
@@ -110,19 +130,38 @@ pub struct VolumeProfile {
     pub stable_id: String,
     pub filesystem: FileSystem,
     pub capacity_bytes: u64,
-    pub free_bytes: u64,
+    /// Proven free bytes from allocation metadata. `None` means discovery has not established it.
+    pub free_bytes: Option<u64>,
     pub logical_sector_bytes: u32,
     pub cluster_bytes: u32,
     pub state: VolumeState,
     pub role: VolumeRole,
     pub features: Vec<SemanticFeature>,
+    /// Whether all allocation and object metadata needed for safe planning was scanned.
+    pub inventory_complete: bool,
 }
 
 /// Mutability-relevant state observed during discovery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VolumeState {
-    pub clean: bool,
-    pub mounted: bool,
+    pub health: HealthState,
+    pub access: AccessState,
+}
+
+/// Filesystem consistency state backed by inspection evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealthState {
+    Clean,
+    Dirty,
+    Unknown,
+}
+
+/// Whether mutation can safely assume exclusive offline access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessState {
+    Offline,
+    Mounted,
+    Unknown,
 }
 
 /// Topology roles that remain outside the initial support envelope.
@@ -141,18 +180,19 @@ impl VolumeProfile {
             stable_id: "image://demo-archive.exfat".into(),
             filesystem: FileSystem::ExFat,
             capacity_bytes: 64 * 1024 * MIB,
-            free_bytes: 21 * 1024 * MIB,
+            free_bytes: Some(21 * 1024 * MIB),
             logical_sector_bytes: 512,
             cluster_bytes: 128 * 1024,
             state: VolumeState {
-                clean: true,
-                mounted: false,
+                health: HealthState::Clean,
+                access: AccessState::Offline,
             },
             role: VolumeRole {
                 system_volume: false,
                 encrypted_container: false,
             },
             features: Vec::new(),
+            inventory_complete: true,
         }
     }
 }
@@ -249,23 +289,29 @@ impl Planner {
 
         let metadata_reserve_bytes = (source.capacity_bytes / 100).max(256 * MIB);
         let required_temporary_bytes = metadata_reserve_bytes.saturating_add(escrow_reserve_bytes);
-        if required_temporary_bytes > source.free_bytes {
-            blocker(
+        match source.free_bytes {
+            Some(free_bytes) if required_temporary_bytes > free_bytes => blocker(
                 &mut issues,
                 "space.insufficient",
                 format!(
                     "The preliminary plan needs {} MiB, but only {} MiB is free.",
                     required_temporary_bytes / MIB,
-                    source.free_bytes / MIB
+                    free_bytes / MIB
                 ),
-            );
+            ),
+            None => blocker(
+                &mut issues,
+                "space.unknown",
+                "Free space has not been proven from allocation metadata.",
+            ),
+            Some(_) => {}
         }
 
         if issues.is_empty() {
             info(
                 &mut issues,
-                "preflight.synthetic",
-                "Synthetic preflight passed. Real filesystem parsing is not implemented yet.",
+                "preflight.ready",
+                "The supplied evidence satisfies the current preflight policy.",
             );
         }
 
@@ -283,6 +329,23 @@ impl Planner {
 }
 
 fn validate_source(source: &VolumeProfile, target: FileSystem, issues: &mut Vec<PlanIssue>) {
+    validate_identity_and_format(source, target, issues);
+    validate_state(source, issues);
+    validate_geometry(source, issues);
+}
+
+fn validate_identity_and_format(
+    source: &VolumeProfile,
+    target: FileSystem,
+    issues: &mut Vec<PlanIssue>,
+) {
+    if source.stable_id.trim().is_empty() {
+        blocker(
+            issues,
+            "identity.missing",
+            "The source does not have a stable identity.",
+        );
+    }
     if source.filesystem == FileSystem::Unknown {
         blocker(
             issues,
@@ -304,19 +367,41 @@ fn validate_source(source: &VolumeProfile, target: FileSystem, issues: &mut Vec<
             format!("The source already uses {target}."),
         );
     }
-    if !source.state.clean {
+    if !source.inventory_complete {
         blocker(
+            issues,
+            "inventory.incomplete",
+            "Allocation and object metadata have not been completely scanned.",
+        );
+    }
+}
+
+fn validate_state(source: &VolumeProfile, issues: &mut Vec<PlanIssue>) {
+    match source.state.health {
+        HealthState::Dirty => blocker(
             issues,
             "health.dirty",
             "The source is dirty. Repair it with the operating-system filesystem checker and analyze again.",
-        );
+        ),
+        HealthState::Unknown => blocker(
+            issues,
+            "health.unknown",
+            "Filesystem cleanliness has not been proven from authoritative metadata.",
+        ),
+        HealthState::Clean => {}
     }
-    if source.state.mounted {
-        blocker(
+    match source.state.access {
+        AccessState::Mounted => blocker(
             issues,
             "access.mounted",
             "The source is mounted. Conversion requires an offline, exclusively locked source.",
-        );
+        ),
+        AccessState::Unknown => blocker(
+            issues,
+            "access.unknown",
+            "Exclusive offline access has not been proven.",
+        ),
+        AccessState::Offline => {}
     }
     if source.role.system_volume {
         blocker(
@@ -332,6 +417,9 @@ fn validate_source(source: &VolumeProfile, target: FileSystem, issues: &mut Vec<
             "Encrypted containers must be decrypted outside StarConverter before planning.",
         );
     }
+}
+
+fn validate_geometry(source: &VolumeProfile, issues: &mut Vec<PlanIssue>) {
     if !matches!(source.logical_sector_bytes, 512 | 4096) {
         blocker(
             issues,
@@ -342,11 +430,32 @@ fn validate_source(source: &VolumeProfile, target: FileSystem, issues: &mut Vec<
             ),
         );
     }
-    if source.cluster_bytes == 0 || !source.cluster_bytes.is_power_of_two() {
+    if source.capacity_bytes == 0 {
+        blocker(
+            issues,
+            "geometry.empty",
+            "The source reports zero capacity.",
+        );
+    }
+    if source
+        .free_bytes
+        .is_some_and(|free_bytes| free_bytes > source.capacity_bytes)
+    {
+        blocker(
+            issues,
+            "space.invalid",
+            "Proven free space exceeds the source capacity.",
+        );
+    }
+    if source.cluster_bytes == 0
+        || !source.cluster_bytes.is_power_of_two()
+        || source.cluster_bytes < source.logical_sector_bytes
+        || source.cluster_bytes % source.logical_sector_bytes != 0
+    {
         blocker(
             issues,
             "geometry.cluster-size",
-            "Cluster size must be a non-zero power of two.",
+            "Cluster size must be a non-zero power-of-two multiple of the logical sector size.",
         );
     }
 }
@@ -537,11 +646,83 @@ mod tests {
     #[test]
     fn dirty_source_is_always_blocked() {
         let mut source = VolumeProfile::demo_exfat();
-        source.state.clean = false;
+        source.state.health = HealthState::Dirty;
 
         let plan = Planner.plan(&source, FileSystem::Ntfs, GuaranteeMode::ContentOnly);
 
         assert!(!plan.is_ready());
         assert!(plan.issues.iter().any(|issue| issue.code == "health.dirty"));
+    }
+
+    #[test]
+    fn unknown_free_space_is_never_ready() {
+        let mut source = VolumeProfile::demo_exfat();
+        source.free_bytes = None;
+
+        let plan = Planner.plan(&source, FileSystem::Ntfs, GuaranteeMode::Strict);
+
+        assert!(!plan.is_ready());
+        assert!(
+            plan.issues
+                .iter()
+                .any(|issue| issue.code == "space.unknown")
+        );
+    }
+
+    #[test]
+    fn unknown_health_and_access_are_never_ready() {
+        let mut source = VolumeProfile::demo_exfat();
+        source.state.health = HealthState::Unknown;
+        source.state.access = AccessState::Unknown;
+
+        let plan = Planner.plan(&source, FileSystem::Ntfs, GuaranteeMode::Strict);
+
+        assert!(!plan.is_ready());
+        assert!(
+            plan.issues
+                .iter()
+                .any(|issue| issue.code == "health.unknown")
+        );
+        assert!(
+            plan.issues
+                .iter()
+                .any(|issue| issue.code == "access.unknown")
+        );
+    }
+
+    #[test]
+    fn contradictory_capacity_evidence_is_blocked() {
+        let mut source = VolumeProfile::demo_exfat();
+        source.free_bytes = Some(source.capacity_bytes + 1);
+        source.cluster_bytes = 256;
+
+        let plan = Planner.plan(&source, FileSystem::Ntfs, GuaranteeMode::Strict);
+
+        assert!(!plan.is_ready());
+        assert!(
+            plan.issues
+                .iter()
+                .any(|issue| issue.code == "space.invalid")
+        );
+        assert!(
+            plan.issues
+                .iter()
+                .any(|issue| issue.code == "geometry.cluster-size")
+        );
+    }
+
+    #[test]
+    fn incomplete_object_inventory_is_never_ready() {
+        let mut source = VolumeProfile::demo_exfat();
+        source.inventory_complete = false;
+
+        let plan = Planner.plan(&source, FileSystem::Ntfs, GuaranteeMode::Strict);
+
+        assert!(!plan.is_ready());
+        assert!(
+            plan.issues
+                .iter()
+                .any(|issue| issue.code == "inventory.incomplete")
+        );
     }
 }

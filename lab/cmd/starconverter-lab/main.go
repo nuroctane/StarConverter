@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/nuroctane/StarConverter/lab/internal/crashmodel"
 	"github.com/nuroctane/StarConverter/lab/internal/matrix"
 )
 
@@ -20,12 +21,28 @@ func main() {
 		printMatrix()
 	case "json":
 		printJSON()
+	case "crashes":
+		printCrashes()
 	case "help", "-h", "--help":
 		usage()
 	default:
 		fmt.Fprintf(os.Stderr, "[ERROR] unknown command %q\n", os.Args[1])
 		usage()
 		os.Exit(2)
+	}
+}
+
+func printCrashes() {
+	campaign, err := crashmodel.Campaign()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[BLOCKED] invalid crash protocol: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("[ STARCONVERTER :: CRASH CAMPAIGN ]")
+	fmt.Println("[SAFE] model only; no images or devices are modified")
+	fmt.Println()
+	for index, injection := range campaign {
+		fmt.Printf("%02d :: after=%-22s fault=%-19s recover=%s\n", index+1, injection.After, injection.Fault, injection.Recovery)
 	}
 }
 
@@ -61,5 +78,5 @@ func printJSON() {
 }
 
 func usage() {
-	fmt.Println("Usage: starconverter-lab <matrix|json|help>")
+	fmt.Println("Usage: starconverter-lab <matrix|json|crashes|help>")
 }

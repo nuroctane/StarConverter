@@ -1,12 +1,18 @@
 [package]
 name = "starconverter-core"
-description = "Safety model and deterministic conversion planner for StarConverter"
+description = "Filesystem inspection, safe copy-based image conversion, and transaction planning for StarConverter"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license-file.workspace = true
 repository.workspace = true
+
+[dependencies]
+crc32fast = "1.4"
+# Safe Rust 1.85-compatible whole-file locks (advisory on Unix, paired with deny-share on Windows).
+fs4 = "1.1"
+sha2 = "0.10"
 
 [lints]
 workspace = true

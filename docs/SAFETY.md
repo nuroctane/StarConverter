@@ -45,9 +45,9 @@ The first physical-device release must refuse:
 | --- | --- | --- |
 | Discovered | Source untouched | Re-run analysis |
 | Reserved | Source valid; placeholders allocated | Remove placeholders or continue |
-| Relocating | Source valid via journaled moves | Replay or reverse moves |
-| Target staged | Source boot remains active | Discard target metadata or continue |
-| Backup boot written | Source primary boot remains active | Restore saved backup sectors |
+| Relocating | Payload copies exist at old and new ranges; source still references the old bytes; target staging may be in flight | Conservatively restore every staging before-image or continue |
+| Target staged | Source boot remains active; the backup-boot write may be in flight | Conservatively restore staging and backup-boot before-images or continue |
+| Backup boot written | Source primary boot remains active; primary activation may be in flight | Conservatively restore all phase before-images or continue |
 | Activated | Target primary boot active | Verify target or restore source from capsule |
 | Verified | Target validated; rollback retained | Continue using target or rollback |
 | Finalized | Target valid; capsule intentionally released | No automatic rollback promise |
@@ -55,6 +55,11 @@ The first physical-device release must refuse:
 Each transition includes an incremented generation number, CRC-protected headers, a payload hash,
 and an explicit flush. Recovery selects the newest complete generation rather than trusting a single
 flag.
+
+Recovery deliberately includes the write group *after* the newest completed checkpoint. A crash can
+occur after that group's bytes reach storage but before its completion generation is durable; exact
+before-images make restoring an untouched range harmless and prevent this acknowledgement window
+from under-restoring a torn write.
 
 ## Physical-device gate
 
@@ -72,6 +77,36 @@ Raw-device code may be merged only after all of these conditions are met:
 
 After that gate, testing begins only on one uniquely labeled sacrificial removable drive with every
 other removable drive unplugged. No automated test targets a physical device by enumeration order.
+
+## Regular-image executor boundary
+
+The image executor opens only an existing canonical regular file. It never creates, truncates, or
+resizes; lexically rejects Windows device namespaces and Unix `/dev`; checks the inspection identity
+and fixed length before mutation; takes Windows deny-share plus a whole-file lock (advisory locking
+on other platforms); and accepts only a complete exact intent from an activation-authorized
+`PreparedConversion`. It verifies every destination chunk, executes both data and metadata flushes,
+and returns evidence without recording a checkpoint itself.
+
+This is not physical-volume authorization. Serializer activation remains opaque and unavailable,
+and frontends expose no in-place conversion command. The create-new path below is a separate safety
+boundary and does not authorize this executor.
+
+## Copy-based candidate boundary
+
+The first executable conversion path never opens the source for write. It requires a caller-selected
+output path that does not exist, lexically rejects device namespaces and reserved device names,
+canonicalizes and validates the output parent, and creates the output with `create_new`. It verifies
+that every preview rollback range is the exact current source before copying. Inspection, planning,
+preimage capture, copying, and final hashing share one pinned read-only file identity. The complete
+source is copied in bounded chunks, candidate metadata and both boot copies are written only to the new file,
+and the result is flushed, reopened through the regular-image reader, fully inventoried, normalized,
+and compared to the planned logical namespace/content manifest.
+
+Escrow mode also requires a second create-new sidecar whose payload first passes the independent
+schema decoder and direction check. Any failure removes only files newly created by that call. The
+source is hashed before and after the export; success requires equality. This path deliberately does
+not consume `ActivationAuthorizedWrites`, because there is no source activation or rollback point to
+authorize. It does not qualify the separate in-place executor or any physical backend.
 
 ## Threats outside the guarantee
 

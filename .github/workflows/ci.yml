@@ -37,6 +37,22 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  rust-msrv:
+    name: Rust / core+CLI MSRV 1.85
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo +1.85.0 fmt --all -- --check
+      - name: Clippy
+        run: cargo +1.85.0 clippy -p starconverter-core -p starconverter-cli --all-targets -- -D warnings
+      - name: Test
+        run: cargo +1.85.0 test -p starconverter-core -p starconverter-cli
+
   go-lab:
     name: Go lab / ${{ matrix.os }}
     strategy:

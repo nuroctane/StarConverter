@@ -1,0 +1,32 @@
+//! Allocation-safe, read-only filesystem structure parsers.
+
+pub mod exfat;
+pub mod exfat_allocation;
+pub mod exfat_directory;
+pub mod exfat_discovery;
+pub mod exfat_image;
+pub mod exfat_inventory;
+pub mod exfat_normalize;
+pub mod exfat_region;
+pub mod exfat_serialize;
+pub mod exfat_upcase;
+pub mod exfat_upcase_serialize;
+pub mod ntfs;
+pub mod ntfs_attribute;
+pub mod ntfs_attribute_list;
+pub mod ntfs_bitmap;
+pub mod ntfs_discovery;
+pub mod ntfs_essential;
+pub mod ntfs_extend;
+pub mod ntfs_index;
+pub mod ntfs_index_serialize;
+pub mod ntfs_inventory;
+pub mod ntfs_logfile;
+pub mod ntfs_normalize;
+pub mod ntfs_record;
+pub mod ntfs_region;
+pub mod ntfs_runlist;
+pub mod ntfs_secure;
+pub mod ntfs_serialize;
+pub mod ntfs_upcase_serialize;
+pub mod ntfs_volume;

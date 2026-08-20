@@ -17,6 +17,9 @@ try {
     Write-Host '[RUST] cargo test'
     cargo test --workspace
 
+    Write-Host '[RUST] compile bounded parser fuzz targets'
+    cargo check --manifest-path .\fuzz\Cargo.toml --bins
+
     $goCommand = Get-Command go -ErrorAction SilentlyContinue
     if ($null -eq $goCommand) {
         Write-Warning '[GO] toolchain not installed; lab checks skipped locally (CI still runs them).'

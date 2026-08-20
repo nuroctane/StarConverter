@@ -1,9 +1,30 @@
+use std::fmt::Write as _;
+use std::fs;
+use std::path::{Path, PathBuf};
+
 use eframe::egui::{
-    self, Align, Button, Color32, FontId, Frame, Label, Layout, Margin, RichText, Stroke,
+    self, Align, Button, Color32, FontId, Frame, IconData, Label, Layout, Margin, RichText, Stroke,
     TextStyle, Vec2,
 };
+use starconverter_core::candidate_export::{
+    CandidateExportEvidence, CandidateExportLimits, export_candidate_image,
+};
+use starconverter_core::cross_format::{
+    ExfatToNtfsLimits, ExfatToNtfsOptions, NtfsToExfatLimits, NtfsToExfatOptions,
+    plan_lossless_exfat_to_ntfs, plan_lossless_ntfs_to_exfat,
+};
+use starconverter_core::geometry::{DestinationReservation, SourceAllocation};
+use starconverter_core::image::ImageFile;
+use starconverter_core::inspect::{inspect_image, inspect_open_image};
+use starconverter_core::object::ObjectGraph;
+use starconverter_core::phase::{
+    PhaseWritePreview, preview_exfat_phase_writes, preview_ntfs_phase_writes,
+};
+use starconverter_core::preimage::PreimageLimits;
+use starconverter_core::preservation::PreservationReport;
 use starconverter_core::{
-    ConversionPlan, FileSystem, GuaranteeMode, Planner, SemanticFeature, Severity, VolumeProfile,
+    ConversionPlan, FileSystem, GuaranteeMode, HealthState, Planner, SemanticFeature, Severity,
+    VolumeProfile,
 };
 
 const VOID: Color32 = Color32::from_rgb(5, 5, 6);
@@ -29,7 +50,8 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(Vec2::new(1180.0, 760.0))
-            .with_min_inner_size(Vec2::new(760.0, 580.0)),
+            .with_min_inner_size(Vec2::new(760.0, 580.0))
+            .with_icon(app_icon()),
         ..Default::default()
     };
 
@@ -40,13 +62,56 @@ fn main() -> eframe::Result {
     )
 }
 
+fn app_icon() -> IconData {
+    const SIZE: usize = 64;
+    const DIMENSION: u32 = 64;
+    const BACKGROUND: [u8; 4] = [5, 5, 6, 255];
+    const INK_RGBA: [u8; 4] = [242, 244, 245, 255];
+    const WORKING_RGBA: [u8; 4] = [168, 216, 255, 255];
+    let mut rgba = vec![BACKGROUND; SIZE * SIZE];
+
+    let mut point = |x: usize, y: usize, color: [u8; 4]| {
+        if x < SIZE && y < SIZE {
+            rgba[y * SIZE + x] = color;
+        }
+    };
+    for delta in 0..=6 {
+        point(32, 8 + delta, INK_RGBA);
+        point(32, 20 - delta, INK_RGBA);
+        point(26 + delta, 14, INK_RGBA);
+        point(38 - delta, 14, INK_RGBA);
+    }
+    for y in 23..=49 {
+        let half_width = (y - 23) / 2;
+        point(32 - half_width, y, WORKING_RGBA);
+        point(32 + half_width, y, WORKING_RGBA);
+    }
+    for x in 18..=46 {
+        point(x, 50, WORKING_RGBA);
+        point(x, 51, WORKING_RGBA);
+    }
+    for x in 24..=40 {
+        point(x, 38, INK_RGBA);
+    }
+
+    IconData {
+        rgba: rgba.into_iter().flatten().collect(),
+        width: DIMENSION,
+        height: DIMENSION,
+    }
+}
+
 #[derive(Debug)]
 struct StarConverterApp {
     source: VolumeProfile,
     target: FileSystem,
     mode: GuaranteeMode,
     plan: ConversionPlan,
-    activity: Vec<&'static str>,
+    image_path: String,
+    real_source: bool,
+    inspection_status: String,
+    exact_preview: Option<String>,
+    activity: Vec<String>,
 }
 
 impl StarConverterApp {
@@ -61,10 +126,15 @@ impl StarConverterApp {
             target,
             mode,
             plan,
+            image_path: String::new(),
+            real_source: false,
+            inspection_status: "Enter a regular image path to begin read-only analysis.".into(),
+            exact_preview: None,
             activity: vec![
-                "00:00:00  [READY] UI initialized",
-                "00:00:00  [SAFE]  raw-device backend absent",
-                "00:00:00  [INFO]  synthetic demo source selected",
+                "00:00:00  [READY] UI initialized".into(),
+                "00:00:00  [SAFE]  raw-device backend absent".into(),
+                "00:00:00  [LOCKED] serializer activation gaps remain".into(),
+                "00:00:00  [INFO]  synthetic demo source selected".into(),
             ],
         }
     }
@@ -76,6 +146,9 @@ impl StarConverterApp {
     fn select_exfat_demo(&mut self) {
         self.source = VolumeProfile::demo_exfat();
         self.target = FileSystem::Ntfs;
+        self.real_source = false;
+        self.exact_preview = None;
+        self.inspection_status = "Synthetic exFAT capability profile selected.".into();
         self.replan();
     }
 
@@ -91,7 +164,296 @@ impl StarConverterApp {
         ];
         self.source = source;
         self.target = FileSystem::ExFat;
+        self.real_source = false;
+        self.exact_preview = None;
+        self.inspection_status = "Synthetic NTFS capability profile selected.".into();
         self.replan();
+    }
+
+    fn analyze_image(&mut self) {
+        self.exact_preview = None;
+        let path = self.image_path.trim();
+        if path.is_empty() {
+            self.inspection_status = "Image path is required.".into();
+            self.activity
+                .push("00:00:00  [BLOCKED] image path is empty".into());
+            return;
+        }
+        match inspect_image(path) {
+            Ok(inspection) => {
+                let inventory_status = if inspection.profile.inventory_complete {
+                    "complete bounded inventory normalized"
+                } else {
+                    "inventory incomplete; conversion remains blocked"
+                };
+                self.target = match inspection.profile.filesystem {
+                    FileSystem::ExFat => FileSystem::Ntfs,
+                    FileSystem::Ntfs => FileSystem::ExFat,
+                    FileSystem::Unknown => FileSystem::Unknown,
+                };
+                self.source = inspection.profile;
+                self.real_source = true;
+                self.inspection_status = format!(
+                    "Read-only evidence accepted: {} boot/allocation integrity; {inventory_status}.",
+                    self.source.filesystem,
+                );
+                self.activity.push(format!(
+                    "00:00:00  [READY] read-only image evidence :: {}",
+                    self.source.display_name
+                ));
+                self.replan();
+            }
+            Err(error) => {
+                self.real_source = false;
+                self.inspection_status = error.to_string();
+                self.activity
+                    .push(format!("00:00:00  [BLOCKED] inspection failed :: {error}"));
+            }
+        }
+    }
+
+    fn choose_image(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Select a regular exFAT or NTFS image")
+            .pick_file()
+        else {
+            return;
+        };
+        self.image_path = path.display().to_string();
+        self.real_source = false;
+        self.exact_preview = None;
+        self.inspection_status = "Image selected; analysis has not started.".into();
+        self.activity
+            .push("00:00:00  [READY] regular image path selected".into());
+    }
+
+    fn save_plan(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Save StarConverter analysis plan")
+            .set_file_name("starconverter-plan.txt")
+            .add_filter("Text report", &["txt"])
+            .save_file()
+        else {
+            return;
+        };
+        let mut report = plan_report(&self.plan);
+        if let Some(preview) = &self.exact_preview {
+            report.push('\n');
+            report.push_str(preview);
+        }
+        match fs::write(&path, report) {
+            Ok(()) => self.activity.push(format!(
+                "00:00:00  [SAVED] plan report :: {}",
+                path.display()
+            )),
+            Err(error) => self.activity.push(format!(
+                "00:00:00  [BLOCKED] could not save plan :: {error}"
+            )),
+        }
+    }
+
+    fn preview_image(&mut self) {
+        let source_path = self.image_path.trim().to_owned();
+        if source_path.is_empty() {
+            self.inspection_status = "Image path is required.".into();
+            self.activity
+                .push("00:00:00  [BLOCKED] preview path is empty".into());
+            return;
+        }
+
+        let result = self.build_exact_preview(&source_path);
+        match result {
+            Ok(report) => {
+                self.exact_preview = Some(report);
+                self.inspection_status =
+                    "Exact candidate and rollback before-images captured in memory; no writes performed."
+                        .into();
+                self.activity
+                    .push("00:00:00  [SAFE]  exact read-only transaction preview ready".into());
+            }
+            Err(error) => {
+                self.exact_preview = None;
+                self.inspection_status.clone_from(&error);
+                self.activity
+                    .push(format!("00:00:00  [BLOCKED] preview refused :: {error}"));
+            }
+        }
+    }
+
+    fn export_new_image(&mut self) {
+        let source_path = self.image_path.trim().to_owned();
+        if source_path.is_empty() {
+            self.inspection_status = "Image path is required.".into();
+            self.activity
+                .push("00:00:00  [BLOCKED] export source path is empty".into());
+            return;
+        }
+        let Some(output_path) = rfd::FileDialog::new()
+            .set_title("Create a new converted image (existing paths are refused)")
+            .set_file_name("starconverter-output.img")
+            .add_filter("Filesystem image", &["img"])
+            .save_file()
+        else {
+            return;
+        };
+
+        match self.build_candidate_export(&source_path, &output_path) {
+            Ok(evidence) => {
+                self.exact_preview = Some(export_evidence_report(&evidence));
+                self.inspection_status =
+                    "New target image exported and independently reinspected; source hash unchanged."
+                        .into();
+                self.activity.push(format!(
+                    "00:00:00  [COMPLETE] copy-based {} image :: {}",
+                    evidence.target_filesystem,
+                    evidence.output_path.display()
+                ));
+            }
+            Err(error) => {
+                self.inspection_status.clone_from(&error);
+                self.activity.push(format!(
+                    "00:00:00  [BLOCKED] image export refused :: {error}"
+                ));
+            }
+        }
+    }
+
+    fn build_exact_preview(&mut self, source_path: &str) -> Result<String, String> {
+        let image = ImageFile::open(source_path).map_err(|error| error.to_string())?;
+        let inspection = inspect_open_image(&image).map_err(|error| error.to_string())?;
+        let target = match inspection.profile.filesystem {
+            FileSystem::ExFat => FileSystem::Ntfs,
+            FileSystem::Ntfs => FileSystem::ExFat,
+            FileSystem::Unknown => return Err("recognized image has unknown filesystem".into()),
+        };
+        self.source = inspection.profile.clone();
+        self.target = target;
+        self.real_source = true;
+        self.replan();
+        match (
+            inspection.normalized_exfat.as_deref(),
+            inspection.normalized_ntfs.as_deref(),
+            target,
+        ) {
+            (Some(normalized), None, FileSystem::Ntfs) => {
+                let plan = plan_lossless_exfat_to_ntfs(
+                    normalized,
+                    self.mode,
+                    ExfatToNtfsOptions::default(),
+                    ExfatToNtfsLimits::default(),
+                )
+                .map_err(|error| format!("cross-format plan refused: {error}"))?;
+                let preview =
+                    preview_ntfs_phase_writes(&image, &plan.destination, PreimageLimits::default())
+                        .map_err(|error| format!("phase preview failed: {error}"))?;
+                Ok(exact_preview_report(
+                    &preview,
+                    &plan.destination.reservations,
+                    &plan.destination.source_allocations,
+                    &plan.preservation,
+                ))
+            }
+            (None, Some(normalized), FileSystem::ExFat) => {
+                let plan = plan_lossless_ntfs_to_exfat(
+                    normalized,
+                    self.mode,
+                    NtfsToExfatOptions::default(),
+                    NtfsToExfatLimits::default(),
+                )
+                .map_err(|error| format!("cross-format plan refused: {error}"))?;
+                let preview = preview_exfat_phase_writes(
+                    &image,
+                    &plan.destination,
+                    PreimageLimits::default(),
+                )
+                .map_err(|error| format!("phase preview failed: {error}"))?;
+                Ok(exact_preview_report(
+                    &preview,
+                    &plan.destination.reservations,
+                    &plan.destination.source_allocations,
+                    &plan.preservation,
+                ))
+            }
+            (Some(_), None, _) | (None, Some(_), _) => {
+                Err("preview direction does not match the inspected source".into())
+            }
+            (None, None, _) => Err("complete normalized inventory is required for preview".into()),
+            (Some(_), Some(_), _) => Err(
+                "inspection unexpectedly contains normalized evidence for two filesystems".into(),
+            ),
+        }
+    }
+
+    fn build_candidate_export(
+        &mut self,
+        source_path: &str,
+        output_path: &Path,
+    ) -> Result<CandidateExportEvidence, String> {
+        let image = ImageFile::open(source_path).map_err(|error| error.to_string())?;
+        let inspection = inspect_open_image(&image).map_err(|error| error.to_string())?;
+        let target = match inspection.profile.filesystem {
+            FileSystem::ExFat => FileSystem::Ntfs,
+            FileSystem::Ntfs => FileSystem::ExFat,
+            FileSystem::Unknown => return Err("recognized image has unknown filesystem".into()),
+        };
+        self.source = inspection.profile.clone();
+        self.target = target;
+        self.real_source = true;
+        self.replan();
+        match (
+            inspection.normalized_exfat.as_deref(),
+            inspection.normalized_ntfs.as_deref(),
+            target,
+        ) {
+            (Some(normalized), None, FileSystem::Ntfs) => {
+                let plan = plan_lossless_exfat_to_ntfs(
+                    normalized,
+                    self.mode,
+                    ExfatToNtfsOptions::default(),
+                    ExfatToNtfsLimits::default(),
+                )
+                .map_err(|error| format!("cross-format plan refused: {error}"))?;
+                let preview =
+                    preview_ntfs_phase_writes(&image, &plan.destination, PreimageLimits::default())
+                        .map_err(|error| format!("phase preview failed: {error}"))?;
+                export_gui_candidate(
+                    &image,
+                    output_path,
+                    &preview,
+                    &plan.target_graph,
+                    &plan.preservation,
+                )
+            }
+            (None, Some(normalized), FileSystem::ExFat) => {
+                let plan = plan_lossless_ntfs_to_exfat(
+                    normalized,
+                    self.mode,
+                    NtfsToExfatOptions::default(),
+                    NtfsToExfatLimits::default(),
+                )
+                .map_err(|error| format!("cross-format plan refused: {error}"))?;
+                let preview = preview_exfat_phase_writes(
+                    &image,
+                    &plan.destination,
+                    PreimageLimits::default(),
+                )
+                .map_err(|error| format!("phase preview failed: {error}"))?;
+                export_gui_candidate(
+                    &image,
+                    output_path,
+                    &preview,
+                    &plan.target_graph,
+                    &plan.preservation,
+                )
+            }
+            (Some(_), None, _) | (None, Some(_), _) => {
+                Err("conversion direction does not match the inspected source".into())
+            }
+            (None, None, _) => {
+                Err("complete normalized inventory is required for conversion".into())
+            }
+            (Some(_), Some(_), _) => Err("inspection contains evidence for two filesystems".into()),
+        }
     }
 }
 
@@ -130,7 +492,7 @@ impl StarConverterApp {
                             .color(MUTED),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        status_label(ui, "READ-ONLY BUILD", WORKING);
+                        status_label(ui, "COPY-ONLY BUILD", WORKING);
                     });
                 });
             });
@@ -147,28 +509,39 @@ impl StarConverterApp {
             .show(root, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new("[SAFE] RAW WRITES DISABLED")
+                        RichText::new("[SAFE] SOURCE WRITES DISABLED")
                             .monospace()
                             .color(READY),
                     );
                     ui.label(
-                        RichText::new("Select a demo profile to inspect planner behavior.")
-                            .monospace()
-                            .color(MUTED),
+                        RichText::new(
+                            "Sources are read-only; exports create new files; device paths are refused.",
+                        )
+                        .monospace()
+                        .color(MUTED),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.add_enabled(false, Button::new("Convert"))
                             .on_disabled_hover_text(
-                                "Physical conversion is locked behind the image-only safety gate.",
+                                "In-place and physical conversion remain locked behind activation gates.",
                             );
+                        if ui.button("Export new image").clicked() {
+                            self.export_new_image();
+                        }
+                        if ui.button("Preview exact").clicked() {
+                            self.preview_image();
+                        }
                         if ui.button("Analyze source").clicked() {
-                            self.activity
-                                .push("00:00:00  [READY] synthetic plan refreshed");
-                            self.replan();
+                            if self.image_path.trim().is_empty() {
+                                self.activity
+                                    .push("00:00:00  [READY] synthetic plan refreshed".into());
+                                self.replan();
+                            } else {
+                                self.analyze_image();
+                            }
                         }
                         if ui.button("Save plan").clicked() {
-                            self.activity
-                                .push("00:00:00  [INFO]  save-plan backend pending");
+                            self.save_plan();
                         }
                     });
                 });
@@ -196,7 +569,7 @@ impl StarConverterApp {
 
                 if source_button(
                     ui,
-                    self.source.filesystem == FileSystem::ExFat,
+                    !self.real_source && self.source.filesystem == FileSystem::ExFat,
                     "DEMO_ARCHIVE",
                     "exFAT  /  64.00 GiB",
                 )
@@ -208,7 +581,7 @@ impl StarConverterApp {
                 ui.add_space(6.0);
                 if source_button(
                     ui,
-                    self.source.filesystem == FileSystem::Ntfs,
+                    !self.real_source && self.source.filesystem == FileSystem::Ntfs,
                     "DEMO_WORKSPACE",
                     "NTFS   /  64.00 GiB",
                 )
@@ -218,11 +591,37 @@ impl StarConverterApp {
                 }
 
                 ui.add_space(12.0);
-                ui.add_sized(
-                    [ui.available_width(), 44.0],
-                    Button::new(RichText::new("+ OPEN IMAGE...").monospace()),
-                )
-                .on_hover_text("Image-file discovery arrives with the read-only parser stage.");
+                ui.horizontal(|ui| {
+                    let browse_width = 78.0;
+                    let path_width = (ui.available_width() - browse_width - 8.0).max(80.0);
+                    ui.add_sized(
+                        [path_width, 44.0],
+                        egui::TextEdit::singleline(&mut self.image_path)
+                            .hint_text("C:\\path\\volume.img"),
+                    )
+                    .on_hover_text("Regular image file only. Raw-device namespaces are rejected.");
+                    if ui
+                        .add_sized([browse_width, 44.0], Button::new("Browse"))
+                        .clicked()
+                    {
+                        self.choose_image();
+                    }
+                });
+                if ui
+                    .add_sized(
+                        [ui.available_width(), 44.0],
+                        Button::new(RichText::new("+ ANALYZE IMAGE").monospace()),
+                    )
+                    .clicked()
+                {
+                    self.analyze_image();
+                }
+                ui.label(
+                    RichText::new(&self.inspection_status)
+                        .monospace()
+                        .size(10.0)
+                        .color(if self.real_source { READY } else { MUTED }),
+                );
 
                 ui.add_space(28.0);
                 section_label(ui, "SOURCE IDENTITY");
@@ -242,10 +641,10 @@ impl StarConverterApp {
                 metadata_row(
                     ui,
                     "HEALTH",
-                    if self.source.state.clean {
-                        "CLEAN"
-                    } else {
-                        "DIRTY"
+                    match self.source.state.health {
+                        HealthState::Clean => "CLEAN",
+                        HealthState::Dirty => "DIRTY",
+                        HealthState::Unknown => "UNKNOWN",
                     },
                 );
             });
@@ -270,7 +669,7 @@ impl StarConverterApp {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         for entry in &self.activity {
-                            ui.label(RichText::new(*entry).monospace().size(11.0).color(MUTED));
+                            ui.label(RichText::new(entry).monospace().size(11.0).color(MUTED));
                             ui.add_space(5.0);
                         }
                     });
@@ -285,6 +684,7 @@ impl StarConverterApp {
                 self.show_modes(ui);
                 self.show_preflight(ui);
                 self.show_phases(ui);
+                self.show_exact_preview(ui);
             });
     }
 
@@ -302,9 +702,9 @@ impl StarConverterApp {
             });
             ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
                 let (text, color) = if self.plan.is_ready() {
-                    ("READY", READY)
+                    ("PREFLIGHT READY", READY)
                 } else {
-                    ("BLOCKED", DANGER)
+                    ("PREFLIGHT BLOCKED", DANGER)
                 };
                 status_label(ui, text, color);
             });
@@ -367,9 +767,26 @@ impl StarConverterApp {
                 preflight_row(
                     ui,
                     "SPACE",
-                    &format_bytes(self.plan.required_temporary_bytes),
-                    "RESERVE",
-                    WORKING,
+                    &self.source.free_bytes.map_or_else(
+                        || "allocation metadata not scanned".to_owned(),
+                        |free| {
+                            format!(
+                                "{} required / {} proven free",
+                                format_bytes(self.plan.required_temporary_bytes),
+                                format_bytes(free)
+                            )
+                        },
+                    ),
+                    if self.source.free_bytes.is_some() {
+                        "PROVEN"
+                    } else {
+                        "UNKNOWN"
+                    },
+                    if self.source.free_bytes.is_some() {
+                        WORKING
+                    } else {
+                        DANGER
+                    },
                 );
 
                 for issue in &self.plan.issues {
@@ -418,6 +835,35 @@ impl StarConverterApp {
                     });
                     ui.add_space(5.0);
                 }
+            });
+    }
+
+    fn show_exact_preview(&self, ui: &mut egui::Ui) {
+        ui.add_space(24.0);
+        section_label(ui, "EXACT IMAGE PREVIEW");
+        ui.add_space(8.0);
+        Frame::new()
+            .fill(SURFACE)
+            .stroke(Stroke::new(1.0, LINE))
+            .inner_margin(Margin::same(14))
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(180.0)
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(self.exact_preview.as_deref().unwrap_or(
+                                "[IDLE] Select a regular image and choose Preview exact.\n\
+                                 [SAFE] The preview captures before-images in memory and has no executor authority.",
+                            ))
+                            .monospace()
+                            .size(11.0)
+                            .color(if self.exact_preview.is_some() {
+                                WORKING
+                            } else {
+                                MUTED
+                            }),
+                        );
+                    });
             });
     }
 }
@@ -565,7 +1011,226 @@ fn format_bytes(bytes: u64) -> String {
     let mut hundredths = ((bytes % GIB) * 100 + GIB / 2) / GIB;
     if hundredths == 100 {
         hundredths = 0;
-        return format!("{}.{hundredths:02} GiB temporary", whole + 1);
+        return format!("{}.{hundredths:02} GiB", whole + 1);
     }
-    format!("{whole}.{hundredths:02} GiB temporary")
+    format!("{whole}.{hundredths:02} GiB")
+}
+
+fn exact_preview_report(
+    preview: &PhaseWritePreview,
+    reservations: &[DestinationReservation],
+    allocations: &[SourceAllocation],
+    preservation: &PreservationReport,
+) -> String {
+    let writes = preview.writes();
+    let forward_count =
+        writes.target_staging.len() + writes.backup_boot.len() + writes.activation.len();
+    let rollback_count = writes.target_staging_rollback.len()
+        + writes.backup_boot_rollback.len()
+        + writes.activation_rollback.len();
+    let forward_bytes = writes
+        .target_staging
+        .iter()
+        .chain(&writes.backup_boot)
+        .chain(&writes.activation)
+        .map(|write| write.write.bytes.len())
+        .sum::<usize>();
+    let rollback_bytes = writes
+        .target_staging_rollback
+        .iter()
+        .chain(&writes.backup_boot_rollback)
+        .chain(&writes.activation_rollback)
+        .map(|write| write.bytes.len())
+        .sum::<usize>();
+    let staging_exclusions = allocations.iter().filter(|value| !value.movable).count();
+    let escrow_bytes = preservation.escrow.as_ref().map_or(0, Vec::len);
+
+    let mut report = String::new();
+    let _ = writeln!(
+        report,
+        "[READ-ONLY] {} candidate",
+        preview.target_filesystem()
+    );
+    let _ = writeln!(
+        report,
+        "policy={} / schema-v{} / escrow={} B",
+        if preservation.permitted {
+            "PERMITTED"
+        } else {
+            "REFUSED"
+        },
+        preservation.schema_version,
+        escrow_bytes
+    );
+    let _ = writeln!(
+        report,
+        "reservations={} / source-spans={} / non-movable={staging_exclusions}",
+        reservations.len(),
+        allocations.len()
+    );
+    let _ = writeln!(
+        report,
+        "forward={forward_count} writes / {}",
+        format_byte_count(forward_bytes)
+    );
+    let _ = writeln!(
+        report,
+        "rollback={rollback_count} writes / {}",
+        format_byte_count(rollback_bytes)
+    );
+    let _ = writeln!(report, "activation=BLOCKED");
+    for gap in preview.activation_gaps() {
+        let _ = writeln!(report, "[BLOCK] {gap}");
+    }
+    report
+        .push_str("[NO AUTHORITY] No bytes were written; this preview cannot invoke the executor.");
+    report
+}
+
+fn export_gui_candidate(
+    source: &ImageFile,
+    output: &Path,
+    preview: &PhaseWritePreview,
+    target_graph: &ObjectGraph,
+    preservation: &PreservationReport,
+) -> Result<CandidateExportEvidence, String> {
+    let escrow_path = preservation.escrow.as_ref().map(|_| {
+        let mut name = output.as_os_str().to_os_string();
+        name.push(".starconverter-escrow");
+        PathBuf::from(name)
+    });
+    export_candidate_image(
+        source,
+        output,
+        escrow_path.as_deref(),
+        preview,
+        target_graph,
+        preservation,
+        CandidateExportLimits::default(),
+    )
+    .map_err(|error| format!("candidate export failed: {error}"))
+}
+
+fn export_evidence_report(evidence: &CandidateExportEvidence) -> String {
+    let mut report = String::new();
+    let _ = writeln!(
+        report,
+        "[COMPLETE] copy-based {} candidate",
+        evidence.target_filesystem
+    );
+    let _ = writeln!(report, "output={}", evidence.output_path.display());
+    if let Some(path) = &evidence.escrow_path {
+        let _ = writeln!(report, "escrow={}", path.display());
+    }
+    let _ = writeln!(
+        report,
+        "writes={} / replaced={} / manifest={}",
+        evidence.applied_writes,
+        format_byte_count(usize::try_from(evidence.replacement_bytes).unwrap_or(usize::MAX)),
+        hex_digest(&evidence.manifest_sha256)
+    );
+    let _ = writeln!(
+        report,
+        "[SOURCE UNCHANGED] {} bytes / sha256={}",
+        evidence.image_bytes,
+        hex_digest(&evidence.source_sha256)
+    );
+    report.push_str(
+        "[SAFE] Create-new regular output only; in-place and device activation remain locked.",
+    );
+    report
+}
+
+fn hex_digest(digest: &[u8; 32]) -> String {
+    let mut output = String::with_capacity(64);
+    for byte in digest {
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
+}
+
+fn format_byte_count(bytes: usize) -> String {
+    const KIB: usize = 1024;
+    const MIB: usize = KIB * KIB;
+    let (divisor, suffix) = if bytes >= MIB {
+        (MIB, "MiB")
+    } else if bytes >= KIB {
+        (KIB, "KiB")
+    } else {
+        return format!("{bytes} B");
+    };
+    let whole = bytes / divisor;
+    let hundredths = ((bytes % divisor) * 100 + divisor / 2) / divisor;
+    format!("{whole}.{hundredths:02} {suffix}")
+}
+
+fn plan_report(plan: &ConversionPlan) -> String {
+    let mut report = String::from(
+        "[ STAR :: CONVERTER ]\nANALYSIS PLAN :: NOT AN EXECUTABLE WRITE AUTHORIZATION\n\n",
+    );
+    let _ = writeln!(report, "source={}", plan.source.display_name);
+    let _ = writeln!(report, "identity={}", plan.source.stable_id);
+    let _ = writeln!(
+        report,
+        "direction={} -> {}",
+        plan.source.filesystem, plan.target
+    );
+    let _ = writeln!(report, "guarantee={}", plan.mode);
+    let _ = writeln!(report, "capacity_bytes={}", plan.source.capacity_bytes);
+    let _ = writeln!(
+        report,
+        "proven_free_bytes={}",
+        plan.source
+            .free_bytes
+            .map_or_else(|| "unknown".into(), |value| value.to_string())
+    );
+    let _ = writeln!(
+        report,
+        "temporary_reservation_bytes={}",
+        plan.required_temporary_bytes
+    );
+    let _ = writeln!(report, "blockers={}", plan.blocker_count());
+    let _ = writeln!(report, "warnings={}", plan.warning_count());
+    report.push_str("\nISSUES\n");
+    for issue in &plan.issues {
+        let _ = writeln!(
+            report,
+            "[{}] {} :: {}",
+            issue.severity.token(),
+            issue.code,
+            issue.message
+        );
+    }
+    report.push_str("\nPHASES\n");
+    for phase in &plan.phases {
+        let _ = writeln!(
+            report,
+            "{:02} :: {:<10} {}",
+            phase.number, phase.name, phase.summary
+        );
+    }
+    report
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn icon_is_complete_rgba_and_report_is_deterministic() {
+        let icon = app_icon();
+        assert_eq!(icon.width, 64);
+        assert_eq!(icon.height, 64);
+        assert_eq!(icon.rgba.len(), 64 * 64 * 4);
+
+        let plan = Planner.plan(
+            &VolumeProfile::demo_exfat(),
+            FileSystem::Ntfs,
+            GuaranteeMode::Strict,
+        );
+        let first = plan_report(&plan);
+        assert_eq!(first, plan_report(&plan));
+        assert!(first.contains("NOT AN EXECUTABLE WRITE AUTHORIZATION"));
+        assert!(first.contains("direction=exFAT -> NTFS"));
+    }
 }
