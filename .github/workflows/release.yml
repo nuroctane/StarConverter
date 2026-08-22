@@ -1,4 +1,4 @@
-name: Portable pre-release bundles
+name: Unsigned engineering pre-release bundles
 
 on:
   workflow_dispatch:
@@ -82,6 +82,7 @@ jobs:
         run: |
           set -euo pipefail
           python -m unittest scripts/test_validate_release_bundle.py -v
+          python -m unittest scripts/test_macos_app_package.py -v
 
   sbom:
     name: CycloneDX SBOM
@@ -325,6 +326,58 @@ jobs:
             --repository-root . \
             --verify-inventory "$inventory"
 
+      - name: Build and validate unsigned macOS application bundle
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          workspace_version="$(sed -nE 's/^version = "([0-9]+\.[0-9]+\.[0-9]+)"$/\1/p' Cargo.toml | head -n 1)"
+          test -n "$workspace_version"
+          python scripts/package-macos-app.py \
+            --gui-executable "target/$TARGET_TRIPLE/release/starconverter-gui" \
+            --repository-root . \
+            --output-dir dist \
+            --release-id "$RELEASE_ID" \
+            --version "$workspace_version" \
+            --target "$TARGET_TRIPLE" \
+            --source-date-epoch "$SOURCE_DATE_EPOCH"
+
+          archive="dist/starconverter-${RELEASE_ID}-${TARGET_TRIPLE}-macos-app.tar.gz"
+          inventory="${archive}.inventory.json"
+          python scripts/validate-macos-app.py "$archive" \
+            --release-id "$RELEASE_ID" \
+            --version "$workspace_version" \
+            --target "$TARGET_TRIPLE" \
+            --source-date-epoch "$SOURCE_DATE_EPOCH" \
+            --repository-root . \
+            --write-inventory "$inventory"
+          python scripts/validate-macos-app.py "$archive" \
+            --release-id "$RELEASE_ID" \
+            --version "$workspace_version" \
+            --target "$TARGET_TRIPLE" \
+            --source-date-epoch "$SOURCE_DATE_EPOCH" \
+            --repository-root . \
+            --verify-inventory "$inventory"
+
+          app_check="$RUNNER_TEMP/starconverter-app-check"
+          mkdir "$app_check"
+          tar -xzf "$archive" -C "$app_check"
+          plutil -lint "$app_check/StarConverter.app/Contents/Info.plist"
+          dependencies="$app_check/macho-dependencies.txt"
+          otool -L "$app_check/StarConverter.app/Contents/MacOS/starconverter-gui" \
+            | tail -n +2 \
+            | sed -E 's/^[[:space:]]*([^[:space:]]+).*/\1/' \
+            | grep -Ev '^(/System/Library/|/usr/lib/)' > "$dependencies" || true
+          if [[ -s "$dependencies" ]]; then
+            echo 'macOS app has an unbundled non-system dynamic dependency:' >&2
+            cat "$dependencies" >&2
+            exit 1
+          fi
+          if codesign --verify --strict "$app_check/StarConverter.app" 2>/dev/null; then
+            echo 'Engineering app unexpectedly contains a code signature.' >&2
+            exit 1
+          fi
+
       - name: Upload validated portable archive and inventory
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -332,6 +385,8 @@ jobs:
           path: |
             dist/starconverter-${{ needs.prepare.outputs.release-id }}-${{ matrix.target }}.${{ matrix.archive-kind }}
             dist/starconverter-${{ needs.prepare.outputs.release-id }}-${{ matrix.target }}.${{ matrix.archive-kind }}.inventory.json
+            dist/starconverter-${{ needs.prepare.outputs.release-id }}-${{ matrix.target }}-macos-app.tar.gz
+            dist/starconverter-${{ needs.prepare.outputs.release-id }}-${{ matrix.target }}-macos-app.tar.gz.inventory.json
           if-no-files-found: error
           compression-level: 0
           retention-days: 30
@@ -397,6 +452,20 @@ jobs:
           done
 
           workspace_version="$(sed -nE 's/^version = "([0-9]+\.[0-9]+\.[0-9]+)"$/\1/p' Cargo.toml | head -n 1)"
+          for target in x86_64-apple-darwin aarch64-apple-darwin; do
+            archive="starconverter-${RELEASE_ID}-${target}-macos-app.tar.gz"
+            inventory="${archive}.inventory.json"
+            archives+=("$archive")
+            inventories+=("$inventory")
+            python scripts/validate-macos-app.py "dist/$archive" \
+              --release-id "$RELEASE_ID" \
+              --version "$workspace_version" \
+              --target "$target" \
+              --source-date-epoch "$SOURCE_DATE_EPOCH" \
+              --repository-root . \
+              --verify-inventory "dist/$inventory"
+          done
+
           sboms=()
           for component in cli core gui; do
             sbom="starconverter-${RELEASE_ID}-${component}.cdx.json"
@@ -497,7 +566,7 @@ jobs:
             for name in "${names[@]}"; do sha256sum "$name"; done
           ) > dist/SHA256SUMS.txt
           (cd dist && sha256sum --check --strict SHA256SUMS.txt)
-          expected_files=18
+          expected_files=22
           test "$(find dist -maxdepth 1 -type f | wc -l)" -eq "$expected_files"
           test "$(wc -l < dist/SHA256SUMS.txt)" -eq "$((expected_files - 1))"
 

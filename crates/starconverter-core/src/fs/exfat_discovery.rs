@@ -219,18 +219,33 @@ fn validate_percent_in_use(
     boot: &ExfatBootSector,
     allocation: AllocationSummary,
 ) -> Result<(), ExfatDiscoveryError> {
-    let calculated = u8::try_from(
-        allocation.allocated_clusters.checked_mul(100).ok_or(
+    let cluster_count = u64::from(boot.cluster_count);
+    let numerator = allocation.allocated_clusters.checked_mul(100).ok_or(
+        ExfatDiscoveryError::ArithmeticOverflow {
+            calculation: "allocated-cluster percentage numerator",
+        },
+    )?;
+    let calculated = u8::try_from(numerator / cluster_count).map_err(|_| {
+        ExfatDiscoveryError::ArithmeticOverflow {
+            calculation: "allocated-cluster percentage conversion",
+        }
+    })?;
+    // Microsoft exFAT section 3.1.18 requires rounding down. fuse-exfat 1.3.0 and 1.4.0
+    // instead persist the exact nearest-integer formula below when unmounting. The active
+    // Allocation Bitmap remains authoritative, so accept only those two independently derived
+    // representations; every other stored value remains a hard failure.
+    let legacy_nearest = u8::try_from(
+        numerator.checked_add(cluster_count / 2).ok_or(
             ExfatDiscoveryError::ArithmeticOverflow {
-                calculation: "allocated-cluster percentage numerator",
+                calculation: "legacy allocated-cluster percentage rounding",
             },
-        )? / u64::from(boot.cluster_count),
+        )? / cluster_count,
     )
     .map_err(|_| ExfatDiscoveryError::ArithmeticOverflow {
-        calculation: "allocated-cluster percentage conversion",
+        calculation: "legacy allocated-cluster percentage conversion",
     })?;
     if let Some(stored) = boot.percent_in_use {
-        if stored != calculated {
+        if stored != calculated && stored != legacy_nearest {
             return Err(ExfatDiscoveryError::PercentInUseMismatch { stored, calculated });
         }
     }
@@ -403,6 +418,31 @@ mod tests {
         assert!(matches!(
             discover_root(&image, &boot, limits()),
             Err(ExfatDiscoveryError::PercentInUseMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn accepts_only_the_legacy_fuse_nearest_percent_alternative() {
+        let (_, mut boot) = fixture();
+        boot.cluster_count = 32_256;
+        boot.percent_in_use = Some(32);
+        let allocation = AllocationSummary {
+            allocated_clusters: 10_254,
+            free_clusters: 22_002,
+            required_bitmap_bytes: 4_032,
+        };
+
+        // 10,254 / 32,256 is 31.789%; Microsoft specifies 31, while fuse-exfat
+        // persists 32 using nearest-integer rounding.
+        validate_percent_in_use(&boot, allocation).unwrap();
+
+        boot.percent_in_use = Some(33);
+        assert!(matches!(
+            validate_percent_in_use(&boot, allocation),
+            Err(ExfatDiscoveryError::PercentInUseMismatch {
+                stored: 33,
+                calculated: 31
+            })
         ));
     }
 }

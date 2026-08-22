@@ -5,6 +5,8 @@
 *.swp
 *.tmp
 *.log
+*.pyc
+__pycache__/
 *.img
 *.raw
 *.vhd

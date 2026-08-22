@@ -650,6 +650,9 @@ fn validate_records(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+// `$FILE_NAME` caches sizes, timestamps, attributes, and EA/reparse state. Those duplicate fields
+// can legitimately become stale until the name changes, so namespace agreement is deliberately
+// limited to the exact binding identity below. Both cached variants remain in preservation data.
 struct DirectoryKey {
     target_record: u64,
     target_sequence: u16,
@@ -658,10 +661,6 @@ struct DirectoryKey {
     namespace: u8,
     name: Vec<u16>,
     name_is_well_formed: bool,
-    allocated_size: u64,
-    data_size: u64,
-    file_attributes: u32,
-    reparse_tag_or_ea_size: u32,
 }
 
 fn directory_key(target: NtfsObjectReference, name: &NtfsFileName) -> DirectoryKey {
@@ -673,10 +672,6 @@ fn directory_key(target: NtfsObjectReference, name: &NtfsFileName) -> DirectoryK
         namespace: namespace_id(name.namespace),
         name: name.name.code_units.clone(),
         name_is_well_formed: name.name.is_well_formed,
-        allocated_size: name.allocated_size,
-        data_size: name.data_size,
-        file_attributes: name.file_attributes,
-        reparse_tag_or_ea_size: name.reparse_tag_or_ea_size,
     }
 }
 
@@ -1274,6 +1269,93 @@ mod tests {
             .code_units = "mismatch".encode_utf16().collect();
         assert_eq!(
             normalize_inventory(&source, 65_536, LIMITS),
+            Err(NtfsNormalizeError::DirectoryEvidenceMismatch)
+        );
+    }
+
+    #[test]
+    fn accepts_stale_file_name_cache_when_namespace_identity_matches() {
+        let mut source = basic();
+        let entry = &mut source.objects[0].directory_entries[0].file_name;
+        entry.allocated_size = 8192;
+        entry.data_size = 4097;
+        entry.file_attributes = 0x400;
+        entry.reparse_tag_or_ea_size = 0xa000_000c;
+
+        let normalized = normalize_inventory(&source, 65_536, LIMITS).unwrap();
+        let preserved_root = &normalized.preservation.objects[0].source;
+        let preserved_target = &normalized.preservation.objects[1].source;
+        assert_eq!(
+            preserved_root.directory_entries[0].file_name.data_size,
+            4097
+        );
+        assert_eq!(preserved_target.file_names[0].data_size, 3);
+        assert_eq!(normalized.graph.entries().len(), 2);
+    }
+
+    #[test]
+    fn rejects_every_directory_namespace_identity_difference() {
+        let mut target_record = basic();
+        target_record.objects[0].directory_entries[0]
+            .target
+            .record_number = 7;
+        assert!(normalize_inventory(&target_record, 65_536, LIMITS).is_err());
+
+        let mut target_sequence = basic();
+        target_sequence.objects[0].directory_entries[0]
+            .target
+            .sequence_number = 99;
+        assert!(matches!(
+            normalize_inventory(&target_sequence, 65_536, LIMITS),
+            Err(NtfsNormalizeError::StaleReference { record: 6, .. })
+        ));
+
+        let mut parent_record = basic();
+        parent_record.objects[0].directory_entries[0]
+            .file_name
+            .parent
+            .record_number = 6;
+        assert!(matches!(
+            normalize_inventory(&parent_record, 65_536, LIMITS),
+            Err(NtfsNormalizeError::DirectoryParentMismatch { .. })
+        ));
+
+        let mut parent_sequence = basic();
+        parent_sequence.objects[0].directory_entries[0]
+            .file_name
+            .parent
+            .sequence_number = 99;
+        assert!(matches!(
+            normalize_inventory(&parent_sequence, 65_536, LIMITS),
+            Err(NtfsNormalizeError::DirectoryParentMismatch { .. })
+        ));
+
+        let mut namespace = basic();
+        namespace.objects[0].directory_entries[0]
+            .file_name
+            .namespace = FileNameNamespace::Posix;
+        assert_eq!(
+            normalize_inventory(&namespace, 65_536, LIMITS),
+            Err(NtfsNormalizeError::DirectoryEvidenceMismatch)
+        );
+
+        let mut name = basic();
+        name.objects[0].directory_entries[0]
+            .file_name
+            .name
+            .code_units = "different".encode_utf16().collect();
+        assert_eq!(
+            normalize_inventory(&name, 65_536, LIMITS),
+            Err(NtfsNormalizeError::DirectoryEvidenceMismatch)
+        );
+
+        let mut well_formedness = basic();
+        well_formedness.objects[0].directory_entries[0]
+            .file_name
+            .name
+            .is_well_formed = false;
+        assert_eq!(
+            normalize_inventory(&well_formedness, 65_536, LIMITS),
             Err(NtfsNormalizeError::DirectoryEvidenceMismatch)
         );
     }

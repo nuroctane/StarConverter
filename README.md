@@ -126,6 +126,7 @@ cargo run -p starconverter-cli -- inspect "C:\path\to\volume.img"
 cargo run -p starconverter-cli -- preview "C:\path\to\volume.img" --mode escrow
 cargo run -p starconverter-cli -- convert-image "C:\path\source.img" "C:\path\new-target.img" --mode escrow
 cargo run -p starconverter-cli -- verify-export "C:\path\new-target.img" "C:\path\new-target.img.starconverter-escrow" --source "C:\path\source.img"
+cargo run -p starconverter-cli -- verify-windows-report "C:\path\windows-validation.json"
 cargo run -p starconverter-gui
 ```
 
@@ -159,6 +160,10 @@ sidecar verification guidance. Current atomic no-clobber publication requires th
 escrow destination directories to support hard links; exFAT/FAT destination directories and other
 filesystems without hard-link support are refused. Parent-directory crash durability remains a
 tracked portability gate.
+
+`verify-windows-report` opens only a bounded regular JSON file and strictly checks the schema-v1
+output of the detached/read-only VHD harness. Its result is explicitly unkeyed, non-authorizing
+evidence; the command never opens, attaches, mounts, or writes a VHD or device.
 
 The Go toolchain is only required for `lab/`:
 
@@ -215,14 +220,18 @@ installed. CI always tests both language stacks.
 - [x] Pinned `$Secure` ordinary-object security-ID assignment in NTFS `$STANDARD_INFORMATION`
 - [x] Reproducible root/rich/edge external fixtures, read-only exfatprogs/NTFS-3G checks, and exFAT/NTFS FUSE payload mounts
 - [x] Formatter-origin exFAT/NTFS differential images with unchanged hashes and parser compatibility regressions
+- [x] Populated formatter-origin feature corpus with nested Unicode, allocation boundaries, fragmentation, and exact driver-read payload hashes
 - [x] Native desktop exact-candidate preview with in-memory rollback capture and no executor authority
 - [x] Nonblocking desktop inspect/preview/export/verify jobs with stale-result and panic containment
+- [x] Bounded desktop session recovery with stale/corrupt/raw-device refusal and keyboard/contrast regressions
 - [x] Create-new exFAT→NTFS and NTFS→exFAT export with reinspection, manifest equality, source re-hash, and escrow sidecar
 - [x] Independently mount both exported rich cross-format candidates read-only and verify exact payload hashes
 - [x] Read-only candidate/source/sidecar verifier and candidate-bound escrow envelope
 - [x] Uniquely named partial construction and atomic no-clobber publication on hard-link-capable filesystems
 - [x] Deterministic converted fixed-VHD fixtures and fail-closed Windows validation harness
 - [x] Four-target deterministic portable packaging with exact bundle inventories, SBOM identity checks, and verified provenance attestations
+- [x] Deterministic unsigned macOS application bundles with closed-schema validation and native dependency/signature gates
+- [x] Scheduled RustSec/Go vulnerability scans and weekly Cargo, Go, and GitHub Actions update proposals
 - [ ] Close serializer activation gaps and qualify the cross-filesystem metadata profiles
 - [ ] In-place image conversion with durable recovery/finalize workflow
 - [ ] Windows `chkdsk`/mount validation of generated and recovered images
@@ -234,10 +243,11 @@ Independent regular-image validator evidence is logged in
 [`docs/EXTERNAL_VALIDATION.md`](docs/EXTERNAL_VALIDATION.md).
 
 Tagged releases are packaged by GitHub Actions as portable CLI + desktop bundles for Windows x64,
-Linux x64, macOS Intel, and macOS Apple Silicon. The workflow emits SHA-256 manifests, CycloneDX
-SBOMs, and GitHub/Sigstore provenance and SBOM attestations. StarConverter is not yet natively
-code-signed or notarized, so those packages remain unsigned pre-alpha validation builds rather than
-a drive-writing release. See [`docs/RELEASE.md`](docs/RELEASE.md).
+Linux x64, macOS Intel, and macOS Apple Silicon, plus canonical unsigned `.app` layouts for both
+macOS architectures. The workflow emits SHA-256 manifests, CycloneDX SBOMs, and GitHub/Sigstore
+provenance and SBOM attestations. StarConverter is not yet natively code-signed or notarized, so
+those packages remain unsigned pre-alpha validation builds rather than a drive-writing release.
+See [`docs/RELEASE.md`](docs/RELEASE.md).
 
 ## Safety and security
 

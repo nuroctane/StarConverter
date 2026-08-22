@@ -1,10 +1,11 @@
 use std::fmt::Write as _;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui::{
     self, Align, Button, Color32, FontId, Frame, Label, Layout, Margin, RichText, Stroke,
@@ -39,11 +40,21 @@ const LINE: Color32 = Color32::from_rgb(41, 45, 50);
 const LINE_STRONG: Color32 = Color32::from_rgb(89, 97, 107);
 const INK: Color32 = Color32::from_rgb(242, 244, 245);
 const MUTED: Color32 = Color32::from_rgb(154, 161, 170);
-const FAINT: Color32 = Color32::from_rgb(98, 105, 113);
+const FAINT: Color32 = Color32::from_rgb(132, 140, 150);
 const READY: Color32 = Color32::from_rgb(123, 255, 178);
 const WARNING: Color32 = Color32::from_rgb(255, 200, 87);
 const DANGER: Color32 = Color32::from_rgb(255, 96, 119);
 const WORKING: Color32 = Color32::from_rgb(168, 216, 255);
+
+const SESSION_MAGIC: &str = "STARCONVERTER-SESSION/1";
+const SESSION_MAX_BYTES: usize = 32 * 1024;
+const SESSION_MAX_PATH_BYTES: usize = 4096;
+const SESSION_MAX_AGE_SECONDS: u64 = 90 * 24 * 60 * 60;
+const SESSION_MAX_FUTURE_SKEW_SECONDS: u64 = 24 * 60 * 60;
+const SESSION_AUTOSAVE_INTERVAL: Duration = Duration::from_secs(5);
+const SESSION_GENERATIONS_TO_KEEP: usize = 3;
+const SESSION_MAX_GENERATIONS: usize = 64;
+static SESSION_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 const ASCII_MARK: &str = r"+---------------------------------------+
 | STAR :: CONVERTER                     |
@@ -54,6 +65,251 @@ const INTERRUPTED_EXPORT_GUIDANCE: &str = "[RECOVERY] Never rename or use a .sta
 [RECOVERY] If both final candidate and escrow exist, verify them here before mounting or copying data.\n\
 [RECOVERY] If only partial or escrow artifacts remain, confirm no export is running, preserve them if forensic review matters, then rerun to a new output name.\n\
 [SAFE] The original source was opened read-only; this screen cannot repair or activate a filesystem.";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionDocument {
+    saved_unix_seconds: u64,
+    mode: GuaranteeMode,
+    image_path: String,
+    verification_candidate_path: String,
+    verification_escrow_path: String,
+    verification_source_path: String,
+}
+
+impl SessionDocument {
+    fn encode(&self) -> Result<Vec<u8>, String> {
+        for (label, value) in self.paths() {
+            validate_session_path(label, value)?;
+        }
+        let mode = match self.mode {
+            GuaranteeMode::Strict => "strict",
+            GuaranteeMode::Escrow => "escrow",
+            GuaranteeMode::ContentOnly => "content-only",
+        };
+        let encoded = format!(
+            "{SESSION_MAGIC}\nsaved_unix_seconds={}\nmode={mode}\nimage_path={}\nverification_candidate_path={}\nverification_escrow_path={}\nverification_source_path={}\n",
+            self.saved_unix_seconds,
+            hex_encode(self.image_path.as_bytes()),
+            hex_encode(self.verification_candidate_path.as_bytes()),
+            hex_encode(self.verification_escrow_path.as_bytes()),
+            hex_encode(self.verification_source_path.as_bytes()),
+        )
+        .into_bytes();
+        if encoded.len() > SESSION_MAX_BYTES {
+            return Err(format!(
+                "session document is {} bytes; maximum is {SESSION_MAX_BYTES}",
+                encoded.len()
+            ));
+        }
+        Ok(encoded)
+    }
+
+    fn decode(bytes: &[u8], now_unix_seconds: u64) -> Result<Self, String> {
+        if bytes.len() > SESSION_MAX_BYTES {
+            return Err(format!(
+                "session document exceeds the {SESSION_MAX_BYTES}-byte limit"
+            ));
+        }
+        let text = std::str::from_utf8(bytes)
+            .map_err(|_| "session document is not valid UTF-8".to_owned())?;
+        let lines = text
+            .strip_suffix('\n')
+            .unwrap_or(text)
+            .split('\n')
+            .collect::<Vec<_>>();
+        if lines.len() != 7 || lines[0] != SESSION_MAGIC {
+            return Err("session header, version, or field count is invalid".into());
+        }
+        let saved_unix_seconds = parse_session_u64(lines[1], "saved_unix_seconds")?;
+        if saved_unix_seconds > now_unix_seconds.saturating_add(SESSION_MAX_FUTURE_SKEW_SECONDS) {
+            return Err("session timestamp is implausibly far in the future".into());
+        }
+        if now_unix_seconds.saturating_sub(saved_unix_seconds) > SESSION_MAX_AGE_SECONDS {
+            return Err("session is older than the 90-day recovery window".into());
+        }
+        let mode = match session_value(lines[2], "mode")? {
+            "strict" => GuaranteeMode::Strict,
+            "escrow" => GuaranteeMode::Escrow,
+            "content-only" => GuaranteeMode::ContentOnly,
+            _ => return Err("session guarantee mode is invalid".into()),
+        };
+        let document = Self {
+            saved_unix_seconds,
+            mode,
+            image_path: decode_session_string(lines[3], "image_path")?,
+            verification_candidate_path: decode_session_string(
+                lines[4],
+                "verification_candidate_path",
+            )?,
+            verification_escrow_path: decode_session_string(lines[5], "verification_escrow_path")?,
+            verification_source_path: decode_session_string(lines[6], "verification_source_path")?,
+        };
+        for (label, value) in document.paths() {
+            validate_session_path(label, value)?;
+        }
+        Ok(document)
+    }
+
+    fn paths(&self) -> [(&'static str, &str); 4] {
+        [
+            ("image path", &self.image_path),
+            ("candidate path", &self.verification_candidate_path),
+            ("escrow path", &self.verification_escrow_path),
+            ("verification source path", &self.verification_source_path),
+        ]
+    }
+}
+
+#[derive(Debug)]
+struct SessionStore {
+    directory: PathBuf,
+}
+
+impl SessionStore {
+    fn from_app_storage() -> Option<Self> {
+        session_storage_root().map(|directory| Self {
+            directory: directory.join("session-recovery"),
+        })
+    }
+
+    fn load(&self, now_unix_seconds: u64) -> SessionLoad {
+        let entries = match fs::read_dir(&self.directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return SessionLoad::Empty;
+            }
+            Err(error) => {
+                return SessionLoad::Refused(format!("could not read session store: {error}"));
+            }
+        };
+        let mut candidates = Vec::new();
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    return SessionLoad::Refused(format!(
+                        "could not enumerate session store: {error}"
+                    ));
+                }
+            };
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if is_session_generation_name(name) {
+                candidates.push((name.to_owned(), entry.path()));
+                if candidates.len() > SESSION_MAX_GENERATIONS {
+                    return SessionLoad::Refused(format!(
+                        "session store exceeds the {SESSION_MAX_GENERATIONS}-generation limit"
+                    ));
+                }
+            }
+        }
+        candidates.sort_unstable_by(|left, right| right.0.cmp(&left.0));
+        let Some((_, path)) = candidates.into_iter().next() else {
+            return SessionLoad::Empty;
+        };
+        match read_bounded_regular_file(&path) {
+            Ok(bytes) => match SessionDocument::decode(&bytes, now_unix_seconds) {
+                Ok(document) => SessionLoad::Recovered(document),
+                Err(message) => SessionLoad::Refused(message),
+            },
+            Err(message) => SessionLoad::Refused(message),
+        }
+    }
+
+    fn save(&self, document: &SessionDocument) -> Result<(), String> {
+        let bytes = document.encode()?;
+        fs::create_dir_all(&self.directory)
+            .map_err(|error| format!("could not create session directory: {error}"))?;
+        let generation = SESSION_GENERATION.fetch_add(1, Ordering::Relaxed);
+        let stem = format!(
+            "session-v1-{:020}-{:010}-{generation:020}",
+            document.saved_unix_seconds,
+            std::process::id()
+        );
+        let partial = self.directory.join(format!(".{stem}.partial"));
+        let published = self.directory.join(format!("{stem}.scsession"));
+        let result = (|| {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&partial)
+                .map_err(|error| format!("could not create session generation: {error}"))?;
+            file.write_all(&bytes)
+                .map_err(|error| format!("could not write session generation: {error}"))?;
+            file.sync_all()
+                .map_err(|error| format!("could not synchronize session generation: {error}"))?;
+            drop(file);
+            fs::hard_link(&partial, &published).map_err(|error| {
+                format!("could not atomically publish no-clobber session generation: {error}")
+            })?;
+            let _ = fs::remove_file(&partial);
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&partial);
+            return result;
+        }
+        self.prune_after(&published);
+        Ok(())
+    }
+
+    fn clear(&self) -> Result<(), String> {
+        let entries = match fs::read_dir(&self.directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(format!("could not read session store: {error}")),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|error| format!("could not read session entry: {error}"))?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if is_session_generation_name(name) || is_session_partial_name(name) {
+                fs::remove_file(entry.path())
+                    .map_err(|error| format!("could not remove session generation: {error}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn prune_after(&self, published: &Path) {
+        let Ok(entries) = fs::read_dir(&self.directory) else {
+            return;
+        };
+        let mut generations = entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let name = entry.file_name().to_str()?.to_owned();
+                is_session_generation_name(&name).then_some((name, entry.path()))
+            })
+            .collect::<Vec<_>>();
+        generations.sort_unstable_by(|left, right| right.0.cmp(&left.0));
+        for (_, path) in generations.into_iter().skip(SESSION_GENERATIONS_TO_KEEP) {
+            if path != published {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum SessionLoad {
+    Empty,
+    Recovered(SessionDocument),
+    Refused(String),
+}
+
+#[derive(Debug)]
+enum SessionRecoveryState {
+    Empty,
+    Recovered { saved_unix_seconds: u64 },
+    Saved { saved_unix_seconds: u64 },
+    Refused(String),
+    Unavailable,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JobKind {
@@ -247,6 +503,10 @@ struct StarConverterApp {
     verification_ok: bool,
     jobs: BackgroundJobs,
     activity: Vec<String>,
+    session_store: Option<SessionStore>,
+    session_recovery: SessionRecoveryState,
+    session_dirty: bool,
+    session_last_save_attempt: Instant,
 }
 
 impl StarConverterApp {
@@ -254,20 +514,64 @@ impl StarConverterApp {
         configure_style(&context.egui_ctx);
         let source = VolumeProfile::demo_exfat();
         let target = FileSystem::Ntfs;
-        let mode = GuaranteeMode::Strict;
+        let mut mode = GuaranteeMode::Strict;
+        let mut image_path = String::new();
+        let mut verification_candidate_path = String::new();
+        let mut verification_escrow_path = String::new();
+        let mut verification_source_path = String::new();
+        let session_store = SessionStore::from_app_storage();
+        let session_recovery =
+            session_store
+                .as_ref()
+                .map_or(SessionRecoveryState::Unavailable, |store| {
+                    match store.load(unix_seconds_now()) {
+                        SessionLoad::Empty => SessionRecoveryState::Empty,
+                        SessionLoad::Recovered(document) => {
+                            mode = document.mode;
+                            image_path = document.image_path;
+                            verification_candidate_path = document.verification_candidate_path;
+                            verification_escrow_path = document.verification_escrow_path;
+                            verification_source_path = document.verification_source_path;
+                            SessionRecoveryState::Recovered {
+                                saved_unix_seconds: document.saved_unix_seconds,
+                            }
+                        }
+                        SessionLoad::Refused(message) => SessionRecoveryState::Refused(message),
+                    }
+                });
         let plan = Planner.plan(&source, target, mode);
+        let recovered_image_path =
+            matches!(session_recovery, SessionRecoveryState::Recovered { .. })
+                && !image_path.is_empty();
+        let recovery_activity = match &session_recovery {
+            SessionRecoveryState::Recovered { .. } => {
+                "00:00:00  [RECOVERED] bounded non-sensitive session fields restored"
+            }
+            SessionRecoveryState::Refused(_) => {
+                "00:00:00  [REFUSED] saved session failed bounded recovery validation"
+            }
+            SessionRecoveryState::Empty => "00:00:00  [SESSION] no recovery document found",
+            SessionRecoveryState::Unavailable => {
+                "00:00:00  [SESSION] local recovery storage unavailable"
+            }
+            SessionRecoveryState::Saved { .. } => unreachable!("new sessions are not saved yet"),
+        };
         Self {
             source,
             target,
             mode,
             plan,
-            image_path: String::new(),
+            image_path,
             real_source: false,
-            inspection_status: "Enter a regular image path to begin read-only analysis.".into(),
+            inspection_status: if recovered_image_path {
+                "Recovered image path; read-only analysis has not started.".into()
+            } else {
+                "Enter a regular image path to begin read-only analysis.".into()
+            },
             exact_preview: None,
-            verification_candidate_path: String::new(),
-            verification_escrow_path: String::new(),
-            verification_source_path: String::new(),
+            verification_candidate_path,
+            verification_escrow_path,
+            verification_source_path,
             verification_status:
                 "Select a final candidate and its escrow sidecar for read-only verification.".into(),
             verification_report: None,
@@ -278,7 +582,79 @@ impl StarConverterApp {
                 "00:00:00  [SAFE]  raw-device backend absent".into(),
                 "00:00:00  [LOCKED] serializer activation gaps remain".into(),
                 "00:00:00  [INFO]  synthetic demo source selected".into(),
+                recovery_activity.into(),
             ],
+            session_store,
+            session_recovery,
+            session_dirty: false,
+            session_last_save_attempt: Instant::now(),
+        }
+    }
+
+    fn session_document(&self, saved_unix_seconds: u64) -> SessionDocument {
+        SessionDocument {
+            saved_unix_seconds,
+            mode: self.mode,
+            image_path: self.image_path.clone(),
+            verification_candidate_path: self.verification_candidate_path.clone(),
+            verification_escrow_path: self.verification_escrow_path.clone(),
+            verification_source_path: self.verification_source_path.clone(),
+        }
+    }
+
+    fn session_fingerprint(&self) -> (GuaranteeMode, String, String, String, String) {
+        (
+            self.mode,
+            self.image_path.clone(),
+            self.verification_candidate_path.clone(),
+            self.verification_escrow_path.clone(),
+            self.verification_source_path.clone(),
+        )
+    }
+
+    fn persist_session(&mut self) {
+        if !self.session_dirty {
+            return;
+        }
+        self.session_last_save_attempt = Instant::now();
+        let saved_unix_seconds = unix_seconds_now();
+        let document = self.session_document(saved_unix_seconds);
+        let Some(store) = &self.session_store else {
+            self.session_recovery = SessionRecoveryState::Unavailable;
+            self.session_dirty = false;
+            return;
+        };
+        match store.save(&document) {
+            Ok(()) => {
+                self.session_recovery = SessionRecoveryState::Saved { saved_unix_seconds };
+                self.session_dirty = false;
+            }
+            Err(message) => {
+                self.session_recovery = SessionRecoveryState::Refused(format!(
+                    "current session was not saved: {message}"
+                ));
+                self.session_dirty = false;
+            }
+        }
+    }
+
+    fn clear_saved_session(&mut self) {
+        let Some(store) = &self.session_store else {
+            self.session_recovery = SessionRecoveryState::Unavailable;
+            return;
+        };
+        match store.clear() {
+            Ok(()) => {
+                self.session_recovery = SessionRecoveryState::Empty;
+                self.session_dirty = false;
+                self.activity
+                    .push("00:00:00  [SESSION] saved recovery data forgotten".into());
+            }
+            Err(message) => {
+                self.session_recovery = SessionRecoveryState::Refused(format!(
+                    "could not forget saved session: {message}"
+                ));
+            }
         }
     }
 
@@ -788,6 +1164,7 @@ fn build_candidate_export(
 
 impl eframe::App for StarConverterApp {
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let session_before = self.session_fingerprint();
         self.poll_background_jobs();
         if self.jobs.is_busy() {
             root.ctx().request_repaint_after(Duration::from_millis(75));
@@ -797,6 +1174,26 @@ impl eframe::App for StarConverterApp {
         self.show_source_rail(root);
         self.show_activity_rail(root);
         self.show_workbench(root);
+        if self.session_fingerprint() != session_before {
+            self.session_dirty = true;
+        }
+        if self.session_dirty
+            && self.session_last_save_attempt.elapsed() >= SESSION_AUTOSAVE_INTERVAL
+        {
+            self.persist_session();
+        } else if self.session_dirty {
+            root.ctx().request_repaint_after(
+                SESSION_AUTOSAVE_INTERVAL.saturating_sub(self.session_last_save_attempt.elapsed()),
+            );
+        }
+    }
+
+    fn save(&mut self, _storage: &mut dyn eframe::Storage) {
+        self.persist_session();
+    }
+
+    fn on_exit(&mut self) {
+        self.persist_session();
     }
 }
 
@@ -991,13 +1388,22 @@ impl StarConverterApp {
     }
 
     fn show_image_path_picker(&mut self, ui: &mut egui::Ui) {
+        let label = ui.label(
+            RichText::new("REGULAR IMAGE PATH")
+                .monospace()
+                .size(10.0)
+                .color(MUTED),
+        );
         ui.horizontal(|ui| {
             let browse_width = 78.0;
             let path_width = (ui.available_width() - browse_width - 8.0).max(80.0);
             ui.add_sized(
                 [path_width, 44.0],
-                egui::TextEdit::singleline(&mut self.image_path).hint_text("C:\\path\\volume.img"),
+                egui::TextEdit::singleline(&mut self.image_path)
+                    .id_source("source_image_path")
+                    .hint_text("C:\\path\\volume.img"),
             )
+            .labelled_by(label.id)
             .on_hover_text("Regular image file only. Raw-device namespaces are rejected.");
             if ui
                 .add_sized([browse_width, 44.0], Button::new("Browse"))
@@ -1035,7 +1441,7 @@ impl StarConverterApp {
         );
     }
 
-    fn show_activity_rail(&self, root: &mut egui::Ui) {
+    fn show_activity_rail(&mut self, root: &mut egui::Ui) {
         egui::Panel::right("activity_rail")
             .resizable(true)
             .default_size(315.0)
@@ -1048,6 +1454,34 @@ impl StarConverterApp {
                     .inner_margin(Margin::same(16)),
             )
             .show(root, |ui| {
+                section_label(ui, "SESSION RECOVERY");
+                ui.label(
+                    RichText::new(self.session_recovery_text())
+                        .monospace()
+                        .size(10.0)
+                        .color(self.session_recovery_color()),
+                );
+                if ui
+                    .add_enabled(
+                        self.session_store.is_some(),
+                        Button::new("Forget saved recovery data"),
+                    )
+                    .on_hover_text(
+                        "Delete only StarConverter's bounded session generations. Current fields remain visible.",
+                    )
+                    .clicked()
+                {
+                    self.clear_saved_session();
+                }
+                ui.label(
+                    RichText::new(
+                        "Only guarantee mode and explicit regular image/candidate/escrow/source fields are recoverable. Evidence and activity are never persisted.",
+                    )
+                    .monospace()
+                    .size(9.0)
+                    .color(MUTED),
+                );
+                ui.add_space(18.0);
                 section_label(ui, "ACTIVITY :: SESSION");
                 ui.add_space(10.0);
                 egui::ScrollArea::vertical()
@@ -1059,6 +1493,32 @@ impl StarConverterApp {
                         }
                     });
             });
+    }
+
+    fn session_recovery_text(&self) -> String {
+        match &self.session_recovery {
+            SessionRecoveryState::Empty => "[EMPTY] No saved session was recovered.".into(),
+            SessionRecoveryState::Recovered { saved_unix_seconds } => format!(
+                "[RECOVERED] Valid v1 session from Unix time {saved_unix_seconds}; analysis and verification results were not restored."
+            ),
+            SessionRecoveryState::Saved { saved_unix_seconds } => format!(
+                "[SAVED] Bounded v1 recovery state published at Unix time {saved_unix_seconds}."
+            ),
+            SessionRecoveryState::Refused(message) => {
+                format!("[REFUSED] {message}")
+            }
+            SessionRecoveryState::Unavailable => {
+                "[UNAVAILABLE] Local session storage is unavailable; no state is persisted.".into()
+            }
+        }
+    }
+
+    const fn session_recovery_color(&self) -> Color32 {
+        match &self.session_recovery {
+            SessionRecoveryState::Recovered { .. } | SessionRecoveryState::Saved { .. } => READY,
+            SessionRecoveryState::Refused(_) => DANGER,
+            SessionRecoveryState::Empty | SessionRecoveryState::Unavailable => MUTED,
+        }
     }
 
     fn show_workbench(&mut self, root: &mut egui::Ui) {
@@ -1403,6 +1863,189 @@ impl StarConverterApp {
     }
 }
 
+fn unix_seconds_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs()
+}
+
+#[cfg(target_os = "windows")]
+fn session_storage_root() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA")
+        .or_else(|| std::env::var_os("APPDATA"))
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .map(|path| path.join("StarConverter"))
+}
+
+#[cfg(target_os = "macos")]
+fn session_storage_root() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .map(|path| {
+            path.join("Library")
+                .join("Application Support")
+                .join("StarConverter")
+        })
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn session_storage_root() -> Option<PathBuf> {
+    std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .map(|path| path.join(".local").join("state"))
+        })
+        .map(|path| path.join("starconverter"))
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
+fn session_storage_root() -> Option<PathBuf> {
+    None
+}
+
+fn validate_session_path(label: &str, value: &str) -> Result<(), String> {
+    if value.len() > SESSION_MAX_PATH_BYTES {
+        return Err(format!(
+            "{label} exceeds the {SESSION_MAX_PATH_BYTES}-byte session limit"
+        ));
+    }
+    if value.contains('\0') {
+        return Err(format!("{label} contains a null character"));
+    }
+    if is_obvious_raw_device_path(value) {
+        return Err(format!(
+            "{label} resembles a raw-device namespace and will not be persisted"
+        ));
+    }
+    Ok(())
+}
+
+fn is_obvious_raw_device_path(value: &str) -> bool {
+    let normalized = value.trim().replace('/', "\\").to_ascii_lowercase();
+    normalized.starts_with("\\\\.\\")
+        || normalized.starts_with("\\\\?\\globalroot\\")
+        || normalized == "\\\\?\\globalroot"
+        || normalized.starts_with("\\\\?\\volume{")
+        || normalized.starts_with("\\\\?\\physicaldrive")
+        || normalized.starts_with("\\\\?\\harddisk")
+        || normalized.starts_with("\\device\\")
+        || normalized.starts_with("\\??\\")
+        || normalized.starts_with(r"\dev\")
+        || normalized == r"\dev"
+}
+
+fn parse_session_u64(line: &str, key: &str) -> Result<u64, String> {
+    session_value(line, key)?
+        .parse::<u64>()
+        .map_err(|_| format!("session field {key} is not an unsigned integer"))
+}
+
+fn session_value<'a>(line: &'a str, key: &str) -> Result<&'a str, String> {
+    line.strip_prefix(key)
+        .and_then(|value| value.strip_prefix('='))
+        .ok_or_else(|| format!("session field {key} is missing or out of order"))
+}
+
+fn decode_session_string(line: &str, key: &str) -> Result<String, String> {
+    let encoded = session_value(line, key)?;
+    if encoded.len() > SESSION_MAX_PATH_BYTES * 2 {
+        return Err(format!(
+            "session field {key} exceeds the encoded path limit"
+        ));
+    }
+    if !encoded.len().is_multiple_of(2) {
+        return Err(format!(
+            "session field {key} contains odd-length hexadecimal"
+        ));
+    }
+    let mut decoded = Vec::new();
+    decoded
+        .try_reserve_exact(encoded.len() / 2)
+        .map_err(|_| format!("session field {key} is too large to decode"))?;
+    for pair in encoded.as_bytes().chunks_exact(2) {
+        let high = hex_nibble(pair[0])
+            .ok_or_else(|| format!("session field {key} contains invalid hexadecimal"))?;
+        let low = hex_nibble(pair[1])
+            .ok_or_else(|| format!("session field {key} contains invalid hexadecimal"))?;
+        decoded.push((high << 4) | low);
+    }
+    String::from_utf8(decoded).map_err(|_| format!("session field {key} is not valid UTF-8"))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        encoded.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        encoded.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+const fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn is_session_generation_name(name: &str) -> bool {
+    let Some(stem) = name
+        .strip_prefix("session-v1-")
+        .and_then(|value| value.strip_suffix(".scsession"))
+    else {
+        return false;
+    };
+    stem.len() == 52
+        && stem.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 20 | 31) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_digit()
+            }
+        })
+}
+
+fn is_session_partial_name(name: &str) -> bool {
+    name.starts_with(".session-v1-") && name.ends_with(".partial")
+}
+
+fn read_bounded_regular_file(path: &Path) -> Result<Vec<u8>, String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("could not inspect session document: {error}"))?;
+    if !metadata.file_type().is_file() {
+        return Err("session document is not a regular file".into());
+    }
+    if metadata.len() > u64::try_from(SESSION_MAX_BYTES).unwrap_or(u64::MAX) {
+        return Err(format!(
+            "session document exceeds the {SESSION_MAX_BYTES}-byte limit"
+        ));
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .open(path)
+        .map_err(|error| format!("could not open session document: {error}"))?;
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    file.take(u64::try_from(SESSION_MAX_BYTES + 1).unwrap_or(u64::MAX))
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("could not read session document: {error}"))?;
+    if bytes.len() > SESSION_MAX_BYTES {
+        return Err(format!(
+            "session document exceeds the {SESSION_MAX_BYTES}-byte limit"
+        ));
+    }
+    Ok(bytes)
+}
+
 fn verification_path_row(
     ui: &mut egui::Ui,
     label: &str,
@@ -1520,30 +2163,19 @@ fn mode_card(
     description: &str,
 ) {
     let selected = *selected_mode == mode;
-    let response = Frame::new()
-        .fill(if selected { RAISED } else { SURFACE })
-        .stroke(Stroke::new(
-            if selected { 2.0 } else { 1.0 },
-            if selected { WORKING } else { LINE },
-        ))
-        .inner_margin(Margin::same(12))
-        .show(ui, |ui| {
-            ui.set_min_height(76.0);
-            ui.label(
-                RichText::new(format!("[ {title} ]"))
-                    .monospace()
-                    .size(12.0)
-                    .color(if selected { INK } else { MUTED }),
-            );
-            ui.label(
-                RichText::new(description)
+    let state = if selected { "SELECTED" } else { "AVAILABLE" };
+    let response = ui
+        .add_sized(
+            [ui.available_width(), 84.0],
+            Button::selectable(
+                selected,
+                RichText::new(format!("[ {title} ] [{state}]\n{description}"))
                     .monospace()
                     .size(11.0)
-                    .color(MUTED),
-            );
-        })
-        .response
-        .interact(egui::Sense::click());
+                    .color(if selected { INK } else { MUTED }),
+            ),
+        )
+        .on_hover_text(format!("Select {title} guarantee mode. {description}"));
     if response.clicked() {
         *selected_mode = mode;
     }
@@ -1864,6 +2496,46 @@ fn plan_report(plan: &ConversionPlan) -> String {
 mod tests {
     use super::*;
 
+    fn session_document_at(saved_unix_seconds: u64) -> SessionDocument {
+        SessionDocument {
+            saved_unix_seconds,
+            mode: GuaranteeMode::Escrow,
+            image_path: "C:\\images\\source image.img".into(),
+            verification_candidate_path: "C:\\images\\candidate.img".into(),
+            verification_escrow_path: "C:\\images\\candidate.img.starconverter-escrow".into(),
+            verification_source_path: String::new(),
+        }
+    }
+
+    fn session_test_directory(label: &str) -> PathBuf {
+        let generation = SESSION_GENERATION.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "starconverter-gui-{label}-{}-{generation}",
+            std::process::id()
+        ))
+    }
+
+    fn relative_luminance(color: Color32) -> f32 {
+        let linear = |component: u8| {
+            let value = f32::from(component) / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.0722_f32.mul_add(
+            linear(color.b()),
+            0.7152_f32.mul_add(linear(color.g()), 0.2126 * linear(color.r())),
+        )
+    }
+
+    fn contrast_ratio(foreground: Color32, background: Color32) -> f32 {
+        let foreground = relative_luminance(foreground);
+        let background = relative_luminance(background);
+        (foreground.max(background) + 0.05) / (foreground.min(background) + 0.05)
+    }
+
     #[test]
     fn report_is_deterministic() {
         let plan = Planner.plan(
@@ -1985,5 +2657,115 @@ mod tests {
             job_result_disposition(None, 7),
             JobResultDisposition::IgnoreStale
         );
+    }
+
+    #[test]
+    fn session_document_roundtrips_only_bounded_explicit_fields() {
+        let now = 1_800_000_000;
+        let document = session_document_at(now);
+        let encoded = document.encode().unwrap();
+        assert!(encoded.len() <= SESSION_MAX_BYTES);
+        assert_eq!(SessionDocument::decode(&encoded, now).unwrap(), document);
+        assert!(
+            !String::from_utf8(encoded)
+                .unwrap()
+                .contains("source image.img")
+        );
+    }
+
+    #[test]
+    fn corrupted_and_oversized_sessions_are_refused() {
+        let now = 1_800_000_000;
+        let mut corrupted = session_document_at(now).encode().unwrap();
+        corrupted[0] = b'X';
+        assert!(SessionDocument::decode(&corrupted, now).is_err());
+
+        let oversized = vec![b'x'; SESSION_MAX_BYTES + 1];
+        let error = SessionDocument::decode(&oversized, now).unwrap_err();
+        assert!(error.contains("exceeds"));
+    }
+
+    #[test]
+    fn stale_or_future_sessions_are_refused() {
+        let now = 1_800_000_000;
+        let stale = session_document_at(now - SESSION_MAX_AGE_SECONDS - 1)
+            .encode()
+            .unwrap();
+        assert!(
+            SessionDocument::decode(&stale, now)
+                .unwrap_err()
+                .contains("90-day")
+        );
+
+        let future = session_document_at(now + SESSION_MAX_FUTURE_SKEW_SECONDS + 1)
+            .encode()
+            .unwrap();
+        assert!(
+            SessionDocument::decode(&future, now)
+                .unwrap_err()
+                .contains("future")
+        );
+    }
+
+    #[test]
+    fn raw_device_namespaces_are_never_persisted_or_recovered() {
+        let now = 1_800_000_000;
+        let mut document = session_document_at(now);
+        document.image_path = r"\\.\PhysicalDrive7".into();
+        assert!(document.encode().unwrap_err().contains("raw-device"));
+
+        let raw_hex = hex_encode(br"\\.\PhysicalDrive7");
+        let encoded = session_document_at(now).encode().unwrap();
+        let encoded = String::from_utf8(encoded).unwrap().replace(
+            &format!("image_path={}", hex_encode(b"C:\\images\\source image.img")),
+            &format!("image_path={raw_hex}"),
+        );
+        assert!(
+            SessionDocument::decode(encoded.as_bytes(), now)
+                .unwrap_err()
+                .contains("raw-device")
+        );
+    }
+
+    #[test]
+    fn session_store_publishes_complete_generations_and_ignores_partials() {
+        let now = 1_800_000_000;
+        let directory = session_test_directory("atomic-publish");
+        let store = SessionStore {
+            directory: directory.clone(),
+        };
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join(".session-v1-abandoned.partial"), b"torn").unwrap();
+        store.save(&session_document_at(now)).unwrap();
+
+        let SessionLoad::Recovered(recovered) = store.load(now) else {
+            panic!("published generation should be recovered");
+        };
+        assert_eq!(recovered, session_document_at(now));
+        let published = fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(is_session_generation_name)
+            })
+            .count();
+        assert_eq!(published, 1);
+
+        store.clear().unwrap();
+        assert!(matches!(store.load(now), SessionLoad::Empty));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn small_text_palette_meets_wcag_aa_contrast_on_app_surfaces() {
+        for foreground in [INK, MUTED, FAINT, READY, WARNING, DANGER, WORKING] {
+            assert!(
+                contrast_ratio(foreground, SURFACE) >= 4.5,
+                "{foreground:?} lacks 4.5:1 contrast on {SURFACE:?}"
+            );
+        }
     }
 }

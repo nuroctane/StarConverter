@@ -16,9 +16,20 @@ A tag such as `v0.1.0` produces these deterministic names:
 | Linux x64 | `starconverter-v0.1.0-x86_64-unknown-linux-gnu.tar.gz` |
 | macOS Intel | `starconverter-v0.1.0-x86_64-apple-darwin.tar.gz` |
 | macOS Apple Silicon | `starconverter-v0.1.0-aarch64-apple-darwin.tar.gz` |
+| macOS Intel app bundle | `starconverter-v0.1.0-x86_64-apple-darwin-macos-app.tar.gz` |
+| macOS Apple Silicon app bundle | `starconverter-v0.1.0-aarch64-apple-darwin-macos-app.tar.gz` |
 
-Every archive contains the `starconverter` CLI, the `starconverter-gui` desktop executable,
-`README.md`, `LICENSE`, and this release guide. The release also contains:
+Each portable archive contains the `starconverter` CLI, the `starconverter-gui` desktop executable,
+`README.md`, `LICENSE`, and this release guide.
+
+The two `-macos-app.tar.gz` engineering archives instead contain an exact four-file
+`StarConverter.app`: its canonical `Contents/Info.plist`, the GUI under `Contents/MacOS`, and the
+license and release guide under `Contents/Resources`. The standalone CLI remains in the portable
+archive. The app bundle intentionally has no custom graphic icon and no `_CodeSignature`; it uses
+the system's generic app presentation until an approved icon and a real distribution signature
+exist.
+
+The release also contains:
 
 - one `<archive>.inventory.json` beside each archive, recording its digest, size, target, normalized
   build epoch, and the exact path, mode, size, and SHA-256 of every member;
@@ -67,6 +78,11 @@ exactly contain the two executables plus `README.md`, `LICENSE`, and `RELEASE.md
 duplicate, encrypted, linked, wrong-architecture, or non-canonical members and refuses inventory
 drift. It then extracts only the packaged CLI into a temporary directory and runs the read-only
 `demo` smoke test. This tests the bytes inside the archive, not merely the build-tree executable.
+The macOS app validator independently enforces its exact bundle paths, canonical property list,
+target Mach-O CPU, source-bound resources, absence of a bundle signature, normalized metadata, and
+adjacent inventory. A native macOS runner also checks the property list with `plutil`, requires all
+dynamic dependencies to come from macOS system locations, and refuses an app that already passes
+`codesign --verify` in this unsigned channel.
 
 ## Verify provenance and SBOM attestations
 
@@ -108,11 +124,34 @@ Linux archives are built on Ubuntu 24.04 and dynamically use the host graphics/w
 They are intended for compatible x86-64 glibc desktop systems, not as universal static Linux
 binaries. macOS packages target macOS 15 runners. Windows packages target 64-bit MSVC Windows.
 
-These are portable archives, not installed applications: there is no MSI/MSIX, signed `.app`/DMG,
-PKG, AppImage, DEB, or RPM, and no upgrade, uninstall, file-association, Start-menu, or application
-bundle integration testing. CI smoke-tests the packaged CLI because launching and assessing the GUI
-requires a native interactive session. Signed native packages and installed-package tests remain
-release blockers for any claim beyond the unsigned engineering pre-alpha channel.
+The macOS artifact is an application bundle layout, but it is still delivered inside an engineering
+tar archive and is neither signed nor notarized. There is no MSI/MSIX, DMG, PKG, AppImage, DEB, or
+RPM, and no upgrade, uninstall, file-association, Start-menu, Gatekeeper, or installed-package
+integration test. CI smoke-tests the packaged CLI because launching and assessing the GUI requires
+a native interactive session. Signed native packages and installed-package tests remain release
+blockers for any claim beyond the unsigned engineering pre-alpha channel.
+
+### Native packaging boundary
+
+| Platform | Current engineering artifact | Deliberately blocked distribution artifact |
+| --- | --- | --- |
+| Windows | Validated unpackaged x64 ZIP | MSIX/MSI/installer until the distribution channel, durable package identity and publisher, signing provider, update/uninstall behavior, and clean-VM certification tests are selected |
+| macOS | Canonical unsigned Intel and Apple Silicon `.app` layouts | Developer ID distribution ZIP/DMG/PKG until hardened-runtime signing, secure timestamping, notarization, stapling, Gatekeeper assessment, and native launch tests are available |
+| Linux | Validated glibc x64 tar archive | AppDir/AppImage until there is an approved icon, a measured dependency-closure policy, and clean-host desktop integration tests; DEB/RPM additionally need an installation and upgrade policy |
+
+These refusals follow the platform contracts rather than a missing archive command. Microsoft
+distinguishes unpackaged deployment from MSIX package identity and warns that unsigned executable
+MSIX is a Windows 11 test-only flow with a separate identity, often requiring elevation. Apple
+places a macOS app's property list, executable, and resources under `Contents`, then requires
+Developer ID signing with hardened runtime and secure timestamps before normal notarized
+distribution. The AppDir specification requires `AppRun`, one desktop file, and actual icon
+entries; generating a placeholder icon would violate the project's visual decision and would not
+prove bundled-library compatibility. See the current primary guidance from
+[Microsoft](https://learn.microsoft.com/windows/apps/package-and-deploy/packaging/),
+[Microsoft unsigned MSIX testing](https://learn.microsoft.com/windows/msix/package/unsigned-package),
+[Apple bundle resources](https://developer.apple.com/documentation/bundleresources/placing-content-in-a-bundle),
+[Apple notarization](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution),
+and [AppImage](https://docs.appimage.org/reference/appdir.html).
 
 ## Reproducibility boundary
 
@@ -125,6 +164,8 @@ The workflow reduces accidental variance by:
 - sorting archive entries and normalizing archive ownership, modes, and gzip headers; and
 - independently reopening each archive, checking its exact schema, and emitting a canonical JSON
   member inventory before it can leave the platform build job; and
+- constructing the unsigned macOS app directly from four sorted, source-bound entries with a
+  canonical property list and USTAR/gzip metadata, then validating it with an independent script;
 - pinning cargo-cyclonedx 0.5.9 and checking the downloaded generator's SHA-256 before use.
 
 The project does **not** yet claim independently reproducible, byte-for-byte native binaries.
@@ -151,7 +192,8 @@ the toolchain, runner image, linker, SDK, environment, and archive inputs have b
 3. Create an annotated or signed tag named exactly `v<workspace-version>` and push that tag. The
    workflow rejects aliases, slashed tags, version mismatches, and commits not reachable from
    `origin/main`.
-4. Let every build, packaged-byte smoke test, inventory, SBOM, checksum, and attestation job finish.
+4. Let every build, packaged-byte smoke test, macOS bundle structure check, inventory, SBOM,
+   checksum, and attestation job finish.
    Do not publish local replacement files under the same version.
 5. Download one published archive and its inventory, verify the archive with
    `gh attestation verify`, compare its digest to both `SHA256SUMS.txt` and `archiveSha256`, and

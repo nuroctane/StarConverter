@@ -1,0 +1,30 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directories:
+      - /
+      - /fuzz
+    schedule:
+      interval: weekly
+      day: monday
+      time: "08:17"
+      timezone: America/Chicago
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: gomod
+    directory: /lab
+    schedule:
+      interval: weekly
+      day: monday
+      time: "08:27"
+      timezone: America/Chicago
+    open-pull-requests-limit: 3
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "08:37"
+      timezone: America/Chicago
+    open-pull-requests-limit: 3

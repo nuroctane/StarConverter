@@ -144,6 +144,70 @@ formatter NTFS  F63C1D49970DF4112810EDD1630841413C25A366E9C47D8E46B37B2DBB5E2B71
 
 The temporary formatter-origin files were removed after the hashes and results were recorded.
 
+## 2026-08-21 populated formatter-origin feature corpus
+
+The differential corpus was repeated with two 128 MiB regular files and real filesystem-driver
+writes. `mkfs.exfat` from exfatprogs 1.2.2 and `mkntfs -F -Q` from NTFS-3G 2022.10.3 created the
+filesystems. fuse-exfat 1.4.0 and NTFS-3G 2022.10.3 then populated only those pinned image files.
+The exFAT driver used a loop device whose backing file was checked before use; the NTFS driver
+opened the regular image directly. No physical drive, partition, VHD, or host filesystem was
+selected.
+
+Both filesystems received the same seven-file manifest beneath `/alpha/Ωmega/🚀`:
+
+- exact 0, 1, 4,095, 4,096, 4,097, and 8,191-byte deterministic payloads;
+- composed Latin, Greek, CJK, and surrogate-pair Unicode names;
+- a deterministic 40 MiB payload written after three 24 MiB fillers were allocated and the middle
+  filler was deleted; the remaining fillers were deleted after the payload was synchronized.
+
+That allocation pattern produced two physical runs for the exFAT payload (and a FAT chain rather
+than `NoFatChain`) and three NTFS runs as independently printed by `ntfsinfo -v -F`. The corpus
+therefore exercised empty/resident data, both sides of the 4 KiB cluster boundary, multi-cluster
+data, nested Unicode namespace traversal, and noncontiguous allocation in both filesystems.
+
+Independent read-only results:
+
+| Candidate | Check | Result |
+| --- | --- | --- |
+| populated exFAT | `fsck.exfat -n` | Exit 0: clean, four directories, seven files |
+| populated exFAT | verified read-only loop plus `mount.exfat-fuse -o ro` | All seven exact path, length, and SHA-256 manifest records matched |
+| populated NTFS | `ntfsinfo -m`, recursive `ntfsls`, `ntfsfix -n` | Exit 0; NTFS 3.1 metadata and the full nested namespace decoded; MFT/MFTMirr and alternate boot sector processed successfully |
+| populated NTFS | `ntfs-3g -o ro` | All seven exact path, length, and SHA-256 manifest records matched |
+| both | `starconverter inspect` | Complete bounded inventory and normalization succeeded without writes |
+
+SHA-256 immediately before and after every read-only checker, payload mount, and StarConverter
+inspection was identical:
+
+```text
+populated formatter exFAT AF26596436817B07E5197268FB0563C64607B1F7E77B40CB198E66D9A7F2D0DE
+populated formatter NTFS  AF9435189688FCCE46890A47B0E214958575328CCF86E8F7D3A8F270079DF029
+```
+
+This run exposed two valid interoperability distinctions and converted them into bounded
+regressions:
+
+1. [Microsoft exFAT section 3.1.18](https://learn.microsoft.com/en-us/windows/win32/fileio/exfat-specification#3118-percentinuse-field)
+   requires `PercentInUse` to be rounded down. The image had 10,254 allocated of 32,256 clusters:
+   31.789%, spec value 31, stored value 32. fuse-exfat 1.4.0's
+   [`finalize_super_block`](https://github.com/relan/exfat/blob/v1.4.0/libexfat/mount.c)
+   deliberately uses `(used * 100 + total / 2) / total`, or nearest-integer rounding. The active
+   Allocation Bitmap remains authoritative. StarConverter now accepts only `0xFF`, the exact spec
+   floor, or that exact legacy nearest formula; a different value, including floor plus two, is
+   still refused. The current evidence model has no separate compatibility-warning collection, so
+   a successful inspection does not yet surface which accepted representation was present.
+2. NTFS-3G kept zero as the cached `$FILE_NAME` data size while its `$I30` index keys contained the
+   current 1/4,095/4,096/4,097/8,191/41,943,040-byte values. The
+   [NTFS `$FILE_NAME` documentation](https://flatcap.github.io/linux-ntfs/ntfs/attributes/file_name.html)
+   states that duplicated fields other than the parent can become stale until the filename changes.
+   Namespace agreement now requires exact target and parent record/sequence, namespace, UTF-16
+   name, and well-formedness. Cached size, allocation, flags, and EA/reparse fields are preserved
+   from both sources but are not treated as current semantics; stream attributes, record flags, and
+   `$STANDARD_INFORMATION` remain authoritative. Tests independently mutate and refuse every
+   identity field, and runlist/allocation/content checks are unchanged.
+
+The temporary formatter-origin images, staging payloads, mount directories, and reference-source
+checkout were removed after evidence was recorded.
+
 ## What this does not prove
 
 - The recommended exFAT up-case profile removes the earlier ASCII-only limitation, but a clean
@@ -151,14 +215,16 @@ The temporary formatter-origin files were removed after the hashes and results w
 - `ntfsfix -n` and NTFS-3G metadata readers are not substitutes for a clean Windows `chkdsk` pass.
 - The rich, edge, and formatter-origin fixtures cover ordinary payloads, nesting,
   Unicode/surrogate/maximum-length
-  names, empty and allocation-boundary files, and two- and three-way fragmented allocation, but not
+  names, empty and allocation-boundary files, and two- and three-way fragmented allocation. The
+  populated formatter-origin corpus closes the earlier generic feature-specific corpus gap, but
+  does not cover
   alternate streams, hard links, ACLs, sparse/compressed data, reparse points,
   multi-level directory indexes, or a completed cross-format execution.
 - No candidate has been mounted by Windows, mounted writable, repaired, converted in-place, or
   tested on a physical drive.
 
-The next external gates are feature-specific corpus fixtures and Windows disposable-VHD `chkdsk`,
-detach, hash comparison, and StarConverter reinspection.
+The next external gates are Windows-origin feature images and disposable-VHD `chkdsk`, detach,
+hash comparison, and StarConverter reinspection.
 
 The current desktop session is not elevated. Microsoft documents that VHD attachment requires
 administrator privileges, so the generated VHDs were not attached in this run. When that gate is

@@ -80,6 +80,8 @@ requiring the GUI. Current and planned command surface:
 starconverter inspect <source>
 starconverter preview <source> --to ntfs --mode escrow
 starconverter convert-image <source> <new-output> --to ntfs --mode escrow
+starconverter verify-export <candidate> <escrow> --source <source>
+starconverter verify-windows-report <report.json>
 starconverter plan [synthetic-options]
 starconverter convert <plan> --confirm-device <stable-id>
 starconverter verify <journal>
@@ -92,7 +94,9 @@ redundant boot structures, allocation evidence, bounded object inventories, pres
 and exact candidate phases. `convert-image` writes only a caller-selected new regular file and its
 new escrow sidecar; it refuses overwrite and devices, reinspects the result, verifies a logical
 manifest, and re-hashes the source. `plan` remains a synthetic capability-model command. No CLI
-command mutates a source image or accesses a raw device.
+command mutates a source image or accesses a raw device. `verify-windows-report` reads one bounded
+regular JSON file, verifies the pinned schema-v1 harness evidence, and explicitly returns no
+activation authority; it does not open or attach the named VHDs.
 
 ### `starconverter-gui`
 
