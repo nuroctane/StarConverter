@@ -525,7 +525,14 @@ impl StarConverterApp {
                             .on_disabled_hover_text(
                                 "In-place and physical conversion remain locked behind activation gates.",
                             );
-                        if ui.button("Export new image").clicked() {
+                        let export_enabled = self.mode != GuaranteeMode::ContentOnly;
+                        if ui
+                            .add_enabled(export_enabled, Button::new("Export new image"))
+                            .on_disabled_hover_text(
+                                "Content-only is preview-only; choose strict or escrow to export.",
+                            )
+                            .clicked()
+                        {
                             self.export_new_image();
                         }
                         if ui.button("Preview exact").clicked() {
@@ -1128,6 +1135,11 @@ fn export_evidence_report(evidence: &CandidateExportEvidence) -> String {
         evidence.applied_writes,
         format_byte_count(usize::try_from(evidence.replacement_bytes).unwrap_or(usize::MAX)),
         hex_digest(&evidence.manifest_sha256)
+    );
+    let _ = writeln!(
+        report,
+        "candidate_sha256={}",
+        hex_digest(&evidence.candidate_sha256)
     );
     let _ = writeln!(
         report,

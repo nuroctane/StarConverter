@@ -10,6 +10,7 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use sha2::{Digest, Sha256};
 
@@ -22,8 +23,13 @@ use crate::phase::PhaseWritePreview;
 use crate::preservation::{
     PreservationError, PreservationLimits, PreservationReport, decode_escrow,
 };
-use crate::verify::{VerificationError, VerificationLimits, build_manifest};
+use crate::verify::{VerificationError, VerificationLimits, VerificationManifest, build_manifest};
 use crate::{FileSystem, GuaranteeMode};
+
+const BOUND_ESCROW_MAGIC: [u8; 8] = *b"STARXESC";
+const BOUND_ESCROW_VERSION: u16 = 1;
+const BOUND_ESCROW_FIXED_BYTES: usize = 8 + 2 + 1 + 1 + 8 + (32 * 3) + 32;
+static NEXT_PARTIAL: AtomicU64 = AtomicU64::new(0);
 
 /// Explicit work and output limits for one copy-based candidate export.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,7 +65,22 @@ pub struct CandidateExportEvidence {
     pub applied_writes: usize,
     pub replacement_bytes: u64,
     pub source_sha256: [u8; 32],
+    pub candidate_sha256: [u8; 32],
     pub manifest_sha256: [u8; 32],
+}
+
+/// Decoded candidate-bound escrow sidecar.
+///
+/// The embedded preservation payload retains source-only semantics. The envelope prevents a valid
+/// sidecar from another conversion in the same direction from being silently substituted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundEscrow {
+    pub source_filesystem: FileSystem,
+    pub target_filesystem: FileSystem,
+    pub source_sha256: [u8; 32],
+    pub candidate_sha256: [u8; 32],
+    pub manifest_sha256: [u8; 32],
+    pub preservation_payload: Vec<u8>,
 }
 
 /// Refusal or failure from the copy-only exporter.
@@ -82,6 +103,8 @@ pub enum CandidateExportError {
         actual: usize,
         maximum: usize,
     },
+    EscrowEnvelope(&'static str),
+    EscrowEnvelopeChecksum,
     OutputExists(PathBuf),
     OutputHasNoFileName(PathBuf),
     OutputParentNotDirectory(PathBuf),
@@ -137,6 +160,10 @@ impl fmt::Display for CandidateExportError {
                     formatter,
                     "escrow is {actual} bytes, exceeding cap {maximum}"
                 )
+            }
+            Self::EscrowEnvelope(reason) => write!(formatter, "invalid bound escrow: {reason}"),
+            Self::EscrowEnvelopeChecksum => {
+                formatter.write_str("bound escrow checksum does not match its contents")
             }
             Self::OutputExists(path) => {
                 write!(
@@ -245,6 +272,136 @@ impl From<VerificationError> for CandidateExportError {
     }
 }
 
+/// Decodes and authenticates a candidate-bound escrow sidecar.
+///
+/// `max_payload_bytes` bounds the embedded schema-v4 preservation payload before allocation.
+///
+/// # Errors
+///
+/// Refuses malformed, oversized, unsupported, trailing, or checksum-invalid envelopes.
+pub fn decode_bound_escrow(
+    bytes: &[u8],
+    max_payload_bytes: usize,
+) -> Result<BoundEscrow, CandidateExportError> {
+    if max_payload_bytes == 0 {
+        return Err(CandidateExportError::InvalidLimit("max_escrow_bytes"));
+    }
+    if bytes.len() < BOUND_ESCROW_FIXED_BYTES {
+        return Err(CandidateExportError::EscrowEnvelope("truncated envelope"));
+    }
+    if bytes[..8] != BOUND_ESCROW_MAGIC {
+        return Err(CandidateExportError::EscrowEnvelope("unexpected magic"));
+    }
+    let version = u16::from_le_bytes([bytes[8], bytes[9]]);
+    if version != BOUND_ESCROW_VERSION {
+        return Err(CandidateExportError::EscrowEnvelope(
+            "unsupported envelope version",
+        ));
+    }
+    let source_filesystem = decode_filesystem(bytes[10])?;
+    let target_filesystem = decode_filesystem(bytes[11])?;
+    if source_filesystem == target_filesystem {
+        return Err(CandidateExportError::EscrowEnvelope(
+            "source and target filesystems are identical",
+        ));
+    }
+    let payload_len =
+        usize::try_from(u64::from_le_bytes(bytes[12..20].try_into().map_err(
+            |_| CandidateExportError::EscrowEnvelope("truncated payload length"),
+        )?))
+        .map_err(|_| CandidateExportError::EscrowEnvelope("payload length is not representable"))?;
+    if payload_len > max_payload_bytes {
+        return Err(CandidateExportError::EscrowLimitExceeded {
+            actual: payload_len,
+            maximum: max_payload_bytes,
+        });
+    }
+    let expected_len = BOUND_ESCROW_FIXED_BYTES.checked_add(payload_len).ok_or(
+        CandidateExportError::ArithmeticOverflow("bound escrow length"),
+    )?;
+    if bytes.len() != expected_len {
+        return Err(CandidateExportError::EscrowEnvelope(
+            "payload length or trailing bytes mismatch",
+        ));
+    }
+    let checksum_offset = expected_len - 32;
+    let expected_checksum: [u8; 32] = bytes[checksum_offset..]
+        .try_into()
+        .map_err(|_| CandidateExportError::EscrowEnvelope("truncated checksum"))?;
+    let actual_checksum: [u8; 32] = Sha256::digest(&bytes[..checksum_offset]).into();
+    if actual_checksum != expected_checksum {
+        return Err(CandidateExportError::EscrowEnvelopeChecksum);
+    }
+    let source_sha256 = bytes[20..52]
+        .try_into()
+        .map_err(|_| CandidateExportError::EscrowEnvelope("truncated source hash"))?;
+    let candidate_sha256 = bytes[52..84]
+        .try_into()
+        .map_err(|_| CandidateExportError::EscrowEnvelope("truncated candidate hash"))?;
+    let manifest_sha256 = bytes[84..116]
+        .try_into()
+        .map_err(|_| CandidateExportError::EscrowEnvelope("truncated manifest hash"))?;
+    let preservation_payload = bytes[116..checksum_offset].to_vec();
+    Ok(BoundEscrow {
+        source_filesystem,
+        target_filesystem,
+        source_sha256,
+        candidate_sha256,
+        manifest_sha256,
+        preservation_payload,
+    })
+}
+
+fn encode_bound_escrow(
+    source_filesystem: FileSystem,
+    target_filesystem: FileSystem,
+    source_sha256: [u8; 32],
+    candidate_sha256: [u8; 32],
+    manifest_sha256: [u8; 32],
+    preservation_payload: &[u8],
+) -> Result<Vec<u8>, CandidateExportError> {
+    let payload_len = u64::try_from(preservation_payload.len())
+        .map_err(|_| CandidateExportError::ArithmeticOverflow("escrow payload length"))?;
+    let capacity = BOUND_ESCROW_FIXED_BYTES
+        .checked_add(preservation_payload.len())
+        .ok_or(CandidateExportError::ArithmeticOverflow(
+            "bound escrow capacity",
+        ))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    bytes.extend_from_slice(&BOUND_ESCROW_MAGIC);
+    bytes.extend_from_slice(&BOUND_ESCROW_VERSION.to_le_bytes());
+    bytes.push(encode_filesystem(source_filesystem)?);
+    bytes.push(encode_filesystem(target_filesystem)?);
+    bytes.extend_from_slice(&payload_len.to_le_bytes());
+    bytes.extend_from_slice(&source_sha256);
+    bytes.extend_from_slice(&candidate_sha256);
+    bytes.extend_from_slice(&manifest_sha256);
+    bytes.extend_from_slice(preservation_payload);
+    let checksum: [u8; 32] = Sha256::digest(&bytes).into();
+    bytes.extend_from_slice(&checksum);
+    Ok(bytes)
+}
+
+const fn encode_filesystem(filesystem: FileSystem) -> Result<u8, CandidateExportError> {
+    match filesystem {
+        FileSystem::ExFat => Ok(1),
+        FileSystem::Ntfs => Ok(2),
+        FileSystem::Unknown => Err(CandidateExportError::EscrowEnvelope(
+            "unknown filesystem cannot be bound",
+        )),
+    }
+}
+
+const fn decode_filesystem(value: u8) -> Result<FileSystem, CandidateExportError> {
+    match value {
+        1 => Ok(FileSystem::ExFat),
+        2 => Ok(FileSystem::Ntfs),
+        _ => Err(CandidateExportError::EscrowEnvelope(
+            "unknown filesystem identifier",
+        )),
+    }
+}
+
 /// Creates and independently verifies a complete target image without modifying the source.
 ///
 /// `output_path` and `escrow_path` must not exist. Escrow mode requires the latter; strict mode
@@ -290,7 +447,7 @@ pub fn export_candidate_image(
     let expected_manifest = build_manifest(source, target_graph, limits.verification)?;
     let source_sha256 = hash_image(source, limits.copy_chunk_bytes)?;
 
-    let mut output_guard = NewFileGuard::create(&output)?;
+    let mut output_guard = NewFileGuard::create_partial(&output)?;
     copy_source(source, output_guard.file_mut(), limits.copy_chunk_bytes)?;
     apply_forward_writes(output_guard.file_mut(), preview.writes())?;
     output_guard
@@ -298,14 +455,77 @@ pub fn export_candidate_image(
         .sync_all()
         .map_err(|source| CandidateExportError::io("flush candidate image", source))?;
 
-    let candidate = ImageFile::open(&output)?;
-    let inspection = inspect_image(&output)?;
-    if inspection.profile.filesystem != preview.target_filesystem()
-        || !inspection.profile.inventory_complete
+    let (manifest_sha256, candidate_sha256) = verify_candidate(
+        &output_guard.path,
+        preview.target_filesystem(),
+        &expected_manifest,
+        limits,
+    )?;
+
+    let after_sha256 = hash_image(source, limits.copy_chunk_bytes)?;
+    if after_sha256 != source_sha256 {
+        return Err(CandidateExportError::SourceChangedAfterExport);
+    }
+
+    let escrow_guard =
+        if let (Some(bytes), Some(path)) = (preservation.escrow.as_deref(), escrow.as_deref()) {
+            let envelope = encode_bound_escrow(
+                preservation.source,
+                preservation.target,
+                source_sha256,
+                candidate_sha256,
+                manifest_sha256,
+                bytes,
+            )?;
+            let mut guard = NewFileGuard::create_partial(path)?;
+            guard
+                .file_mut()
+                .write_all(&envelope)
+                .map_err(|source| CandidateExportError::io("write bound escrow", source))?;
+            guard
+                .file()
+                .sync_all()
+                .map_err(|source| CandidateExportError::io("flush bound escrow", source))?;
+            Some(guard)
+        } else {
+            None
+        };
+
+    if let (Some(guard), Some(path)) = (escrow_guard, escrow.as_deref()) {
+        guard.publish(path)?;
+    }
+    if let Err(error) = output_guard.publish(&output) {
+        if let Some(path) = &escrow {
+            let _ = fs::remove_file(path);
+        }
+        return Err(error);
+    }
+    Ok(CandidateExportEvidence {
+        output_path: output,
+        escrow_path: escrow,
+        target_filesystem: preview.target_filesystem(),
+        image_bytes: source.len(),
+        applied_writes: write_count,
+        replacement_bytes,
+        source_sha256,
+        candidate_sha256,
+        manifest_sha256,
+    })
+}
+
+fn verify_candidate(
+    path: &Path,
+    target_filesystem: FileSystem,
+    expected_manifest: &VerificationManifest,
+    limits: CandidateExportLimits,
+) -> Result<([u8; 32], [u8; 32]), CandidateExportError> {
+    let candidate = ImageFile::open(path)?;
+    let inspection = inspect_image(path)?;
+    if inspection.profile.filesystem != target_filesystem || !inspection.profile.inventory_complete
     {
         return Err(CandidateExportError::TargetInspectionMismatch);
     }
-    let actual_graph = match preview.target_filesystem() {
+    let actual_graph = match target_filesystem {
         FileSystem::ExFat => inspection
             .normalized_exfat
             .as_deref()
@@ -321,42 +541,10 @@ pub fn export_candidate_image(
     if !expected_manifest.equivalent_to(&actual_manifest) {
         return Err(CandidateExportError::ManifestMismatch);
     }
-
-    let escrow_guard =
-        if let (Some(bytes), Some(path)) = (preservation.escrow.as_deref(), escrow.as_deref()) {
-            let mut guard = NewFileGuard::create(path)?;
-            guard
-                .file_mut()
-                .write_all(bytes)
-                .map_err(|source| CandidateExportError::io("write escrow", source))?;
-            guard
-                .file()
-                .sync_all()
-                .map_err(|source| CandidateExportError::io("flush escrow", source))?;
-            Some(guard)
-        } else {
-            None
-        };
-
-    let after_sha256 = hash_image(source, limits.copy_chunk_bytes)?;
-    if after_sha256 != source_sha256 {
-        return Err(CandidateExportError::SourceChangedAfterExport);
-    }
-
-    output_guard.keep();
-    if let Some(guard) = &escrow_guard {
-        guard.keep();
-    }
-    Ok(CandidateExportEvidence {
-        output_path: output,
-        escrow_path: escrow,
-        target_filesystem: preview.target_filesystem(),
-        image_bytes: source.len(),
-        applied_writes: write_count,
-        replacement_bytes,
-        source_sha256,
-        manifest_sha256: actual_manifest.metadata_sha256,
-    })
+    Ok((
+        actual_manifest.metadata_sha256,
+        hash_image(&candidate, limits.copy_chunk_bytes)?,
+    ))
 }
 
 fn validate_limits(limits: CandidateExportLimits) -> Result<(), CandidateExportError> {
@@ -610,6 +798,35 @@ impl NewFileGuard {
         Ok(guard)
     }
 
+    fn create_partial(destination: &Path) -> Result<Self, CandidateExportError> {
+        let file_name = destination
+            .file_name()
+            .ok_or_else(|| CandidateExportError::OutputHasNoFileName(destination.to_path_buf()))?;
+        let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+        for _ in 0..128 {
+            let sequence = NEXT_PARTIAL.fetch_add(1, Ordering::Relaxed);
+            let mut partial_name = file_name.to_os_string();
+            partial_name.push(format!(
+                ".starconverter-partial-{}-{sequence}",
+                std::process::id()
+            ));
+            let partial = parent.join(partial_name);
+            match Self::create(&partial) {
+                Ok(guard) => return Ok(guard),
+                Err(CandidateExportError::Io { source, .. })
+                    if source.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(CandidateExportError::Io {
+            operation: "create unique partial output",
+            source: io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "exhausted partial output name attempts",
+            ),
+        })
+    }
+
     const fn file(&self) -> &File {
         &self.file
     }
@@ -620,6 +837,38 @@ impl NewFileGuard {
 
     fn keep(&self) {
         self.keep.set(true);
+    }
+
+    fn publish(&self, destination: &Path) -> Result<(), CandidateExportError> {
+        if destination.exists() {
+            return Err(CandidateExportError::OutputExists(
+                destination.to_path_buf(),
+            ));
+        }
+
+        #[cfg(windows)]
+        fs::rename(&self.path, destination).map_err(|source| {
+            if source.kind() == io::ErrorKind::AlreadyExists {
+                CandidateExportError::OutputExists(destination.to_path_buf())
+            } else {
+                CandidateExportError::io("publish verified output", source)
+            }
+        })?;
+
+        #[cfg(not(windows))]
+        {
+            fs::hard_link(&self.path, destination).map_err(|source| {
+                if source.kind() == io::ErrorKind::AlreadyExists {
+                    CandidateExportError::OutputExists(destination.to_path_buf())
+                } else {
+                    CandidateExportError::io("publish verified output", source)
+                }
+            })?;
+            let _ = fs::remove_file(&self.path);
+        }
+
+        self.keep();
+        Ok(())
     }
 }
 
@@ -762,6 +1011,74 @@ mod tests {
             resolve_new_path(&existing.path),
             Err(CandidateExportError::OutputExists(_))
         ));
+    }
+
+    #[test]
+    fn bound_escrow_round_trips_and_rejects_tampering() {
+        let payload = b"schema-v4-preservation-payload";
+        let encoded = encode_bound_escrow(
+            FileSystem::ExFat,
+            FileSystem::Ntfs,
+            [0x11; 32],
+            [0x22; 32],
+            [0x33; 32],
+            payload,
+        )
+        .unwrap();
+        let decoded = decode_bound_escrow(&encoded, 1024).unwrap();
+        assert_eq!(decoded.source_filesystem, FileSystem::ExFat);
+        assert_eq!(decoded.target_filesystem, FileSystem::Ntfs);
+        assert_eq!(decoded.source_sha256, [0x11; 32]);
+        assert_eq!(decoded.candidate_sha256, [0x22; 32]);
+        assert_eq!(decoded.manifest_sha256, [0x33; 32]);
+        assert_eq!(decoded.preservation_payload, payload);
+
+        let mut tampered = encoded;
+        tampered[52] ^= 0xff;
+        assert!(matches!(
+            decode_bound_escrow(&tampered, 1024),
+            Err(CandidateExportError::EscrowEnvelopeChecksum)
+        ));
+    }
+
+    #[test]
+    fn bound_escrow_identity_prevents_same_direction_substitution() {
+        let first = encode_bound_escrow(
+            FileSystem::Ntfs,
+            FileSystem::ExFat,
+            [1; 32],
+            [2; 32],
+            [3; 32],
+            b"payload",
+        )
+        .unwrap();
+        let second = encode_bound_escrow(
+            FileSystem::Ntfs,
+            FileSystem::ExFat,
+            [4; 32],
+            [5; 32],
+            [6; 32],
+            b"payload",
+        )
+        .unwrap();
+        let first = decode_bound_escrow(&first, 1024).unwrap();
+        let second = decode_bound_escrow(&second, 1024).unwrap();
+        assert_ne!(first.source_sha256, second.source_sha256);
+        assert_ne!(first.candidate_sha256, second.candidate_sha256);
+        assert_ne!(first.manifest_sha256, second.manifest_sha256);
+    }
+
+    #[test]
+    fn partial_output_is_not_exposed_at_requested_path() {
+        let destination = temp_path("published.img");
+        let mut guard = NewFileGuard::create_partial(&destination).unwrap();
+        guard.file_mut().write_all(b"verified").unwrap();
+        guard.file().sync_all().unwrap();
+        assert!(!destination.exists());
+        assert!(guard.path.exists());
+        guard.publish(&destination).unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"verified");
+        let _ = fs::remove_file(destination);
     }
 
     #[cfg(windows)]

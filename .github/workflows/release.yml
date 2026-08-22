@@ -1,4 +1,4 @@
-name: Portable release bundles
+name: Portable pre-release bundles
 
 on:
   workflow_dispatch:
@@ -6,88 +6,456 @@ on:
     tags:
       - 'v*'
 
-permissions:
-  contents: read
+# A job receives no token capability unless it declares one below.
+permissions: {}
+
+concurrency:
+  group: portable-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RUST_TOOLCHAIN: 1.95.0
+  CARGO_CYCLONEDX_VERSION: 0.5.9
+  CARGO_CYCLONEDX_LINUX_SHA256: fb8dbee9f182173e062a64a387b21a0badc6fab8b2abf9294973f012972bf6d8
 
 jobs:
+  prepare:
+    name: Validate release identity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      release-id: ${{ steps.identity.outputs.release-id }}
+      source-date-epoch: ${{ steps.identity.outputs.source-date-epoch }}
+    steps:
+      - name: Check out the exact source revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate tag and derive deterministic identity
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          workspace_version="$({
+            sed -nE 's/^version = "([0-9]+\.[0-9]+\.[0-9]+)"$/\1/p' Cargo.toml
+          } | head -n 1)"
+          if [[ -z "$workspace_version" ]]; then
+            echo 'Unable to read [workspace.package] version from Cargo.toml.' >&2
+            exit 1
+          fi
+
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            if [[ "$GITHUB_REF_NAME" != "v${workspace_version}" ]]; then
+              printf 'Tag %s must exactly match Cargo workspace version v%s.\n' \
+                "$GITHUB_REF_NAME" "$workspace_version" >&2
+              exit 1
+            fi
+            if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
+              echo 'Release tags must identify a commit reachable from origin/main.' >&2
+              exit 1
+            fi
+            release_id="$GITHUB_REF_NAME"
+          else
+            release_id="manual-${GITHUB_SHA:0:12}"
+          fi
+
+          source_date_epoch="$(git show -s --format=%ct "$GITHUB_SHA")"
+          if [[ ! "$source_date_epoch" =~ ^[0-9]+$ ]]; then
+            echo 'Commit timestamp is not a Unix epoch.' >&2
+            exit 1
+          fi
+          if (( source_date_epoch < 315532800 || source_date_epoch > 4354819199 )); then
+            echo 'Commit timestamp falls outside the representable ZIP date range.' >&2
+            exit 1
+          fi
+
+          printf 'release-id=%s\n' "$release_id" >> "$GITHUB_OUTPUT"
+          printf 'source-date-epoch=%s\n' "$source_date_epoch" >> "$GITHUB_OUTPUT"
+
+  sbom:
+    name: CycloneDX SBOM
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      SOURCE_DATE_EPOCH: ${{ needs.prepare.outputs.source-date-epoch }}
+      RELEASE_ID: ${{ needs.prepare.outputs.release-id }}
+    steps:
+      - name: Check out the exact source revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Cargo toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          cargo "+$RUST_TOOLCHAIN" metadata --locked --format-version 1 > /dev/null
+
+      - name: Install checksum-pinned cargo-cyclonedx
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset="cargo-cyclonedx-x86_64-unknown-linux-gnu.tar.xz"
+          url="https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-${CARGO_CYCLONEDX_VERSION}/${asset}"
+          curl --fail --location --proto '=https' --tlsv1.2 --output "$RUNNER_TEMP/$asset" "$url"
+          printf '%s  %s\n' "$CARGO_CYCLONEDX_LINUX_SHA256" "$RUNNER_TEMP/$asset" \
+            | sha256sum --check --strict
+          mkdir -p "$RUNNER_TEMP/cargo-cyclonedx"
+          tar -xJf "$RUNNER_TEMP/$asset" -C "$RUNNER_TEMP/cargo-cyclonedx"
+          tool="$(find "$RUNNER_TEMP/cargo-cyclonedx" -type f -name cargo-cyclonedx -print -quit)"
+          test -n "$tool"
+          install -m 0755 "$tool" "$RUNNER_TEMP/cargo-cyclonedx-bin"
+          "$RUNNER_TEMP/cargo-cyclonedx-bin" cyclonedx --version
+
+      - name: Generate reproducible all-target dependency manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+          tool="$RUNNER_TEMP/cargo-cyclonedx-bin"
+          "$tool" cyclonedx --format json --target all --spec-version 1.5
+
+          mkdir -p dist/reference
+          cp crates/starconverter-cli/starconverter-cli.cdx.json \
+            "dist/reference/starconverter-${RELEASE_ID}-cli.cdx.json"
+          cp crates/starconverter-core/starconverter-core.cdx.json \
+            "dist/reference/starconverter-${RELEASE_ID}-core.cdx.json"
+          cp crates/starconverter-gui/starconverter-gui.cdx.json \
+            "dist/reference/starconverter-${RELEASE_ID}-gui.cdx.json"
+
+          # SOURCE_DATE_EPOCH removes the random serial and fixes the SBOM timestamp.
+          "$tool" cyclonedx --format json --target all --spec-version 1.5
+          cmp crates/starconverter-cli/starconverter-cli.cdx.json \
+            "dist/reference/starconverter-${RELEASE_ID}-cli.cdx.json"
+          cmp crates/starconverter-core/starconverter-core.cdx.json \
+            "dist/reference/starconverter-${RELEASE_ID}-core.cdx.json"
+          cmp crates/starconverter-gui/starconverter-gui.cdx.json \
+            "dist/reference/starconverter-${RELEASE_ID}-gui.cdx.json"
+
+          mkdir -p dist/upload
+          cp dist/reference/*.cdx.json dist/upload/
+          for bom in dist/upload/*.cdx.json; do
+            jq -e '.bomFormat == "CycloneDX" and .specVersion == "1.5"' "$bom" > /dev/null
+          done
+          test "$(find dist/upload -maxdepth 1 -type f -name '*.cdx.json' | wc -l)" -eq 3
+          git diff --exit-code -- Cargo.lock
+
+      - name: Upload SBOMs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-sboms
+          path: dist/upload/*.cdx.json
+          if-no-files-found: error
+          compression-level: 9
+          retention-days: 30
+
   build:
-    name: Bundle / ${{ matrix.label }}
+    name: Bundle / ${{ matrix.target }}
+    needs: prepare
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: windows-latest
-            label: windows-x86_64
-            extension: .exe
-          - os: ubuntu-latest
-            label: linux-x86_64
-            extension: ''
-          - os: macos-latest
-            label: macos-native
-            extension: ''
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            exe-suffix: .exe
+            archive-kind: zip
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            exe-suffix: ''
+            archive-kind: tar.gz
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            exe-suffix: ''
+            archive-kind: tar.gz
+          - os: macos-15
+            target: aarch64-apple-darwin
+            exe-suffix: ''
+            archive-kind: tar.gz
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_RELEASE_DEBUG: 0
+      CARGO_PROFILE_RELEASE_STRIP: symbols
+      RELEASE_ID: ${{ needs.prepare.outputs.release-id }}
+      SOURCE_DATE_EPOCH: ${{ needs.prepare.outputs.source-date-epoch }}
+      TARGET_TRIPLE: ${{ matrix.target }}
+      EXE_SUFFIX: ${{ matrix.exe-suffix }}
+      ARCHIVE_KIND: ${{ matrix.archive-kind }}
+      RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/workspace
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Install Linux desktop dependencies
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxi-dev libgl1-mesa-dev
-      - name: Build portable binaries
-        run: cargo build --release -p starconverter-cli -p starconverter-gui
-      - name: Package Windows bundle
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $name = "starconverter-${{ github.ref_name }}-${{ matrix.label }}"
-          New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
-          Copy-Item "target/release/starconverter${{ matrix.extension }}" "dist/$name/"
-          Copy-Item "target/release/starconverter-gui${{ matrix.extension }}" "dist/$name/"
-          Copy-Item README.md,LICENSE "dist/$name/"
-          Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
-          $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  $name.zip" | Set-Content -NoNewline -Encoding ascii "dist/$name.zip.sha256"
-      - name: Package Unix bundle
-        if: runner.os != 'Windows'
+      - name: Check out the exact source revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain and target
         shell: bash
         run: |
           set -euo pipefail
-          name="starconverter-${{ github.ref_name }}-${{ matrix.label }}"
-          mkdir -p "dist/$name"
-          cp "target/release/starconverter${{ matrix.extension }}" "dist/$name/"
-          cp "target/release/starconverter-gui${{ matrix.extension }}" "dist/$name/"
-          cp README.md LICENSE "dist/$name/"
-          tar -C dist -czf "dist/$name.tar.gz" "$name"
-          if command -v sha256sum >/dev/null 2>&1; then
-            (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
-          else
-            (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
-          fi
-      - uses: actions/upload-artifact@v6
-        with:
-          name: starconverter-${{ github.ref_name }}-${{ matrix.label }}
-          path: |
-            dist/*.zip
-            dist/*.zip.sha256
-            dist/*.tar.gz
-            dist/*.tar.gz.sha256
-          if-no-files-found: error
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup target add --toolchain "$RUST_TOOLCHAIN" "$TARGET_TRIPLE"
 
-  publish:
-    name: Publish tagged release
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@v7
+      - name: Install Linux desktop build dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            libgl1-mesa-dev libwayland-dev libx11-dev libxi-dev libxkbcommon-dev
+
+      - name: Build locked CLI and desktop binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo "+$RUST_TOOLCHAIN" build --locked --release --target "$TARGET_TRIPLE" \
+            --package starconverter-cli --package starconverter-gui
+          test -f "target/$TARGET_TRIPLE/release/starconverter$EXE_SUFFIX"
+          test -f "target/$TARGET_TRIPLE/release/starconverter-gui$EXE_SUFFIX"
+
+      - name: Smoke-test CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          "target/$TARGET_TRIPLE/release/starconverter$EXE_SUFFIX" demo > smoke-test.txt
+          grep -F '[READ-ONLY]' smoke-test.txt
+
+      - name: Build deterministic portable archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import gzip
+          import os
+          import pathlib
+          import tarfile
+          import time
+          import zipfile
+
+          root = pathlib.Path.cwd()
+          target = os.environ["TARGET_TRIPLE"]
+          suffix = os.environ["EXE_SUFFIX"]
+          release_id = os.environ["RELEASE_ID"]
+          archive_kind = os.environ["ARCHIVE_KIND"]
+          epoch = int(os.environ["SOURCE_DATE_EPOCH"])
+          bundle = f"starconverter-{release_id}-{target}"
+          dist = root / "dist"
+          dist.mkdir(exist_ok=True)
+
+          entries = [
+              (root / "target" / target / "release" / f"starconverter{suffix}",
+               f"{bundle}/starconverter{suffix}", 0o755),
+              (root / "target" / target / "release" / f"starconverter-gui{suffix}",
+               f"{bundle}/starconverter-gui{suffix}", 0o755),
+              (root / "README.md", f"{bundle}/README.md", 0o644),
+              (root / "LICENSE", f"{bundle}/LICENSE", 0o644),
+              (root / "docs" / "RELEASE.md", f"{bundle}/RELEASE.md", 0o644),
+          ]
+          for source, _, _ in entries:
+              if not source.is_file():
+                  raise SystemExit(f"missing release input: {source}")
+
+          if archive_kind == "zip":
+              archive = dist / f"{bundle}.zip"
+              zip_epoch = max(epoch, 315532800)  # ZIP timestamps cannot predate 1980.
+              zip_time = time.gmtime(zip_epoch)[:6]
+              with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as output:
+                  for source, name, mode in sorted(entries, key=lambda item: item[1]):
+                      info = zipfile.ZipInfo(name, zip_time)
+                      info.create_system = 3
+                      info.external_attr = mode << 16
+                      info.compress_type = zipfile.ZIP_DEFLATED
+                      output.writestr(info, source.read_bytes(), compresslevel=9)
+          elif archive_kind == "tar.gz":
+              archive = dist / f"{bundle}.tar.gz"
+              with archive.open("wb") as raw:
+                  with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=epoch, compresslevel=9) as gz:
+                      with tarfile.open(fileobj=gz, mode="w", format=tarfile.PAX_FORMAT) as output:
+                          for source, name, mode in sorted(entries, key=lambda item: item[1]):
+                              info = output.gettarinfo(str(source), arcname=name)
+                              info.uid = 0
+                              info.gid = 0
+                              info.uname = ""
+                              info.gname = ""
+                              info.mode = mode
+                              info.mtime = epoch
+                              with source.open("rb") as data:
+                                  output.addfile(info, data)
+          else:
+              raise SystemExit(f"unsupported archive kind: {archive_kind}")
+
+          print(archive)
+          PY
+
+      - name: Upload portable archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          pattern: starconverter-*
+          name: portable-${{ matrix.target }}
+          path: dist/starconverter-${{ needs.prepare.outputs.release-id }}-${{ matrix.target }}.*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  attest:
+    name: Checksums and attestations
+    needs: [prepare, sbom, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: read # Download only artifacts created by this workflow run.
+      artifact-metadata: write # Required by actions/attest to register subjects.
+      attestations: write # Persist signed attestations in the repository API.
+      contents: read
+      id-token: write # Mint the short-lived OIDC identity used by Sigstore.
+    env:
+      RELEASE_ID: ${{ needs.prepare.outputs.release-id }}
+    steps:
+      - name: Download build products
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: portable-*
           path: dist
           merge-multiple: true
-      - uses: softprops/action-gh-release@v2
+
+      - name: Download SBOMs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          generate_release_notes: true
-          prerelease: true
-          files: dist/*
+          name: release-sboms
+          path: dist
+
+      - name: Inventory release subjects
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(find dist -maxdepth 1 -type f \( -name '*.zip' -o -name '*.tar.gz' \) | wc -l)" -eq 4
+          test "$(find dist -maxdepth 1 -type f -name '*.cdx.json' | wc -l)" -eq 3
+          (
+            cd dist
+            find . -maxdepth 1 -type f \( -name '*.zip' -o -name '*.tar.gz' \) \
+              -printf '%f\n' | LC_ALL=C sort | xargs sha256sum
+          ) > "$RUNNER_TEMP/archive-sha256sums.txt"
+          (
+            cd dist
+            find . -maxdepth 1 -type f \( -name '*.zip' -o -name '*.tar.gz' -o -name '*.cdx.json' \) \
+              -printf '%f\n' | LC_ALL=C sort | xargs sha256sum
+          ) > dist/SHA256SUMS.txt
+          (cd dist && sha256sum --check --strict SHA256SUMS.txt)
+
+      - name: Attest SLSA build provenance
+        id: provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-checksums: dist/SHA256SUMS.txt
+
+      - name: Attest CLI dependency SBOM
+        id: sbom_cli
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-checksums: ${{ runner.temp }}/archive-sha256sums.txt
+          sbom-path: dist/starconverter-${{ needs.prepare.outputs.release-id }}-cli.cdx.json
+
+      - name: Attest core dependency SBOM
+        id: sbom_core
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-checksums: ${{ runner.temp }}/archive-sha256sums.txt
+          sbom-path: dist/starconverter-${{ needs.prepare.outputs.release-id }}-core.cdx.json
+
+      - name: Attest GUI dependency SBOM
+        id: sbom_gui
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-checksums: ${{ runner.temp }}/archive-sha256sums.txt
+          sbom-path: dist/starconverter-${{ needs.prepare.outputs.release-id }}-gui.cdx.json
+
+      - name: Add offline Sigstore bundles and final checksums
+        shell: bash
+        env:
+          PROVENANCE_BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
+          CLI_SBOM_BUNDLE: ${{ steps.sbom_cli.outputs.bundle-path }}
+          CORE_SBOM_BUNDLE: ${{ steps.sbom_core.outputs.bundle-path }}
+          GUI_SBOM_BUNDLE: ${{ steps.sbom_gui.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          cp "$PROVENANCE_BUNDLE" "dist/starconverter-${RELEASE_ID}-provenance.sigstore.json"
+          cp "$CLI_SBOM_BUNDLE" "dist/starconverter-${RELEASE_ID}-cli-sbom.sigstore.json"
+          cp "$CORE_SBOM_BUNDLE" "dist/starconverter-${RELEASE_ID}-core-sbom.sigstore.json"
+          cp "$GUI_SBOM_BUNDLE" "dist/starconverter-${RELEASE_ID}-gui-sbom.sigstore.json"
+          (
+            cd dist
+            find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -printf '%f\n' \
+              | LC_ALL=C sort | xargs sha256sum
+          ) > dist/SHA256SUMS.txt
+          (cd dist && sha256sum --check --strict SHA256SUMS.txt)
+
+      - name: Upload complete release set
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-${{ needs.prepare.outputs.release-id }}
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  publish:
+    name: Publish immutable tagged pre-release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [prepare, attest]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read # Download only the already-attested release artifact.
+      contents: write # Create the GitHub pre-release and attach its immutable files.
+    steps:
+      - name: Download complete release set
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: release-${{ needs.prepare.outputs.release-id }}
+          path: dist
+
+      - name: Stage and publish unsigned pre-alpha release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists; refusing to replace immutable artifacts." >&2
+            exit 1
+          fi
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --draft \
+            --prerelease \
+            --latest=false \
+            --generate-notes \
+            --notes '**UNSIGNED PRE-ALPHA:** copy-based regular-image conversion only; no raw-device or in-place activation support. Verify SHA-256 and GitHub attestations before running.' \
+            --title "StarConverter $GITHUB_REF_NAME (unsigned pre-alpha)"
+          gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY"
+
+          mapfile -t local_assets < <(find dist -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)
+          mapfile -t remote_assets < <(
+            gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --json assets --jq '.assets[].name' | LC_ALL=C sort
+          )
+          diff \
+            <(printf '%s\n' "${local_assets[@]}") \
+            <(printf '%s\n' "${remote_assets[@]}")
+
+          gh release edit "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false \
+            --prerelease

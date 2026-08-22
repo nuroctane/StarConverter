@@ -99,6 +99,12 @@ fn convert_image_command(args: &[String]) -> Result<(), String> {
     let mut mode = GuaranteeMode::Escrow;
     let mut escrow_override = None;
     parse_convert_options(&args[2..], &mut target, &mut mode, &mut escrow_override)?;
+    if mode == GuaranteeMode::ContentOnly {
+        return Err(
+            "convert-image supports only strict or escrow losslessness; content-only is preview-only"
+                .into(),
+        );
+    }
     if target == inspection.profile.filesystem {
         return Err("convert-image target must differ from the source filesystem".into());
     }
@@ -148,6 +154,10 @@ fn convert_image_command(args: &[String]) -> Result<(), String> {
         evidence.applied_writes,
         format_bytes(evidence.replacement_bytes),
         hex_digest(&evidence.manifest_sha256)
+    );
+    println!(
+        "[CANDIDATE] sha256 {}",
+        hex_digest(&evidence.candidate_sha256)
     );
     println!(
         "[SOURCE UNCHANGED] {} bytes / sha256 {}",
@@ -979,6 +989,7 @@ fn print_help() {
     println!(
         "  Escrow mode writes <NEW-OUTPUT>.starconverter-escrow unless --escrow selects another new path.\n"
     );
+    println!("  Conversion accepts strict or escrow mode; content-only remains preview-only.\n");
     println!("PLAN OPTIONS");
     println!("  --source <PATH>       Image path or synthetic identity");
     println!("  --from <exfat|ntfs>   Source filesystem (default: exfat)");

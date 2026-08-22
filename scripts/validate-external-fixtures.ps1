@@ -18,7 +18,20 @@ $convertedNtfsImage = Join-Path $fixtureRoot "converted-rich-exfat-to-ntfs.img"
 $convertedNtfsEscrow = Join-Path $fixtureRoot "converted-rich-exfat-to-ntfs.img.starconverter-escrow"
 $convertedExfatImage = Join-Path $fixtureRoot "converted-rich-ntfs-to-exfat.img"
 $convertedExfatEscrow = Join-Path $fixtureRoot "converted-rich-ntfs-to-exfat.img.starconverter-escrow"
+$windowsNtfsPartition = Join-Path $fixtureRoot "converted-rich-exfat-to-ntfs-windows-partition.img"
+$windowsNtfsEscrow = Join-Path $fixtureRoot "converted-rich-exfat-to-ntfs-windows-partition.img.starconverter-escrow"
+$windowsNtfsVhd = Join-Path $fixtureRoot "converted-rich-exfat-to-ntfs-windows.vhd"
+$windowsExfatPartition = Join-Path $fixtureRoot "converted-rich-ntfs-to-exfat-windows-partition.img"
+$windowsExfatEscrow = Join-Path $fixtureRoot "converted-rich-ntfs-to-exfat-windows-partition.img.starconverter-escrow"
+$windowsExfatVhd = Join-Path $fixtureRoot "converted-rich-ntfs-to-exfat-windows.vhd"
 $manifest = Join-Path $fixtureRoot "rich-fixture-manifest.txt"
+$edgeExfatImage = Join-Path $fixtureRoot "exfat-edge-corpus.img"
+$edgeNtfsImage = Join-Path $fixtureRoot "ntfs-edge-corpus.img"
+$convertedEdgeNtfsImage = Join-Path $fixtureRoot "converted-edge-exfat-to-ntfs.img"
+$convertedEdgeNtfsEscrow = Join-Path $fixtureRoot "converted-edge-exfat-to-ntfs.img.starconverter-escrow"
+$convertedEdgeExfatImage = Join-Path $fixtureRoot "converted-edge-ntfs-to-exfat.img"
+$convertedEdgeExfatEscrow = Join-Path $fixtureRoot "converted-edge-ntfs-to-exfat.img.starconverter-escrow"
+$edgeManifest = Join-Path $fixtureRoot "edge-corpus-manifest.tsv"
 $allFixtures = @(
     $exfatImage,
     $ntfsImage,
@@ -30,7 +43,20 @@ $allFixtures = @(
     $convertedNtfsEscrow,
     $convertedExfatImage,
     $convertedExfatEscrow,
-    $manifest
+    $windowsNtfsPartition,
+    $windowsNtfsEscrow,
+    $windowsNtfsVhd,
+    $windowsExfatPartition,
+    $windowsExfatEscrow,
+    $windowsExfatVhd,
+    $manifest,
+    $edgeExfatImage,
+    $edgeNtfsImage,
+    $convertedEdgeNtfsImage,
+    $convertedEdgeNtfsEscrow,
+    $convertedEdgeExfatImage,
+    $convertedEdgeExfatEscrow,
+    $edgeManifest
 )
 
 function Convert-ToWslPath {
@@ -88,6 +114,11 @@ try {
     $richNtfsWsl = Convert-ToWslPath $richNtfsImage
     $convertedNtfsWsl = Convert-ToWslPath $convertedNtfsImage
     $convertedExfatWsl = Convert-ToWslPath $convertedExfatImage
+    $edgeExfatWsl = Convert-ToWslPath $edgeExfatImage
+    $edgeNtfsWsl = Convert-ToWslPath $edgeNtfsImage
+    $convertedEdgeNtfsWsl = Convert-ToWslPath $convertedEdgeNtfsImage
+    $convertedEdgeExfatWsl = Convert-ToWslPath $convertedEdgeExfatImage
+    $edgeManifestWsl = Convert-ToWslPath $edgeManifest
     $exfatMountValidatorWsl = Convert-ToWslPath (Join-Path $repoRoot "scripts\validate-exfat-readonly-mount.sh")
     $mountValidatorWsl = Convert-ToWslPath (Join-Path $repoRoot "scripts\validate-ntfs-readonly-mount.sh")
     Invoke-WslValidator "usr/sbin/fsck.exfat" @("-n", $exfatWsl)
@@ -120,6 +151,30 @@ try {
     & wsl.exe -u root -- sh $mountValidatorWsl $ValidatorRoot $convertedNtfsWsl
     if ($LASTEXITCODE -ne 0) {
         throw "Read-only converted NTFS mount validation failed with exit code $LASTEXITCODE"
+    }
+    Invoke-WslValidator "usr/sbin/fsck.exfat" @("-n", $edgeExfatWsl)
+    & wsl.exe -u root -- sh $exfatMountValidatorWsl $ValidatorRoot $edgeExfatWsl $edgeManifestWsl
+    if ($LASTEXITCODE -ne 0) {
+        throw "Read-only edge-corpus exFAT mount validation failed with exit code $LASTEXITCODE"
+    }
+    Invoke-WslValidator "bin/ntfsinfo" @("-m", $edgeNtfsWsl)
+    Invoke-WslValidator "bin/ntfsls" @("-a", "-l", "-R", "-p", "/", $edgeNtfsWsl)
+    Invoke-WslValidator "bin/ntfsfix" @("-n", $edgeNtfsWsl)
+    & wsl.exe -u root -- sh $mountValidatorWsl $ValidatorRoot $edgeNtfsWsl $edgeManifestWsl
+    if ($LASTEXITCODE -ne 0) {
+        throw "Read-only edge-corpus NTFS mount validation failed with exit code $LASTEXITCODE"
+    }
+    Invoke-WslValidator "usr/sbin/fsck.exfat" @("-n", $convertedEdgeExfatWsl)
+    & wsl.exe -u root -- sh $exfatMountValidatorWsl $ValidatorRoot $convertedEdgeExfatWsl $edgeManifestWsl
+    if ($LASTEXITCODE -ne 0) {
+        throw "Read-only converted edge-corpus exFAT mount validation failed with exit code $LASTEXITCODE"
+    }
+    Invoke-WslValidator "bin/ntfsinfo" @("-m", $convertedEdgeNtfsWsl)
+    Invoke-WslValidator "bin/ntfsls" @("-a", "-l", "-R", "-p", "/", $convertedEdgeNtfsWsl)
+    Invoke-WslValidator "bin/ntfsfix" @("-n", $convertedEdgeNtfsWsl)
+    & wsl.exe -u root -- sh $mountValidatorWsl $ValidatorRoot $convertedEdgeNtfsWsl $edgeManifestWsl
+    if ($LASTEXITCODE -ne 0) {
+        throw "Read-only converted edge-corpus NTFS mount validation failed with exit code $LASTEXITCODE"
     }
 
     foreach ($path in $allFixtures) {

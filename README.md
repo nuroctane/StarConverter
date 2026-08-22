@@ -137,7 +137,8 @@ opens the image read-only, validates bounded boot geometry plus the exFAT main/b
 the NTFS final backup sector, recursively inventories and normalizes exFAT objects, and scans the
 initialized NTFS `$MFT` under explicit resource caps. It then explains which evidence remains
 insufficient for conversion. The target defaults to the opposite filesystem; `--to exfat|ntfs` and
-`--mode strict|escrow|content-only` can override the preflight request. Inspection never writes to
+`--mode strict|escrow|content-only` can override the preflight request. Content-only is available
+for inspection and preview only; copy export accepts strict or escrow losslessness. Inspection never writes to
 the image.
 
 `preview` goes further without writing: it runs the preservation-bound cross-format adapter,
