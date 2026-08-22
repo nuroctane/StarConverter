@@ -575,6 +575,7 @@ jobs:
               gh attestation verify "dist/$subject" \
                 --repo "$GITHUB_REPOSITORY" \
                 --signer-workflow "$signer" \
+                --predicate-type https://cyclonedx.org/bom \
                 --bundle "$bundle" > /dev/null
             done < dist/ARCHIVE-SUBJECTS.txt
           done

@@ -104,6 +104,19 @@ gh attestation verify starconverter-v0.1.0-x86_64-unknown-linux-gnu.tar.gz \
   --bundle starconverter-v0.1.0-provenance.sigstore.json
 ```
 
+CycloneDX SBOM attestations use a different predicate and must name it explicitly:
+
+```bash
+gh attestation verify starconverter-v0.1.0-x86_64-unknown-linux-gnu.tar.gz \
+  --repo nuroctane/StarConverter \
+  --signer-workflow nuroctane/StarConverter/.github/workflows/release.yml \
+  --predicate-type https://cyclonedx.org/bom \
+  --bundle starconverter-v0.1.0-gui-sbom.sigstore.json
+```
+
+For a disconnected verification environment, also export a current trusted root with
+`gh attestation trusted-root` while online and provide it with `--custom-trusted-root` offline.
+
 The provenance bundle covers all archives, their canonical inventory documents, and the standalone
 SBOM documents. `PROVENANCE-SUBJECTS.txt` preserves that exact subject set; it is not replaced when
 the final release checksum file is assembled. Each `*-sbom.sigstore.json` bundle binds all four
