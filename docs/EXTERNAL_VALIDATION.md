@@ -57,9 +57,10 @@ detaches it in a trap. No physical device is discovered or selected.
 The exporter writes no device and never overwrites a path. It builds each regular output beneath a
 uniquely named partial path, verifies it, publishes escrow first with atomic no-clobber hard links,
 and exposes the final candidate name only after all checks succeed. Publication therefore fails
-closed on output filesystems without hard-link support, and parent-directory crash durability is
-still a platform qualification gate. The fixture command removes and recreates only its named
-files beneath Cargo's `target` directory.
+closed on output filesystems without hard-link support. Unix publication synchronizes the parent
+directory before and after partial-link cleanup; Windows evidence explicitly reports directory
+durability as unsupported until a Rust-1.85-compatible safe platform primitive is qualified. The
+fixture command removes and recreates only its named files beneath Cargo's `target` directory.
 
 ## 2026-08-21 expanded corpus
 
@@ -152,3 +153,11 @@ attachment:
 ```powershell
 powershell.exe -NoProfile -File scripts\validate-windows-vhd.ps1 -PreflightOnly
 ```
+
+Both preflight and the later elevated driver run can emit a create-new JSON evidence file with
+`-ReportPath C:\path\validation.json`. Schema
+`starconverter.windows-vhd-validation` v1 records the exact before/after VHD hashes, detach state,
+filesystem and partition observations, payload hashes, CHKDSK exit/transcript, Windows and
+PowerShell versions, and filesystem-driver versions. A report is written only after every requested
+case succeeds, and an existing report path is never replaced. The detached-preflight mode is
+explicitly labeled and must not be mistaken for Windows filesystem-driver qualification.

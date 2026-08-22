@@ -15,8 +15,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use sha2::{Digest, Sha256};
 
 use crate::conversion::{OpaqueWriteSets, ReservedWrite};
-use crate::image::{ImageError, ImageFile, reject_device_like_path};
-use crate::inspect::{InspectionError, inspect_image, inspect_open_image};
+use crate::image::{ImageError, ImageFile, ImageIdentity, reject_device_like_path};
+use crate::inspect::{InspectionError, inspect_open_image};
 use crate::object::ObjectGraph;
 use crate::overlay::OverlayWrite;
 use crate::phase::PhaseWritePreview;
@@ -68,6 +68,38 @@ pub struct CandidateExportEvidence {
     pub source_sha256: [u8; 32],
     pub candidate_sha256: [u8; 32],
     pub manifest_sha256: [u8; 32],
+    pub output_directory_durability: DirectoryDurability,
+    pub escrow_directory_durability: Option<DirectoryDurability>,
+}
+
+/// Strength of the namespace-durability barrier completed after publishing one artifact.
+///
+/// File contents are always flushed before publication. Safe Rust exposes directory `sync_all` on
+/// Unix, but the standard library does not expose an equivalent Windows directory-handle flush.
+/// Callers must therefore retain this evidence rather than assuming equal guarantees everywhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectoryDurability {
+    /// The parent directory accepted a successful `sync_all` after the namespace change.
+    Synchronized,
+    /// The host or filesystem does not expose a supported directory synchronization operation.
+    Unsupported,
+}
+
+impl DirectoryDurability {
+    /// Stable label for CLI, GUI, logs, and saved evidence.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Synchronized => "synchronized",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+impl fmt::Display for DirectoryDurability {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 /// Decoded candidate-bound escrow sidecar.
@@ -183,6 +215,28 @@ pub enum CandidateExportError {
         expected: FileSystem,
         actual: FileSystem,
     },
+    PublishedDirectorySyncFailed {
+        published_path: PathBuf,
+        partial_path: PathBuf,
+        partial_removed: bool,
+        source: io::Error,
+    },
+    PublishedPartialCleanupFailed {
+        published_path: PathBuf,
+        partial_path: PathBuf,
+        source: io::Error,
+    },
+    PublicationCollision {
+        destination: PathBuf,
+        partial_path: PathBuf,
+    },
+    PublicationFailed {
+        destination: PathBuf,
+        partial_path: PathBuf,
+        source: io::Error,
+    },
+    PartialIdentityMismatch(PathBuf),
+    PublishedIdentityMismatch(PathBuf),
 }
 
 impl fmt::Display for CandidateExportError {
@@ -303,6 +357,63 @@ impl fmt::Display for CandidateExportError {
                 formatter,
                 "source filesystem is {actual}, but the bound escrow requires {expected}",
             ),
+            Self::PublishedDirectorySyncFailed {
+                published_path,
+                partial_path,
+                partial_removed,
+                source,
+            } => {
+                let cleanup = if *partial_removed {
+                    "was removed, but that removal is not known durable"
+                } else {
+                    "was retained"
+                };
+                write!(
+                    formatter,
+                    "published {} but could not make its parent-directory update durable; partial {} {cleanup}: {source}",
+                    published_path.display(),
+                    partial_path.display(),
+                )
+            }
+            Self::PublishedPartialCleanupFailed {
+                published_path,
+                partial_path,
+                source,
+            } => write!(
+                formatter,
+                "published {} but could not remove partial hard-link {}: {source}",
+                published_path.display(),
+                partial_path.display(),
+            ),
+            Self::PublicationCollision {
+                destination,
+                partial_path,
+            } => write!(
+                formatter,
+                "refusing to overwrite raced-in destination {}; unpublished partial was retained at {}",
+                destination.display(),
+                partial_path.display(),
+            ),
+            Self::PublicationFailed {
+                destination,
+                partial_path,
+                source,
+            } => write!(
+                formatter,
+                "could not atomically publish {} without replacement; partial was retained at {}: {source}",
+                destination.display(),
+                partial_path.display(),
+            ),
+            Self::PartialIdentityMismatch(path) => write!(
+                formatter,
+                "verified partial path no longer identifies the pinned file: {}",
+                path.display(),
+            ),
+            Self::PublishedIdentityMismatch(path) => write!(
+                formatter,
+                "published path does not identify the verified pinned file: {}",
+                path.display(),
+            ),
         }
     }
 }
@@ -310,7 +421,10 @@ impl fmt::Display for CandidateExportError {
 impl std::error::Error for CandidateExportError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Io { source, .. } => Some(source),
+            Self::Io { source, .. }
+            | Self::PublishedDirectorySyncFailed { source, .. }
+            | Self::PublishedPartialCleanupFailed { source, .. }
+            | Self::PublicationFailed { source, .. } => Some(source),
             Self::Image(source) => Some(source),
             Self::Preservation(source) => Some(source),
             Self::Inspection(source) => Some(source),
@@ -687,12 +801,13 @@ pub fn export_candidate_image(
         .sync_all()
         .map_err(|source| CandidateExportError::io("flush candidate image", source))?;
 
-    let (manifest_sha256, candidate_sha256) = verify_candidate(
-        &output_guard.path,
+    let (manifest_sha256, candidate_sha256, candidate_identity) = verify_candidate(
+        &output_guard,
         preview.target_filesystem(),
         &expected_manifest,
         limits,
     )?;
+    output_guard.bind_verified_identity(candidate_identity);
 
     let after_sha256 = hash_image(source, limits.copy_chunk_bytes)?;
     if after_sha256 != source_sha256 {
@@ -718,18 +833,22 @@ pub fn export_candidate_image(
                 .file()
                 .sync_all()
                 .map_err(|source| CandidateExportError::io("flush bound escrow", source))?;
+            guard.bind_current_identity()?;
             Some(guard)
         } else {
             None
         };
 
-    if let (Some(guard), Some(path)) = (escrow_guard, escrow.as_deref()) {
-        guard.publish(path)?;
-    }
+    let escrow_directory_durability =
+        if let (Some(guard), Some(path)) = (escrow_guard, escrow.as_deref()) {
+            Some(guard.publish(path)?)
+        } else {
+            None
+        };
     // A published escrow path is intentionally retained if candidate publication fails. Removing
     // it by pathname here could unlink a raced-in foreign file in a hostile directory, and a lone
     // bound sidecar is safer than a final candidate without its preservation evidence.
-    output_guard.publish(&output)?;
+    let output_directory_durability = output_guard.publish(&output)?;
     Ok(CandidateExportEvidence {
         output_path: output,
         escrow_path: escrow,
@@ -740,17 +859,23 @@ pub fn export_candidate_image(
         source_sha256,
         candidate_sha256,
         manifest_sha256,
+        output_directory_durability,
+        escrow_directory_durability,
     })
 }
 
 fn verify_candidate(
-    path: &Path,
+    guard: &NewFileGuard,
     target_filesystem: FileSystem,
     expected_manifest: &VerificationManifest,
     limits: CandidateExportLimits,
-) -> Result<([u8; 32], [u8; 32]), CandidateExportError> {
-    let candidate = ImageFile::open(path)?;
-    let inspection = inspect_image(path)?;
+) -> Result<([u8; 32], [u8; 32], ImageIdentity), CandidateExportError> {
+    let candidate = ImageFile::from_open_regular_file(
+        guard.file(),
+        guard.path.clone(),
+        limits.copy_chunk_bytes,
+    )?;
+    let inspection = inspect_open_image(&candidate)?;
     if inspection.profile.filesystem != target_filesystem || !inspection.profile.inventory_complete
     {
         return Err(CandidateExportError::TargetInspectionMismatch);
@@ -771,10 +896,19 @@ fn verify_candidate(
     if !expected_manifest.equivalent_to(&actual_manifest) {
         return Err(CandidateExportError::ManifestMismatch);
     }
-    Ok((
-        actual_manifest.metadata_sha256,
-        hash_image(&candidate, limits.copy_chunk_bytes)?,
-    ))
+    let candidate_sha256 = hash_image(&candidate, limits.copy_chunk_bytes)?;
+    let identity = candidate.identity().clone();
+    if !identity.matches_container_metadata(
+        &guard
+            .file()
+            .metadata()
+            .map_err(|source| CandidateExportError::io("revalidate candidate handle", source))?,
+    ) {
+        return Err(CandidateExportError::PartialIdentityMismatch(
+            guard.path.clone(),
+        ));
+    }
+    Ok((actual_manifest.metadata_sha256, candidate_sha256, identity))
 }
 
 fn validate_limits(limits: CandidateExportLimits) -> Result<(), CandidateExportError> {
@@ -1000,24 +1134,47 @@ fn apply_forward_writes(
 
 struct NewFileGuard {
     path: PathBuf,
-    file: File,
+    file: Option<File>,
+    verified_identity: Option<ImageIdentity>,
     keep: std::cell::Cell<bool>,
 }
 
 impl NewFileGuard {
     fn create(path: &Path) -> Result<Self, CandidateExportError> {
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            // Candidate images and escrow can contain the complete source volume's private data.
+            // Begin restrictive; a future explicit export-permissions policy may relax the final
+            // artifact after publication.
+            options.mode(0o600);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+
+            const FILE_SHARE_READ: u32 = 0x0000_0001;
+            // Verification needs a second read handle. Denying write and delete sharing prevents
+            // another Windows handle from mutating or replacing the partial before publication.
+            options.share_mode(FILE_SHARE_READ);
+        }
+        let file = options
             .open(path)
             .map_err(|source| CandidateExportError::io("create new output", source))?;
+        #[cfg(unix)]
+        fs4::FileExt::try_lock(&file)
+            .map_err(|source| CandidateExportError::io("lock new partial output", source.into()))?;
         let guard = Self {
             path: path.to_path_buf(),
-            file,
+            file: Some(file),
+            verified_identity: None,
             keep: std::cell::Cell::new(false),
         };
         let metadata = guard
-            .file
+            .file()
             .metadata()
             .map_err(|source| CandidateExportError::io("inspect new output", source))?;
         if !metadata.is_file() {
@@ -1054,46 +1211,213 @@ impl NewFileGuard {
     }
 
     const fn file(&self) -> &File {
-        &self.file
+        self.file
+            .as_ref()
+            .expect("a partial file remains open until publication cleanup")
     }
 
     const fn file_mut(&mut self) -> &mut File {
-        &mut self.file
+        self.file
+            .as_mut()
+            .expect("a partial file remains open until publication cleanup")
     }
 
     fn keep(&self) {
         self.keep.set(true);
     }
 
-    fn publish(&self, destination: &Path) -> Result<(), CandidateExportError> {
-        if destination.exists() {
-            return Err(CandidateExportError::OutputExists(
+    fn bind_verified_identity(&mut self, identity: ImageIdentity) {
+        self.verified_identity = Some(identity);
+    }
+
+    fn bind_current_identity(&mut self) -> Result<(), CandidateExportError> {
+        let image = ImageFile::from_open_regular_file(self.file(), self.path.clone(), 1)?;
+        self.bind_verified_identity(image.identity().clone());
+        Ok(())
+    }
+
+    fn ensure_verified_path(&self, path: &Path) -> Result<(), CandidateExportError> {
+        let identity = self
+            .verified_identity
+            .as_ref()
+            .ok_or_else(|| CandidateExportError::PartialIdentityMismatch(self.path.clone()))?;
+        let handle_metadata = self
+            .file()
+            .metadata()
+            .map_err(|source| CandidateExportError::io("revalidate partial handle", source))?;
+        let path_metadata = fs::metadata(path)
+            .map_err(|source| CandidateExportError::io("revalidate partial path", source))?;
+        if identity.matches_container_metadata(&handle_metadata)
+            && identity.matches_container_metadata(&path_metadata)
+        {
+            Ok(())
+        } else {
+            Err(CandidateExportError::PartialIdentityMismatch(
+                path.to_path_buf(),
+            ))
+        }
+    }
+
+    /// Publishes through a hard link because stable safe Rust has no portable no-replace rename.
+    ///
+    /// This is intentionally fail-closed on exFAT, FAT, and other filesystems without hard-link
+    /// support. Falling back to `rename` would reintroduce an overwrite race on Windows and Unix.
+    fn publish(self, destination: &Path) -> Result<DirectoryDurability, CandidateExportError> {
+        self.publish_with(destination, &HostPublicationIo)
+    }
+
+    fn publish_with(
+        mut self,
+        destination: &Path,
+        io: &impl PublicationIo,
+    ) -> Result<DirectoryDurability, CandidateExportError> {
+        if let Err(error) = self.ensure_verified_path(&self.path) {
+            self.keep();
+            return Err(error);
+        }
+        // From here on, even publication failure retains the partial. Deleting it by pathname
+        // would reopen the same-UID Unix replacement race this identity check is meant to detect.
+        self.keep();
+        if let Err(source) = io.hard_link(&self.path, destination) {
+            return if source.kind() == io::ErrorKind::AlreadyExists {
+                Err(CandidateExportError::PublicationCollision {
+                    destination: destination.to_path_buf(),
+                    partial_path: self.path.clone(),
+                })
+            } else {
+                Err(CandidateExportError::PublicationFailed {
+                    destination: destination.to_path_buf(),
+                    partial_path: self.path.clone(),
+                    source,
+                })
+            };
+        }
+        // From this point onward the final path exists. Never let Drop obscure a partial-success
+        // state by deleting the partial without being able to report whether cleanup was durable.
+        let published_metadata = fs::metadata(destination)
+            .map_err(|source| CandidateExportError::io("inspect published output", source))?;
+        if !self
+            .verified_identity
+            .as_ref()
+            .is_some_and(|identity| identity.matches_container_metadata(&published_metadata))
+        {
+            return Err(CandidateExportError::PublishedIdentityMismatch(
                 destination.to_path_buf(),
             ));
         }
-
-        fs::hard_link(&self.path, destination).map_err(|source| {
-            if source.kind() == io::ErrorKind::AlreadyExists {
-                CandidateExportError::OutputExists(destination.to_path_buf())
-            } else {
-                CandidateExportError::io(
-                    "publish verified output (destination must support hard links)",
-                    source,
-                )
+        let first_sync = io.sync_parent(destination).map_err(|source| {
+            CandidateExportError::PublishedDirectorySyncFailed {
+                published_path: destination.to_path_buf(),
+                partial_path: self.path.clone(),
+                partial_removed: false,
+                source,
             }
         })?;
-        let _ = fs::remove_file(&self.path);
+        self.close_file();
+        io.remove_partial(&self.path).map_err(|source| {
+            CandidateExportError::PublishedPartialCleanupFailed {
+                published_path: destination.to_path_buf(),
+                partial_path: self.path.clone(),
+                source,
+            }
+        })?;
+        let second_sync = io.sync_parent(destination).map_err(|source| {
+            CandidateExportError::PublishedDirectorySyncFailed {
+                published_path: destination.to_path_buf(),
+                partial_path: self.path.clone(),
+                partial_removed: true,
+                source,
+            }
+        })?;
+        Ok(combine_directory_durability(first_sync, second_sync))
+    }
 
-        self.keep();
-        Ok(())
+    fn close_file(&mut self) {
+        if let Some(file) = self.file.take() {
+            #[cfg(unix)]
+            let _ = fs4::FileExt::unlock(&file);
+            drop(file);
+        }
     }
 }
 
 impl Drop for NewFileGuard {
     fn drop(&mut self) {
+        self.close_file();
+        // An unpublished partial is best-effort cleanup during unwinding because Drop cannot
+        // return an I/O error. Every cleanup after publication is explicit in `publish_with`.
         if !self.keep.get() {
             let _ = fs::remove_file(&self.path);
         }
+    }
+}
+
+trait PublicationIo {
+    fn hard_link(&self, partial: &Path, destination: &Path) -> io::Result<()>;
+    fn remove_partial(&self, partial: &Path) -> io::Result<()>;
+    fn sync_parent(&self, destination: &Path) -> io::Result<DirectoryDurability>;
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HostPublicationIo;
+
+impl PublicationIo for HostPublicationIo {
+    fn hard_link(&self, partial: &Path, destination: &Path) -> io::Result<()> {
+        fs::hard_link(partial, destination)
+    }
+
+    fn remove_partial(&self, partial: &Path) -> io::Result<()> {
+        fs::remove_file(partial)
+    }
+
+    fn sync_parent(&self, destination: &Path) -> io::Result<DirectoryDurability> {
+        #[cfg(unix)]
+        {
+            sync_parent_directory(destination)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = destination;
+            // Windows requires platform directory-handle APIs that stable safe Rust does not
+            // expose. Returning explicit evidence is safer than pretending that file `sync_all`
+            // flushed the name.
+            Ok(DirectoryDurability::Unsupported)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(destination: &Path) -> io::Result<DirectoryDurability> {
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    let directory = File::open(parent)?;
+    match directory.sync_all() {
+        Ok(()) => Ok(DirectoryDurability::Synchronized),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported
+            ) =>
+        {
+            Ok(DirectoryDurability::Unsupported)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+const fn combine_directory_durability(
+    first: DirectoryDurability,
+    second: DirectoryDurability,
+) -> DirectoryDurability {
+    if matches!(
+        (first, second),
+        (
+            DirectoryDurability::Synchronized,
+            DirectoryDurability::Synchronized
+        )
+    ) {
+        DirectoryDurability::Synchronized
+    } else {
+        DirectoryDurability::Unsupported
     }
 }
 
@@ -1105,6 +1429,7 @@ impl CandidateExportError {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
@@ -1119,6 +1444,53 @@ mod tests {
     use crate::preservation::evaluate_ntfs;
 
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Debug)]
+    struct FaultingPublicationIo {
+        fail_remove: bool,
+        fail_sync_call: Option<usize>,
+        remove_calls: Cell<usize>,
+        sync_calls: Cell<usize>,
+    }
+
+    impl FaultingPublicationIo {
+        const fn new(fail_remove: bool, fail_sync_call: Option<usize>) -> Self {
+            Self {
+                fail_remove,
+                fail_sync_call,
+                remove_calls: Cell::new(0),
+                sync_calls: Cell::new(0),
+            }
+        }
+    }
+
+    impl PublicationIo for FaultingPublicationIo {
+        fn hard_link(&self, partial: &Path, destination: &Path) -> io::Result<()> {
+            fs::hard_link(partial, destination)
+        }
+
+        fn remove_partial(&self, partial: &Path) -> io::Result<()> {
+            self.remove_calls.set(self.remove_calls.get() + 1);
+            if self.fail_remove {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected partial cleanup failure",
+                ))
+            } else {
+                fs::remove_file(partial)
+            }
+        }
+
+        fn sync_parent(&self, _destination: &Path) -> io::Result<DirectoryDurability> {
+            let call = self.sync_calls.get() + 1;
+            self.sync_calls.set(call);
+            if self.fail_sync_call == Some(call) {
+                Err(io::Error::other("injected parent sync failure"))
+            } else {
+                Ok(DirectoryDurability::Synchronized)
+            }
+        }
+    }
 
     struct TempFile {
         path: PathBuf,
@@ -1345,6 +1717,15 @@ mod tests {
     }
 
     #[test]
+    fn directory_durability_has_stable_user_facing_labels() {
+        assert_eq!(
+            DirectoryDurability::Synchronized.to_string(),
+            "synchronized"
+        );
+        assert_eq!(DirectoryDurability::Unsupported.to_string(), "unsupported");
+    }
+
+    #[test]
     fn refuses_preview_whose_before_image_is_not_the_source() {
         let bytes = vec![b'x'; 1536];
         let source_file = TempFile::create(&bytes);
@@ -1471,6 +1852,7 @@ mod tests {
         let mut guard = NewFileGuard::create_partial(&destination).unwrap();
         guard.file_mut().write_all(b"verified").unwrap();
         guard.file().sync_all().unwrap();
+        guard.bind_current_identity().unwrap();
         assert!(!destination.exists());
         assert!(guard.path.exists());
         guard.publish(&destination).unwrap();
@@ -1484,16 +1866,155 @@ mod tests {
         let mut guard = NewFileGuard::create_partial(&destination).unwrap();
         guard.file_mut().write_all(b"candidate").unwrap();
         guard.file().sync_all().unwrap();
+        guard.bind_current_identity().unwrap();
+        let partial = guard.path.clone();
 
         // Model another creator winning after the export's initial path checks but before publish.
         fs::write(&destination, b"foreign").unwrap();
         assert!(matches!(
             guard.publish(&destination),
-            Err(CandidateExportError::OutputExists(path)) if path == destination
+            Err(CandidateExportError::PublicationCollision {
+                destination: path,
+                partial_path,
+            }) if path == destination && partial_path == partial
         ));
         assert_eq!(fs::read(&destination).unwrap(), b"foreign");
-        assert_eq!(fs::read(&guard.path).unwrap(), b"candidate");
+        assert_eq!(fs::read(&partial).unwrap(), b"candidate");
         let _ = fs::remove_file(destination);
+        let _ = fs::remove_file(partial);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replaced_partial_path_is_refused_without_deleting_the_replacement() {
+        let destination = temp_path("identity-race-destination.img");
+        let mut guard = NewFileGuard::create_partial(&destination).unwrap();
+        guard.file_mut().write_all(b"verified").unwrap();
+        guard.file().sync_all().unwrap();
+        guard.bind_current_identity().unwrap();
+        let partial = guard.path.clone();
+        let moved_partial = temp_path("identity-race-original.img");
+        fs::rename(&partial, &moved_partial).unwrap();
+        fs::write(&partial, b"foreign").unwrap();
+
+        assert!(matches!(
+            guard.publish(&destination),
+            Err(CandidateExportError::PartialIdentityMismatch(path)) if path == partial
+        ));
+        assert!(!destination.exists());
+        assert_eq!(fs::read(&partial).unwrap(), b"foreign");
+        assert_eq!(fs::read(&moved_partial).unwrap(), b"verified");
+        fs::remove_file(partial).unwrap();
+        fs::remove_file(moved_partial).unwrap();
+    }
+
+    #[test]
+    fn published_partial_unlink_failure_is_returned_with_both_paths_intact() {
+        let destination = temp_path("unlink-failure.img");
+        let mut guard = NewFileGuard::create_partial(&destination).unwrap();
+        guard.file_mut().write_all(b"verified").unwrap();
+        guard.file().sync_all().unwrap();
+        guard.bind_current_identity().unwrap();
+        let partial = guard.path.clone();
+        let publication_io = FaultingPublicationIo::new(true, None);
+
+        assert!(matches!(
+            guard.publish_with(&destination, &publication_io),
+            Err(CandidateExportError::PublishedPartialCleanupFailed {
+                published_path,
+                partial_path,
+                ..
+            }) if published_path == destination && partial_path == partial
+        ));
+        assert_eq!(publication_io.sync_calls.get(), 1);
+        assert_eq!(publication_io.remove_calls.get(), 1);
+        assert_eq!(fs::read(&destination).unwrap(), b"verified");
+        assert_eq!(fs::read(&partial).unwrap(), b"verified");
+        assert!(
+            partial.exists(),
+            "reported orphan must not be hidden by Drop"
+        );
+        fs::remove_file(destination).unwrap();
+        fs::remove_file(partial).unwrap();
+    }
+
+    #[test]
+    fn first_parent_sync_failure_retains_the_partial_and_reports_publication() {
+        let destination = temp_path("first-sync-failure.img");
+        let mut guard = NewFileGuard::create_partial(&destination).unwrap();
+        guard.file_mut().write_all(b"verified").unwrap();
+        guard.file().sync_all().unwrap();
+        guard.bind_current_identity().unwrap();
+        let partial = guard.path.clone();
+        let publication_io = FaultingPublicationIo::new(false, Some(1));
+
+        assert!(matches!(
+            guard.publish_with(&destination, &publication_io),
+            Err(CandidateExportError::PublishedDirectorySyncFailed {
+                published_path,
+                partial_path,
+                partial_removed: false,
+                ..
+            }) if published_path == destination && partial_path == partial
+        ));
+        assert_eq!(publication_io.sync_calls.get(), 1);
+        assert_eq!(publication_io.remove_calls.get(), 0);
+        assert!(destination.exists());
+        assert!(partial.exists(), "reported partial must remain available");
+        fs::remove_file(destination).unwrap();
+        fs::remove_file(partial).unwrap();
+    }
+
+    #[test]
+    fn second_parent_sync_failure_reports_that_partial_was_removed() {
+        let destination = temp_path("second-sync-failure.img");
+        let mut guard = NewFileGuard::create_partial(&destination).unwrap();
+        guard.file_mut().write_all(b"verified").unwrap();
+        guard.file().sync_all().unwrap();
+        guard.bind_current_identity().unwrap();
+        let partial = guard.path.clone();
+        let publication_io = FaultingPublicationIo::new(false, Some(2));
+
+        assert!(matches!(
+            guard.publish_with(&destination, &publication_io),
+            Err(CandidateExportError::PublishedDirectorySyncFailed {
+                published_path,
+                partial_path,
+                partial_removed: true,
+                ..
+            }) if published_path == destination && partial_path == partial
+        ));
+        assert_eq!(publication_io.sync_calls.get(), 2);
+        assert_eq!(publication_io.remove_calls.get(), 1);
+        assert!(destination.exists());
+        assert!(!partial.exists());
+        fs::remove_file(destination).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn partial_files_begin_owner_only_and_hold_an_advisory_lock() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let destination = temp_path("private-partial.img");
+        let guard = NewFileGuard::create_partial(&destination).unwrap();
+        let mode = guard.file().metadata().unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let competing = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&guard.path)
+            .unwrap();
+        assert!(fs4::FileExt::try_lock(&competing).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn partial_files_deny_competing_write_and_delete_sharing() {
+        let destination = temp_path("deny-share-partial.img");
+        let guard = NewFileGuard::create_partial(&destination).unwrap();
+        assert!(OpenOptions::new().write(true).open(&guard.path).is_err());
+        assert!(fs::remove_file(&guard.path).is_err());
     }
 
     #[cfg(windows)]

@@ -21,8 +21,8 @@ use crate::fs::exfat_upcase_serialize::{
 };
 use crate::fs::ntfs_index::FileNameNamespace;
 use crate::fs::ntfs_inventory::{
-    NtfsDataStream, NtfsExtentPlacement, NtfsFileName, NtfsInventoryExtent, NtfsName, NtfsObject,
-    NtfsObjectReference, NtfsStandardInformation, NtfsStreamStorage,
+    NtfsAttributeEvidence, NtfsDataStream, NtfsExtentPlacement, NtfsFileName, NtfsInventoryExtent,
+    NtfsName, NtfsObject, NtfsObjectReference, NtfsStandardInformation, NtfsStreamStorage,
 };
 use crate::fs::ntfs_normalize::{
     NormalizedNtfs, NtfsPreservationSidecar, NtfsSecurityDescriptorEvidence,
@@ -67,10 +67,11 @@ pub enum PreservationField {
     FileSystemMetadataExtents = 22,
     AllocationTopology = 23,
     InventoryAccounting = 24,
+    NtfsAttributes = 25,
 }
 
 impl PreservationField {
-    const ALL: [Self; 24] = [
+    const ALL: [Self; 25] = [
         Self::Content,
         Self::ObjectKinds,
         Self::DirectoryHierarchy,
@@ -95,6 +96,7 @@ impl PreservationField {
         Self::FileSystemMetadataExtents,
         Self::AllocationTopology,
         Self::InventoryAccounting,
+        Self::NtfsAttributes,
     ];
 
     fn from_tag(tag: u16) -> Option<Self> {
@@ -533,6 +535,28 @@ fn ntfs_assessments(
     let graph = &normalized.graph;
     let sidecar = &normalized.preservation;
     let mut result = base_assessments()?;
+    let unsupported_attributes = sidecar.objects.iter().any(|preserved| {
+        preserved.source.attribute_census.is_empty()
+            || preserved
+                .source
+                .attribute_census
+                .iter()
+                .any(|attribute| !ntfs_attribute_supported(attribute))
+    });
+    set(
+        &mut result,
+        PreservationField::NtfsAttributes,
+        if unsupported_attributes {
+            FieldDisposition::Refusal
+        } else {
+            FieldDisposition::Native
+        },
+        if unsupported_attributes {
+            "the complete NTFS attribute census contains missing, unrecognized, or unsupported attribute evidence"
+        } else {
+            "every inventoried NTFS attribute is in the bounded common-subset allowlist"
+        },
+    );
     if has_named_stream(graph) {
         set(
             &mut result,
@@ -699,27 +723,26 @@ fn ntfs_assessments(
         FieldDisposition::EscrowRequired,
         "the exact 64-bit NTFS serial cannot fit exFAT's 32-bit serial field without truncation",
     );
-    let bad_stream_present = sidecar.objects.iter().any(|object| {
-        object.source.reference.record_number == 8
-            && object.source.data_streams.iter().any(|stream| {
-                stream
-                    .name
-                    .as_ref()
-                    .is_some_and(|name| name.code_units.as_slice() == [0x24, 0x42, 0x61, 0x64])
-            })
-    });
+    let bad_clusters = classify_ntfs_bad_clusters(sidecar);
     set(
         &mut result,
         PreservationField::BadClusters,
-        if bad_stream_present {
-            FieldDisposition::EscrowRequired
-        } else {
-            FieldDisposition::Refusal
+        match bad_clusters {
+            NtfsBadClusterEvidence::EntirelySparse => FieldDisposition::EscrowRequired,
+            NtfsBadClusterEvidence::Physical | NtfsBadClusterEvidence::Incomplete => {
+                FieldDisposition::Refusal
+            }
         },
-        if bad_stream_present {
-            "$BadClus:$Bad mapping requires format-specific escrow"
-        } else {
-            "complete $BadClus:$Bad evidence is not present in the normalized inventory"
+        match bad_clusters {
+            NtfsBadClusterEvidence::EntirelySparse => {
+                "$BadClus:$Bad is completely mapped and entirely sparse; its exact mapping remains in escrow"
+            }
+            NtfsBadClusterEvidence::Physical => {
+                "$BadClus:$Bad contains physical bad-cluster extents and is outside the activation common subset"
+            }
+            NtfsBadClusterEvidence::Incomplete => {
+                "complete unambiguous $BadClus:$Bad mapping evidence is unavailable"
+            }
         },
     );
     if !sidecar.source_extents.is_empty() {
@@ -744,6 +767,98 @@ fn ntfs_assessments(
     );
     debug_assert_eq!(result.len(), PreservationField::ALL.len());
     Ok(result)
+}
+
+const NTFS_STANDARD_INFORMATION: u32 = 0x10;
+const NTFS_ATTRIBUTE_LIST: u32 = 0x20;
+const NTFS_FILE_NAME: u32 = 0x30;
+const NTFS_VOLUME_NAME: u32 = 0x60;
+const NTFS_VOLUME_INFORMATION: u32 = 0x70;
+const NTFS_DATA: u32 = 0x80;
+const NTFS_INDEX_ROOT: u32 = 0x90;
+const NTFS_INDEX_ALLOCATION: u32 = 0xa0;
+const NTFS_BITMAP: u32 = 0xb0;
+
+fn ntfs_attribute_supported(attribute: &NtfsAttributeEvidence) -> bool {
+    if attribute.flags_unknown_bits != 0
+        || attribute
+            .name
+            .as_ref()
+            .is_some_and(|name| !name.is_well_formed)
+    {
+        return false;
+    }
+    let unnamed = attribute.name.is_none();
+    match attribute.attribute_type {
+        NTFS_STANDARD_INFORMATION | NTFS_FILE_NAME | NTFS_VOLUME_NAME | NTFS_VOLUME_INFORMATION => {
+            unnamed && attribute.resident && attribute.flags_raw == 0
+        }
+        NTFS_ATTRIBUTE_LIST => unnamed && attribute.flags_raw == 0,
+        NTFS_DATA => true,
+        NTFS_INDEX_ROOT => attribute.resident && attribute.flags_raw == 0,
+        NTFS_INDEX_ALLOCATION => !attribute.resident && attribute.flags_raw == 0,
+        NTFS_BITMAP => attribute.flags_raw == 0,
+        _ => false,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NtfsBadClusterEvidence {
+    Incomplete,
+    EntirelySparse,
+    Physical,
+}
+
+fn classify_ntfs_bad_clusters(sidecar: &NtfsPreservationSidecar) -> NtfsBadClusterEvidence {
+    const BADCLUS_RECORD: u64 = 8;
+    const BAD_NAME: &[u16] = &[0x24, 0x42, 0x61, 0x64];
+
+    let mut matching = sidecar
+        .objects
+        .iter()
+        .filter(|preserved| preserved.source.reference.record_number == BADCLUS_RECORD)
+        .flat_map(|preserved| preserved.source.data_streams.iter())
+        .filter(|stream| {
+            stream
+                .name
+                .as_ref()
+                .is_some_and(|name| name.is_well_formed && name.code_units == BAD_NAME)
+        });
+    let Some(stream) = matching.next() else {
+        return NtfsBadClusterEvidence::Incomplete;
+    };
+    if matching.next().is_some() {
+        return NtfsBadClusterEvidence::Incomplete;
+    }
+    let NtfsStreamStorage::NonResident {
+        data_bytes,
+        mapping_complete,
+        extents,
+        ..
+    } = &stream.storage
+    else {
+        return NtfsBadClusterEvidence::Incomplete;
+    };
+    if !mapping_complete
+        || stream.compressed
+        || stream.encrypted
+        || *data_bytes == 0
+        || extents.is_empty()
+    {
+        return NtfsBadClusterEvidence::Incomplete;
+    }
+    // `$BadClus:$Bad` has deliberately unusual size fields in widely deployed formatter output:
+    // the attribute need not carry the sparse flag, its allocated size can equal the volume size,
+    // and its initialized size can be zero even when its sole mapping-pairs run is sparse. The
+    // decoded runlist is therefore the authoritative evidence for whether bad clusters exist.
+    if extents
+        .iter()
+        .all(|extent| matches!(extent.placement, NtfsExtentPlacement::Sparse))
+    {
+        NtfsBadClusterEvidence::EntirelySparse
+    } else {
+        NtfsBadClusterEvidence::Physical
+    }
 }
 
 fn is_canonical_exfat_volume_label(units: &[u16]) -> bool {
@@ -1139,12 +1254,15 @@ fn validate_snapshot_version(
         offset,
         reason: "truncated sidecar snapshot version",
     })?;
-    let expected = match source {
-        FileSystem::ExFat => 2,
-        FileSystem::Ntfs => 3,
+    let version = u16::from_le_bytes([version[0], version[1]]);
+    let supported = match source {
+        FileSystem::ExFat => version == 2,
+        // Version 4 adds the bounded attribute census. Version 3 remains readable as historical
+        // preservation evidence, but cannot supply the census required by activation policy.
+        FileSystem::Ntfs => matches!(version, 3 | 4),
         FileSystem::Unknown => return malformed(offset, "unknown snapshot filesystem"),
     };
-    if u16::from_le_bytes([version[0], version[1]]) != expected {
+    if !supported {
         return malformed(offset, "unsupported sidecar snapshot version");
     }
     Ok(())
@@ -1609,7 +1727,7 @@ fn encode_ntfs_sidecar(
     writer: &mut BoundedWriter,
     sidecar: &NtfsPreservationSidecar,
 ) -> Result<(), PreservationError> {
-    writer.u16(3)?;
+    writer.u16(4)?;
     writer.u64(sidecar.volume_serial_number)?;
     writer.bool(sidecar.volume_label.is_some())?;
     if let Some(units) = &sidecar.volume_label {
@@ -1672,6 +1790,10 @@ fn encode_ntfs_object(
     for stream in &object.data_streams {
         encode_data_stream(writer, stream)?;
     }
+    writer.usize(object.attribute_census.len())?;
+    for attribute in &object.attribute_census {
+        encode_ntfs_attribute_evidence(writer, attribute)?;
+    }
     writer.usize(object.directory_entries.len())?;
     for entry in &object.directory_entries {
         encode_reference(writer, entry.target)?;
@@ -1680,6 +1802,21 @@ fn encode_ntfs_object(
     writer.bool(object.has_reparse_point)?;
     writer.bool(object.has_attribute_list)?;
     writer.bool(object.directory_index_complete)
+}
+
+fn encode_ntfs_attribute_evidence(
+    writer: &mut BoundedWriter,
+    attribute: &NtfsAttributeEvidence,
+) -> Result<(), PreservationError> {
+    writer.u32(attribute.attribute_type)?;
+    writer.bool(attribute.name.is_some())?;
+    if let Some(name) = &attribute.name {
+        encode_name(writer, name)?;
+    }
+    writer.u16(attribute.flags_raw)?;
+    writer.u16(attribute.flags_unknown_bits)?;
+    writer.u16(attribute.attribute_id)?;
+    writer.bool(attribute.resident)
 }
 
 fn encode_standard_information(
@@ -1902,7 +2039,7 @@ mod tests {
         }
     }
 
-    const fn ntfs_object() -> NtfsObject {
+    fn ntfs_object() -> NtfsObject {
         NtfsObject {
             reference: NtfsObjectReference {
                 record_number: 5,
@@ -1924,6 +2061,14 @@ mod tests {
             }),
             file_names: Vec::new(),
             data_streams: Vec::new(),
+            attribute_census: vec![NtfsAttributeEvidence {
+                attribute_type: NTFS_STANDARD_INFORMATION,
+                name: None,
+                flags_raw: 0,
+                flags_unknown_bits: 0,
+                attribute_id: 0,
+                resident: true,
+            }],
             directory_entries: Vec::new(),
             has_reparse_point: false,
             has_attribute_list: false,
@@ -1933,6 +2078,53 @@ mod tests {
 
     fn ntfs() -> NormalizedNtfs {
         let object = ntfs_object();
+        let bad_name = NtfsName {
+            code_units: "$Bad".encode_utf16().collect(),
+            is_well_formed: true,
+        };
+        let badclus = NtfsObject {
+            reference: NtfsObjectReference {
+                record_number: 8,
+                sequence_number: 1,
+            },
+            hard_link_count: 0,
+            is_directory: false,
+            is_metadata: true,
+            standard_information: None,
+            file_names: Vec::new(),
+            data_streams: vec![NtfsDataStream {
+                attribute_id: 1,
+                name: Some(bad_name.clone()),
+                compressed: false,
+                encrypted: false,
+                sparse: false,
+                storage: NtfsStreamStorage::NonResident {
+                    allocated_bytes: 1_048_576,
+                    data_bytes: 1_048_576,
+                    initialized_bytes: 0,
+                    compressed_bytes: None,
+                    mapping_complete: true,
+                    extents: vec![NtfsInventoryExtent {
+                        stream_id: (8 << 16) | 1,
+                        logical_offset: 0,
+                        length: 1_048_576,
+                        placement: NtfsExtentPlacement::Sparse,
+                    }],
+                },
+            }],
+            attribute_census: vec![NtfsAttributeEvidence {
+                attribute_type: NTFS_DATA,
+                name: Some(bad_name),
+                flags_raw: 0,
+                flags_unknown_bits: 0,
+                attribute_id: 1,
+                resident: false,
+            }],
+            directory_entries: Vec::new(),
+            has_reparse_point: false,
+            has_attribute_list: false,
+            directory_index_complete: true,
+        };
         NormalizedNtfs {
             graph: empty_graph(),
             preservation: NtfsPreservationSidecar {
@@ -1940,14 +2132,20 @@ mod tests {
                 volume_label: None,
                 security_descriptors: NtfsSecurityDescriptorEvidence::Unavailable,
                 root_reference: object.reference,
-                objects: vec![NtfsObjectPreservation {
-                    object: ObjectId(1),
-                    source: object,
-                }],
+                objects: vec![
+                    NtfsObjectPreservation {
+                        object: ObjectId(1),
+                        source: object,
+                    },
+                    NtfsObjectPreservation {
+                        object: ObjectId(8),
+                        source: badclus,
+                    },
+                ],
                 source_extents: Vec::new(),
                 scanned_records: 16,
                 initialized_records: 16,
-                in_use_base_records: 1,
+                in_use_base_records: 2,
                 extension_records: 0,
                 bytes_read: 16_384,
             },
@@ -2311,6 +2509,104 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_and_missing_ntfs_attribute_census_is_a_refusal() {
+        let mut unsupported = ntfs();
+        unsupported.preservation.objects[0]
+            .source
+            .attribute_census
+            .push(NtfsAttributeEvidence {
+                attribute_type: 0x40,
+                name: None,
+                flags_raw: 0,
+                flags_unknown_bits: 0,
+                attribute_id: 9,
+                resident: true,
+            });
+        let report = evaluate_ntfs(
+            &unsupported,
+            FileSystem::ExFat,
+            GuaranteeMode::Escrow,
+            PreservationLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            disposition(&report, PreservationField::NtfsAttributes),
+            FieldDisposition::Refusal
+        );
+        assert!(report.blockers.contains(&PreservationField::NtfsAttributes));
+
+        let mut missing = ntfs();
+        missing.preservation.objects[0]
+            .source
+            .attribute_census
+            .clear();
+        let report = evaluate_ntfs(
+            &missing,
+            FileSystem::ExFat,
+            GuaranteeMode::Escrow,
+            PreservationLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            disposition(&report, PreservationField::NtfsAttributes),
+            FieldDisposition::Refusal
+        );
+    }
+
+    #[test]
+    fn badclus_requires_a_complete_entirely_sparse_mapping() {
+        let sparse = evaluate_ntfs(
+            &ntfs(),
+            FileSystem::ExFat,
+            GuaranteeMode::Escrow,
+            PreservationLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            disposition(&sparse, PreservationField::BadClusters),
+            FieldDisposition::EscrowRequired
+        );
+
+        let mut physical = ntfs();
+        let NtfsStreamStorage::NonResident {
+            allocated_bytes,
+            extents,
+            ..
+        } = &mut physical.preservation.objects[1].source.data_streams[0].storage
+        else {
+            panic!("test $Bad stream must be non-resident");
+        };
+        *allocated_bytes = 1_048_576;
+        extents[0].placement = NtfsExtentPlacement::Physical { byte_offset: 4096 };
+        let report = evaluate_ntfs(
+            &physical,
+            FileSystem::ExFat,
+            GuaranteeMode::Escrow,
+            PreservationLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            disposition(&report, PreservationField::BadClusters),
+            FieldDisposition::Refusal
+        );
+        assert!(report.blockers.contains(&PreservationField::BadClusters));
+
+        let mut incomplete = ntfs();
+        incomplete.preservation.objects.pop();
+        let report = evaluate_ntfs(
+            &incomplete,
+            FileSystem::ExFat,
+            GuaranteeMode::Escrow,
+            PreservationLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            disposition(&report, PreservationField::BadClusters),
+            FieldDisposition::Refusal
+        );
+    }
+
+    #[test]
     fn pinned_ntfs_security_bytes_are_escrowed_and_independently_decoded() {
         let mut source = ntfs();
         let mut objects = source.graph.objects().to_vec();
@@ -2471,6 +2767,40 @@ mod tests {
             decode_escrow(&trailing, PreservationLimits::default()),
             Err(PreservationError::MalformedEscrow { .. })
         ));
+    }
+
+    #[test]
+    fn decoder_keeps_legacy_ntfs_v3_snapshots_readable() {
+        let report = evaluate_ntfs(
+            &ntfs(),
+            FileSystem::ExFat,
+            GuaranteeMode::Escrow,
+            PreservationLimits::default(),
+        )
+        .expect("policy");
+        let mut legacy = report.escrow.expect("escrow");
+        let snapshot_start = HEADER_BYTES + RECORD_HEADER_BYTES;
+        assert_eq!(
+            &legacy[snapshot_start..snapshot_start + 2],
+            &4_u16.to_le_bytes()
+        );
+        legacy[snapshot_start..snapshot_start + 2].copy_from_slice(&3_u16.to_le_bytes());
+        let checksum = escrow_checksum(&legacy[..24], &legacy[HEADER_BYTES..]);
+        legacy[24..28].copy_from_slice(&checksum.to_le_bytes());
+
+        let decoded = decode_escrow(&legacy, PreservationLimits::default()).expect("legacy v3");
+        assert_eq!(
+            &decoded.records[0].value[..2],
+            &3_u16.to_le_bytes(),
+            "the historical snapshot remains preserved verbatim"
+        );
+        assert_eq!(
+            decoded.ntfs_volume_identity,
+            Some(NtfsVolumeIdentity {
+                volume_serial_number: ntfs().preservation.volume_serial_number,
+                volume_label: NtfsVolumeLabelIdentity::Absent,
+            })
+        );
     }
 
     #[test]

@@ -171,6 +171,38 @@ impl ImageFile {
         })
     }
 
+    /// Clones an already-open regular-file handle for pinned internal verification.
+    ///
+    /// Unlike [`Self::open`], this never resolves or reopens `canonical_path`; the supplied path is
+    /// retained only as identity evidence for diagnostics and later same-container comparisons.
+    pub(crate) fn from_open_regular_file(
+        file: &File,
+        canonical_path: PathBuf,
+        max_read_bytes: usize,
+    ) -> Result<Self, ImageError> {
+        if max_read_bytes == 0 {
+            return Err(ImageError::InvalidReadLimit);
+        }
+        reject_device_like_path(&canonical_path)?;
+        let file = file
+            .try_clone()
+            .map_err(|source| ImageError::io("clone open regular file", source))?;
+        let metadata = file
+            .metadata()
+            .map_err(|source| ImageError::io("inspect cloned regular file", source))?;
+        if !metadata.is_file() {
+            return Err(ImageError::NotRegularFile {
+                path: canonical_path,
+            });
+        }
+        let identity = ImageIdentity::from_metadata(canonical_path, &metadata);
+        Ok(Self {
+            file,
+            identity,
+            max_read_bytes,
+        })
+    }
+
     /// Immutable identity captured from the opened file handle.
     #[must_use]
     pub const fn identity(&self) -> &ImageIdentity {

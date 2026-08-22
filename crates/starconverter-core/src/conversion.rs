@@ -37,25 +37,40 @@ pub struct ImageIdentity {
 }
 
 /// Independently established facts required before any conversion can be coordinated.
+///
+/// Fields are module-private so callers cannot manufacture clean/offline/complete evidence. A
+/// filesystem-specific locked inspector must eventually feed the only constructor exposed by the
+/// activation path.
+///
+/// ```compile_fail
+/// use starconverter_core::conversion::{ImageIdentity, PreflightEvidence};
+///
+/// let _forged = PreflightEvidence {
+///     image: ImageIdentity { instance: [0; 32], image_bytes: 1 },
+/// };
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PreflightEvidence {
-    pub image: ImageIdentity,
-    pub source_filesystem: FileSystem,
-    pub source_evidence_digest: [u8; 32],
-    pub sector_bytes: u32,
-    pub allocation_alignment: u64,
-    pub inventory_complete: bool,
-    pub allocation_map_complete: bool,
-    pub health: HealthState,
-    pub access: AccessState,
+    image: ImageIdentity,
+    source_filesystem: FileSystem,
+    source_evidence_digest: [u8; 32],
+    sector_bytes: u32,
+    allocation_alignment: u64,
+    inventory_complete: bool,
+    allocation_map_complete: bool,
+    health: HealthState,
+    access: AccessState,
 }
 
 /// A fresh observation used to reject a swapped image or stale pre-activation evidence.
+///
+/// This is sealed to the module so a future locked-image observer, rather than an untrusted caller,
+/// must establish it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObservedImage {
-    pub image: ImageIdentity,
+    image: ImageIdentity,
     /// Required until activation; it may be absent after the target boot region is activated.
-    pub source_evidence_digest: Option<[u8; 32]>,
+    source_evidence_digest: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,40 +173,40 @@ pub struct ExpectedStagingVerification {
 /// Result of parsing and checking the immutable overlay through the target filesystem reader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StagingVerificationEvidence {
-    pub target_filesystem: FileSystem,
-    pub parser_validated: bool,
-    pub inventory_complete: bool,
-    pub object_graph_digest: [u8; 32],
-    pub plan_digest: [u8; 32],
-    pub candidate_overlay_digest: [u8; 32],
+    target_filesystem: FileSystem,
+    parser_validated: bool,
+    inventory_complete: bool,
+    object_graph_digest: [u8; 32],
+    plan_digest: [u8; 32],
+    candidate_overlay_digest: [u8; 32],
 }
 
 /// Evidence acknowledging completion of one emitted intent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PhaseCompletion {
-    pub image: ImageIdentity,
-    pub plan_digest: [u8; 32],
-    pub health: HealthState,
-    pub access: AccessState,
+    image: ImageIdentity,
+    plan_digest: [u8; 32],
+    health: HealthState,
+    access: AccessState,
 }
 
 /// Independent target reinspection evidence required for the `Verified` checkpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VerificationEvidence {
-    pub target_filesystem: FileSystem,
-    pub inventory_complete: bool,
-    pub object_graph_digest: [u8; 32],
-    pub plan_digest: [u8; 32],
+    target_filesystem: FileSystem,
+    inventory_complete: bool,
+    object_graph_digest: [u8; 32],
+    plan_digest: [u8; 32],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RollbackCompletion {
-    pub image: ImageIdentity,
-    pub plan_digest: [u8; 32],
+    image: ImageIdentity,
+    plan_digest: [u8; 32],
     /// Required after either source-visible boot write; digest must match the phase-specific intent.
-    pub applied_rollback_digest: Option<[u8; 32]>,
-    pub health: HealthState,
-    pub access: AccessState,
+    applied_rollback_digest: Option<[u8; 32]>,
+    health: HealthState,
+    access: AccessState,
 }
 
 /// Next externally executed operation. Every borrowed byte slice remains opaque to this module.

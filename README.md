@@ -1,14 +1,10 @@
 <div align="center">
 
-<img src="assets/starconverter-mark.svg" width="112" alt="StarConverter mark">
-
 ```text
-                 *
-             .  /|\  .
-          ---<  /_\  >---
-             ' /___\ '
-        [ S T A R :: C O N V E R T E R ]
-              DATA STAYS PUT
++---------------------------------------+
+| STAR :: CONVERTER                     |
+| EXFAT <-> NTFS / ANALYZE BEFORE WRITE |
++---------------------------------------+
 ```
 
 # StarConverter
@@ -151,9 +147,11 @@ result type cannot be submitted to the executor as activation authority.
 existing output or device-like path, copies the complete source into a uniquely named partial file,
 applies the active candidate only to that copy, reinspects and normalizes it, and requires its
 namespace/content manifest to match the plan. Escrow mode creates
-`<new-target>.starconverter-escrow` unless `--escrow` selects another new path. A failure removes
-only files created by that attempt during a normal unwind. The final candidate name is published
-only after verification; escrow is bound to the exact source, candidate, manifest, and direction.
+`<new-target>.starconverter-escrow` unless `--escrow` selects another new path. Before publication,
+a normal failure removes only the attempt's partial files. Publication collisions and ambiguous
+post-publication cleanup/durability failures retain and report the exact partial/final paths for
+recovery rather than deleting by pathname. The final candidate name is published only after
+verification; escrow is bound to the exact source, candidate, manifest, and direction.
 Inspection, planning, preimage capture, copying, and final source hashing share one pinned read-only
 file identity. The command hashes the source again before success and never uses the in-place
 activation-authority type. See [`docs/RECOVERY.md`](docs/RECOVERY.md) for interrupted-export and
@@ -192,6 +190,7 @@ installed. CI always tests both language stacks.
 - [x] Lossless exFAT-to-neutral object normalization
 - [x] NTFS FILE/attribute/runlist/index parsers and bounded `$MFT` bootstrap
 - [x] Bounded NTFS volume bitmap and object/stream/directory inventory
+- [x] Complete bounded NTFS attribute census and sparse-only `$BadClus:$Bad` proof
 - [x] `$ATTRIBUTE_LIST` continuation resolution and NTFS-to-neutral normalization
 - [x] Exact relocation geometry solver
 - [x] Redundant append-only recovery capsule format
@@ -205,12 +204,13 @@ installed. CI always tests both language stacks.
 - [x] Modeled crash campaign across every durable transaction barrier
 - [x] Every-byte capsule-tail and in-flight write-group recovery matrix
 - [x] Type-level serializer activation authorization (no public bypass)
+- [x] Module-sealed preflight/verification/completion evidence (no caller-forged clean state)
 - [x] Exact-intent regular-image executor with locking, read-back, flush, rollback, and fault cuts
 - [x] Deterministic parser mutation suite
 - [x] Real-image `inspect` command with evidence-aware blocking
 - [x] Real-image read-only `preview` with exact candidate phases and rollback bytes
 - [x] Resolve and normalize supported NTFS continuations
-- [x] Fail-closed 24-field cross-format preservation policy with bounded versioned escrow
+- [x] Fail-closed 25-field cross-format preservation policy with bounded versioned escrow
 - [x] Policy-bound exFAT→NTFS and NTFS→exFAT structural adapters with exact timestamp/identity evidence
 - [x] Pinned `$Secure` ordinary-object security-ID assignment in NTFS `$STANDARD_INFORMATION`
 - [x] Reproducible root/rich/edge external fixtures, read-only exfatprogs/NTFS-3G checks, and exFAT/NTFS FUSE payload mounts

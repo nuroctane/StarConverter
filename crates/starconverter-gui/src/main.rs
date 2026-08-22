@@ -3,11 +3,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use eframe::egui::{
-    self, Align, Button, Color32, FontId, Frame, IconData, Label, Layout, Margin, RichText, Stroke,
+    self, Align, Button, Color32, FontId, Frame, Label, Layout, Margin, RichText, Stroke,
     TextStyle, Vec2,
 };
 use starconverter_core::candidate_export::{
-    CandidateExportEvidence, CandidateExportLimits, export_candidate_image,
+    CandidateExportEvidence, CandidateExportLimits, CandidateVerificationEvidence,
+    CandidateVerificationLimits, export_candidate_image, verify_bound_export,
 };
 use starconverter_core::cross_format::{
     ExfatToNtfsLimits, ExfatToNtfsOptions, NtfsToExfatLimits, NtfsToExfatOptions,
@@ -40,18 +41,21 @@ const WARNING: Color32 = Color32::from_rgb(255, 200, 87);
 const DANGER: Color32 = Color32::from_rgb(255, 96, 119);
 const WORKING: Color32 = Color32::from_rgb(168, 216, 255);
 
-const ASCII_MARK: &str = r"       *
-   .  /|\  .
----<  /_\  >---
-   ' /___\ '
-[ STAR :: CONVERTER ]";
+const ASCII_MARK: &str = r"+---------------------------------------+
+| STAR :: CONVERTER                     |
+| EXFAT <-> NTFS / ANALYZE BEFORE WRITE |
++---------------------------------------+";
+
+const INTERRUPTED_EXPORT_GUIDANCE: &str = "[RECOVERY] Never rename or use a .starconverter-partial-* file.\n\
+[RECOVERY] If both final candidate and escrow exist, verify them here before mounting or copying data.\n\
+[RECOVERY] If only partial or escrow artifacts remain, confirm no export is running, preserve them if forensic review matters, then rerun to a new output name.\n\
+[SAFE] The original source was opened read-only; this screen cannot repair or activate a filesystem.";
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(Vec2::new(1180.0, 760.0))
-            .with_min_inner_size(Vec2::new(760.0, 580.0))
-            .with_icon(app_icon()),
+            .with_min_inner_size(Vec2::new(760.0, 580.0)),
         ..Default::default()
     };
 
@@ -60,45 +64,6 @@ fn main() -> eframe::Result {
         options,
         Box::new(|creation_context| Ok(Box::new(StarConverterApp::new(creation_context)))),
     )
-}
-
-fn app_icon() -> IconData {
-    const SIZE: usize = 64;
-    const DIMENSION: u32 = 64;
-    const BACKGROUND: [u8; 4] = [5, 5, 6, 255];
-    const INK_RGBA: [u8; 4] = [242, 244, 245, 255];
-    const WORKING_RGBA: [u8; 4] = [168, 216, 255, 255];
-    let mut rgba = vec![BACKGROUND; SIZE * SIZE];
-
-    let mut point = |x: usize, y: usize, color: [u8; 4]| {
-        if x < SIZE && y < SIZE {
-            rgba[y * SIZE + x] = color;
-        }
-    };
-    for delta in 0..=6 {
-        point(32, 8 + delta, INK_RGBA);
-        point(32, 20 - delta, INK_RGBA);
-        point(26 + delta, 14, INK_RGBA);
-        point(38 - delta, 14, INK_RGBA);
-    }
-    for y in 23..=49 {
-        let half_width = (y - 23) / 2;
-        point(32 - half_width, y, WORKING_RGBA);
-        point(32 + half_width, y, WORKING_RGBA);
-    }
-    for x in 18..=46 {
-        point(x, 50, WORKING_RGBA);
-        point(x, 51, WORKING_RGBA);
-    }
-    for x in 24..=40 {
-        point(x, 38, INK_RGBA);
-    }
-
-    IconData {
-        rgba: rgba.into_iter().flatten().collect(),
-        width: DIMENSION,
-        height: DIMENSION,
-    }
 }
 
 #[derive(Debug)]
@@ -111,6 +76,12 @@ struct StarConverterApp {
     real_source: bool,
     inspection_status: String,
     exact_preview: Option<String>,
+    verification_candidate_path: String,
+    verification_escrow_path: String,
+    verification_source_path: String,
+    verification_status: String,
+    verification_report: Option<String>,
+    verification_ok: bool,
     activity: Vec<String>,
 }
 
@@ -130,6 +101,13 @@ impl StarConverterApp {
             real_source: false,
             inspection_status: "Enter a regular image path to begin read-only analysis.".into(),
             exact_preview: None,
+            verification_candidate_path: String::new(),
+            verification_escrow_path: String::new(),
+            verification_source_path: String::new(),
+            verification_status:
+                "Select a final candidate and its escrow sidecar for read-only verification.".into(),
+            verification_report: None,
+            verification_ok: false,
             activity: vec![
                 "00:00:00  [READY] UI initialized".into(),
                 "00:00:00  [SAFE]  raw-device backend absent".into(),
@@ -299,6 +277,20 @@ impl StarConverterApp {
 
         match self.build_candidate_export(&source_path, &output_path) {
             Ok(evidence) => {
+                self.verification_candidate_path = evidence.output_path.display().to_string();
+                self.verification_escrow_path = evidence
+                    .escrow_path
+                    .as_ref()
+                    .map_or_else(String::new, |path| path.display().to_string());
+                self.verification_source_path.clone_from(&source_path);
+                self.verification_status = if evidence.escrow_path.is_some() {
+                    "Export complete. Run read-only verification below before using the candidate."
+                        .into()
+                } else {
+                    "Strict export complete without an escrow sidecar.".into()
+                };
+                self.verification_report = None;
+                self.verification_ok = false;
                 self.exact_preview = Some(export_evidence_report(&evidence));
                 self.inspection_status =
                     "New target image exported and independently reinspected; source hash unchanged."
@@ -313,6 +305,85 @@ impl StarConverterApp {
                 self.inspection_status.clone_from(&error);
                 self.activity.push(format!(
                     "00:00:00  [BLOCKED] image export refused :: {error}"
+                ));
+            }
+        }
+    }
+
+    fn choose_verification_candidate(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .set_title("Select the final candidate image to verify read-only")
+            .pick_file()
+        {
+            self.verification_candidate_path = path.display().to_string();
+            self.clear_verification_result("Candidate selected; verification has not run.");
+        }
+    }
+
+    fn choose_verification_escrow(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .set_title("Select the candidate-bound StarConverter escrow sidecar")
+            .pick_file()
+        {
+            self.verification_escrow_path = path.display().to_string();
+            self.clear_verification_result("Escrow selected; verification has not run.");
+        }
+    }
+
+    fn choose_verification_source(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .set_title("Optionally select the original source image for identity verification")
+            .pick_file()
+        {
+            self.verification_source_path = path.display().to_string();
+            self.clear_verification_result("Original source selected; verification has not run.");
+        }
+    }
+
+    fn clear_verification_result(&mut self, status: &str) {
+        self.verification_status = status.into();
+        self.verification_report = None;
+        self.verification_ok = false;
+    }
+
+    fn verify_export_read_only(&mut self) {
+        let candidate = self.verification_candidate_path.trim();
+        let escrow = self.verification_escrow_path.trim();
+        if let Some(missing) = missing_verification_path(candidate, escrow) {
+            self.verification_ok = false;
+            self.verification_status = missing.into();
+            self.verification_report = Some(verification_failure_report(missing));
+            self.activity.push(format!(
+                "00:00:00  [BLOCKED] export verification :: {missing}"
+            ));
+            return;
+        }
+        let source = self.verification_source_path.trim();
+        let source = (!source.is_empty()).then(|| Path::new(source));
+        match verify_bound_export(
+            candidate,
+            escrow,
+            source,
+            CandidateVerificationLimits::default(),
+        ) {
+            Ok(evidence) => {
+                self.verification_ok = true;
+                self.verification_status =
+                    "Candidate and bound escrow passed every read-only check.".into();
+                self.verification_report = Some(verification_evidence_report(&evidence));
+                self.activity.push(format!(
+                    "00:00:00  [VERIFIED] bound {} candidate :: {}",
+                    evidence.target_filesystem,
+                    evidence.candidate_path.display()
+                ));
+            }
+            Err(error) => {
+                let message = error.to_string();
+                self.verification_ok = false;
+                self.verification_status = format!("Verification failed: {message}");
+                self.verification_report = Some(verification_failure_report(&message));
+                self.activity.push(format!(
+                    "00:00:00  [BLOCKED] export verification failed :: {message}"
                 ));
             }
         }
@@ -687,11 +758,16 @@ impl StarConverterApp {
         egui::CentralPanel::default()
             .frame(Frame::new().fill(VOID).inner_margin(Margin::same(24)))
             .show(root, |ui| {
-                self.show_direction(ui);
-                self.show_modes(ui);
-                self.show_preflight(ui);
-                self.show_phases(ui);
-                self.show_exact_preview(ui);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        self.show_direction(ui);
+                        self.show_modes(ui);
+                        self.show_preflight(ui);
+                        self.show_phases(ui);
+                        self.show_exact_preview(ui);
+                        self.show_export_verification(ui);
+                    });
             });
     }
 
@@ -873,6 +949,178 @@ impl StarConverterApp {
                     });
             });
     }
+
+    fn show_export_verification(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(24.0);
+        section_label(ui, "VERIFY / RECOVER EXPORT");
+        ui.add_space(8.0);
+        Frame::new()
+            .fill(SURFACE)
+            .stroke(Stroke::new(1.0, LINE))
+            .inner_margin(Margin::same(14))
+            .show(ui, |ui| {
+                self.show_verification_inputs(ui);
+                self.show_verification_result(ui);
+            });
+        ui.add_space(24.0);
+    }
+
+    fn show_verification_inputs(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            RichText::new("READ-ONLY :: prove a final candidate belongs to its escrow sidecar")
+                .monospace()
+                .size(11.0)
+                .color(WORKING),
+        );
+        ui.label(
+            RichText::new(
+                "The original source is optional; select it to confirm source filesystem and full SHA-256.",
+            )
+            .monospace()
+            .size(10.0)
+            .color(MUTED),
+        );
+        ui.add_space(10.0);
+        let (browse_candidate, candidate_changed) = verification_path_row(
+            ui,
+            "FINAL CANDIDATE",
+            "verification_candidate_path",
+            &mut self.verification_candidate_path,
+            "C:\\path\\candidate.img",
+            "Browse candidate…",
+        );
+        let (browse_escrow, escrow_changed) = verification_path_row(
+            ui,
+            "BOUND ESCROW",
+            "verification_escrow_path",
+            &mut self.verification_escrow_path,
+            "C:\\path\\candidate.img.starconverter-escrow",
+            "Browse escrow…",
+        );
+        let (browse_source, source_changed) = verification_path_row(
+            ui,
+            "ORIGINAL SOURCE (OPTIONAL)",
+            "verification_source_path",
+            &mut self.verification_source_path,
+            "C:\\path\\original-source.img",
+            "Browse source…",
+        );
+        if candidate_changed || escrow_changed || source_changed {
+            self.clear_verification_result(
+                "Verification input changed; the displayed evidence was cleared.",
+            );
+        }
+        if browse_candidate {
+            self.choose_verification_candidate();
+        }
+        if browse_escrow {
+            self.choose_verification_escrow();
+        }
+        if browse_source {
+            self.choose_verification_source();
+        }
+        self.show_verification_actions(ui);
+    }
+
+    fn show_verification_actions(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let ready = !self.verification_candidate_path.trim().is_empty()
+                && !self.verification_escrow_path.trim().is_empty();
+            if ui
+                .add_enabled(
+                    ready,
+                    Button::new(
+                        RichText::new("VERIFY EXPORT READ-ONLY")
+                            .monospace()
+                            .color(if ready { READY } else { FAINT }),
+                    ),
+                )
+                .on_disabled_hover_text(
+                    "Select both the final candidate and its bound escrow sidecar.",
+                )
+                .on_hover_text(
+                    "Hash and inspect regular files only; no repair, mount, or activation is performed.",
+                )
+                .clicked()
+            {
+                self.verify_export_read_only();
+            }
+            if ui
+                .add_enabled(
+                    !self.verification_source_path.trim().is_empty(),
+                    Button::new("Clear optional source"),
+                )
+                .clicked()
+            {
+                self.verification_source_path.clear();
+                self.clear_verification_result(
+                    "Original source cleared; candidate-only verification has not run.",
+                );
+            }
+        });
+        ui.label(
+            RichText::new(&self.verification_status)
+                .monospace()
+                .size(10.0)
+                .color(if self.verification_ok { READY } else { MUTED }),
+        );
+    }
+
+    fn show_verification_result(&self, ui: &mut egui::Ui) {
+        ui.add_space(8.0);
+        egui::ScrollArea::vertical()
+            .id_salt("verification_report_scroll")
+            .max_height(230.0)
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(self.verification_report.as_deref().unwrap_or(
+                        "[IDLE] No bound export has been verified in this session.\n\
+                         [READ-ONLY] Candidate, escrow, and optional source must be regular files.",
+                    ))
+                    .monospace()
+                    .size(11.0)
+                    .color(if self.verification_ok { READY } else { MUTED }),
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(INTERRUPTED_EXPORT_GUIDANCE)
+                        .monospace()
+                        .size(10.0)
+                        .color(WARNING),
+                );
+            });
+    }
+}
+
+fn verification_path_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    id_source: &'static str,
+    path: &mut String,
+    hint: &str,
+    browse_label: &str,
+) -> (bool, bool) {
+    let label_response = ui.label(RichText::new(label).monospace().size(10.0).color(MUTED));
+    let mut browse = false;
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        let browse_width = 124.0;
+        let path_width = (ui.available_width() - browse_width - 8.0).max(120.0);
+        changed = ui
+            .add_sized(
+                [path_width, 36.0],
+                egui::TextEdit::singleline(path)
+                    .id_source(id_source)
+                    .hint_text(hint),
+            )
+            .labelled_by(label_response.id)
+            .on_hover_text("Regular file path only; device namespaces are rejected.")
+            .changed();
+        browse = ui
+            .add_sized([browse_width, 36.0], Button::new(browse_label))
+            .clicked();
+    });
+    (browse, changed)
 }
 
 fn configure_style(context: &egui::Context) {
@@ -1147,10 +1395,87 @@ fn export_evidence_report(evidence: &CandidateExportEvidence) -> String {
         evidence.image_bytes,
         hex_digest(&evidence.source_sha256)
     );
+    let _ = writeln!(
+        report,
+        "output_directory_durability={}",
+        evidence.output_directory_durability
+    );
+    if let Some(durability) = evidence.escrow_directory_durability {
+        let _ = writeln!(report, "escrow_directory_durability={durability}");
+    }
     report.push_str(
         "[SAFE] Create-new regular output only; in-place and device activation remain locked.",
     );
     report
+}
+
+fn verification_evidence_report(evidence: &CandidateVerificationEvidence) -> String {
+    let mut report = String::new();
+    let _ = writeln!(
+        report,
+        "[VERIFIED] bound {} -> {} export",
+        evidence.source_filesystem, evidence.target_filesystem
+    );
+    let _ = writeln!(report, "candidate={}", evidence.candidate_path.display());
+    let _ = writeln!(report, "escrow={}", evidence.escrow_path.display());
+    let _ = writeln!(report, "candidate_bytes={}", evidence.candidate_bytes);
+    let _ = writeln!(
+        report,
+        "candidate_sha256={}",
+        hex_digest(&evidence.candidate_sha256)
+    );
+    let _ = writeln!(
+        report,
+        "manifest_sha256={}",
+        hex_digest(&evidence.manifest_sha256)
+    );
+    let _ = writeln!(
+        report,
+        "logical_bytes_hashed={}",
+        evidence.logical_bytes_hashed
+    );
+    let _ = writeln!(
+        report,
+        "escrow_schema=v{} / records={}",
+        evidence.escrow_schema_version, evidence.escrow_records
+    );
+    if let (Some(path), Some(bytes)) = (&evidence.source_path, evidence.source_bytes) {
+        let _ = writeln!(report, "[SOURCE VERIFIED] {}", path.display());
+        let _ = writeln!(report, "source_bytes={bytes}");
+    } else {
+        let _ = writeln!(
+            report,
+            "[SOURCE NOT CHECKED] original source was not supplied"
+        );
+    }
+    let _ = writeln!(
+        report,
+        "source_sha256={}",
+        hex_digest(&evidence.source_sha256)
+    );
+    report.push_str(
+        "[READ-ONLY] No repair, mount, physical-device access, or in-place action was performed.",
+    );
+    report
+}
+
+fn verification_failure_report(message: &str) -> String {
+    format!(
+        "[FAILED] bound export verification\nreason={message}\n\
+         [DO NOT USE] Treat the candidate as unverified. Follow the recovery guidance below."
+    )
+}
+
+const fn missing_verification_path(candidate: &str, escrow: &str) -> Option<&'static str> {
+    if candidate.is_empty() && escrow.is_empty() {
+        Some("candidate and escrow paths are required")
+    } else if candidate.is_empty() {
+        Some("candidate path is required")
+    } else if escrow.is_empty() {
+        Some("escrow path is required")
+    } else {
+        None
+    }
 }
 
 fn hex_digest(digest: &[u8; 32]) -> String {
@@ -1229,12 +1554,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn icon_is_complete_rgba_and_report_is_deterministic() {
-        let icon = app_icon();
-        assert_eq!(icon.width, 64);
-        assert_eq!(icon.height, 64);
-        assert_eq!(icon.rgba.len(), 64 * 64 * 4);
-
+    fn report_is_deterministic() {
         let plan = Planner.plan(
             &VolumeProfile::demo_exfat(),
             FileSystem::Ntfs,
@@ -1244,5 +1564,52 @@ mod tests {
         assert_eq!(first, plan_report(&plan));
         assert!(first.contains("NOT AN EXECUTABLE WRITE AUTHORIZATION"));
         assert!(first.contains("direction=exFAT -> NTFS"));
+    }
+
+    #[test]
+    fn verification_report_is_deterministic_and_explicitly_read_only() {
+        let evidence = CandidateVerificationEvidence {
+            candidate_path: PathBuf::from("candidate.img"),
+            escrow_path: PathBuf::from("candidate.img.starconverter-escrow"),
+            source_path: Some(PathBuf::from("source.img")),
+            source_filesystem: FileSystem::ExFat,
+            target_filesystem: FileSystem::Ntfs,
+            candidate_bytes: 4096,
+            source_bytes: Some(4096),
+            source_sha256: [0x11; 32],
+            candidate_sha256: [0x22; 32],
+            manifest_sha256: [0x33; 32],
+            logical_bytes_hashed: 2048,
+            escrow_schema_version: 4,
+            escrow_records: 1,
+        };
+        let first = verification_evidence_report(&evidence);
+        assert_eq!(first, verification_evidence_report(&evidence));
+        assert!(first.contains("[VERIFIED] bound exFAT -> NTFS export"));
+        assert!(first.contains("[SOURCE VERIFIED] source.img"));
+        assert!(first.contains("physical-device access"));
+    }
+
+    #[test]
+    fn verification_inputs_and_recovery_copy_fail_closed() {
+        assert_eq!(
+            missing_verification_path("", ""),
+            Some("candidate and escrow paths are required")
+        );
+        assert_eq!(
+            missing_verification_path("candidate.img", ""),
+            Some("escrow path is required")
+        );
+        assert_eq!(
+            missing_verification_path("", "escrow.bin"),
+            Some("candidate path is required")
+        );
+        assert_eq!(
+            missing_verification_path("candidate.img", "escrow.bin"),
+            None
+        );
+        assert!(INTERRUPTED_EXPORT_GUIDANCE.contains(".starconverter-partial-*"));
+        assert!(INTERRUPTED_EXPORT_GUIDANCE.contains("original source was opened read-only"));
+        assert!(verification_failure_report("hash mismatch").contains("[DO NOT USE]"));
     }
 }

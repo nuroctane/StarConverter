@@ -169,6 +169,22 @@ pub struct NtfsDataStream {
     pub storage: NtfsStreamStorage,
 }
 
+/// Bounded header evidence for every attribute in one fully resolved base record.
+///
+/// Inventory consumers must not infer that an attribute was absent merely because this module
+/// does not otherwise normalize its value. Retaining the type, name, flags, identifier, and
+/// storage form lets preservation and activation policy fail closed on attributes whose semantics
+/// are not implemented.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NtfsAttributeEvidence {
+    pub attribute_type: u32,
+    pub name: Option<NtfsName>,
+    pub flags_raw: u16,
+    pub flags_unknown_bits: u16,
+    pub attribute_id: u16,
+    pub resident: bool,
+}
+
 /// One validated directory-index reference and its redundant `$FILE_NAME` key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NtfsDirectoryEntry {
@@ -187,6 +203,8 @@ pub struct NtfsObject {
     pub standard_information: Option<NtfsStandardInformation>,
     pub file_names: Vec<NtfsFileName>,
     pub data_streams: Vec<NtfsDataStream>,
+    /// Complete bounded census of the resolved attributes backing this base record.
+    pub attribute_census: Vec<NtfsAttributeEvidence>,
     pub directory_entries: Vec<NtfsDirectoryEntry>,
     pub has_reparse_point: bool,
     pub has_attribute_list: bool,
@@ -894,6 +912,23 @@ fn inventory_base_record(
     let attributes = resolved_attributes
         .as_deref()
         .unwrap_or(&base_attributes.attributes);
+    let mut attribute_census = Vec::new();
+    attribute_census
+        .try_reserve_exact(attributes.len())
+        .map_err(|_| NtfsInventoryError::AllocationFailed)?;
+    for attribute in attributes {
+        attribute_census.push(NtfsAttributeEvidence {
+            attribute_type: attribute.attribute_type,
+            name: attribute.name.as_ref().map(|name| NtfsName {
+                code_units: name.code_units.clone(),
+                is_well_formed: name.is_well_formed,
+            }),
+            flags_raw: attribute.flags.raw,
+            flags_unknown_bits: attribute.flags.unknown_bits,
+            attribute_id: attribute.id,
+            resident: matches!(attribute.body, AttributeBody::Resident(_)),
+        });
+    }
     if let Some(extent) = resolved.and_then(|list| {
         list.extents.iter().find(|extent| {
             extent.attribute_type == VOLUME_NAME
@@ -1031,6 +1066,7 @@ fn inventory_base_record(
             standard_information,
             file_names,
             data_streams,
+            attribute_census,
             directory_entries: Vec::new(),
             has_reparse_point,
             has_attribute_list,
@@ -2326,6 +2362,7 @@ mod tests {
             standard_information: None,
             file_names: Vec::new(),
             data_streams: Vec::new(),
+            attribute_census: Vec::new(),
             directory_entries: Vec::new(),
             has_reparse_point: false,
             has_attribute_list: false,
@@ -2374,6 +2411,7 @@ mod tests {
             standard_information: None,
             file_names: Vec::new(),
             data_streams: Vec::new(),
+            attribute_census: Vec::new(),
             directory_entries: vec![NtfsDirectoryEntry {
                 target: NtfsObjectReference {
                     record_number: 99,
@@ -2426,6 +2464,41 @@ mod tests {
         assert_eq!(inventory.bytes_read, 2048);
         assert_eq!(inventory.volume_serial_number, boot().volume_serial_number);
         assert_eq!(inventory.volume_label, NtfsVolumeLabelEvidence::Unavailable);
+    }
+
+    #[test]
+    fn retains_unknown_attribute_headers_in_the_bounded_census() {
+        const OBJECT_ID: u32 = 0x40;
+        let unknown = named_resident_attribute(
+            OBJECT_ID,
+            7,
+            &"opaque".encode_utf16().collect::<Vec<_>>(),
+            &[0x5a; 16],
+        );
+        let record = record_with_attributes(0, 1, None, &[unknown]);
+        let mut bytes = vec![0_u8; 128 * 512];
+        let offset = 4 * 4096;
+        bytes[offset..offset + 1024].copy_from_slice(&record);
+        let temp = TempImage::create(&bytes);
+        let image = ImageFile::open(&temp.0).unwrap();
+        let inventory = inventory_ntfs(
+            &image,
+            &boot(),
+            &bootstrap(1024),
+            NtfsInventoryLimits::default(),
+        )
+        .unwrap();
+
+        let census = &inventory.objects[0].attribute_census;
+        assert_eq!(census.len(), 1);
+        assert_eq!(census[0].attribute_type, OBJECT_ID);
+        assert_eq!(census[0].attribute_id, 7);
+        assert!(census[0].resident);
+        assert_eq!(census[0].flags_raw, 0);
+        assert_eq!(
+            census[0].name.as_ref().unwrap().code_units,
+            "opaque".encode_utf16().collect::<Vec<_>>()
+        );
     }
 
     #[test]

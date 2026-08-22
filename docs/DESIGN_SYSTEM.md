@@ -29,7 +29,7 @@ level below the primary workflow and remain available for audit.
 | `danger` | `#FF6077` | Blocker, destructive, or failed |
 | `working` | `#A8D8FF` | Active analysis/progress |
 
-Pure white is reserved for high-priority text and the star mark. Status color must never be the only
+Pure white is reserved for high-priority text and the ASCII wordmark. Status color must never be the only
 signal: pair it with `[READY]`, `[WARN]`, `[BLOCKED]`, or `[ACTIVE]`.
 
 ### Typography
@@ -39,7 +39,7 @@ signal: pair it with `[READY]`, `[WARN]`, `[BLOCKED]`, or `[ACTIVE]`.
 - Section label: 12 px uppercase, letter spacing equivalent to 0.08 em.
 - Page title: 24 px medium; do not exceed 30 px in the desktop utility.
 - Numeric capacity values use tabular figures and right alignment.
-- Avoid a decorative display face inside controls. The ASCII mark supplies identity.
+- Avoid a decorative display face inside controls. The ASCII wordmark supplies identity.
 
 ### Spacing and shape
 
@@ -61,10 +61,9 @@ signal: pair it with `[READY]`, `[WARN]`, `[BLOCKED]`, or `[ACTIVE]`.
 
 ### Product mark
 
-[`assets/starconverter-mark.svg`](../assets/starconverter-mark.svg) is the canonical scalable mark.
-It uses only design-system tokens and simple geometry so release packaging can render deterministic
-PNG/ICO/ICNS variants without font or generative-image dependencies. The desktop window icon is a
-small code-rendered version of the same star/prism grammar.
+The canonical product mark is the text-only ASCII wordmark `[ STAR :: CONVERTER ]`. StarConverter
+does not use a separate pictogram, SVG logo, or custom window icon. This keeps the identity literal,
+portable, and consistent with the interface grammar instead of inventing an unrelated symbol.
 
 ## Component-level rules
 

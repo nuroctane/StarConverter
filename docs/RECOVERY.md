@@ -37,9 +37,11 @@ Current publication uses hard links to obtain atomic create-new/no-clobber behav
 directories must therefore support hard links. In particular, requesting a final image or escrow
 path directly on exFAT/FAT, or on another filesystem that does not implement hard links, fails
 closed before exposing a completed name. Export to a supported local filesystem, verify and back
-up the pair, and copy it to removable media separately if needed. Directory-entry persistence is
-not yet forced with a platform-specific parent-directory barrier, so an operating-system or power
-failure can still leave a partial or a lone sidecar even after file contents were flushed.
+up the pair, and copy it to removable media separately if needed. On Unix, successful publication
+includes parent-directory synchronization before and after partial-name cleanup. Windows stable
+safe Rust does not expose the required directory-handle flush, so successful evidence explicitly
+reports directory durability as `unsupported`; an operating-system or power failure can still
+leave a partial or a lone sidecar even after file contents were flushed.
 
 ## If export was interrupted
 
@@ -60,6 +62,14 @@ Safe response:
 
 StarConverter deliberately does not auto-delete partial files discovered from earlier processes:
 the application cannot prove ownership of an arbitrary pre-existing path after a crash.
+
+Publication errors deliberately name every affected path. A collision or unsupported publication
+primitive leaves the verified partial in place because deleting it by pathname could remove a
+raced-in foreign file. A partial-cleanup failure means the partial and final names may be two hard
+links to the same verified bytes. A directory-sync failure means the reported final name may exist
+but its survival across the triggering power/OS failure was not proven. In every case, stop using
+the path pair, preserve the console evidence, rerun `verify-export` when both final artifacts exist,
+and choose new final/sidecar names for any retry. Never promote a partial by renaming it.
 
 ## Existing final name or lone sidecar
 

@@ -943,8 +943,8 @@ mod tests {
         generate_recommended_exfat_upcase,
     };
     use crate::fs::ntfs_inventory::{
-        NtfsDataStream, NtfsName, NtfsObject, NtfsObjectReference, NtfsStandardInformation,
-        NtfsStreamStorage,
+        NtfsAttributeEvidence, NtfsDataStream, NtfsInventoryExtent, NtfsName, NtfsObject,
+        NtfsObjectReference, NtfsStandardInformation, NtfsStreamStorage,
     };
     use crate::fs::ntfs_normalize::{NtfsObjectPreservation, NtfsPreservationSidecar};
     use crate::object::{
@@ -1110,7 +1110,7 @@ mod tests {
         }
     }
 
-    const fn ntfs_source_object(
+    fn ntfs_source_object(
         record_number: u64,
         is_directory: bool,
         attributes: u32,
@@ -1137,11 +1137,56 @@ mod tests {
             }),
             file_names: Vec::new(),
             data_streams: Vec::new(),
+            attribute_census: vec![NtfsAttributeEvidence {
+                attribute_type: 0x10,
+                name: None,
+                flags_raw: 0,
+                flags_unknown_bits: 0,
+                attribute_id: 1,
+                resident: true,
+            }],
             directory_entries: Vec::new(),
             has_reparse_point: false,
             has_attribute_list: false,
             directory_index_complete: true,
         }
+    }
+
+    fn ntfs_empty_badclus(timestamp: u64) -> NtfsObject {
+        let mut badclus = ntfs_source_object(8, false, 0x06, timestamp);
+        let bad_name = NtfsName {
+            code_units: "$Bad".encode_utf16().collect(),
+            is_well_formed: true,
+        };
+        badclus.data_streams.push(NtfsDataStream {
+            attribute_id: 3,
+            name: Some(bad_name.clone()),
+            compressed: false,
+            encrypted: false,
+            sparse: false,
+            storage: NtfsStreamStorage::NonResident {
+                allocated_bytes: 64 * 1024 * 1024,
+                data_bytes: 64 * 1024 * 1024,
+                initialized_bytes: 0,
+                compressed_bytes: None,
+                mapping_complete: true,
+                extents: vec![NtfsInventoryExtent {
+                    stream_id: (8 << 16) | 3,
+                    logical_offset: 0,
+                    length: 64 * 1024 * 1024,
+                    placement: NtfsExtentPlacement::Sparse,
+                }],
+            },
+        });
+        badclus.attribute_census.push(NtfsAttributeEvidence {
+            attribute_type: 0x80,
+            name: Some(bad_name),
+            flags_raw: 0,
+            flags_unknown_bits: 0,
+            attribute_id: 3,
+            resident: false,
+        });
+        badclus
     }
 
     fn normalized_ntfs() -> NormalizedNtfs {
@@ -1190,18 +1235,6 @@ mod tests {
         .unwrap();
         let timestamp =
             exfat_timestamp_to_filetime(packed_timestamp(2024, 4, 5, 6, 7, 8), 91, 0x80).unwrap();
-        let mut badclus = ntfs_source_object(8, false, 0x06, timestamp);
-        badclus.data_streams.push(NtfsDataStream {
-            attribute_id: 3,
-            name: Some(NtfsName {
-                code_units: "$Bad".encode_utf16().collect(),
-                is_well_formed: true,
-            }),
-            compressed: false,
-            encrypted: false,
-            sparse: true,
-            storage: NtfsStreamStorage::Resident { bytes: Vec::new() },
-        });
         NormalizedNtfs {
             graph,
             preservation: NtfsPreservationSidecar {
@@ -1224,7 +1257,7 @@ mod tests {
                     },
                     NtfsObjectPreservation {
                         object: ObjectId(8),
-                        source: badclus,
+                        source: ntfs_empty_badclus(timestamp),
                     },
                 ],
                 source_extents: vec![crate::fs::ntfs_inventory::NtfsInventoryExtent {

@@ -36,14 +36,7 @@ use starconverter_core::{
     VolumeProfile, VolumeRole, VolumeState,
 };
 
-const BANNER: &str = r"
-                 *
-             .  /|\  .
-          ---<  /_\  >---
-             ' /___\ '
-        [ S T A R :: C O N V E R T E R ]
-              DATA STAYS PUT
-";
+const BANNER: &str = "\n[ STAR :: CONVERTER ]\n";
 
 fn main() -> ExitCode {
     let args = env::args().skip(1).collect::<Vec<_>>();
@@ -239,6 +232,13 @@ fn convert_image_command(args: &[String]) -> Result<(), String> {
         evidence.image_bytes,
         hex_digest(&evidence.source_sha256)
     );
+    println!(
+        "[PUBLICATION] output directory durability {}",
+        evidence.output_directory_durability
+    );
+    if let Some(durability) = evidence.escrow_directory_durability {
+        println!("[PUBLICATION] escrow directory durability {durability}");
+    }
     println!(
         "[SAFE] Output paths were create-new; no existing file or device was opened for write."
     );
@@ -674,6 +674,7 @@ const fn preservation_field_label(field: PreservationField) -> &'static str {
         PreservationField::FileSystemMetadataExtents => "filesystem metadata extents",
         PreservationField::AllocationTopology => "allocation topology",
         PreservationField::InventoryAccounting => "inventory provenance",
+        PreservationField::NtfsAttributes => "NTFS attribute census",
     }
 }
 

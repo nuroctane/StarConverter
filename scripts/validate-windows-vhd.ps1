@@ -1,6 +1,7 @@
 param(
     [string]$FixtureRoot = "",
-    [switch]$PreflightOnly
+    [switch]$PreflightOnly,
+    [string]$ReportPath = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -51,6 +52,24 @@ if ($fixtureDirectory.StartsWith("\\")) {
     throw "Network fixture paths are refused: $fixtureDirectory"
 }
 
+$reportFullPath = $null
+if (-not [string]::IsNullOrWhiteSpace($ReportPath)) {
+    if ($ReportPath.StartsWith("\\")) {
+        throw "Network report paths are refused: $ReportPath"
+    }
+    $reportFullPath = [IO.Path]::GetFullPath($ReportPath)
+    if ([IO.Path]::GetExtension($reportFullPath) -ine ".json") {
+        throw "The machine-readable report path must end in .json: $reportFullPath"
+    }
+    $reportParent = [IO.Path]::GetDirectoryName($reportFullPath)
+    if ([string]::IsNullOrWhiteSpace($reportParent) -or -not [IO.Directory]::Exists($reportParent)) {
+        throw "The report parent directory must already exist: $reportParent"
+    }
+    if ([IO.File]::Exists($reportFullPath)) {
+        throw "Refusing to replace an existing machine-readable report: $reportFullPath"
+    }
+}
+
 $cases = @(
     [pscustomobject]@{
         Name = "exFAT-to-NTFS rich conversion"
@@ -82,6 +101,7 @@ $payloads = @(
         Sha256 = "6F5B3BEF759FFD6505BEB8112B023A869B1B771946F88BAEC7F016CCFB1035D6"
     }
 )
+$results = @()
 
 foreach ($case in $cases) {
     $candidatePath = Join-Path $fixtureDirectory $case.File
@@ -114,11 +134,32 @@ foreach ($case in $cases) {
         if ($initialImage.Size -ne 34603008) {
             throw "Unexpected fixed-VHD virtual size: $($initialImage.Size)"
         }
+        $results += [pscustomobject]@{
+            Name = $case.Name
+            FileSystem = $case.FileSystem
+            VhdPath = $vhdPath
+            VhdBytes = $beforeLength
+            VirtualBytes = $initialImage.Size
+            Sha256Before = $beforeHash
+            Sha256After = $beforeHash
+            DetachedBefore = $true
+            DetachedAfter = $true
+            ReadOnlyAttached = $null
+            NoDriveLetter = $null
+            PartitionOffsetBytes = $null
+            Payloads = @()
+            ChkdskExitCode = $null
+            ChkdskOutput = @()
+        }
         Write-Host "[PASS] pinned detached VHD preflight / $beforeHash / $vhdPath"
         continue
     }
 
     $attached = $false
+    $payloadResults = @()
+    $chkdskOutput = @()
+    $chkdskExit = $null
+    $volumePath = $null
     try {
         $null = Mount-DiskImage -ImagePath $vhdPath -StorageType VHD -Access ReadOnly -NoDriveLetter -PassThru
         $attached = $true
@@ -172,10 +213,19 @@ foreach ($case in $cases) {
             if ($payloadHash -ne $payload.Sha256) {
                 throw "Payload hash mismatch: $($payload.Path)"
             }
+            $payloadResults += [pscustomobject]@{
+                Path = $payload.Path
+                Length = $payloadItem.Length
+                Sha256 = $payloadHash
+            }
         }
 
         Write-Host "[CHECK] $($case.Name) at $($volume.Path)"
-        & "$env:SystemRoot\System32\chkdsk.exe" $volume.Path
+        $volumePath = $volume.Path
+        $chkdskOutput = @(& "$env:SystemRoot\System32\chkdsk.exe" $volume.Path 2>&1 | ForEach-Object {
+            Write-Host $_
+            $_.ToString()
+        })
         $chkdskExit = $LASTEXITCODE
         if ($chkdskExit -ne 0) {
             throw "CHKDSK reported exit code $chkdskExit; no repair was attempted."
@@ -196,5 +246,62 @@ foreach ($case in $cases) {
     if ($afterItem.Length -ne $beforeLength -or $afterHash -ne $beforeHash) {
         throw "Read-only Windows validation changed VHD bytes: $vhdPath"
     }
+    $results += [pscustomobject]@{
+        Name = $case.Name
+        FileSystem = $case.FileSystem
+        VhdPath = $vhdPath
+        VhdBytes = $afterItem.Length
+        VirtualBytes = $finalImage.Size
+        Sha256Before = $beforeHash
+        Sha256After = $afterHash
+        DetachedBefore = $true
+        DetachedAfter = $true
+        ReadOnlyAttached = $true
+        NoDriveLetter = $true
+        PartitionOffsetBytes = 1MB
+        VolumeGuidPath = $volumePath
+        Payloads = $payloadResults
+        ChkdskExitCode = $chkdskExit
+        ChkdskOutput = $chkdskOutput
+    }
     Write-Host "[PASS] $($case.Name) / SHA256 $afterHash / detached / no drive letter"
+}
+
+if ($null -ne $reportFullPath) {
+    $report = [ordered]@{
+        Schema = "starconverter.windows-vhd-validation"
+        Version = 1
+        Complete = $true
+        Mode = $(if ($PreflightOnly) { "detached-preflight" } else { "read-only-windows-driver" })
+        GeneratedUtc = [DateTime]::UtcNow.ToString("o")
+        WindowsVersion = [Environment]::OSVersion.VersionString
+        PowerShellVersion = $PSVersionTable.PSVersion.ToString()
+        ChkdskVersion = (Get-Item -LiteralPath "$env:SystemRoot\System32\chkdsk.exe").VersionInfo.FileVersion
+        NtfsDriverVersion = (Get-Item -LiteralPath "$env:SystemRoot\System32\drivers\ntfs.sys").VersionInfo.FileVersion
+        ExfatDriverVersion = (Get-Item -LiteralPath "$env:SystemRoot\System32\drivers\exfat.sys").VersionInfo.FileVersion
+        Cases = $results
+    }
+    $json = $report | ConvertTo-Json -Depth 8
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    $stream = New-Object System.IO.FileStream(
+        $reportFullPath,
+        [System.IO.FileMode]::CreateNew,
+        [System.IO.FileAccess]::Write,
+        [System.IO.FileShare]::None
+    )
+    try {
+        $writer = New-Object System.IO.StreamWriter($stream, $encoding)
+        try {
+            $writer.Write($json)
+            $writer.Flush()
+            $stream.Flush($true)
+        }
+        finally {
+            $writer.Dispose()
+        }
+    }
+    finally {
+        $stream.Dispose()
+    }
+    Write-Host "[REPORT] $reportFullPath"
 }
