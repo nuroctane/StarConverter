@@ -161,6 +161,8 @@ The workflow reduces accidental variance by:
 - selecting explicit runner operating systems and target triples;
 - disabling incremental compilation and remapping the workspace source path;
 - deriving archive and SBOM timestamps from the source commit;
+- replacing the SBOM generator's intentionally omitted random serial with a deterministic UUIDv5
+  bound to repository, source commit, and component, then refusing foreign identities;
 - sorting archive entries and normalizing archive ownership, modes, and gzip headers; and
 - independently reopening each archive, checking its exact schema, and emitting a canonical JSON
   member inventory before it can leave the platform build job; and

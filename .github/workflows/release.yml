@@ -83,6 +83,7 @@ jobs:
           set -euo pipefail
           python -m unittest scripts/test_validate_release_bundle.py -v
           python -m unittest scripts/test_macos_app_package.py -v
+          python -m unittest scripts/test_canonicalize_cyclonedx.py -v
 
   sbom:
     name: CycloneDX SBOM
@@ -129,6 +130,13 @@ jobs:
           set -euo pipefail
           tool="$RUNNER_TEMP/cargo-cyclonedx-bin"
           "$tool" cyclonedx --format json --target all --spec-version 1.5
+          for component in cli core gui; do
+            python scripts/canonicalize-cyclonedx.py \
+              "crates/starconverter-${component}/starconverter-${component}.cdx.json" \
+              --repository "$GITHUB_REPOSITORY" \
+              --commit "$GITHUB_SHA" \
+              --component "$component"
+          done
 
           mkdir -p dist/reference
           cp crates/starconverter-cli/starconverter-cli.cdx.json \
@@ -140,6 +148,13 @@ jobs:
 
           # SOURCE_DATE_EPOCH removes the random serial and fixes the SBOM timestamp.
           "$tool" cyclonedx --format json --target all --spec-version 1.5
+          for component in cli core gui; do
+            python scripts/canonicalize-cyclonedx.py \
+              "crates/starconverter-${component}/starconverter-${component}.cdx.json" \
+              --repository "$GITHUB_REPOSITORY" \
+              --commit "$GITHUB_SHA" \
+              --component "$component"
+          done
           cmp crates/starconverter-cli/starconverter-cli.cdx.json \
             "dist/reference/starconverter-${RELEASE_ID}-cli.cdx.json"
           cmp crates/starconverter-core/starconverter-core.cdx.json \
@@ -150,7 +165,11 @@ jobs:
           mkdir -p dist/upload
           cp dist/reference/*.cdx.json dist/upload/
           for bom in dist/upload/*.cdx.json; do
-            jq -e '.bomFormat == "CycloneDX" and .specVersion == "1.5"' "$bom" > /dev/null
+            jq -e '
+              .bomFormat == "CycloneDX" and
+              .specVersion == "1.5" and
+              (.serialNumber | test("^urn:uuid:[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"))
+            ' "$bom" > /dev/null
           done
           test "$(find dist/upload -maxdepth 1 -type f -name '*.cdx.json' | wc -l)" -eq 3
           git diff --exit-code -- Cargo.lock
