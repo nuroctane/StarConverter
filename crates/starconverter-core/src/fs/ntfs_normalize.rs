@@ -599,7 +599,10 @@ fn validate_records(
         let standard = object
             .standard_information
             .ok_or(NtfsNormalizeError::MissingStandardInformation(record))?;
-        if (standard.file_attributes & FILE_ATTRIBUTE_DIRECTORY != 0) != object.is_directory {
+        // The FILE record's directory flag is authoritative. NTFS-3G-created directories can
+        // legitimately omit FILE_ATTRIBUTE_DIRECTORY from $STANDARD_INFORMATION (record 5 uses
+        // HIDDEN|SYSTEM|ARCHIVE), while setting that bit on a non-directory is contradictory.
+        if standard.file_attributes & FILE_ATTRIBUTE_DIRECTORY != 0 && !object.is_directory {
             return Err(NtfsNormalizeError::AttributeKindMismatch(record));
         }
         if (standard.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0)
@@ -732,7 +735,23 @@ fn validate_directory_evidence(
                 NtfsNormalizeError::MissingTarget(entry.target.record_number),
             )?;
             validate_reference(entry.target, target.reference)?;
-            increment(&mut observed, directory_key(entry.target, &entry.file_name))?;
+            let key = directory_key(entry.target, &entry.file_name);
+            if directory.reference.record_number == NTFS_ROOT_RECORD
+                && entry.target == directory.reference
+            {
+                // NTFS-3G indexes the root's self-parented `.` FILE_NAME while other valid
+                // formatters omit that redundant index entry. Accept either representation, but
+                // require any present self-entry to match the root's actual FILE_NAME evidence.
+                if !target
+                    .file_names
+                    .iter()
+                    .any(|name| directory_key(target.reference, name) == key)
+                {
+                    return Err(NtfsNormalizeError::DirectoryEvidenceMismatch);
+                }
+                continue;
+            }
+            increment(&mut observed, key)?;
         }
     }
     if expected != observed {
@@ -1214,6 +1233,48 @@ mod tests {
                 SemanticFeature::AlternateDataStreams,
                 SemanticFeature::HardLinks,
             ]
+        );
+    }
+
+    #[test]
+    fn accepts_directory_without_standard_information_directory_bit() {
+        let mut source = basic();
+        source.objects[0].standard_information = Some(standard(0x26, 1));
+        let normalized = normalize_inventory(&source, 65_536, LIMITS).unwrap();
+        assert_eq!(normalized.graph.objects()[0].kind, ObjectKind::Directory);
+        assert_eq!(
+            normalized.preservation.objects[0]
+                .source
+                .standard_information
+                .unwrap()
+                .file_attributes,
+            0x26
+        );
+    }
+
+    #[test]
+    fn accepts_only_matching_optional_root_self_index_entry() {
+        let mut source = basic();
+        let root = source.objects[0].reference;
+        let file_name = source.objects[0].file_names[0].clone();
+        source.objects[0]
+            .directory_entries
+            .push(NtfsDirectoryEntry {
+                target: root,
+                file_name,
+            });
+        normalize_inventory(&source, 65_536, LIMITS).unwrap();
+
+        source.objects[0]
+            .directory_entries
+            .last_mut()
+            .unwrap()
+            .file_name
+            .name
+            .code_units = "mismatch".encode_utf16().collect();
+        assert_eq!(
+            normalize_inventory(&source, 65_536, LIMITS),
+            Err(NtfsNormalizeError::DirectoryEvidenceMismatch)
         );
     }
 

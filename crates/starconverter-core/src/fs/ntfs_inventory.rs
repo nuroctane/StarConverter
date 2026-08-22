@@ -16,7 +16,7 @@ use crate::fs::ntfs_attribute::{
 use crate::fs::ntfs_attribute_list::{
     AttributeListError, AttributeListLimits, ResolvedAttributeList, resolve_attribute_list,
 };
-use crate::fs::ntfs_discovery::{MftBootstrap, NtfsDiscoveryError, read_mft_record};
+use crate::fs::ntfs_discovery::{MftBootstrap, NtfsDiscoveryError, read_mft_record_for_inventory};
 use crate::fs::ntfs_index::{
     FileNameNamespace, NtfsFileReference, NtfsIndexError, NtfsIndexLimits, NtfsIndexRoot,
     parse_index_block, parse_index_root,
@@ -40,6 +40,9 @@ const REPARSE_POINT: u32 = 0xc0;
 const FILE_NAME_MINIMUM: usize = 66;
 const STANDARD_INFORMATION_MINIMUM: usize = 48;
 const NTFS_VOLUME_RECORD: u64 = 3;
+const NTFS_ROOT_RECORD: u64 = 5;
+const NTFS_EXTEND_RECORD: u64 = 11;
+const NTFS_FIRST_USER_RECORD: u64 = 16;
 const NTFS_VOLUME_LABEL_MAX_CODE_UNITS: usize = 32;
 
 /// Resource limits applied to one inventory operation.
@@ -695,7 +698,7 @@ pub fn inventory_ntfs(
                 maximum: limits.max_bytes,
             });
         }
-        let record = read_mft_record(image, boot, mft, record_number, record_bytes)?;
+        let record = read_mft_record_for_inventory(image, boot, mft, record_number, record_bytes)?;
         bytes_read = requested_total;
         if !record.flags.is_in_use() {
             continue;
@@ -1062,7 +1065,11 @@ fn inventory_base_record(
             },
             hard_link_count: record.hard_link_count,
             is_directory: record.flags.is_directory(),
-            is_metadata: record.flags.is_metadata(),
+            // Record numbers below 16 are reserved NTFS metafiles even when a formatter omits
+            // the optional 0x0004 FILE-record hint (NTFS-3G does this for record 12).
+            is_metadata: (record_number < NTFS_FIRST_USER_RECORD
+                && !matches!(record_number, NTFS_ROOT_RECORD | NTFS_EXTEND_RECORD))
+                || record.flags.is_metadata(),
             standard_information,
             file_names,
             data_streams,
@@ -2447,7 +2454,9 @@ mod tests {
         let mut bytes = vec![0_u8; 128 * 512];
         let offset = 4 * 4096;
         bytes[offset..offset + 1024].copy_from_slice(&empty_record(0, true));
-        bytes[offset + 1024..offset + 2048].copy_from_slice(&empty_record(1, false));
+        // NTFS-3G leaves the embedded identity at zero in never-allocated records. The in-use flag
+        // is the authority here; the unused record is ignored without weakening live identities.
+        bytes[offset + 1024..offset + 2048].copy_from_slice(&empty_record(0, false));
         let temp = TempImage::create(&bytes);
         let image = ImageFile::open(&temp.0).unwrap();
         let inventory = inventory_ntfs(

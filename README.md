@@ -214,13 +214,15 @@ installed. CI always tests both language stacks.
 - [x] Policy-bound exFAT→NTFS and NTFS→exFAT structural adapters with exact timestamp/identity evidence
 - [x] Pinned `$Secure` ordinary-object security-ID assignment in NTFS `$STANDARD_INFORMATION`
 - [x] Reproducible root/rich/edge external fixtures, read-only exfatprogs/NTFS-3G checks, and exFAT/NTFS FUSE payload mounts
+- [x] Formatter-origin exFAT/NTFS differential images with unchanged hashes and parser compatibility regressions
 - [x] Native desktop exact-candidate preview with in-memory rollback capture and no executor authority
+- [x] Nonblocking desktop inspect/preview/export/verify jobs with stale-result and panic containment
 - [x] Create-new exFAT→NTFS and NTFS→exFAT export with reinspection, manifest equality, source re-hash, and escrow sidecar
 - [x] Independently mount both exported rich cross-format candidates read-only and verify exact payload hashes
 - [x] Read-only candidate/source/sidecar verifier and candidate-bound escrow envelope
 - [x] Uniquely named partial construction and atomic no-clobber publication on hard-link-capable filesystems
 - [x] Deterministic converted fixed-VHD fixtures and fail-closed Windows validation harness
-- [x] Four-target deterministic portable packaging with SBOM and provenance attestations
+- [x] Four-target deterministic portable packaging with exact bundle inventories, SBOM identity checks, and verified provenance attestations
 - [ ] Close serializer activation gaps and qualify the cross-filesystem metadata profiles
 - [ ] In-place image conversion with durable recovery/finalize workflow
 - [ ] Windows `chkdsk`/mount validation of generated and recovered images

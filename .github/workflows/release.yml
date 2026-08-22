@@ -69,13 +69,19 @@ jobs:
             echo 'Commit timestamp is not a Unix epoch.' >&2
             exit 1
           fi
-          if (( source_date_epoch < 315532800 || source_date_epoch > 4354819199 )); then
-            echo 'Commit timestamp falls outside the representable ZIP date range.' >&2
+          if (( source_date_epoch < 315532800 || source_date_epoch > 4294967295 )); then
+            echo 'Commit timestamp falls outside the shared ZIP and gzip date range.' >&2
             exit 1
           fi
 
           printf 'release-id=%s\n' "$release_id" >> "$GITHUB_OUTPUT"
           printf 'source-date-epoch=%s\n' "$source_date_epoch" >> "$GITHUB_OUTPUT"
+
+      - name: Test fail-closed package validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m unittest scripts/test_validate_release_bundle.py -v
 
   sbom:
     name: CycloneDX SBOM
@@ -299,11 +305,33 @@ jobs:
           print(archive)
           PY
 
-      - name: Upload portable archive
+      - name: Validate the packaged bytes and write canonical inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="dist/starconverter-${RELEASE_ID}-${TARGET_TRIPLE}.${ARCHIVE_KIND}"
+          inventory="${archive}.inventory.json"
+          python scripts/validate-release-bundle.py "$archive" \
+            --release-id "$RELEASE_ID" \
+            --target "$TARGET_TRIPLE" \
+            --source-date-epoch "$SOURCE_DATE_EPOCH" \
+            --repository-root . \
+            --write-inventory "$inventory" \
+            --smoke-cli
+          python scripts/validate-release-bundle.py "$archive" \
+            --release-id "$RELEASE_ID" \
+            --target "$TARGET_TRIPLE" \
+            --source-date-epoch "$SOURCE_DATE_EPOCH" \
+            --repository-root . \
+            --verify-inventory "$inventory"
+
+      - name: Upload validated portable archive and inventory
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: portable-${{ matrix.target }}
-          path: dist/starconverter-${{ needs.prepare.outputs.release-id }}-${{ matrix.target }}.*
+          path: |
+            dist/starconverter-${{ needs.prepare.outputs.release-id }}-${{ matrix.target }}.${{ matrix.archive-kind }}
+            dist/starconverter-${{ needs.prepare.outputs.release-id }}-${{ matrix.target }}.${{ matrix.archive-kind }}.inventory.json
           if-no-files-found: error
           compression-level: 0
           retention-days: 30
@@ -321,7 +349,13 @@ jobs:
       id-token: write # Mint the short-lived OIDC identity used by Sigstore.
     env:
       RELEASE_ID: ${{ needs.prepare.outputs.release-id }}
+      SOURCE_DATE_EPOCH: ${{ needs.prepare.outputs.source-date-epoch }}
     steps:
+      - name: Check out the exact source revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
       - name: Download build products
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -335,54 +369,95 @@ jobs:
           name: release-sboms
           path: dist
 
-      - name: Inventory release subjects
+      - name: Validate release subjects and freeze attestation manifests
         shell: bash
         run: |
           set -euo pipefail
-          test "$(find dist -maxdepth 1 -type f \( -name '*.zip' -o -name '*.tar.gz' \) | wc -l)" -eq 4
-          test "$(find dist -maxdepth 1 -type f -name '*.cdx.json' | wc -l)" -eq 3
+          targets=(
+            x86_64-pc-windows-msvc
+            x86_64-unknown-linux-gnu
+            x86_64-apple-darwin
+            aarch64-apple-darwin
+          )
+          archives=()
+          inventories=()
+          for target in "${targets[@]}"; do
+            kind=tar.gz
+            if [[ "$target" == x86_64-pc-windows-msvc ]]; then kind=zip; fi
+            archive="starconverter-${RELEASE_ID}-${target}.${kind}"
+            inventory="${archive}.inventory.json"
+            archives+=("$archive")
+            inventories+=("$inventory")
+            python scripts/validate-release-bundle.py "dist/$archive" \
+              --release-id "$RELEASE_ID" \
+              --target "$target" \
+              --source-date-epoch "$SOURCE_DATE_EPOCH" \
+              --repository-root . \
+              --verify-inventory "dist/$inventory"
+          done
+
+          workspace_version="$(sed -nE 's/^version = "([0-9]+\.[0-9]+\.[0-9]+)"$/\1/p' Cargo.toml | head -n 1)"
+          sboms=()
+          for component in cli core gui; do
+            sbom="starconverter-${RELEASE_ID}-${component}.cdx.json"
+            sboms+=("$sbom")
+            jq -e --arg name "starconverter-${component}" --arg version "$workspace_version" '
+              .bomFormat == "CycloneDX" and
+              .specVersion == "1.5" and
+              .metadata.component.name == $name and
+              .metadata.component.version == $version and
+              (.components | type == "array") and
+              (.dependencies | type == "array")
+            ' "dist/$sbom" > /dev/null
+          done
+
+          expected=("${archives[@]}" "${inventories[@]}" "${sboms[@]}")
+          mapfile -t actual < <(find dist -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)
+          mapfile -t expected_sorted < <(printf '%s\n' "${expected[@]}" | LC_ALL=C sort)
+          diff <(printf '%s\n' "${expected_sorted[@]}") <(printf '%s\n' "${actual[@]}")
+
           (
             cd dist
-            find . -maxdepth 1 -type f \( -name '*.zip' -o -name '*.tar.gz' \) \
-              -printf '%f\n' | LC_ALL=C sort | xargs sha256sum
-          ) > "$RUNNER_TEMP/archive-sha256sums.txt"
+            for name in "${archives[@]}"; do sha256sum "$name"; done
+          ) > dist/ARCHIVE-SUBJECTS.txt
           (
             cd dist
-            find . -maxdepth 1 -type f \( -name '*.zip' -o -name '*.tar.gz' -o -name '*.cdx.json' \) \
-              -printf '%f\n' | LC_ALL=C sort | xargs sha256sum
-          ) > dist/SHA256SUMS.txt
-          (cd dist && sha256sum --check --strict SHA256SUMS.txt)
+            for name in "${expected_sorted[@]}"; do sha256sum "$name"; done
+          ) > dist/PROVENANCE-SUBJECTS.txt
+          (cd dist && sha256sum --check --strict ARCHIVE-SUBJECTS.txt)
+          (cd dist && sha256sum --check --strict PROVENANCE-SUBJECTS.txt)
 
       - name: Attest SLSA build provenance
         id: provenance
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
-          subject-checksums: dist/SHA256SUMS.txt
+          subject-checksums: dist/PROVENANCE-SUBJECTS.txt
 
       - name: Attest CLI dependency SBOM
         id: sbom_cli
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
-          subject-checksums: ${{ runner.temp }}/archive-sha256sums.txt
+          subject-checksums: dist/ARCHIVE-SUBJECTS.txt
           sbom-path: dist/starconverter-${{ needs.prepare.outputs.release-id }}-cli.cdx.json
 
       - name: Attest core dependency SBOM
         id: sbom_core
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
-          subject-checksums: ${{ runner.temp }}/archive-sha256sums.txt
+          subject-checksums: dist/ARCHIVE-SUBJECTS.txt
           sbom-path: dist/starconverter-${{ needs.prepare.outputs.release-id }}-core.cdx.json
 
       - name: Attest GUI dependency SBOM
         id: sbom_gui
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
-          subject-checksums: ${{ runner.temp }}/archive-sha256sums.txt
+          subject-checksums: dist/ARCHIVE-SUBJECTS.txt
           sbom-path: dist/starconverter-${{ needs.prepare.outputs.release-id }}-gui.cdx.json
 
       - name: Add offline Sigstore bundles and final checksums
         shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
           PROVENANCE_BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
           CLI_SBOM_BUNDLE: ${{ steps.sbom_cli.outputs.bundle-path }}
           CORE_SBOM_BUNDLE: ${{ steps.sbom_core.outputs.bundle-path }}
@@ -393,12 +468,38 @@ jobs:
           cp "$CLI_SBOM_BUNDLE" "dist/starconverter-${RELEASE_ID}-cli-sbom.sigstore.json"
           cp "$CORE_SBOM_BUNDLE" "dist/starconverter-${RELEASE_ID}-core-sbom.sigstore.json"
           cp "$GUI_SBOM_BUNDLE" "dist/starconverter-${RELEASE_ID}-gui-sbom.sigstore.json"
+          for bundle in dist/*.sigstore.json; do
+            jq -e 'type == "object"' "$bundle" > /dev/null
+          done
+
+          signer="$GITHUB_REPOSITORY/.github/workflows/release.yml"
+          while read -r _ subject; do
+            gh attestation verify "dist/$subject" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$signer" \
+              --bundle "dist/starconverter-${RELEASE_ID}-provenance.sigstore.json" > /dev/null
+          done < dist/PROVENANCE-SUBJECTS.txt
+          for bundle in \
+            "dist/starconverter-${RELEASE_ID}-cli-sbom.sigstore.json" \
+            "dist/starconverter-${RELEASE_ID}-core-sbom.sigstore.json" \
+            "dist/starconverter-${RELEASE_ID}-gui-sbom.sigstore.json"; do
+            while read -r _ subject; do
+              gh attestation verify "dist/$subject" \
+                --repo "$GITHUB_REPOSITORY" \
+                --signer-workflow "$signer" \
+                --bundle "$bundle" > /dev/null
+            done < dist/ARCHIVE-SUBJECTS.txt
+          done
+
           (
             cd dist
-            find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -printf '%f\n' \
-              | LC_ALL=C sort | xargs sha256sum
+            mapfile -t names < <(find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -printf '%f\n' | LC_ALL=C sort)
+            for name in "${names[@]}"; do sha256sum "$name"; done
           ) > dist/SHA256SUMS.txt
           (cd dist && sha256sum --check --strict SHA256SUMS.txt)
+          expected_files=18
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq "$expected_files"
+          test "$(wc -l < dist/SHA256SUMS.txt)" -eq "$((expected_files - 1))"
 
       - name: Upload complete release set
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

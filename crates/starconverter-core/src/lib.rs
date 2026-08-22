@@ -22,6 +22,7 @@ pub mod preservation;
 pub mod recovery;
 pub mod validation_vhd;
 pub mod verify;
+pub mod windows_validation;
 
 use std::fmt;
 use std::str::FromStr;

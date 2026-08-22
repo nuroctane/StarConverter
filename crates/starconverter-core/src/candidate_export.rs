@@ -77,6 +77,8 @@ pub struct CandidateExportEvidence {
 /// File contents are always flushed before publication. Safe Rust exposes directory `sync_all` on
 /// Unix, but the standard library does not expose an equivalent Windows directory-handle flush.
 /// Callers must therefore retain this evidence rather than assuming equal guarantees everywhere.
+/// In particular, `Unsupported` is not permission to retire the source after a power-loss-sensitive
+/// workflow: it means that publication completed, but the namespace change is not proven durable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirectoryDurability {
     /// The parent directory accepted a successful `sync_all` after the namespace change.
@@ -93,6 +95,15 @@ impl DirectoryDurability {
             Self::Synchronized => "synchronized",
             Self::Unsupported => "unsupported",
         }
+    }
+
+    /// Whether publication completed with a proven parent-namespace durability barrier.
+    ///
+    /// This deliberately returns `false` for every weaker or future unknown guarantee, allowing
+    /// callers to fail closed before retiring source data.
+    #[must_use]
+    pub const fn is_synchronized(self) -> bool {
+        matches!(self, Self::Synchronized)
     }
 }
 
@@ -745,7 +756,9 @@ const fn decode_filesystem(value: u8) -> Result<FileSystem, CandidateExportError
 /// Creates and independently verifies a complete target image without modifying the source.
 ///
 /// `output_path` and `escrow_path` must not exist. Escrow mode requires the latter; strict mode
-/// rejects it. Any failure removes only files newly created by this call.
+/// rejects it. Failures before publication attempt best-effort cleanup of newly created partials.
+/// Publication races and failures retain their partial and report its path. A failure after a hard
+/// link is published reports that partial-success state and never silently removes published data.
 ///
 /// # Errors
 ///
@@ -1262,6 +1275,12 @@ impl NewFileGuard {
     ///
     /// This is intentionally fail-closed on exFAT, FAT, and other filesystems without hard-link
     /// support. Falling back to `rename` would reintroduce an overwrite race on Windows and Unix.
+    /// A path-based Windows `MoveFileEx(..., WRITE_THROUGH)` wrapper is not an equivalent safe
+    /// substitute here: moving requires releasing this guard's deny-delete handle, opening a path
+    /// replacement race, and the MSRV-compatible safe wrapper accepts `str` rather than arbitrary
+    /// Windows `Path` values. Until a safe handle-relative no-replace primitive exists, Windows
+    /// publication therefore remains atomic/no-clobber but explicitly reports directory durability
+    /// as unsupported.
     fn publish(self, destination: &Path) -> Result<DirectoryDurability, CandidateExportError> {
         self.publish_with(destination, &HostPublicationIo)
     }
@@ -1378,9 +1397,11 @@ impl PublicationIo for HostPublicationIo {
         #[cfg(not(unix))]
         {
             let _ = destination;
-            // Windows requires platform directory-handle APIs that stable safe Rust does not
-            // expose. Returning explicit evidence is safer than pretending that file `sync_all`
-            // flushed the name.
+            // Windows' documented FlushFileBuffers contract requires GENERIC_WRITE on a file (or
+            // privileged volume) handle, while its documented directory-handle operations do not
+            // include FlushFileBuffers. Stable safe Rust exposes neither a proven parent-directory
+            // barrier nor a safe handle-relative write-through rename. Do not infer that the
+            // pre-publication file `sync_all` flushed either hard-link namespace change.
             Ok(DirectoryDurability::Unsupported)
         }
     }
@@ -1723,6 +1744,8 @@ mod tests {
             "synchronized"
         );
         assert_eq!(DirectoryDurability::Unsupported.to_string(), "unsupported");
+        assert!(DirectoryDurability::Synchronized.is_synchronized());
+        assert!(!DirectoryDurability::Unsupported.is_synchronized());
     }
 
     #[test]
@@ -2015,6 +2038,23 @@ mod tests {
         let guard = NewFileGuard::create_partial(&destination).unwrap();
         assert!(OpenOptions::new().write(true).open(&guard.path).is_err());
         assert!(fs::remove_file(&guard.path).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_publication_never_claims_an_unavailable_parent_barrier() {
+        let destination = temp_path("windows-durability-boundary.img");
+        let mut guard = NewFileGuard::create_partial(&destination).unwrap();
+        guard.file_mut().write_all(b"verified").unwrap();
+        guard.file().sync_all().unwrap();
+        guard.bind_current_identity().unwrap();
+
+        let durability = guard.publish(&destination).unwrap();
+
+        assert_eq!(durability, DirectoryDurability::Unsupported);
+        assert!(!durability.is_synchronized());
+        assert_eq!(fs::read(&destination).unwrap(), b"verified");
+        fs::remove_file(destination).unwrap();
     }
 
     #[cfg(windows)]

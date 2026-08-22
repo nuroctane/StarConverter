@@ -71,3 +71,10 @@ path = "fuzz_targets/ntfs_index.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "escrow_decode"
+path = "fuzz_targets/escrow_decode.rs"
+test = false
+doc = false
+bench = false

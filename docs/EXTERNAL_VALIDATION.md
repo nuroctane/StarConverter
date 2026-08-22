@@ -118,12 +118,39 @@ edge manifest C5DCE3F82BA24AF24C4C941EA56032873281D03A7BE530FCEDEC3A6243B10490
 a positional volume-label entry and mislabels later entries when the optional label is absent, so
 that diagnostic is retained as supporting output rather than a release gate.
 
+## 2026-08-21 formatter-origin differential corpus
+
+Two 64 MiB regular files were created directly by exfatprogs 1.2.2 (`mkfs.exfat`, label `SCXFAT`)
+and NTFS-3G 2022.10.3 (`mkntfs -F -Q`, label `SCNTFS`). No mount, loop device, VHD attachment, or
+physical drive was used. The exFAT image passed `fsck.exfat -n`; the NTFS 3.1 image passed
+`ntfsinfo -m`, root enumeration with `ntfsls`, and `ntfsfix -n`. StarConverter then completed its
+bounded read-only inspection and normalized inventory for both images.
+
+The NTFS image exposed three valid formatter differences that are now regression-covered:
+
+- never-allocated MFT records may retain an embedded record number of zero; live records still
+  require exact embedded identity;
+- a directory FILE record may omit `FILE_ATTRIBUTE_DIRECTORY` from `$STANDARD_INFORMATION`; the
+  FILE-record directory flag remains authoritative, while the bit on a non-directory is refused;
+- NTFS-3G may include a root self-entry in `$I30`; StarConverter accepts it only when it exactly
+  matches the root's self-parented `$FILE_NAME` evidence.
+
+SHA-256 was identical before and after every independent check and both StarConverter inspections:
+
+```text
+formatter exFAT DFAC99E5F752220A5DAB0266DCA24174BB4A97727A2696E60B07534A8CADF357
+formatter NTFS  F63C1D49970DF4112810EDD1630841413C25A366E9C47D8E46B37B2DBB5E2B71
+```
+
+The temporary formatter-origin files were removed after the hashes and results were recorded.
+
 ## What this does not prove
 
 - The recommended exFAT up-case profile removes the earlier ASCII-only limitation, but a clean
   Linux checker result still does not prove every Windows case-collation behavior.
 - `ntfsfix -n` and NTFS-3G metadata readers are not substitutes for a clean Windows `chkdsk` pass.
-- The rich and edge fixtures cover ordinary payloads, nesting, Unicode/surrogate/maximum-length
+- The rich, edge, and formatter-origin fixtures cover ordinary payloads, nesting,
+  Unicode/surrogate/maximum-length
   names, empty and allocation-boundary files, and two- and three-way fragmented allocation, but not
   alternate streams, hard links, ACLs, sparse/compressed data, reparse points,
   multi-level directory indexes, or a completed cross-format execution.

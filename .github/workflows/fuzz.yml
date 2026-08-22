@@ -46,6 +46,7 @@ jobs:
             ntfs_attribute_list
             ntfs_runlist_bitmap
             ntfs_index
+            escrow_decode
           )
           for target in "${targets[@]}"; do
             cargo +nightly fuzz build "$target"
@@ -62,6 +63,7 @@ jobs:
             ntfs_attribute_list
             ntfs_runlist_bitmap
             ntfs_index
+            escrow_decode
           )
           for target in "${targets[@]}"; do
             cargo +nightly fuzz run "$target" -- \

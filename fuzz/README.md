@@ -1,8 +1,9 @@
 # StarConverter parser fuzzing
 
 These `cargo-fuzz` targets exercise only StarConverter's pure, in-memory
-filesystem parsers. They do not open paths, images, volumes, or devices. Every
-target rejects inputs above a small explicit cap before invoking a parser.
+filesystem parsers and versioned escrow decoder. They do not open paths, images,
+volumes, or devices. Every target rejects inputs above a small explicit cap
+before invoking a parser.
 
 Install nightly and `cargo-fuzz`, then run all targets from the repository root:
 

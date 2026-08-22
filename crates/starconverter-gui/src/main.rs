@@ -1,6 +1,10 @@
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
+use std::thread;
+use std::time::Duration;
 
 use eframe::egui::{
     self, Align, Button, Color32, FontId, Frame, Label, Layout, Margin, RichText, Stroke,
@@ -51,6 +55,165 @@ const INTERRUPTED_EXPORT_GUIDANCE: &str = "[RECOVERY] Never rename or use a .sta
 [RECOVERY] If only partial or escrow artifacts remain, confirm no export is running, preserve them if forensic review matters, then rerun to a new output name.\n\
 [SAFE] The original source was opened read-only; this screen cannot repair or activate a filesystem.";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobKind {
+    Inspect,
+    Preview,
+    Export,
+    VerifyExport,
+}
+
+impl JobKind {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Inspect => "image inspection",
+            Self::Preview => "exact preview",
+            Self::Export => "candidate export",
+            Self::VerifyExport => "export verification",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct InspectionJobSuccess {
+    profile: VolumeProfile,
+}
+
+#[derive(Debug)]
+struct PreviewJobSuccess {
+    profile: VolumeProfile,
+    target: FileSystem,
+    report: String,
+}
+
+#[derive(Debug)]
+struct ExportJobSuccess {
+    profile: VolumeProfile,
+    target: FileSystem,
+    source_path: String,
+    evidence: CandidateExportEvidence,
+}
+
+#[derive(Debug)]
+enum JobOutcome {
+    Inspection(InspectionJobSuccess),
+    Preview(PreviewJobSuccess),
+    Export(ExportJobSuccess),
+    Verification(CandidateVerificationEvidence),
+    Failed { kind: JobKind, message: String },
+}
+
+#[derive(Debug)]
+struct JobMessage {
+    id: u64,
+    outcome: JobOutcome,
+}
+
+#[derive(Debug)]
+struct ActiveJob {
+    id: u64,
+    kind: JobKind,
+    cancelled: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobResultDisposition {
+    Apply,
+    IgnoreStale,
+}
+
+fn job_result_disposition(active: Option<&ActiveJob>, message_id: u64) -> JobResultDisposition {
+    match active {
+        Some(job) if job.id == message_id && !job.cancelled.load(Ordering::Acquire) => {
+            JobResultDisposition::Apply
+        }
+        Some(_) | None => JobResultDisposition::IgnoreStale,
+    }
+}
+
+#[derive(Debug)]
+struct BackgroundJobs {
+    sender: mpsc::Sender<JobMessage>,
+    receiver: mpsc::Receiver<JobMessage>,
+    next_id: u64,
+    active: Option<ActiveJob>,
+}
+
+impl BackgroundJobs {
+    fn new() -> Self {
+        let (sender, receiver) = mpsc::channel();
+        Self {
+            sender,
+            receiver,
+            next_id: 1,
+            active: None,
+        }
+    }
+
+    const fn active(&self) -> Option<&ActiveJob> {
+        self.active.as_ref()
+    }
+
+    const fn is_busy(&self) -> bool {
+        self.active.is_some()
+    }
+
+    fn start<F>(&mut self, kind: JobKind, work: F) -> Result<u64, String>
+    where
+        F: FnOnce() -> JobOutcome + Send + 'static,
+    {
+        if self.is_busy() {
+            return Err("another background job is already active".into());
+        }
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let sender = self.sender.clone();
+        thread::Builder::new()
+            .name(format!(
+                "starconverter-{}-{id}",
+                kind.label().replace(' ', "-")
+            ))
+            .spawn(move || {
+                if worker_cancelled.load(Ordering::Acquire) {
+                    return;
+                }
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+                    .unwrap_or_else(|_| JobOutcome::Failed {
+                        kind,
+                        message: "background worker panicked; no result was accepted".into(),
+                    });
+                let _ = sender.send(JobMessage { id, outcome });
+            })
+            .map_err(|error| format!("could not start {} worker: {error}", kind.label()))?;
+        self.active = Some(ActiveJob {
+            id,
+            kind,
+            cancelled,
+        });
+        Ok(id)
+    }
+
+    fn cancel(&mut self) -> Option<JobKind> {
+        let active = self.active.take()?;
+        active.cancelled.store(true, Ordering::Release);
+        Some(active.kind)
+    }
+
+    fn take_ready(&mut self) -> Option<JobOutcome> {
+        loop {
+            let message = self.receiver.try_recv().ok()?;
+            if job_result_disposition(self.active.as_ref(), message.id)
+                == JobResultDisposition::Apply
+            {
+                self.active = None;
+                return Some(message.outcome);
+            }
+        }
+    }
+}
+
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -82,6 +245,7 @@ struct StarConverterApp {
     verification_status: String,
     verification_report: Option<String>,
     verification_ok: bool,
+    jobs: BackgroundJobs,
     activity: Vec<String>,
 }
 
@@ -108,6 +272,7 @@ impl StarConverterApp {
                 "Select a final candidate and its escrow sidecar for read-only verification.".into(),
             verification_report: None,
             verification_ok: false,
+            jobs: BackgroundJobs::new(),
             activity: vec![
                 "00:00:00  [READY] UI initialized".into(),
                 "00:00:00  [SAFE]  raw-device backend absent".into(),
@@ -119,6 +284,146 @@ impl StarConverterApp {
 
     fn replan(&mut self) {
         self.plan = Planner.plan(&self.source, self.target, self.mode);
+    }
+
+    fn start_background_job<F>(&mut self, kind: JobKind, work: F)
+    where
+        F: FnOnce() -> JobOutcome + Send + 'static,
+    {
+        match self.jobs.start(kind, work) {
+            Ok(id) => self.activity.push(format!(
+                "00:00:00  [WORKING] {} started :: job {id}",
+                kind.label()
+            )),
+            Err(message) => self.apply_job_outcome(JobOutcome::Failed { kind, message }),
+        }
+    }
+
+    fn poll_background_jobs(&mut self) {
+        while let Some(outcome) = self.jobs.take_ready() {
+            self.apply_job_outcome(outcome);
+        }
+    }
+
+    fn cancel_background_job(&mut self) {
+        let Some(kind) = self.jobs.cancel() else {
+            return;
+        };
+        let message = format!(
+            "{} result detached; an already-running worker may finish safely in the background",
+            kind.label()
+        );
+        self.activity
+            .push(format!("00:00:00  [DETACHED] {message}"));
+        match kind {
+            JobKind::VerifyExport => {
+                self.verification_ok = false;
+                self.verification_report = None;
+                self.verification_status = format!("Cancelled: {message}.");
+            }
+            JobKind::Inspect | JobKind::Preview | JobKind::Export => {
+                self.inspection_status = format!("Cancelled: {message}.");
+            }
+        }
+    }
+
+    fn apply_job_outcome(&mut self, outcome: JobOutcome) {
+        match outcome {
+            JobOutcome::Inspection(success) => {
+                let inventory_status = if success.profile.inventory_complete {
+                    "complete bounded inventory normalized"
+                } else {
+                    "inventory incomplete; conversion remains blocked"
+                };
+                self.target = opposite_filesystem(success.profile.filesystem);
+                self.source = success.profile;
+                self.real_source = true;
+                self.inspection_status = format!(
+                    "Read-only evidence accepted: {} boot/allocation integrity; {inventory_status}.",
+                    self.source.filesystem,
+                );
+                self.activity.push(format!(
+                    "00:00:00  [READY] read-only image evidence :: {}",
+                    self.source.display_name
+                ));
+                self.replan();
+            }
+            JobOutcome::Preview(success) => {
+                self.source = success.profile;
+                self.target = success.target;
+                self.real_source = true;
+                self.exact_preview = Some(success.report);
+                self.inspection_status =
+                    "Exact candidate and rollback before-images captured in memory; no writes performed."
+                        .into();
+                self.activity
+                    .push("00:00:00  [SAFE]  exact read-only transaction preview ready".into());
+                self.replan();
+            }
+            JobOutcome::Export(success) => {
+                self.source = success.profile;
+                self.target = success.target;
+                self.real_source = true;
+                let evidence = success.evidence;
+                self.verification_candidate_path = evidence.output_path.display().to_string();
+                self.verification_escrow_path = evidence
+                    .escrow_path
+                    .as_ref()
+                    .map_or_else(String::new, |path| path.display().to_string());
+                self.verification_source_path = success.source_path;
+                self.verification_status = if evidence.escrow_path.is_some() {
+                    "Export complete. Run read-only verification below before using the candidate."
+                        .into()
+                } else {
+                    "Strict export complete without an escrow sidecar.".into()
+                };
+                self.verification_report = None;
+                self.verification_ok = false;
+                self.exact_preview = Some(export_evidence_report(&evidence));
+                self.inspection_status =
+                    "New target image exported and independently reinspected; source hash unchanged."
+                        .into();
+                self.activity.push(format!(
+                    "00:00:00  [COMPLETE] copy-based {} image :: {}",
+                    evidence.target_filesystem,
+                    evidence.output_path.display()
+                ));
+                self.replan();
+            }
+            JobOutcome::Verification(evidence) => {
+                self.verification_ok = true;
+                self.verification_status =
+                    "Candidate and bound escrow passed every read-only check.".into();
+                self.verification_report = Some(verification_evidence_report(&evidence));
+                self.activity.push(format!(
+                    "00:00:00  [VERIFIED] bound {} candidate :: {}",
+                    evidence.target_filesystem,
+                    evidence.candidate_path.display()
+                ));
+            }
+            JobOutcome::Failed { kind, message } => {
+                self.activity.push(format!(
+                    "00:00:00  [BLOCKED] {} failed :: {message}",
+                    kind.label()
+                ));
+                match kind {
+                    JobKind::VerifyExport => {
+                        self.verification_ok = false;
+                        self.verification_status = format!("Verification failed: {message}");
+                        self.verification_report = Some(verification_failure_report(&message));
+                    }
+                    JobKind::Inspect => {
+                        self.real_source = false;
+                        self.inspection_status = message;
+                    }
+                    JobKind::Preview => {
+                        self.exact_preview = None;
+                        self.inspection_status = message;
+                    }
+                    JobKind::Export => self.inspection_status = message,
+                }
+            }
+        }
     }
 
     fn select_exfat_demo(&mut self) {
@@ -150,44 +455,23 @@ impl StarConverterApp {
 
     fn analyze_image(&mut self) {
         self.exact_preview = None;
-        let path = self.image_path.trim();
+        let path = self.image_path.trim().to_owned();
         if path.is_empty() {
             self.inspection_status = "Image path is required.".into();
             self.activity
                 .push("00:00:00  [BLOCKED] image path is empty".into());
             return;
         }
-        match inspect_image(path) {
-            Ok(inspection) => {
-                let inventory_status = if inspection.profile.inventory_complete {
-                    "complete bounded inventory normalized"
-                } else {
-                    "inventory incomplete; conversion remains blocked"
-                };
-                self.target = match inspection.profile.filesystem {
-                    FileSystem::ExFat => FileSystem::Ntfs,
-                    FileSystem::Ntfs => FileSystem::ExFat,
-                    FileSystem::Unknown => FileSystem::Unknown,
-                };
-                self.source = inspection.profile;
-                self.real_source = true;
-                self.inspection_status = format!(
-                    "Read-only evidence accepted: {} boot/allocation integrity; {inventory_status}.",
-                    self.source.filesystem,
-                );
-                self.activity.push(format!(
-                    "00:00:00  [READY] read-only image evidence :: {}",
-                    self.source.display_name
-                ));
-                self.replan();
-            }
-            Err(error) => {
-                self.real_source = false;
-                self.inspection_status = error.to_string();
-                self.activity
-                    .push(format!("00:00:00  [BLOCKED] inspection failed :: {error}"));
-            }
-        }
+        self.inspection_status = "Read-only image inspection is running in the background.".into();
+        self.start_background_job(JobKind::Inspect, move || match inspect_image(&path) {
+            Ok(inspection) => JobOutcome::Inspection(InspectionJobSuccess {
+                profile: inspection.profile,
+            }),
+            Err(error) => JobOutcome::Failed {
+                kind: JobKind::Inspect,
+                message: error.to_string(),
+            },
+        });
     }
 
     fn choose_image(&mut self) {
@@ -238,24 +522,18 @@ impl StarConverterApp {
                 .push("00:00:00  [BLOCKED] preview path is empty".into());
             return;
         }
-
-        let result = self.build_exact_preview(&source_path);
-        match result {
-            Ok(report) => {
-                self.exact_preview = Some(report);
-                self.inspection_status =
-                    "Exact candidate and rollback before-images captured in memory; no writes performed."
-                        .into();
-                self.activity
-                    .push("00:00:00  [SAFE]  exact read-only transaction preview ready".into());
+        let mode = self.mode;
+        self.exact_preview = None;
+        self.inspection_status = "Exact preview is being built in the background.".into();
+        self.start_background_job(JobKind::Preview, move || {
+            match build_exact_preview(&source_path, mode) {
+                Ok(success) => JobOutcome::Preview(success),
+                Err(message) => JobOutcome::Failed {
+                    kind: JobKind::Preview,
+                    message,
+                },
             }
-            Err(error) => {
-                self.exact_preview = None;
-                self.inspection_status.clone_from(&error);
-                self.activity
-                    .push(format!("00:00:00  [BLOCKED] preview refused :: {error}"));
-            }
-        }
+        });
     }
 
     fn export_new_image(&mut self) {
@@ -275,39 +553,17 @@ impl StarConverterApp {
             return;
         };
 
-        match self.build_candidate_export(&source_path, &output_path) {
-            Ok(evidence) => {
-                self.verification_candidate_path = evidence.output_path.display().to_string();
-                self.verification_escrow_path = evidence
-                    .escrow_path
-                    .as_ref()
-                    .map_or_else(String::new, |path| path.display().to_string());
-                self.verification_source_path.clone_from(&source_path);
-                self.verification_status = if evidence.escrow_path.is_some() {
-                    "Export complete. Run read-only verification below before using the candidate."
-                        .into()
-                } else {
-                    "Strict export complete without an escrow sidecar.".into()
-                };
-                self.verification_report = None;
-                self.verification_ok = false;
-                self.exact_preview = Some(export_evidence_report(&evidence));
-                self.inspection_status =
-                    "New target image exported and independently reinspected; source hash unchanged."
-                        .into();
-                self.activity.push(format!(
-                    "00:00:00  [COMPLETE] copy-based {} image :: {}",
-                    evidence.target_filesystem,
-                    evidence.output_path.display()
-                ));
+        let mode = self.mode;
+        self.inspection_status = "Create-new candidate export is running in the background.".into();
+        self.start_background_job(JobKind::Export, move || {
+            match build_candidate_export(&source_path, &output_path, mode) {
+                Ok(success) => JobOutcome::Export(success),
+                Err(message) => JobOutcome::Failed {
+                    kind: JobKind::Export,
+                    message,
+                },
             }
-            Err(error) => {
-                self.inspection_status.clone_from(&error);
-                self.activity.push(format!(
-                    "00:00:00  [BLOCKED] image export refused :: {error}"
-                ));
-            }
-        }
+        });
     }
 
     fn choose_verification_candidate(&mut self) {
@@ -347,9 +603,9 @@ impl StarConverterApp {
     }
 
     fn verify_export_read_only(&mut self) {
-        let candidate = self.verification_candidate_path.trim();
-        let escrow = self.verification_escrow_path.trim();
-        if let Some(missing) = missing_verification_path(candidate, escrow) {
+        let candidate = self.verification_candidate_path.trim().to_owned();
+        let escrow = self.verification_escrow_path.trim().to_owned();
+        if let Some(missing) = missing_verification_path(&candidate, &escrow) {
             self.verification_ok = false;
             self.verification_status = missing.into();
             self.verification_report = Some(verification_failure_report(missing));
@@ -358,178 +614,184 @@ impl StarConverterApp {
             ));
             return;
         }
-        let source = self.verification_source_path.trim();
-        let source = (!source.is_empty()).then(|| Path::new(source));
-        match verify_bound_export(
-            candidate,
-            escrow,
-            source,
-            CandidateVerificationLimits::default(),
-        ) {
-            Ok(evidence) => {
-                self.verification_ok = true;
-                self.verification_status =
-                    "Candidate and bound escrow passed every read-only check.".into();
-                self.verification_report = Some(verification_evidence_report(&evidence));
-                self.activity.push(format!(
-                    "00:00:00  [VERIFIED] bound {} candidate :: {}",
-                    evidence.target_filesystem,
-                    evidence.candidate_path.display()
-                ));
+        let source = self.verification_source_path.trim().to_owned();
+        self.verification_ok = false;
+        self.verification_report = None;
+        self.verification_status = "Read-only bound export verification is running.".into();
+        self.start_background_job(JobKind::VerifyExport, move || {
+            let source = (!source.is_empty()).then(|| PathBuf::from(source));
+            match verify_bound_export(
+                &candidate,
+                &escrow,
+                source.as_deref(),
+                CandidateVerificationLimits::default(),
+            ) {
+                Ok(evidence) => JobOutcome::Verification(evidence),
+                Err(error) => JobOutcome::Failed {
+                    kind: JobKind::VerifyExport,
+                    message: error.to_string(),
+                },
             }
-            Err(error) => {
-                let message = error.to_string();
-                self.verification_ok = false;
-                self.verification_status = format!("Verification failed: {message}");
-                self.verification_report = Some(verification_failure_report(&message));
-                self.activity.push(format!(
-                    "00:00:00  [BLOCKED] export verification failed :: {message}"
-                ));
-            }
-        }
+        });
     }
+}
 
-    fn build_exact_preview(&mut self, source_path: &str) -> Result<String, String> {
-        let image = ImageFile::open(source_path).map_err(|error| error.to_string())?;
-        let inspection = inspect_open_image(&image).map_err(|error| error.to_string())?;
-        let target = match inspection.profile.filesystem {
-            FileSystem::ExFat => FileSystem::Ntfs,
-            FileSystem::Ntfs => FileSystem::ExFat,
-            FileSystem::Unknown => return Err("recognized image has unknown filesystem".into()),
-        };
-        self.source = inspection.profile.clone();
-        self.target = target;
-        self.real_source = true;
-        self.replan();
-        match (
-            inspection.normalized_exfat.as_deref(),
-            inspection.normalized_ntfs.as_deref(),
-            target,
-        ) {
-            (Some(normalized), None, FileSystem::Ntfs) => {
-                let plan = plan_lossless_exfat_to_ntfs(
-                    normalized,
-                    self.mode,
-                    ExfatToNtfsOptions::default(),
-                    ExfatToNtfsLimits::default(),
-                )
-                .map_err(|error| format!("cross-format plan refused: {error}"))?;
-                let preview =
-                    preview_ntfs_phase_writes(&image, &plan.destination, PreimageLimits::default())
-                        .map_err(|error| format!("phase preview failed: {error}"))?;
-                Ok(exact_preview_report(
-                    &preview,
-                    &plan.destination.reservations,
-                    &plan.destination.source_allocations,
-                    &plan.preservation,
-                ))
-            }
-            (None, Some(normalized), FileSystem::ExFat) => {
-                let plan = plan_lossless_ntfs_to_exfat(
-                    normalized,
-                    self.mode,
-                    NtfsToExfatOptions::default(),
-                    NtfsToExfatLimits::default(),
-                )
-                .map_err(|error| format!("cross-format plan refused: {error}"))?;
-                let preview = preview_exfat_phase_writes(
-                    &image,
-                    &plan.destination,
-                    PreimageLimits::default(),
-                )
-                .map_err(|error| format!("phase preview failed: {error}"))?;
-                Ok(exact_preview_report(
-                    &preview,
-                    &plan.destination.reservations,
-                    &plan.destination.source_allocations,
-                    &plan.preservation,
-                ))
-            }
-            (Some(_), None, _) | (None, Some(_), _) => {
-                Err("preview direction does not match the inspected source".into())
-            }
-            (None, None, _) => Err("complete normalized inventory is required for preview".into()),
-            (Some(_), Some(_), _) => Err(
+const fn opposite_filesystem(filesystem: FileSystem) -> FileSystem {
+    match filesystem {
+        FileSystem::ExFat => FileSystem::Ntfs,
+        FileSystem::Ntfs => FileSystem::ExFat,
+        FileSystem::Unknown => FileSystem::Unknown,
+    }
+}
+
+fn build_exact_preview(
+    source_path: &str,
+    mode: GuaranteeMode,
+) -> Result<PreviewJobSuccess, String> {
+    let image = ImageFile::open(source_path).map_err(|error| error.to_string())?;
+    let inspection = inspect_open_image(&image).map_err(|error| error.to_string())?;
+    let target = opposite_filesystem(inspection.profile.filesystem);
+    if target == FileSystem::Unknown {
+        return Err("recognized image has unknown filesystem".into());
+    }
+    let report = match (
+        inspection.normalized_exfat.as_deref(),
+        inspection.normalized_ntfs.as_deref(),
+        target,
+    ) {
+        (Some(normalized), None, FileSystem::Ntfs) => {
+            let plan = plan_lossless_exfat_to_ntfs(
+                normalized,
+                mode,
+                ExfatToNtfsOptions::default(),
+                ExfatToNtfsLimits::default(),
+            )
+            .map_err(|error| format!("cross-format plan refused: {error}"))?;
+            let preview =
+                preview_ntfs_phase_writes(&image, &plan.destination, PreimageLimits::default())
+                    .map_err(|error| format!("phase preview failed: {error}"))?;
+            exact_preview_report(
+                &preview,
+                &plan.destination.reservations,
+                &plan.destination.source_allocations,
+                &plan.preservation,
+            )
+        }
+        (None, Some(normalized), FileSystem::ExFat) => {
+            let plan = plan_lossless_ntfs_to_exfat(
+                normalized,
+                mode,
+                NtfsToExfatOptions::default(),
+                NtfsToExfatLimits::default(),
+            )
+            .map_err(|error| format!("cross-format plan refused: {error}"))?;
+            let preview =
+                preview_exfat_phase_writes(&image, &plan.destination, PreimageLimits::default())
+                    .map_err(|error| format!("phase preview failed: {error}"))?;
+            exact_preview_report(
+                &preview,
+                &plan.destination.reservations,
+                &plan.destination.source_allocations,
+                &plan.preservation,
+            )
+        }
+        (Some(_), None, _) | (None, Some(_), _) => {
+            return Err("preview direction does not match the inspected source".into());
+        }
+        (None, None, _) => {
+            return Err("complete normalized inventory is required for preview".into());
+        }
+        (Some(_), Some(_), _) => {
+            return Err(
                 "inspection unexpectedly contains normalized evidence for two filesystems".into(),
-            ),
+            );
         }
-    }
+    };
+    Ok(PreviewJobSuccess {
+        profile: inspection.profile,
+        target,
+        report,
+    })
+}
 
-    fn build_candidate_export(
-        &mut self,
-        source_path: &str,
-        output_path: &Path,
-    ) -> Result<CandidateExportEvidence, String> {
-        let image = ImageFile::open(source_path).map_err(|error| error.to_string())?;
-        let inspection = inspect_open_image(&image).map_err(|error| error.to_string())?;
-        let target = match inspection.profile.filesystem {
-            FileSystem::ExFat => FileSystem::Ntfs,
-            FileSystem::Ntfs => FileSystem::ExFat,
-            FileSystem::Unknown => return Err("recognized image has unknown filesystem".into()),
-        };
-        self.source = inspection.profile.clone();
-        self.target = target;
-        self.real_source = true;
-        self.replan();
-        match (
-            inspection.normalized_exfat.as_deref(),
-            inspection.normalized_ntfs.as_deref(),
-            target,
-        ) {
-            (Some(normalized), None, FileSystem::Ntfs) => {
-                let plan = plan_lossless_exfat_to_ntfs(
-                    normalized,
-                    self.mode,
-                    ExfatToNtfsOptions::default(),
-                    ExfatToNtfsLimits::default(),
-                )
-                .map_err(|error| format!("cross-format plan refused: {error}"))?;
-                let preview =
-                    preview_ntfs_phase_writes(&image, &plan.destination, PreimageLimits::default())
-                        .map_err(|error| format!("phase preview failed: {error}"))?;
-                export_gui_candidate(
-                    &image,
-                    output_path,
-                    &preview,
-                    &plan.target_graph,
-                    &plan.preservation,
-                )
-            }
-            (None, Some(normalized), FileSystem::ExFat) => {
-                let plan = plan_lossless_ntfs_to_exfat(
-                    normalized,
-                    self.mode,
-                    NtfsToExfatOptions::default(),
-                    NtfsToExfatLimits::default(),
-                )
-                .map_err(|error| format!("cross-format plan refused: {error}"))?;
-                let preview = preview_exfat_phase_writes(
-                    &image,
-                    &plan.destination,
-                    PreimageLimits::default(),
-                )
-                .map_err(|error| format!("phase preview failed: {error}"))?;
-                export_gui_candidate(
-                    &image,
-                    output_path,
-                    &preview,
-                    &plan.target_graph,
-                    &plan.preservation,
-                )
-            }
-            (Some(_), None, _) | (None, Some(_), _) => {
-                Err("conversion direction does not match the inspected source".into())
-            }
-            (None, None, _) => {
-                Err("complete normalized inventory is required for conversion".into())
-            }
-            (Some(_), Some(_), _) => Err("inspection contains evidence for two filesystems".into()),
-        }
+fn build_candidate_export(
+    source_path: &str,
+    output_path: &Path,
+    mode: GuaranteeMode,
+) -> Result<ExportJobSuccess, String> {
+    let image = ImageFile::open(source_path).map_err(|error| error.to_string())?;
+    let inspection = inspect_open_image(&image).map_err(|error| error.to_string())?;
+    let target = opposite_filesystem(inspection.profile.filesystem);
+    if target == FileSystem::Unknown {
+        return Err("recognized image has unknown filesystem".into());
     }
+    let evidence = match (
+        inspection.normalized_exfat.as_deref(),
+        inspection.normalized_ntfs.as_deref(),
+        target,
+    ) {
+        (Some(normalized), None, FileSystem::Ntfs) => {
+            let plan = plan_lossless_exfat_to_ntfs(
+                normalized,
+                mode,
+                ExfatToNtfsOptions::default(),
+                ExfatToNtfsLimits::default(),
+            )
+            .map_err(|error| format!("cross-format plan refused: {error}"))?;
+            let preview =
+                preview_ntfs_phase_writes(&image, &plan.destination, PreimageLimits::default())
+                    .map_err(|error| format!("phase preview failed: {error}"))?;
+            export_gui_candidate(
+                &image,
+                output_path,
+                &preview,
+                &plan.target_graph,
+                &plan.preservation,
+            )?
+        }
+        (None, Some(normalized), FileSystem::ExFat) => {
+            let plan = plan_lossless_ntfs_to_exfat(
+                normalized,
+                mode,
+                NtfsToExfatOptions::default(),
+                NtfsToExfatLimits::default(),
+            )
+            .map_err(|error| format!("cross-format plan refused: {error}"))?;
+            let preview =
+                preview_exfat_phase_writes(&image, &plan.destination, PreimageLimits::default())
+                    .map_err(|error| format!("phase preview failed: {error}"))?;
+            export_gui_candidate(
+                &image,
+                output_path,
+                &preview,
+                &plan.target_graph,
+                &plan.preservation,
+            )?
+        }
+        (Some(_), None, _) | (None, Some(_), _) => {
+            return Err("conversion direction does not match the inspected source".into());
+        }
+        (None, None, _) => {
+            return Err("complete normalized inventory is required for conversion".into());
+        }
+        (Some(_), Some(_), _) => {
+            return Err("inspection contains evidence for two filesystems".into());
+        }
+    };
+    Ok(ExportJobSuccess {
+        profile: inspection.profile,
+        target,
+        source_path: source_path.to_owned(),
+        evidence,
+    })
 }
 
 impl eframe::App for StarConverterApp {
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.poll_background_jobs();
+        if self.jobs.is_busy() {
+            root.ctx().request_repaint_after(Duration::from_millis(75));
+        }
         Self::show_header(root);
         self.show_footer(root);
         self.show_source_rail(root);
@@ -596,7 +858,8 @@ impl StarConverterApp {
                             .on_disabled_hover_text(
                                 "In-place and physical conversion remain locked behind activation gates.",
                             );
-                        let export_enabled = self.mode != GuaranteeMode::ContentOnly;
+                        let idle = !self.jobs.is_busy();
+                        let export_enabled = idle && self.mode != GuaranteeMode::ContentOnly;
                         if ui
                             .add_enabled(export_enabled, Button::new("Export new image"))
                             .on_disabled_hover_text(
@@ -606,10 +869,16 @@ impl StarConverterApp {
                         {
                             self.export_new_image();
                         }
-                        if ui.button("Preview exact").clicked() {
+                        if ui
+                            .add_enabled(idle, Button::new("Preview exact"))
+                            .clicked()
+                        {
                             self.preview_image();
                         }
-                        if ui.button("Analyze source").clicked() {
+                        if ui
+                            .add_enabled(idle, Button::new("Analyze source"))
+                            .clicked()
+                        {
                             if self.image_path.trim().is_empty() {
                                 self.activity
                                     .push("00:00:00  [READY] synthetic plan refreshed".into());
@@ -620,6 +889,25 @@ impl StarConverterApp {
                         }
                         if ui.button("Save plan").clicked() {
                             self.save_plan();
+                        }
+                        if ui
+                            .add_enabled(
+                                !idle,
+                                Button::new("Detach background job").fill(DANGER),
+                            )
+                            .on_hover_text(
+                                "Ignore this result. An export already in progress may continue to safe completion.",
+                            )
+                            .clicked()
+                        {
+                            self.cancel_background_job();
+                        }
+                        if let Some(job) = self.jobs.active() {
+                            ui.label(
+                                RichText::new(format!("[WORKING] {}", job.kind.label()))
+                                    .monospace()
+                                    .color(WORKING),
+                            );
                         }
                     });
                 });
@@ -641,91 +929,110 @@ impl StarConverterApp {
                     Label::new(RichText::new(ASCII_MARK).monospace().size(13.0).color(INK))
                         .selectable(false),
                 );
-                ui.add_space(22.0);
-                section_label(ui, "SOURCE");
-                ui.add_space(8.0);
+                self.show_source_selector(ui);
+                self.show_source_identity(ui);
+            });
+    }
 
-                if source_button(
+    fn show_source_selector(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(22.0);
+        section_label(ui, "SOURCE");
+        ui.add_space(8.0);
+        let idle = !self.jobs.is_busy();
+        if ui
+            .add_enabled_ui(idle, |ui| {
+                source_button(
                     ui,
                     !self.real_source && self.source.filesystem == FileSystem::ExFat,
                     "DEMO_ARCHIVE",
                     "exFAT  /  64.00 GiB",
                 )
-                .clicked()
-                {
-                    self.select_exfat_demo();
-                }
-
-                ui.add_space(6.0);
-                if source_button(
+            })
+            .inner
+            .clicked()
+        {
+            self.select_exfat_demo();
+        }
+        ui.add_space(6.0);
+        if ui
+            .add_enabled_ui(idle, |ui| {
+                source_button(
                     ui,
                     !self.real_source && self.source.filesystem == FileSystem::Ntfs,
                     "DEMO_WORKSPACE",
                     "NTFS   /  64.00 GiB",
                 )
+            })
+            .inner
+            .clicked()
+        {
+            self.select_ntfs_demo();
+        }
+        ui.add_space(12.0);
+        ui.add_enabled_ui(idle, |ui| self.show_image_path_picker(ui));
+        if ui
+            .add_enabled_ui(idle, |ui| {
+                ui.add_sized(
+                    [ui.available_width(), 44.0],
+                    Button::new(RichText::new("+ ANALYZE IMAGE").monospace()),
+                )
+            })
+            .inner
+            .clicked()
+        {
+            self.analyze_image();
+        }
+        ui.label(
+            RichText::new(&self.inspection_status)
+                .monospace()
+                .size(10.0)
+                .color(if self.real_source { READY } else { MUTED }),
+        );
+    }
+
+    fn show_image_path_picker(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let browse_width = 78.0;
+            let path_width = (ui.available_width() - browse_width - 8.0).max(80.0);
+            ui.add_sized(
+                [path_width, 44.0],
+                egui::TextEdit::singleline(&mut self.image_path).hint_text("C:\\path\\volume.img"),
+            )
+            .on_hover_text("Regular image file only. Raw-device namespaces are rejected.");
+            if ui
+                .add_sized([browse_width, 44.0], Button::new("Browse"))
                 .clicked()
-                {
-                    self.select_ntfs_demo();
-                }
+            {
+                self.choose_image();
+            }
+        });
+    }
 
-                ui.add_space(12.0);
-                ui.horizontal(|ui| {
-                    let browse_width = 78.0;
-                    let path_width = (ui.available_width() - browse_width - 8.0).max(80.0);
-                    ui.add_sized(
-                        [path_width, 44.0],
-                        egui::TextEdit::singleline(&mut self.image_path)
-                            .hint_text("C:\\path\\volume.img"),
-                    )
-                    .on_hover_text("Regular image file only. Raw-device namespaces are rejected.");
-                    if ui
-                        .add_sized([browse_width, 44.0], Button::new("Browse"))
-                        .clicked()
-                    {
-                        self.choose_image();
-                    }
-                });
-                if ui
-                    .add_sized(
-                        [ui.available_width(), 44.0],
-                        Button::new(RichText::new("+ ANALYZE IMAGE").monospace()),
-                    )
-                    .clicked()
-                {
-                    self.analyze_image();
-                }
-                ui.label(
-                    RichText::new(&self.inspection_status)
-                        .monospace()
-                        .size(10.0)
-                        .color(if self.real_source { READY } else { MUTED }),
-                );
-
-                ui.add_space(28.0);
-                section_label(ui, "SOURCE IDENTITY");
-                ui.add_space(8.0);
-                metadata_row(ui, "LABEL", &self.source.display_name);
-                metadata_row(ui, "FORMAT", &self.source.filesystem.to_string());
-                metadata_row(
-                    ui,
-                    "SECTOR",
-                    &format!("{} B", self.source.logical_sector_bytes),
-                );
-                metadata_row(
-                    ui,
-                    "CLUSTER",
-                    &format!("{} KiB", self.source.cluster_bytes / 1024),
-                );
-                metadata_row(
-                    ui,
-                    "HEALTH",
-                    match self.source.state.health {
-                        HealthState::Clean => "CLEAN",
-                        HealthState::Dirty => "DIRTY",
-                        HealthState::Unknown => "UNKNOWN",
-                    },
-                );
-            });
+    fn show_source_identity(&self, ui: &mut egui::Ui) {
+        ui.add_space(28.0);
+        section_label(ui, "SOURCE IDENTITY");
+        ui.add_space(8.0);
+        metadata_row(ui, "LABEL", &self.source.display_name);
+        metadata_row(ui, "FORMAT", &self.source.filesystem.to_string());
+        metadata_row(
+            ui,
+            "SECTOR",
+            &format!("{} B", self.source.logical_sector_bytes),
+        );
+        metadata_row(
+            ui,
+            "CLUSTER",
+            &format!("{} KiB", self.source.cluster_bytes / 1024),
+        );
+        metadata_row(
+            ui,
+            "HEALTH",
+            match self.source.state.health {
+                HealthState::Clean => "CLEAN",
+                HealthState::Dirty => "DIRTY",
+                HealthState::Unknown => "UNKNOWN",
+            },
+        );
     }
 
     fn show_activity_rail(&self, root: &mut egui::Ui) {
@@ -798,28 +1105,30 @@ impl StarConverterApp {
         ui.add_space(24.0);
         section_label(ui, "GUARANTEE MODE");
         ui.add_space(8.0);
-        ui.columns(3, |columns| {
-            mode_card(
-                &mut columns[0],
-                &mut self.mode,
-                GuaranteeMode::Strict,
-                "STRICT",
-                "Refuse anything that cannot round-trip natively.",
-            );
-            mode_card(
-                &mut columns[1],
-                &mut self.mode,
-                GuaranteeMode::Escrow,
-                "ESCROW",
-                "Keep source-only semantics in a durable capsule.",
-            );
-            mode_card(
-                &mut columns[2],
-                &mut self.mode,
-                GuaranteeMode::ContentOnly,
-                "CONTENT ONLY",
-                "Preserve bytes; report metadata downgrades.",
-            );
+        ui.add_enabled_ui(!self.jobs.is_busy(), |ui| {
+            ui.columns(3, |columns| {
+                mode_card(
+                    &mut columns[0],
+                    &mut self.mode,
+                    GuaranteeMode::Strict,
+                    "STRICT",
+                    "Refuse anything that cannot round-trip natively.",
+                );
+                mode_card(
+                    &mut columns[1],
+                    &mut self.mode,
+                    GuaranteeMode::Escrow,
+                    "ESCROW",
+                    "Keep source-only semantics in a durable capsule.",
+                );
+                mode_card(
+                    &mut columns[2],
+                    &mut self.mode,
+                    GuaranteeMode::ContentOnly,
+                    "CONTENT ONLY",
+                    "Preserve bytes; report metadata downgrades.",
+                );
+            });
         });
         if self.mode != self.plan.mode {
             self.replan();
@@ -959,7 +1268,9 @@ impl StarConverterApp {
             .stroke(Stroke::new(1.0, LINE))
             .inner_margin(Margin::same(14))
             .show(ui, |ui| {
-                self.show_verification_inputs(ui);
+                ui.add_enabled_ui(!self.jobs.is_busy(), |ui| {
+                    self.show_verification_inputs(ui);
+                });
                 self.show_verification_result(ui);
             });
         ui.add_space(24.0);
@@ -1611,5 +1922,68 @@ mod tests {
         assert!(INTERRUPTED_EXPORT_GUIDANCE.contains(".starconverter-partial-*"));
         assert!(INTERRUPTED_EXPORT_GUIDANCE.contains("original source was opened read-only"));
         assert!(verification_failure_report("hash mismatch").contains("[DO NOT USE]"));
+    }
+
+    #[test]
+    fn background_queue_applies_only_the_current_generation() {
+        let mut jobs = BackgroundJobs::new();
+        jobs.active = Some(ActiveJob {
+            id: 2,
+            kind: JobKind::Preview,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        });
+        jobs.sender
+            .send(JobMessage {
+                id: 1,
+                outcome: JobOutcome::Failed {
+                    kind: JobKind::Inspect,
+                    message: "stale".into(),
+                },
+            })
+            .unwrap();
+        jobs.sender
+            .send(JobMessage {
+                id: 2,
+                outcome: JobOutcome::Failed {
+                    kind: JobKind::Preview,
+                    message: "current".into(),
+                },
+            })
+            .unwrap();
+
+        let Some(JobOutcome::Failed { kind, message }) = jobs.take_ready() else {
+            panic!("current result should be delivered");
+        };
+        assert_eq!(kind, JobKind::Preview);
+        assert_eq!(message, "current");
+        assert!(!jobs.is_busy());
+    }
+
+    #[test]
+    fn detached_job_result_is_deterministically_ignored() {
+        let mut jobs = BackgroundJobs::new();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        jobs.active = Some(ActiveJob {
+            id: 7,
+            kind: JobKind::Export,
+            cancelled: Arc::clone(&cancelled),
+        });
+        assert_eq!(jobs.cancel(), Some(JobKind::Export));
+        assert!(cancelled.load(Ordering::Acquire));
+        jobs.sender
+            .send(JobMessage {
+                id: 7,
+                outcome: JobOutcome::Failed {
+                    kind: JobKind::Export,
+                    message: "must not surface".into(),
+                },
+            })
+            .unwrap();
+
+        assert!(jobs.take_ready().is_none());
+        assert_eq!(
+            job_result_disposition(None, 7),
+            JobResultDisposition::IgnoreStale
+        );
     }
 }

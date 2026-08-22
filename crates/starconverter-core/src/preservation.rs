@@ -1188,7 +1188,7 @@ pub fn decode_escrow(
                 offset: HEADER_BYTES + cursor,
                 reason: "truncated record value",
             })?;
-        validate_snapshot_version(value, source, HEADER_BYTES + cursor)?;
+        validate_snapshot(value, source, HEADER_BYTES + cursor)?;
         let mut owned = Vec::new();
         owned
             .try_reserve_exact(value.len())
@@ -1245,7 +1245,7 @@ fn escrow_checksum(header_prefix: &[u8], body: &[u8]) -> u32 {
     hasher.finalize()
 }
 
-fn validate_snapshot_version(
+fn validate_snapshot(
     bytes: &[u8],
     source: FileSystem,
     offset: usize,
@@ -1255,15 +1255,422 @@ fn validate_snapshot_version(
         reason: "truncated sidecar snapshot version",
     })?;
     let version = u16::from_le_bytes([version[0], version[1]]);
-    let supported = match source {
-        FileSystem::ExFat => version == 2,
-        // Version 4 adds the bounded attribute census. Version 3 remains readable as historical
-        // preservation evidence, but cannot supply the census required by activation policy.
-        FileSystem::Ntfs => matches!(version, 3 | 4),
-        FileSystem::Unknown => return malformed(offset, "unknown snapshot filesystem"),
-    };
-    if !supported {
-        return malformed(offset, "unsupported sidecar snapshot version");
+    match source {
+        FileSystem::ExFat if version == 2 => validate_exfat_snapshot(bytes, offset),
+        FileSystem::Ntfs if version == 4 => validate_ntfs_snapshot(bytes, offset, true),
+        // Historical development snapshots used version 3 both immediately before and during the
+        // attribute-census transition. Both layouts are fully walked; neither can authorize the
+        // current census-dependent preservation policy.
+        FileSystem::Ntfs if version == 3 => validate_ntfs_snapshot(bytes, offset, false)
+            .or_else(|_| validate_ntfs_snapshot(bytes, offset, true)),
+        FileSystem::Unknown => malformed(offset, "unknown snapshot filesystem"),
+        _ => malformed(offset, "unsupported sidecar snapshot version"),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SnapshotCursor<'a> {
+    bytes: &'a [u8],
+    cursor: usize,
+    base: usize,
+}
+
+impl<'a> SnapshotCursor<'a> {
+    const fn new(bytes: &'a [u8], base: usize) -> Self {
+        Self {
+            bytes,
+            cursor: 0,
+            base,
+        }
+    }
+
+    const fn finish(self) -> Result<(), PreservationError> {
+        if self.cursor == self.bytes.len() {
+            Ok(())
+        } else {
+            malformed(self.base + self.cursor, "unclaimed snapshot bytes")
+        }
+    }
+
+    fn take(&mut self, length: usize) -> Result<&'a [u8], PreservationError> {
+        let end = self
+            .cursor
+            .checked_add(length)
+            .ok_or(PreservationError::ArithmeticOverflow)?;
+        let value = self
+            .bytes
+            .get(self.cursor..end)
+            .ok_or(PreservationError::MalformedEscrow {
+                offset: self.base + self.cursor,
+                reason: "truncated sidecar snapshot",
+            })?;
+        self.cursor = end;
+        Ok(value)
+    }
+
+    fn u8(&mut self) -> Result<u8, PreservationError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u16(&mut self) -> Result<u16, PreservationError> {
+        let value = self.take(2)?;
+        Ok(u16::from_le_bytes([value[0], value[1]]))
+    }
+
+    fn u32(&mut self) -> Result<u32, PreservationError> {
+        let value = self.take(4)?;
+        Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
+    }
+
+    fn u64(&mut self) -> Result<u64, PreservationError> {
+        let value = self.take(8)?;
+        Ok(u64::from_le_bytes([
+            value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
+        ]))
+    }
+
+    fn usize(&mut self) -> Result<usize, PreservationError> {
+        usize::try_from(self.u64()?).map_err(|_| PreservationError::ArithmeticOverflow)
+    }
+
+    fn boolean(&mut self) -> Result<bool, PreservationError> {
+        let offset = self.base + self.cursor;
+        match self.u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => malformed(offset, "invalid sidecar boolean"),
+        }
+    }
+
+    fn optional_u32(&mut self) -> Result<(), PreservationError> {
+        if self.boolean()? {
+            self.u32()?;
+        }
+        Ok(())
+    }
+
+    fn optional_u64(&mut self) -> Result<(), PreservationError> {
+        if self.boolean()? {
+            self.u64()?;
+        }
+        Ok(())
+    }
+
+    fn count(&mut self, minimum_item_bytes: usize) -> Result<usize, PreservationError> {
+        let count_offset = self.base + self.cursor;
+        let count = self.usize()?;
+        let remaining = self.bytes.len() - self.cursor;
+        if minimum_item_bytes != 0 && count > remaining / minimum_item_bytes {
+            return malformed(count_offset, "snapshot count exceeds remaining bytes");
+        }
+        Ok(count)
+    }
+
+    fn utf16(&mut self) -> Result<bool, PreservationError> {
+        let count = self.count(2)?;
+        let byte_length = count
+            .checked_mul(2)
+            .ok_or(PreservationError::ArithmeticOverflow)?;
+        let bytes = self.take(byte_length)?;
+        let units = bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]));
+        let well_formed = char::decode_utf16(units).all(|unit| unit.is_ok());
+        Ok(well_formed)
+    }
+
+    fn bytes(&mut self) -> Result<(), PreservationError> {
+        let length = self.count(1)?;
+        self.take(length)?;
+        Ok(())
+    }
+}
+
+fn validate_exfat_snapshot(bytes: &[u8], base: usize) -> Result<(), PreservationError> {
+    let mut reader = SnapshotCursor::new(bytes, base);
+    if reader.u16()? != 2 {
+        return malformed(base, "unsupported exFAT sidecar snapshot version");
+    }
+    reader.u32()?;
+    let label_offset = reader.base + reader.cursor;
+    match reader.u8()? {
+        0 | 2 => {}
+        1 => {
+            let length_offset = reader.base + reader.cursor;
+            let length = usize::from(reader.u8()?);
+            if length > 11 {
+                return malformed(
+                    length_offset,
+                    "exFAT snapshot label exceeds 11 UTF-16 units",
+                );
+            }
+            let encoded = reader.take(
+                length
+                    .checked_mul(2)
+                    .ok_or(PreservationError::ArithmeticOverflow)?,
+            )?;
+            let units = encoded
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]));
+            if char::decode_utf16(units).any(|unit| unit.is_err()) {
+                return malformed(
+                    length_offset,
+                    "exFAT snapshot label contains invalid UTF-16",
+                );
+            }
+        }
+        _ => return malformed(label_offset, "invalid exFAT snapshot label tag"),
+    }
+    for _ in 0..5 {
+        reader.usize()?;
+    }
+    reader.boolean()?;
+    for _ in 0..4 {
+        reader.u8()?;
+    }
+    reader.u32()?;
+    reader.u64()?;
+    reader.u32()?;
+    reader.u32()?;
+    reader.u64()?;
+    let mappings = reader.count(2)?;
+    reader.take(
+        mappings
+            .checked_mul(2)
+            .ok_or(PreservationError::ArithmeticOverflow)?,
+    )?;
+    for _ in 0..4 {
+        reader.u64()?;
+    }
+    for _ in 0..3 {
+        validate_u32_vector(&mut reader)?;
+    }
+    let objects = reader.count(1)?;
+    for _ in 0..objects {
+        reader.u64()?;
+        reader.u64()?;
+        let components = reader.count(8)?;
+        for _ in 0..components {
+            let component_offset = reader.base + reader.cursor;
+            if !reader.utf16()? {
+                return malformed(
+                    component_offset,
+                    "exFAT snapshot path contains invalid UTF-16",
+                );
+            }
+        }
+        reader.u16()?;
+        if reader.boolean()? {
+            for _ in 0..3 {
+                reader.u32()?;
+            }
+            for _ in 0..5 {
+                reader.u8()?;
+            }
+        }
+        validate_u32_vector(&mut reader)?;
+        reader.boolean()?;
+        reader.boolean()?;
+        reader.u8()?;
+    }
+    let extents = reader.count(26)?;
+    for _ in 0..extents {
+        validate_extent(&mut reader, true)?;
+    }
+    for _ in 0..4 {
+        reader.u64()?;
+    }
+    reader.boolean()?;
+    reader.u64()?;
+    reader.finish()
+}
+
+fn validate_u32_vector(reader: &mut SnapshotCursor<'_>) -> Result<(), PreservationError> {
+    let count = reader.count(4)?;
+    reader.take(
+        count
+            .checked_mul(4)
+            .ok_or(PreservationError::ArithmeticOverflow)?,
+    )?;
+    Ok(())
+}
+
+fn validate_ntfs_snapshot(
+    bytes: &[u8],
+    base: usize,
+    has_attribute_census: bool,
+) -> Result<(), PreservationError> {
+    let mut reader = SnapshotCursor::new(bytes, base);
+    let version = reader.u16()?;
+    if !matches!(version, 3 | 4) {
+        return malformed(base, "unsupported NTFS sidecar snapshot version");
+    }
+    reader.u64()?;
+    if reader.boolean()? {
+        let length_offset = reader.base + reader.cursor;
+        let length = usize::from(reader.u8()?);
+        if length > 32 {
+            return malformed(length_offset, "NTFS snapshot label exceeds 32 UTF-16 units");
+        }
+        let encoded = reader.take(
+            length
+                .checked_mul(2)
+                .ok_or(PreservationError::ArithmeticOverflow)?,
+        )?;
+        let units = encoded
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]));
+        if char::decode_utf16(units).any(|unit| unit.is_err()) {
+            return malformed(length_offset, "NTFS snapshot label contains invalid UTF-16");
+        }
+    }
+    let security_offset = reader.base + reader.cursor;
+    match reader.u8()? {
+        0 => {}
+        1 => reader.bytes()?,
+        _ => return malformed(security_offset, "invalid NTFS security snapshot tag"),
+    }
+    validate_reference(&mut reader)?;
+    let objects = reader.count(1)?;
+    for _ in 0..objects {
+        reader.u64()?;
+        validate_ntfs_object(&mut reader, has_attribute_census)?;
+    }
+    let extents = reader.count(25)?;
+    for _ in 0..extents {
+        validate_extent(&mut reader, false)?;
+    }
+    for _ in 0..5 {
+        reader.u64()?;
+    }
+    reader.finish()
+}
+
+fn validate_reference(reader: &mut SnapshotCursor<'_>) -> Result<(), PreservationError> {
+    reader.u64()?;
+    reader.u16()?;
+    Ok(())
+}
+
+fn validate_ntfs_object(
+    reader: &mut SnapshotCursor<'_>,
+    has_attribute_census: bool,
+) -> Result<(), PreservationError> {
+    validate_reference(reader)?;
+    reader.u16()?;
+    reader.boolean()?;
+    reader.boolean()?;
+    if reader.boolean()? {
+        for _ in 0..4 {
+            reader.u64()?;
+        }
+        reader.u32()?;
+        reader.optional_u32()?;
+        reader.optional_u32()?;
+        reader.optional_u64()?;
+        reader.optional_u64()?;
+    }
+    let names = reader.count(1)?;
+    for _ in 0..names {
+        validate_ntfs_file_name(reader)?;
+    }
+    let streams = reader.count(1)?;
+    for _ in 0..streams {
+        reader.u16()?;
+        if reader.boolean()? {
+            validate_ntfs_name(reader)?;
+        }
+        reader.boolean()?;
+        reader.boolean()?;
+        reader.boolean()?;
+        let storage_offset = reader.base + reader.cursor;
+        match reader.u8()? {
+            1 => reader.bytes()?,
+            2 => {
+                reader.u64()?;
+                reader.u64()?;
+                reader.u64()?;
+                reader.optional_u64()?;
+                reader.boolean()?;
+                let extents = reader.count(25)?;
+                for _ in 0..extents {
+                    validate_extent(reader, false)?;
+                }
+            }
+            _ => return malformed(storage_offset, "invalid NTFS stream-storage tag"),
+        }
+    }
+    if has_attribute_census {
+        let attributes = reader.count(1)?;
+        for _ in 0..attributes {
+            reader.u32()?;
+            if reader.boolean()? {
+                validate_ntfs_name(reader)?;
+            }
+            reader.u16()?;
+            reader.u16()?;
+            reader.u16()?;
+            reader.boolean()?;
+        }
+    }
+    let entries = reader.count(1)?;
+    for _ in 0..entries {
+        validate_reference(reader)?;
+        validate_ntfs_file_name(reader)?;
+    }
+    reader.boolean()?;
+    reader.boolean()?;
+    reader.boolean()?;
+    Ok(())
+}
+
+fn validate_ntfs_name(reader: &mut SnapshotCursor<'_>) -> Result<(), PreservationError> {
+    let name_offset = reader.base + reader.cursor;
+    let actual = reader.utf16()?;
+    let declared = reader.boolean()?;
+    if actual != declared {
+        return malformed(
+            name_offset,
+            "NTFS UTF-16 validity evidence disagrees with the name",
+        );
+    }
+    Ok(())
+}
+
+fn validate_ntfs_file_name(reader: &mut SnapshotCursor<'_>) -> Result<(), PreservationError> {
+    validate_reference(reader)?;
+    let namespace_offset = reader.base + reader.cursor;
+    if !matches!(reader.u8()?, 1..=4) {
+        return malformed(namespace_offset, "invalid NTFS filename namespace tag");
+    }
+    validate_ntfs_name(reader)?;
+    reader.u64()?;
+    reader.u64()?;
+    reader.u32()?;
+    reader.u32()?;
+    Ok(())
+}
+
+fn validate_extent(
+    reader: &mut SnapshotCursor<'_>,
+    includes_kind: bool,
+) -> Result<(), PreservationError> {
+    reader.u64()?;
+    reader.u64()?;
+    reader.u64()?;
+    let placement_offset = reader.base + reader.cursor;
+    match reader.u8()? {
+        1 => {
+            reader.u64()?;
+        }
+        2 => {}
+        _ => return malformed(placement_offset, "invalid snapshot extent-placement tag"),
+    }
+    if includes_kind {
+        let kind_offset = reader.base + reader.cursor;
+        if !matches!(reader.u8()?, 1..=5) {
+            return malformed(kind_offset, "invalid snapshot extent-kind tag");
+        }
     }
     Ok(())
 }
@@ -2766,6 +3173,39 @@ mod tests {
         assert!(matches!(
             decode_escrow(&trailing, PreservationLimits::default()),
             Err(PreservationError::MalformedEscrow { .. })
+        ));
+    }
+
+    #[test]
+    fn decoder_walks_every_nested_snapshot_field_after_checksum_validation() {
+        let report = evaluate_exfat(
+            &exfat(),
+            FileSystem::Ntfs,
+            GuaranteeMode::Escrow,
+            PreservationLimits::default(),
+        )
+        .expect("policy");
+        let encoded = report.escrow.expect("escrow");
+        let snapshot = HEADER_BYTES + RECORD_HEADER_BYTES;
+
+        // This root-directory boolean lies beyond the identity fields decoded by older readers.
+        let mut invalid_boolean = encoded.clone();
+        invalid_boolean[snapshot + 47] = 2;
+        let checksum = escrow_checksum(&invalid_boolean[..24], &invalid_boolean[HEADER_BYTES..]);
+        invalid_boolean[24..28].copy_from_slice(&checksum.to_le_bytes());
+        assert!(matches!(
+            decode_escrow(&invalid_boolean, PreservationLimits::default()),
+            Err(PreservationError::MalformedEscrow { .. })
+        ));
+
+        // The nested Up-case mapping count must be rejected before an attacker-controlled loop.
+        let mut impossible_count = encoded;
+        impossible_count[snapshot + 80..snapshot + 88].copy_from_slice(&u64::MAX.to_le_bytes());
+        let checksum = escrow_checksum(&impossible_count[..24], &impossible_count[HEADER_BYTES..]);
+        impossible_count[24..28].copy_from_slice(&checksum.to_le_bytes());
+        assert!(matches!(
+            decode_escrow(&impossible_count, PreservationLimits::default()),
+            Err(PreservationError::MalformedEscrow { .. } | PreservationError::ArithmeticOverflow)
         ));
     }
 
