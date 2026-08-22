@@ -129,6 +129,7 @@ cargo run -p starconverter-cli -- demo
 cargo run -p starconverter-cli -- inspect "C:\path\to\volume.img"
 cargo run -p starconverter-cli -- preview "C:\path\to\volume.img" --mode escrow
 cargo run -p starconverter-cli -- convert-image "C:\path\source.img" "C:\path\new-target.img" --mode escrow
+cargo run -p starconverter-cli -- verify-export "C:\path\new-target.img" "C:\path\new-target.img.starconverter-escrow" --source "C:\path\source.img"
 cargo run -p starconverter-gui
 ```
 
@@ -147,13 +148,19 @@ their exact rollback before-images into memory. It prints every remaining activa
 result type cannot be submitted to the executor as activation authority.
 
 `convert-image` is the safe first conversion surface. It opens the source read-only, refuses any
-existing output or device-like path, copies the complete source into a newly created regular file,
+existing output or device-like path, copies the complete source into a uniquely named partial file,
 applies the active candidate only to that copy, reinspects and normalizes it, and requires its
 namespace/content manifest to match the plan. Escrow mode creates
 `<new-target>.starconverter-escrow` unless `--escrow` selects another new path. A failure removes
-only files created by that attempt. Inspection, planning, preimage capture, copying, and final
-source hashing share one pinned read-only file identity. The command hashes the source again before
-success and never uses the in-place activation-authority type.
+only files created by that attempt during a normal unwind. The final candidate name is published
+only after verification; escrow is bound to the exact source, candidate, manifest, and direction.
+Inspection, planning, preimage capture, copying, and final source hashing share one pinned read-only
+file identity. The command hashes the source again before success and never uses the in-place
+activation-authority type. See [`docs/RECOVERY.md`](docs/RECOVERY.md) for interrupted-export and
+sidecar verification guidance. Current atomic no-clobber publication requires the candidate and
+escrow destination directories to support hard links; exFAT/FAT destination directories and other
+filesystems without hard-link support are refused. Parent-directory crash durability remains a
+tracked portability gate.
 
 The Go toolchain is only required for `lab/`:
 
@@ -206,10 +213,14 @@ installed. CI always tests both language stacks.
 - [x] Fail-closed 24-field cross-format preservation policy with bounded versioned escrow
 - [x] Policy-bound exFAT→NTFS and NTFS→exFAT structural adapters with exact timestamp/identity evidence
 - [x] Pinned `$Secure` ordinary-object security-ID assignment in NTFS `$STANDARD_INFORMATION`
-- [x] Reproducible root/rich external fixtures, read-only exfatprogs/NTFS-3G checks, and exFAT/NTFS FUSE payload mounts
+- [x] Reproducible root/rich/edge external fixtures, read-only exfatprogs/NTFS-3G checks, and exFAT/NTFS FUSE payload mounts
 - [x] Native desktop exact-candidate preview with in-memory rollback capture and no executor authority
 - [x] Create-new exFAT→NTFS and NTFS→exFAT export with reinspection, manifest equality, source re-hash, and escrow sidecar
 - [x] Independently mount both exported rich cross-format candidates read-only and verify exact payload hashes
+- [x] Read-only candidate/source/sidecar verifier and candidate-bound escrow envelope
+- [x] Uniquely named partial construction and atomic no-clobber publication on hard-link-capable filesystems
+- [x] Deterministic converted fixed-VHD fixtures and fail-closed Windows validation harness
+- [x] Four-target deterministic portable packaging with SBOM and provenance attestations
 - [ ] Close serializer activation gaps and qualify the cross-filesystem metadata profiles
 - [ ] In-place image conversion with durable recovery/finalize workflow
 - [ ] Windows `chkdsk`/mount validation of generated and recovered images
@@ -220,10 +231,11 @@ before any readiness claim is tracked in [`docs/COMPLETION_MATRIX.md`](docs/COMP
 Independent regular-image validator evidence is logged in
 [`docs/EXTERNAL_VALIDATION.md`](docs/EXTERNAL_VALIDATION.md).
 
-Tagged releases are packaged by GitHub Actions as portable CLI + desktop bundles for Windows,
-Linux, and macOS. Each archive is accompanied by a SHA-256 checksum; StarConverter is not yet
-code-signed, so those packages remain pre-alpha validation builds rather than a drive-writing
-release.
+Tagged releases are packaged by GitHub Actions as portable CLI + desktop bundles for Windows x64,
+Linux x64, macOS Intel, and macOS Apple Silicon. The workflow emits SHA-256 manifests, CycloneDX
+SBOMs, and GitHub/Sigstore provenance and SBOM attestations. StarConverter is not yet natively
+code-signed or notarized, so those packages remain unsigned pre-alpha validation builds rather than
+a drive-writing release. See [`docs/RELEASE.md`](docs/RELEASE.md).
 
 ## Safety and security
 

@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 
 use crate::conversion::{OpaqueWriteSets, ReservedWrite};
 use crate::image::{ImageError, ImageFile, reject_device_like_path};
-use crate::inspect::{InspectionError, inspect_image};
+use crate::inspect::{InspectionError, inspect_image, inspect_open_image};
 use crate::object::ObjectGraph;
 use crate::overlay::OverlayWrite;
 use crate::phase::PhaseWritePreview;
@@ -55,7 +55,8 @@ impl Default for CandidateExportLimits {
     }
 }
 
-/// Evidence returned only after the new candidate and optional escrow are durable and reinspected.
+/// Evidence returned only after the new candidate and optional escrow are flushed, reinspected,
+/// and published.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CandidateExportEvidence {
     pub output_path: PathBuf,
@@ -81,6 +82,45 @@ pub struct BoundEscrow {
     pub candidate_sha256: [u8; 32],
     pub manifest_sha256: [u8; 32],
     pub preservation_payload: Vec<u8>,
+}
+
+/// Explicit work and allocation limits for read-only export verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CandidateVerificationLimits {
+    pub max_image_bytes: u64,
+    pub hash_chunk_bytes: usize,
+    pub max_escrow_bytes: usize,
+    pub verification: VerificationLimits,
+}
+
+impl Default for CandidateVerificationLimits {
+    fn default() -> Self {
+        let export = CandidateExportLimits::default();
+        Self {
+            max_image_bytes: export.max_image_bytes,
+            hash_chunk_bytes: export.copy_chunk_bytes,
+            max_escrow_bytes: export.max_escrow_bytes,
+            verification: export.verification,
+        }
+    }
+}
+
+/// Evidence returned only after every bound-export check succeeds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateVerificationEvidence {
+    pub candidate_path: PathBuf,
+    pub escrow_path: PathBuf,
+    pub source_path: Option<PathBuf>,
+    pub source_filesystem: FileSystem,
+    pub target_filesystem: FileSystem,
+    pub candidate_bytes: u64,
+    pub source_bytes: Option<u64>,
+    pub source_sha256: [u8; 32],
+    pub candidate_sha256: [u8; 32],
+    pub manifest_sha256: [u8; 32],
+    pub logical_bytes_hashed: u64,
+    pub escrow_schema_version: u16,
+    pub escrow_records: usize,
 }
 
 /// Refusal or failure from the copy-only exporter.
@@ -127,13 +167,26 @@ pub enum CandidateExportError {
     Image(ImageError),
     Preservation(PreservationError),
     Inspection(InspectionError),
+    SourceInspectionMismatch,
     TargetInspectionMismatch,
     Verification(VerificationError),
     ManifestMismatch,
     SourceChangedAfterExport,
+    CandidateHashMismatch,
+    CandidateManifestMismatch,
+    CandidateFilesystemMismatch {
+        expected: FileSystem,
+        actual: FileSystem,
+    },
+    SourceHashMismatch,
+    SourceFilesystemMismatch {
+        expected: FileSystem,
+        actual: FileSystem,
+    },
 }
 
 impl fmt::Display for CandidateExportError {
+    #[allow(clippy::too_many_lines)]
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidLimit(field) => {
@@ -218,8 +271,11 @@ impl fmt::Display for CandidateExportError {
             Self::Image(source) => write!(formatter, "source image access failed: {source}"),
             Self::Preservation(source) => write!(formatter, "escrow validation failed: {source}"),
             Self::Inspection(source) => {
-                write!(formatter, "candidate reinspection failed: {source}")
+                write!(formatter, "image inspection failed: {source}")
             }
+            Self::SourceInspectionMismatch => formatter.write_str(
+                "pinned source inspection does not match the preservation direction or is incomplete",
+            ),
             Self::TargetInspectionMismatch => formatter
                 .write_str("candidate reinspection did not produce the expected complete target"),
             Self::Verification(source) => {
@@ -231,6 +287,22 @@ impl fmt::Display for CandidateExportError {
             Self::SourceChangedAfterExport => {
                 formatter.write_str("source content hash changed during candidate export")
             }
+            Self::CandidateHashMismatch => formatter
+                .write_str("candidate SHA-256 does not match the bound escrow envelope"),
+            Self::CandidateManifestMismatch => formatter.write_str(
+                "candidate logical namespace/content manifest does not match the bound escrow envelope",
+            ),
+            Self::CandidateFilesystemMismatch { expected, actual } => write!(
+                formatter,
+                "candidate filesystem is {actual}, but the bound escrow requires {expected}",
+            ),
+            Self::SourceHashMismatch => {
+                formatter.write_str("source SHA-256 does not match the bound escrow envelope")
+            }
+            Self::SourceFilesystemMismatch { expected, actual } => write!(
+                formatter,
+                "source filesystem is {actual}, but the bound escrow requires {expected}",
+            ),
         }
     }
 }
@@ -272,7 +344,7 @@ impl From<VerificationError> for CandidateExportError {
     }
 }
 
-/// Decodes and authenticates a candidate-bound escrow sidecar.
+/// Decodes and verifies the integrity of a candidate-bound escrow sidecar.
 ///
 /// `max_payload_bytes` bounds the embedded schema-v4 preservation payload before allocation.
 ///
@@ -352,6 +424,160 @@ pub fn decode_bound_escrow(
     })
 }
 
+/// Verifies a candidate image and its bound escrow without opening any path for write.
+///
+/// Both required paths, and the optional original source, must resolve to regular files. The
+/// candidate is hashed, fully inspected, and reduced to the same deterministic logical manifest
+/// used during export. When `source_path` is supplied, its filesystem and complete byte hash are
+/// also checked against the envelope. No raw-device path is accepted.
+///
+/// # Errors
+///
+/// Refuses non-regular or device-like paths, invalid or oversized envelopes/images, malformed
+/// preservation payloads, incomplete filesystem inventories, and every binding mismatch.
+pub fn verify_bound_export(
+    candidate_path: impl AsRef<Path>,
+    escrow_path: impl AsRef<Path>,
+    source_path: Option<&Path>,
+    limits: CandidateVerificationLimits,
+) -> Result<CandidateVerificationEvidence, CandidateExportError> {
+    validate_verification_limits(limits)?;
+
+    let max_envelope_bytes = BOUND_ESCROW_FIXED_BYTES
+        .checked_add(limits.max_escrow_bytes)
+        .ok_or(CandidateExportError::ArithmeticOverflow(
+            "bound escrow verification limit",
+        ))?;
+    let escrow = ImageFile::open_with_limit(escrow_path, max_envelope_bytes)?;
+    let escrow_bytes =
+        usize::try_from(escrow.len()).map_err(|_| CandidateExportError::EscrowLimitExceeded {
+            actual: usize::MAX,
+            maximum: limits.max_escrow_bytes,
+        })?;
+    if escrow_bytes > max_envelope_bytes {
+        return Err(CandidateExportError::EscrowLimitExceeded {
+            actual: escrow_bytes,
+            maximum: max_envelope_bytes,
+        });
+    }
+    let envelope_bytes = escrow.read_exact_at(0, escrow_bytes)?;
+    let envelope = decode_bound_escrow(&envelope_bytes, limits.max_escrow_bytes)?;
+    let decoded = decode_escrow(
+        &envelope.preservation_payload,
+        PreservationLimits {
+            max_escrow_bytes: limits.max_escrow_bytes,
+            max_record_bytes: limits.max_escrow_bytes,
+            ..PreservationLimits::default()
+        },
+    )?;
+    if decoded.source != envelope.source_filesystem || decoded.target != envelope.target_filesystem
+    {
+        return Err(CandidateExportError::PolicyDirectionMismatch);
+    }
+
+    let candidate = ImageFile::open(candidate_path)?;
+    if candidate.len() > limits.max_image_bytes {
+        return Err(CandidateExportError::ImageTooLarge {
+            actual: candidate.len(),
+            maximum: limits.max_image_bytes,
+        });
+    }
+    let inspection = inspect_open_image(&candidate)?;
+    if inspection.profile.filesystem != envelope.target_filesystem {
+        return Err(CandidateExportError::CandidateFilesystemMismatch {
+            expected: envelope.target_filesystem,
+            actual: inspection.profile.filesystem,
+        });
+    }
+    if !inspection.profile.inventory_complete {
+        return Err(CandidateExportError::TargetInspectionMismatch);
+    }
+    let graph = normalized_graph(&inspection, envelope.target_filesystem)
+        .ok_or(CandidateExportError::TargetInspectionMismatch)?;
+    let manifest = build_manifest(&candidate, graph, limits.verification)?;
+    if manifest.metadata_sha256 != envelope.manifest_sha256 {
+        return Err(CandidateExportError::CandidateManifestMismatch);
+    }
+    let candidate_sha256 = hash_image(&candidate, limits.hash_chunk_bytes)?;
+    if candidate_sha256 != envelope.candidate_sha256 {
+        return Err(CandidateExportError::CandidateHashMismatch);
+    }
+
+    let (resolved_source_path, source_bytes) = if let Some(path) = source_path {
+        let source = ImageFile::open(path)?;
+        if source.len() > limits.max_image_bytes {
+            return Err(CandidateExportError::ImageTooLarge {
+                actual: source.len(),
+                maximum: limits.max_image_bytes,
+            });
+        }
+        let source_inspection = inspect_open_image(&source)?;
+        if source_inspection.profile.filesystem != envelope.source_filesystem {
+            return Err(CandidateExportError::SourceFilesystemMismatch {
+                expected: envelope.source_filesystem,
+                actual: source_inspection.profile.filesystem,
+            });
+        }
+        if hash_image(&source, limits.hash_chunk_bytes)? != envelope.source_sha256 {
+            return Err(CandidateExportError::SourceHashMismatch);
+        }
+        (
+            Some(source.identity().canonical_path().to_path_buf()),
+            Some(source.len()),
+        )
+    } else {
+        (None, None)
+    };
+
+    Ok(CandidateVerificationEvidence {
+        candidate_path: candidate.identity().canonical_path().to_path_buf(),
+        escrow_path: escrow.identity().canonical_path().to_path_buf(),
+        source_path: resolved_source_path,
+        source_filesystem: envelope.source_filesystem,
+        target_filesystem: envelope.target_filesystem,
+        candidate_bytes: candidate.len(),
+        source_bytes,
+        source_sha256: envelope.source_sha256,
+        candidate_sha256,
+        manifest_sha256: manifest.metadata_sha256,
+        logical_bytes_hashed: manifest.logical_bytes_hashed,
+        escrow_schema_version: decoded.schema_version,
+        escrow_records: decoded.records.len(),
+    })
+}
+
+fn normalized_graph(
+    inspection: &crate::inspect::ImageInspection,
+    filesystem: FileSystem,
+) -> Option<&ObjectGraph> {
+    match filesystem {
+        FileSystem::ExFat => inspection
+            .normalized_exfat
+            .as_deref()
+            .map(|normalized| &normalized.graph),
+        FileSystem::Ntfs => inspection
+            .normalized_ntfs
+            .as_deref()
+            .map(|normalized| &normalized.graph),
+        FileSystem::Unknown => None,
+    }
+}
+
+const fn validate_verification_limits(
+    limits: CandidateVerificationLimits,
+) -> Result<(), CandidateExportError> {
+    if limits.max_image_bytes == 0 {
+        return Err(CandidateExportError::InvalidLimit("max_image_bytes"));
+    }
+    if limits.hash_chunk_bytes == 0 {
+        return Err(CandidateExportError::InvalidLimit("hash_chunk_bytes"));
+    }
+    if limits.max_escrow_bytes == 0 {
+        return Err(CandidateExportError::InvalidLimit("max_escrow_bytes"));
+    }
+    Ok(())
+}
+
 fn encode_bound_escrow(
     source_filesystem: FileSystem,
     target_filesystem: FileSystem,
@@ -422,6 +648,12 @@ pub fn export_candidate_image(
 ) -> Result<CandidateExportEvidence, CandidateExportError> {
     validate_limits(limits)?;
     validate_policy(preview, preservation, escrow_path, limits.max_escrow_bytes)?;
+    let source_inspection = inspect_open_image(source)?;
+    if source_inspection.profile.filesystem != preservation.source
+        || !source_inspection.profile.inventory_complete
+    {
+        return Err(CandidateExportError::SourceInspectionMismatch);
+    }
     if source.len() > limits.max_image_bytes {
         return Err(CandidateExportError::ImageTooLarge {
             actual: source.len(),
@@ -494,12 +726,10 @@ pub fn export_candidate_image(
     if let (Some(guard), Some(path)) = (escrow_guard, escrow.as_deref()) {
         guard.publish(path)?;
     }
-    if let Err(error) = output_guard.publish(&output) {
-        if let Some(path) = &escrow {
-            let _ = fs::remove_file(path);
-        }
-        return Err(error);
-    }
+    // A published escrow path is intentionally retained if candidate publication fails. Removing
+    // it by pathname here could unlink a raced-in foreign file in a hostile directory, and a lone
+    // bound sidecar is safer than a final candidate without its preservation evidence.
+    output_guard.publish(&output)?;
     Ok(CandidateExportEvidence {
         output_path: output,
         escrow_path: escrow,
@@ -799,17 +1029,13 @@ impl NewFileGuard {
     }
 
     fn create_partial(destination: &Path) -> Result<Self, CandidateExportError> {
-        let file_name = destination
+        destination
             .file_name()
             .ok_or_else(|| CandidateExportError::OutputHasNoFileName(destination.to_path_buf()))?;
         let parent = destination.parent().unwrap_or_else(|| Path::new("."));
         for _ in 0..128 {
             let sequence = NEXT_PARTIAL.fetch_add(1, Ordering::Relaxed);
-            let mut partial_name = file_name.to_os_string();
-            partial_name.push(format!(
-                ".starconverter-partial-{}-{sequence}",
-                std::process::id()
-            ));
+            let partial_name = format!(".starconverter-partial-{}-{sequence}", std::process::id());
             let partial = parent.join(partial_name);
             match Self::create(&partial) {
                 Ok(guard) => return Ok(guard),
@@ -846,26 +1072,17 @@ impl NewFileGuard {
             ));
         }
 
-        #[cfg(windows)]
-        fs::rename(&self.path, destination).map_err(|source| {
+        fs::hard_link(&self.path, destination).map_err(|source| {
             if source.kind() == io::ErrorKind::AlreadyExists {
                 CandidateExportError::OutputExists(destination.to_path_buf())
             } else {
-                CandidateExportError::io("publish verified output", source)
+                CandidateExportError::io(
+                    "publish verified output (destination must support hard links)",
+                    source,
+                )
             }
         })?;
-
-        #[cfg(not(windows))]
-        {
-            fs::hard_link(&self.path, destination).map_err(|source| {
-                if source.kind() == io::ErrorKind::AlreadyExists {
-                    CandidateExportError::OutputExists(destination.to_path_buf())
-                } else {
-                    CandidateExportError::io("publish verified output", source)
-                }
-            })?;
-            let _ = fs::remove_file(&self.path);
-        }
+        let _ = fs::remove_file(&self.path);
 
         self.keep();
         Ok(())
@@ -892,7 +1109,14 @@ mod tests {
 
     use super::*;
     use crate::conversion::OpaqueWriteSets;
+    use crate::extent::ExtentGraph;
+    use crate::fs::ntfs_inventory::NtfsObjectReference;
+    use crate::fs::ntfs_normalize::{
+        NormalizedNtfs, NtfsPreservationSidecar, NtfsSecurityDescriptorEvidence,
+    };
     use crate::geometry::ReservationKind;
+    use crate::object::{ObjectGraphLimits, ObjectId, ObjectKind, ObjectRecord, ObjectSemantics};
+    use crate::preservation::evaluate_ntfs;
 
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
@@ -920,6 +1144,139 @@ mod tests {
             "starconverter-export-{}-{sequence}-{suffix}",
             std::process::id()
         ))
+    }
+
+    fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
+        bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
+        bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn minimal_exfat_image() -> Vec<u8> {
+        const SECTOR_BYTES: usize = 512;
+        const VOLUME_SECTORS: u64 = 2_048;
+
+        let mut image = vec![0_u8; usize::try_from(VOLUME_SECTORS * 512).unwrap()];
+        image[0..3].copy_from_slice(&[0xeb, 0x76, 0x90]);
+        image[3..11].copy_from_slice(b"EXFAT   ");
+        put_u64(&mut image, 72, VOLUME_SECTORS);
+        put_u32(&mut image, 80, 24);
+        put_u32(&mut image, 84, 16);
+        put_u32(&mut image, 88, 40);
+        put_u32(&mut image, 92, 2_008);
+        put_u32(&mut image, 96, 2);
+        put_u32(&mut image, 100, 0x1234_abcd);
+        put_u16(&mut image, 104, 0x0100);
+        image[108] = 9;
+        image[110] = 1;
+        image[112] = 0xff;
+        put_u16(&mut image, 510, 0xaa55);
+        for sector in 1..=8 {
+            let signature = sector * SECTOR_BYTES + SECTOR_BYTES - 4;
+            image[signature..signature + 4].copy_from_slice(&[0x00, 0x00, 0x55, 0xaa]);
+        }
+        let checksum = image[..11 * SECTOR_BYTES]
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(offset, _)| !matches!(offset, 106 | 107 | 112))
+            .fold(0_u32, |sum, (_, byte)| {
+                sum.rotate_right(1).wrapping_add(u32::from(byte))
+            });
+        for offset in (11 * SECTOR_BYTES..12 * SECTOR_BYTES).step_by(4) {
+            put_u32(&mut image, offset, checksum);
+        }
+        image.copy_within(0..12 * SECTOR_BYTES, 12 * SECTOR_BYTES);
+        for cluster in [2_u32, 3, 4] {
+            put_u32(
+                &mut image,
+                24 * SECTOR_BYTES + usize::try_from(cluster).unwrap() * 4,
+                u32::MAX,
+            );
+        }
+        let root = 40 * SECTOR_BYTES;
+        image[root] = 0x81;
+        put_u32(&mut image, root + 20, 3);
+        put_u64(&mut image, root + 24, 251);
+        let mut upcase = Vec::new();
+        for code_unit in 0_u16..128 {
+            let mapping = if (u16::from(b'a')..=u16::from(b'z')).contains(&code_unit) {
+                code_unit - 0x20
+            } else {
+                code_unit
+            };
+            upcase.extend_from_slice(&mapping.to_le_bytes());
+        }
+        upcase.extend_from_slice(&0xffff_u16.to_le_bytes());
+        upcase.extend_from_slice(&65_408_u16.to_le_bytes());
+        image[root + 32] = 0x82;
+        put_u32(
+            &mut image,
+            root + 36,
+            crate::fs::exfat_upcase::table_checksum(&upcase),
+        );
+        put_u32(&mut image, root + 52, 4);
+        put_u64(&mut image, root + 56, upcase.len() as u64);
+        image[41 * SECTOR_BYTES] = 0b0000_0111;
+        image[42 * SECTOR_BYTES..42 * SECTOR_BYTES + upcase.len()].copy_from_slice(&upcase);
+        image
+    }
+
+    fn test_ntfs_escrow_payload() -> Vec<u8> {
+        let root = ObjectId(1);
+        let graph = ObjectGraph::build(
+            root,
+            vec![ObjectRecord {
+                id: root,
+                kind: ObjectKind::Directory,
+                link_count: 0,
+                semantics: ObjectSemantics::default(),
+                streams: Vec::new(),
+            }],
+            Vec::new(),
+            ExtentGraph::build(Vec::new(), 1, 1).unwrap(),
+            ObjectGraphLimits {
+                max_objects: 1,
+                max_entries: 1,
+                max_streams: 1,
+                max_name_code_units: 255,
+            },
+        )
+        .unwrap();
+        let normalized = NormalizedNtfs {
+            graph,
+            preservation: NtfsPreservationSidecar {
+                volume_serial_number: 7,
+                volume_label: None,
+                security_descriptors: NtfsSecurityDescriptorEvidence::Unavailable,
+                root_reference: NtfsObjectReference {
+                    record_number: 5,
+                    sequence_number: 1,
+                },
+                objects: Vec::new(),
+                source_extents: Vec::new(),
+                scanned_records: 1,
+                initialized_records: 1,
+                in_use_base_records: 1,
+                extension_records: 0,
+                bytes_read: 1,
+            },
+        };
+        evaluate_ntfs(
+            &normalized,
+            FileSystem::ExFat,
+            GuaranteeMode::Escrow,
+            PreservationLimits::default(),
+        )
+        .unwrap()
+        .escrow
+        .unwrap()
     }
 
     fn reserved(offset: u64, byte: u8) -> ReservedWrite {
@@ -1069,6 +1426,46 @@ mod tests {
     }
 
     #[test]
+    fn verifies_bound_candidate_read_only_and_reports_evidence() {
+        let candidate_file = TempFile::create(&minimal_exfat_image());
+        let candidate = ImageFile::open(&candidate_file.path).unwrap();
+        let inspection = inspect_open_image(&candidate).unwrap();
+        let graph = normalized_graph(&inspection, FileSystem::ExFat).unwrap();
+        let manifest = build_manifest(&candidate, graph, VerificationLimits::default()).unwrap();
+        let candidate_sha256 = hash_image(&candidate, 64 * 1024).unwrap();
+        let source_sha256 = [0x5a; 32];
+        let envelope = encode_bound_escrow(
+            FileSystem::Ntfs,
+            FileSystem::ExFat,
+            source_sha256,
+            candidate_sha256,
+            manifest.metadata_sha256,
+            &test_ntfs_escrow_payload(),
+        )
+        .unwrap();
+        let escrow_file = TempFile::create(&envelope);
+        let candidate_before = fs::read(&candidate_file.path).unwrap();
+        let escrow_before = fs::read(&escrow_file.path).unwrap();
+
+        let evidence = verify_bound_export(
+            &candidate_file.path,
+            &escrow_file.path,
+            None,
+            CandidateVerificationLimits::default(),
+        )
+        .unwrap();
+
+        assert_eq!(evidence.source_filesystem, FileSystem::Ntfs);
+        assert_eq!(evidence.target_filesystem, FileSystem::ExFat);
+        assert_eq!(evidence.source_sha256, source_sha256);
+        assert_eq!(evidence.candidate_sha256, candidate_sha256);
+        assert_eq!(evidence.manifest_sha256, manifest.metadata_sha256);
+        assert_eq!(evidence.escrow_schema_version, 4);
+        assert_eq!(fs::read(&candidate_file.path).unwrap(), candidate_before);
+        assert_eq!(fs::read(&escrow_file.path).unwrap(), escrow_before);
+    }
+
+    #[test]
     fn partial_output_is_not_exposed_at_requested_path() {
         let destination = temp_path("published.img");
         let mut guard = NewFileGuard::create_partial(&destination).unwrap();
@@ -1078,6 +1475,24 @@ mod tests {
         assert!(guard.path.exists());
         guard.publish(&destination).unwrap();
         assert_eq!(fs::read(&destination).unwrap(), b"verified");
+        let _ = fs::remove_file(destination);
+    }
+
+    #[test]
+    fn publication_never_replaces_an_existing_destination() {
+        let destination = temp_path("publish-race.img");
+        let mut guard = NewFileGuard::create_partial(&destination).unwrap();
+        guard.file_mut().write_all(b"candidate").unwrap();
+        guard.file().sync_all().unwrap();
+
+        // Model another creator winning after the export's initial path checks but before publish.
+        fs::write(&destination, b"foreign").unwrap();
+        assert!(matches!(
+            guard.publish(&destination),
+            Err(CandidateExportError::OutputExists(path)) if path == destination
+        ));
+        assert_eq!(fs::read(&destination).unwrap(), b"foreign");
+        assert_eq!(fs::read(&guard.path).unwrap(), b"candidate");
         let _ = fs::remove_file(destination);
     }
 

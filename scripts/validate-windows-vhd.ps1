@@ -1,5 +1,6 @@
 param(
-    [string]$FixtureRoot = ""
+    [string]$FixtureRoot = "",
+    [switch]$PreflightOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -22,7 +23,7 @@ function Assert-One {
     return $Values[0]
 }
 
-if (-not (Test-IsAdministrator)) {
+if (-not $PreflightOnly -and -not (Test-IsAdministrator)) {
     throw "Windows VHD validation requires an elevated PowerShell 5.1 prompt."
 }
 
@@ -108,6 +109,13 @@ foreach ($case in $cases) {
     $initialImage = Get-DiskImage -ImagePath $vhdPath -StorageType VHD
     if ($initialImage.Attached) {
         throw "Refusing an already-attached VHD: $vhdPath"
+    }
+    if ($PreflightOnly) {
+        if ($initialImage.Size -ne 34603008) {
+            throw "Unexpected fixed-VHD virtual size: $($initialImage.Size)"
+        }
+        Write-Host "[PASS] pinned detached VHD preflight / $beforeHash / $vhdPath"
+        continue
     }
 
     $attached = $false

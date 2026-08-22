@@ -55,9 +55,11 @@ detaches it in a trap. No physical device is discovered or selected.
   helpers; all ten payloads are verified through each filesystem driver.
 
 The exporter writes no device and never overwrites a path. It builds each regular output beneath a
-private partial name, verifies it, publishes escrow first, and exposes the final candidate name only
-after all checks succeed. The fixture command removes and recreates only its named files beneath
-Cargo's `target` directory.
+uniquely named partial path, verifies it, publishes escrow first with atomic no-clobber hard links,
+and exposes the final candidate name only after all checks succeed. Publication therefore fails
+closed on output filesystems without hard-link support, and parent-directory crash durability is
+still a platform qualification gate. The fixture command removes and recreates only its named
+files beneath Cargo's `target` directory.
 
 ## 2026-08-21 expanded corpus
 
@@ -143,3 +145,10 @@ no drive letter, an exact volume-to-image association, and exact sizes/SHA-256 v
 rich-corpus payloads through the Windows filesystem driver; then detaches and re-hashes in all
 paths. It must be run later from an elevated Windows PowerShell 5.1 prompt. It has not been run in
 this non-elevated session, so Windows filesystem qualification remains pending.
+
+The detached, non-elevated identity/container preflight is safe to run separately and performs no
+attachment:
+
+```powershell
+powershell.exe -NoProfile -File scripts\validate-windows-vhd.ps1 -PreflightOnly
+```

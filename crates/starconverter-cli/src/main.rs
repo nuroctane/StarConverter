@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use starconverter_core::candidate_export::{
-    CandidateExportEvidence, CandidateExportLimits, export_candidate_image,
+    CandidateExportEvidence, CandidateExportLimits, CandidateVerificationLimits,
+    export_candidate_image, verify_bound_export,
 };
 use starconverter_core::cross_format::{
     ExfatToNtfsLimits, ExfatToNtfsOptions, NtfsToExfatLimits, NtfsToExfatOptions,
@@ -75,11 +76,85 @@ fn run(args: &[String]) -> Result<(), String> {
         "inspect" => inspect_command(&args[1..])?,
         "preview" => preview_command(&args[1..])?,
         "convert-image" => convert_image_command(&args[1..])?,
+        "verify-export" => verify_export_command(&args[1..])?,
         "plan" => plan_command(&args[1..])?,
         unknown => return Err(format!("unknown command `{unknown}`")),
     }
 
     Ok(())
+}
+
+fn verify_export_command(args: &[String]) -> Result<(), String> {
+    let candidate = args
+        .first()
+        .ok_or_else(|| "verify-export requires a candidate image path".to_owned())?;
+    let escrow = args
+        .get(1)
+        .ok_or_else(|| "verify-export requires an escrow sidecar path".to_owned())?;
+    let source = parse_verify_export_options(&args[2..])?;
+    let evidence = verify_bound_export(
+        candidate,
+        escrow,
+        source.as_deref(),
+        CandidateVerificationLimits::default(),
+    )
+    .map_err(|error| format!("export verification failed: {error}"))?;
+
+    println!("{BANNER}");
+    println!(
+        "[VERIFIED] bound {} -> {} export",
+        evidence.source_filesystem, evidence.target_filesystem
+    );
+    println!("[CANDIDATE] {}", evidence.candidate_path.display());
+    println!(
+        "[CANDIDATE] {} bytes / sha256 {}",
+        evidence.candidate_bytes,
+        hex_digest(&evidence.candidate_sha256)
+    );
+    println!(
+        "[MANIFEST] {} logical bytes / sha256 {}",
+        evidence.logical_bytes_hashed,
+        hex_digest(&evidence.manifest_sha256)
+    );
+    println!("[ESCROW] {}", evidence.escrow_path.display());
+    println!(
+        "[ESCROW] schema v{} / {} record(s)",
+        evidence.escrow_schema_version, evidence.escrow_records
+    );
+    if let (Some(path), Some(bytes)) = (&evidence.source_path, evidence.source_bytes) {
+        println!("[SOURCE] {}", path.display());
+        println!(
+            "[SOURCE] {bytes} bytes / sha256 {}",
+            hex_digest(&evidence.source_sha256)
+        );
+    } else {
+        println!(
+            "[SOURCE BINDING] sha256 {} (original source not supplied)",
+            hex_digest(&evidence.source_sha256)
+        );
+    }
+    println!(
+        "[READ-ONLY] Candidate, escrow, and optional source were opened as regular files without write access."
+    );
+    Ok(())
+}
+
+fn parse_verify_export_options(args: &[String]) -> Result<Option<PathBuf>, String> {
+    let mut source = None;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| format!("missing value after `{flag}`"))?;
+        match flag {
+            "--source" if source.is_none() => source = Some(PathBuf::from(value)),
+            "--source" => return Err("verify-export accepts --source only once".into()),
+            _ => return Err(format!("unknown verify-export option `{flag}`")),
+        }
+        index += 2;
+    }
+    Ok(source)
 }
 
 fn convert_image_command(args: &[String]) -> Result<(), String> {
@@ -968,6 +1043,7 @@ fn print_help() {
     println!(
         "  starconverter convert-image <SOURCE> <NEW-OUTPUT> [--to exfat|ntfs] [--mode MODE] [--escrow PATH]"
     );
+    println!("  starconverter verify-export <CANDIDATE> <ESCROW> [--source SOURCE]");
     println!("  starconverter plan [OPTIONS]\n");
     println!("INSPECT");
     println!(
@@ -990,6 +1066,13 @@ fn print_help() {
         "  Escrow mode writes <NEW-OUTPUT>.starconverter-escrow unless --escrow selects another new path.\n"
     );
     println!("  Conversion accepts strict or escrow mode; content-only remains preview-only.\n");
+    println!("VERIFY-EXPORT");
+    println!(
+        "  Opens regular files read-only and validates the escrow envelope, candidate SHA-256, filesystem, and logical manifest."
+    );
+    println!(
+        "  With --source, also validates the original source filesystem and complete SHA-256.\n"
+    );
     println!("PLAN OPTIONS");
     println!("  --source <PATH>       Image path or synthetic identity");
     println!("  --from <exfat|ntfs>   Source filesystem (default: exfat)");
@@ -1330,6 +1413,43 @@ mod tests {
         assert_eq!(
             run(&["convert-image".to_owned(), "source.img".to_owned()]),
             Err("convert-image requires a new output image path".to_owned())
+        );
+    }
+
+    #[test]
+    fn verify_export_requires_candidate_and_escrow_paths() {
+        assert_eq!(
+            run(&["verify-export".to_owned()]),
+            Err("verify-export requires a candidate image path".to_owned())
+        );
+        assert_eq!(
+            run(&["verify-export".to_owned(), "candidate.img".to_owned()]),
+            Err("verify-export requires an escrow sidecar path".to_owned())
+        );
+    }
+
+    #[test]
+    fn verify_export_option_parser_is_fail_closed() {
+        assert_eq!(
+            parse_verify_export_options(&["--source".into(), "source.img".into()]).unwrap(),
+            Some(PathBuf::from("source.img"))
+        );
+        assert_eq!(
+            parse_verify_export_options(&["--source".into()]),
+            Err("missing value after `--source`".into())
+        );
+        assert_eq!(
+            parse_verify_export_options(&["--mystery".into(), "source.img".into()]),
+            Err("unknown verify-export option `--mystery`".into())
+        );
+        assert_eq!(
+            parse_verify_export_options(&[
+                "--source".into(),
+                "one.img".into(),
+                "--source".into(),
+                "two.img".into(),
+            ]),
+            Err("verify-export accepts --source only once".into())
         );
     }
 
