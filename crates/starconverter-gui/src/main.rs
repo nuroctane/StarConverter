@@ -1969,7 +1969,7 @@ fn decode_session_string(line: &str, key: &str) -> Result<String, String> {
     decoded
         .try_reserve_exact(encoded.len() / 2)
         .map_err(|_| format!("session field {key} is too large to decode"))?;
-    for pair in encoded.as_bytes().chunks_exact(2) {
+    for pair in encoded.as_bytes().as_chunks::<2>().0 {
         let high = hex_nibble(pair[0])
             .ok_or_else(|| format!("session field {key} contains invalid hexadecimal"))?;
         let low = hex_nibble(pair[1])
