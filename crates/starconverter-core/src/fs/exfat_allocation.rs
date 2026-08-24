@@ -42,14 +42,42 @@ pub struct AllocationSummary {
 /// Structural failure while interpreting exFAT allocation metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExfatAllocationError {
-    InvalidCluster { cluster: u32 },
-    ArithmeticOverflow { calculation: &'static str },
-    FatSliceTooShort { required: u64, actual: usize },
-    BitmapSliceTooShort { required: u64, actual: usize },
-    InvalidFatValue { cluster: u32, value: u32 },
-    FreeClusterInChain { cluster: u32 },
-    BadClusterInChain { cluster: u32 },
-    ChainCycleOrTooLong { start_cluster: u32 },
+    InvalidCluster {
+        cluster: u32,
+    },
+    ArithmeticOverflow {
+        calculation: &'static str,
+    },
+    FatSliceTooShort {
+        required: u64,
+        actual: usize,
+    },
+    BitmapSliceTooShort {
+        required: u64,
+        actual: usize,
+    },
+    /// The bitmap contains reserved bytes which this version cannot escrow byte-for-byte.
+    BitmapSliceTooLong {
+        required: u64,
+        actual: usize,
+    },
+    /// A reserved bit after the final cluster bit is set and cannot yet be preserved.
+    BitmapReservedTailBitSet {
+        bit_index: u64,
+    },
+    InvalidFatValue {
+        cluster: u32,
+        value: u32,
+    },
+    FreeClusterInChain {
+        cluster: u32,
+    },
+    BadClusterInChain {
+        cluster: u32,
+    },
+    ChainCycleOrTooLong {
+        start_cluster: u32,
+    },
 }
 
 impl fmt::Display for ExfatAllocationError {
@@ -71,6 +99,14 @@ impl fmt::Display for ExfatAllocationError {
             Self::BitmapSliceTooShort { required, actual } => write!(
                 formatter,
                 "allocation bitmap is too short: requires {required} bytes, contains {actual}"
+            ),
+            Self::BitmapSliceTooLong { required, actual } => write!(
+                formatter,
+                "allocation bitmap contains {actual} bytes, but exactly {required} are supported; reserved tail bytes cannot yet be preserved"
+            ),
+            Self::BitmapReservedTailBitSet { bit_index } => write!(
+                formatter,
+                "allocation bitmap reserved tail bit {bit_index} is set and cannot yet be preserved"
             ),
             Self::InvalidFatValue { cluster, value } => write!(
                 formatter,
@@ -190,15 +226,15 @@ pub fn bitmap_cluster_is_allocated(
     Ok(byte & (1 << (bit_index % 8)) != 0)
 }
 
-/// Counts allocated and free clusters without interpreting reserved bitmap tail bits.
+/// Counts allocated and free clusters after proving the bitmap has canonical, preservable bounds.
 ///
-/// The bitmap may be longer than the minimum required length because the exFAT specification
-/// defines bits after `ClusterCount` as reserved. Only the first `ClusterCount` bits are counted.
+/// The current preservation sidecar does not retain reserved bitmap bytes or non-zero reserved
+/// bits. This parser therefore fails closed rather than silently canonicalizing that evidence.
 ///
 /// # Errors
 ///
-/// Returns [`ExfatAllocationError::BitmapSliceTooShort`] if the supplied data does not contain one
-/// bit per cluster.
+/// Returns [`ExfatAllocationError`] if the supplied data does not contain exactly one rounded-up
+/// byte span for every cluster bit, or if an unused bit in the final byte is non-zero.
 pub fn summarize_allocation_bitmap(
     bitmap: &[u8],
     geometry: &ExfatBootSector,
@@ -207,6 +243,12 @@ pub fn summarize_allocation_bitmap(
     let required_bitmap_bytes = cluster_count.div_ceil(8);
     if u64::try_from(bitmap.len()).unwrap_or(u64::MAX) < required_bitmap_bytes {
         return Err(ExfatAllocationError::BitmapSliceTooShort {
+            required: required_bitmap_bytes,
+            actual: bitmap.len(),
+        });
+    }
+    if u64::try_from(bitmap.len()).unwrap_or(u64::MAX) > required_bitmap_bytes {
+        return Err(ExfatAllocationError::BitmapSliceTooLong {
             required: required_bitmap_bytes,
             actual: bitmap.len(),
         });
@@ -225,6 +267,20 @@ pub fn summarize_allocation_bitmap(
         u32::try_from(cluster_count % 8).map_err(|_| ExfatAllocationError::ArithmeticOverflow {
             calculation: "allocation bitmap tail bit count",
         })?;
+    if tail_bits != 0 {
+        let meaningful_mask = (1_u8 << tail_bits) - 1;
+        let reserved = bitmap[full_bytes] & !meaningful_mask;
+        if reserved != 0 {
+            return Err(ExfatAllocationError::BitmapReservedTailBitSet {
+                bit_index: (u64::try_from(full_bytes).map_err(|_| {
+                    ExfatAllocationError::ArithmeticOverflow {
+                        calculation: "allocation bitmap tail byte index",
+                    }
+                })? * 8)
+                    + u64::from(reserved.trailing_zeros()),
+            });
+        }
+    }
     let allocated_in_tail = if tail_bits == 0 {
         0
     } else {
@@ -399,11 +455,10 @@ mod tests {
     }
 
     #[test]
-    fn summarizes_only_meaningful_bitmap_bits() {
+    fn summarizes_canonical_bitmap_bits() {
         let boot = geometry();
-        let mut bitmap = vec![0xff_u8; 252];
+        let mut bitmap = vec![0xff_u8; 251];
         bitmap[250] = 0b0000_0001;
-        bitmap[251] = 0xff;
 
         let summary = summarize_allocation_bitmap(&bitmap, &boot).unwrap();
         assert_eq!(summary.required_bitmap_bytes, 251);
@@ -417,6 +472,42 @@ mod tests {
                 actual: 250
             })
         ));
+    }
+
+    #[test]
+    fn refuses_unpreserved_bitmap_tail_bits_and_bytes() {
+        let mut boot = geometry();
+        boot.cluster_count = 2001;
+        let mut canonical = vec![0xff_u8; 251];
+        canonical[250] = 0b0000_0001;
+        assert!(summarize_allocation_bitmap(&canonical, &boot).is_ok());
+
+        let mut final_unused_bit = canonical.clone();
+        final_unused_bit[250] |= 0b1000_0000;
+        assert_eq!(
+            summarize_allocation_bitmap(&final_unused_bit, &boot),
+            Err(ExfatAllocationError::BitmapReservedTailBitSet { bit_index: 2007 })
+        );
+
+        let mut extra_zero = canonical.clone();
+        extra_zero.push(0);
+        assert_eq!(
+            summarize_allocation_bitmap(&extra_zero, &boot),
+            Err(ExfatAllocationError::BitmapSliceTooLong {
+                required: 251,
+                actual: 252,
+            })
+        );
+
+        let mut extra_nonzero = canonical;
+        extra_nonzero.push(0xa5);
+        assert_eq!(
+            summarize_allocation_bitmap(&extra_nonzero, &boot),
+            Err(ExfatAllocationError::BitmapSliceTooLong {
+                required: 251,
+                actual: 252,
+            })
+        );
     }
 
     #[test]

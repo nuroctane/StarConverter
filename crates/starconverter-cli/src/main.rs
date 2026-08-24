@@ -841,7 +841,7 @@ fn print_inspection(inspection: &ImageInspection) {
             );
         }
         if let starconverter_core::fs::ntfs_volume::NtfsBitmapEvidence::Complete(allocation) =
-            volume.bitmap
+            &volume.bitmap
         {
             println!(
                 "| allocation  : {} used / {} free clusters",
@@ -1422,8 +1422,7 @@ mod tests {
             put_u32(&mut record, attribute + 4, 56);
             put_u32(&mut record, attribute + 16, 32);
             put_u16(&mut record, attribute + 20, 24);
-            record[attribute + 24] = 0xff;
-            record[attribute + 25] = 0x03;
+            record[attribute + 24] = 0b0011_0000;
             record[attribute + 55] = 0x80;
             put_u32(&mut record, attribute + 56, u32::MAX);
             120

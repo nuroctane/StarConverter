@@ -191,10 +191,12 @@ installed. CI always tests both language stacks.
 - [x] Read-only NTFS boot-geometry parser
 - [x] exFAT main/backup boot checksums and NTFS backup-sector validation
 - [x] exFAT active bitmap, Up-case Table, root directory, and free-space discovery
+- [x] Exact exFAT bitmap length/tail validation with fail-closed refusal of unpreserved reserved data
 - [x] Recursive exFAT object/allocation/extent inventory
 - [x] Lossless exFAT-to-neutral object normalization
 - [x] NTFS FILE/attribute/runlist/index parsers and bounded `$MFT` bootstrap
 - [x] Bounded NTFS volume bitmap and object/stream/directory inventory
+- [x] Exact NTFS bitmap-to-runlist ownership reconciliation, including metadata attributes
 - [x] Complete bounded NTFS attribute census and sparse-only `$BadClus:$Bad` proof
 - [x] `$ATTRIBUTE_LIST` continuation resolution and NTFS-to-neutral normalization
 - [x] Exact relocation geometry solver
@@ -213,6 +215,7 @@ installed. CI always tests both language stacks.
 - [x] Type-level serializer activation authorization (no public bypass)
 - [x] Module-sealed preflight/verification/completion evidence (no caller-forged clean state)
 - [x] Exact-intent regular-image executor with locking, read-back, flush, rollback, and fault cuts
+- [x] Opaque plan/container-bound executor completion evidence for mutation and rollback checkpoints
 - [x] Deterministic parser mutation suite
 - [x] Real-image `inspect` command with evidence-aware blocking
 - [x] Real-image read-only `preview` with exact candidate phases and rollback bytes
@@ -228,6 +231,7 @@ installed. CI always tests both language stacks.
 - [x] Byte-level candidate progress and cooperative cancellation through the last safe
       pre-publication checkpoint, with truthful non-cancellable publication reporting
 - [x] Bounded desktop session recovery with stale/corrupt/raw-device refusal and keyboard/contrast regressions
+- [x] Deterministic wide/medium/compact desktop layouts, 44-point targets, and screen-reader-safe ASCII branding
 - [x] Create-new exFAT→NTFS and NTFS→exFAT export with reinspection, manifest equality, source re-hash, and escrow sidecar
 - [x] Independently mount both exported rich cross-format candidates read-only and verify exact payload hashes
 - [x] Read-only candidate/source/sidecar verifier and candidate-bound escrow envelope

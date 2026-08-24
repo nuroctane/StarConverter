@@ -3019,7 +3019,11 @@ fn write_bitmap(
 ) -> Result<(), NtfsSerializeError> {
     let offset = usize::try_from(layout.bitmap_lcn * layout.cluster)
         .map_err(|_| NtfsSerializeError::ArithmeticOverflow)?;
-    for cluster in 0..layout.metadata_clusters {
+    let boot_clusters = div_ceil(BOOT_FILE_BYTES, layout.cluster)?;
+    for cluster in 0..boot_clusters {
+        set_bitmap(metadata, offset, cluster)?;
+    }
+    for cluster in MFT_LCN..layout.metadata_clusters {
         set_bitmap(metadata, offset, cluster)?;
     }
     for extent in graph.extents().extents() {
@@ -4321,6 +4325,13 @@ mod tests {
             bitmap_offset,
             usize::try_from(layout.cluster_count.div_ceil(8)).unwrap(),
         );
+        let is_allocated = |cluster: u64| {
+            bitmap[usize::try_from(cluster / 8).unwrap()] & (1 << (cluster % 8)) != 0
+        };
+        let boot_clusters = div_ceil(BOOT_FILE_BYTES, layout.cluster).unwrap();
+        assert!((0..boot_clusters).all(is_allocated));
+        assert!((boot_clusters..MFT_LCN).all(|cluster| !is_allocated(cluster)));
+        assert!((MFT_LCN..layout.metadata_clusters).all(is_allocated));
         for cluster in [
             layout.logfile_lcn,
             layout.logfile_lcn + layout.logfile_clusters - 1,
@@ -4329,10 +4340,7 @@ mod tests {
             layout.secure_sds_lcn,
             layout.secure_sds_lcn + layout.secure_sds_clusters - 1,
         ] {
-            assert_ne!(
-                bitmap[usize::try_from(cluster / 8).unwrap()] & (1 << (cluster % 8)),
-                0
-            );
+            assert!(is_allocated(cluster));
         }
     }
 

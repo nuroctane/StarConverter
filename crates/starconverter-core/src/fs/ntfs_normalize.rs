@@ -1183,6 +1183,7 @@ mod tests {
             volume_label: NtfsVolumeLabelEvidence::Absent,
             objects: vec![root(entries), file],
             extents,
+            physical_allocations: Vec::new(),
             scanned_records: 7,
             initialized_records: 7,
             in_use_base_records: 2,

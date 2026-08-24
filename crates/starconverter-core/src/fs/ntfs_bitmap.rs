@@ -5,7 +5,9 @@
 //! ordering for volume bitmaps, and NTFS-3G's `mkntfs` rounds the on-disk `$Bitmap` data length to
 //! an eight-byte boundary and marks every bit beyond the last addressable cluster as allocated.
 //!
-//! This module interprets only caller-owned bytes. It performs no I/O and allocates no memory.
+//! Bitmap parsing interprets only caller-owned bytes and performs no I/O or allocation. The
+//! optional ownership reconciler allocates a caller-bounded list of cluster ranges so it can
+//! compare the bitmap with independently inventoried non-resident attributes.
 
 use std::fmt;
 
@@ -63,6 +65,46 @@ pub struct NtfsBitmap<'a> {
     cluster_count: u64,
     allocated_clusters: u64,
     tail: TailEvidence,
+}
+
+/// One physical cluster range claimed by an independently inventoried NTFS attribute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NtfsAllocationClaim {
+    pub start_lcn: u64,
+    pub cluster_count: u64,
+}
+
+/// Resource limits for exact bitmap/ownership reconciliation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NtfsReconciliationLimits {
+    pub max_claims: usize,
+}
+
+impl Default for NtfsReconciliationLimits {
+    fn default() -> Self {
+        Self {
+            max_claims: 8 * 1024 * 1024,
+        }
+    }
+}
+
+/// Exact counts proven while comparing `$Bitmap` with physical ownership claims.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NtfsAllocationReconciliation {
+    pub claim_count: usize,
+    pub claimed_clusters: u64,
+    pub unexplained_allocated_clusters: u64,
+    pub first_unexplained_lcn: Option<u64>,
+}
+
+/// Whether the ownership comparison proves the complete allocated-cluster set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NtfsAllocationReconciliationEvidence {
+    /// Every allocated bit has exactly one physical owner and every claim has an allocated bit.
+    Complete(NtfsAllocationReconciliation),
+    /// Known claims are sound, but the inventory was already incomplete and therefore cannot
+    /// explain every allocated cluster authoritatively.
+    IncompleteInventory(NtfsAllocationReconciliation),
 }
 
 impl NtfsBitmap<'_> {
@@ -160,6 +202,33 @@ pub enum NtfsBitmapError {
     UnallocatedTailBit { bit_index: u64 },
     /// A caller attempted to query outside the addressable cluster range.
     ClusterOutOfRange { lcn: u64, cluster_count: u64 },
+    /// Ownership reconciliation requires a non-zero claim cap.
+    ZeroReconciliationClaimLimit,
+    /// The caller supplied more ownership claims than the explicit reconciliation cap.
+    ReconciliationClaimLimitExceeded { actual: usize, maximum: usize },
+    /// Temporary storage for the bounded, sorted claim index could not be allocated.
+    ReconciliationAllocationFailed,
+    /// A physical allocation claim cannot contain zero clusters.
+    EmptyAllocationClaim { claim_index: usize },
+    /// A physical allocation claim overflowed while calculating its exclusive end LCN.
+    AllocationClaimOverflow { claim_index: usize },
+    /// A physical allocation claim extends beyond the addressable volume.
+    AllocationClaimOutOfRange {
+        claim_index: usize,
+        start_lcn: u64,
+        cluster_count: u64,
+        volume_cluster_count: u64,
+    },
+    /// Two physical ownership claims overlap, which NTFS cannot represent losslessly here.
+    OverlappingAllocationClaims {
+        first_claim_index: usize,
+        second_claim_index: usize,
+        lcn: u64,
+    },
+    /// An inventoried physical extent claims a cluster that `$Bitmap` marks free.
+    ClaimedClusterMarkedFree { claim_index: usize, lcn: u64 },
+    /// An exhaustive inventory left one or more allocated bitmap clusters without an owner.
+    UnexplainedAllocatedCluster { lcn: u64, unexplained_clusters: u64 },
 }
 
 impl fmt::Display for NtfsBitmapError {
@@ -196,6 +265,51 @@ impl fmt::Display for NtfsBitmapError {
             Self::ClusterOutOfRange { lcn, cluster_count } => write!(
                 formatter,
                 "NTFS bitmap LCN {lcn} is out of range for {cluster_count} clusters"
+            ),
+            Self::ZeroReconciliationClaimLimit => {
+                formatter.write_str("NTFS reconciliation claim limit is zero")
+            }
+            Self::ReconciliationClaimLimitExceeded { actual, maximum } => write!(
+                formatter,
+                "NTFS reconciliation received {actual} claims, exceeding caller cap {maximum}"
+            ),
+            Self::ReconciliationAllocationFailed => formatter
+                .write_str("could not allocate the bounded NTFS reconciliation claim index"),
+            Self::EmptyAllocationClaim { claim_index } => write!(
+                formatter,
+                "NTFS allocation claim {claim_index} contains zero clusters"
+            ),
+            Self::AllocationClaimOverflow { claim_index } => write!(
+                formatter,
+                "NTFS allocation claim {claim_index} overflows its ending LCN"
+            ),
+            Self::AllocationClaimOutOfRange {
+                claim_index,
+                start_lcn,
+                cluster_count,
+                volume_cluster_count,
+            } => write!(
+                formatter,
+                "NTFS allocation claim {claim_index} at LCN {start_lcn} for {cluster_count} clusters exceeds the {volume_cluster_count}-cluster volume"
+            ),
+            Self::OverlappingAllocationClaims {
+                first_claim_index,
+                second_claim_index,
+                lcn,
+            } => write!(
+                formatter,
+                "NTFS allocation claims {first_claim_index} and {second_claim_index} overlap at LCN {lcn}"
+            ),
+            Self::ClaimedClusterMarkedFree { claim_index, lcn } => write!(
+                formatter,
+                "NTFS allocation claim {claim_index} uses LCN {lcn}, but $Bitmap marks it free"
+            ),
+            Self::UnexplainedAllocatedCluster {
+                lcn,
+                unexplained_clusters,
+            } => write!(
+                formatter,
+                "NTFS $Bitmap marks {unexplained_clusters} clusters allocated without an inventoried owner; the first is LCN {lcn}"
             ),
         }
     }
@@ -260,6 +374,183 @@ pub fn parse_bitmap_with_tail_policy(
         allocated_clusters,
         tail,
     })
+}
+
+/// Reconciles every addressable `$Bitmap` bit with independent physical ownership claims.
+///
+/// Claims are sorted under `limits.max_claims`, must be non-empty, in-range and pairwise
+/// disjoint, and every claimed cluster must be allocated. When `ownership_complete` is true,
+/// every allocated bitmap cluster must also have exactly one claim. When it is false, unexplained
+/// allocated clusters are counted and returned as explicit incomplete evidence.
+///
+/// # Errors
+///
+/// Returns [`NtfsBitmapError`] for an invalid bound, malformed/overlapping claims, a claimed-free
+/// cluster, an unexplained allocation under exhaustive ownership, or bounded allocation failure.
+pub fn reconcile_allocation_claims(
+    bitmap: &NtfsBitmap<'_>,
+    claims: &[NtfsAllocationClaim],
+    ownership_complete: bool,
+    limits: NtfsReconciliationLimits,
+) -> Result<NtfsAllocationReconciliationEvidence, NtfsBitmapError> {
+    if limits.max_claims == 0 {
+        return Err(NtfsBitmapError::ZeroReconciliationClaimLimit);
+    }
+    if claims.len() > limits.max_claims {
+        return Err(NtfsBitmapError::ReconciliationClaimLimitExceeded {
+            actual: claims.len(),
+            maximum: limits.max_claims,
+        });
+    }
+
+    let mut ordered = Vec::new();
+    ordered
+        .try_reserve_exact(claims.len())
+        .map_err(|_| NtfsBitmapError::ReconciliationAllocationFailed)?;
+    for (claim_index, claim) in claims.iter().copied().enumerate() {
+        if claim.cluster_count == 0 {
+            return Err(NtfsBitmapError::EmptyAllocationClaim { claim_index });
+        }
+        let end_lcn = claim
+            .start_lcn
+            .checked_add(claim.cluster_count)
+            .ok_or(NtfsBitmapError::AllocationClaimOverflow { claim_index })?;
+        if end_lcn > bitmap.cluster_count {
+            return Err(NtfsBitmapError::AllocationClaimOutOfRange {
+                claim_index,
+                start_lcn: claim.start_lcn,
+                cluster_count: claim.cluster_count,
+                volume_cluster_count: bitmap.cluster_count,
+            });
+        }
+        ordered.push(OrderedClaim {
+            claim_index,
+            start_lcn: claim.start_lcn,
+            end_lcn,
+        });
+    }
+    ordered.sort_unstable_by_key(|claim| (claim.start_lcn, claim.end_lcn, claim.claim_index));
+
+    let mut claimed_clusters = 0_u64;
+    let mut previous: Option<OrderedClaim> = None;
+    for claim in &ordered {
+        if let Some(prior) = previous {
+            if claim.start_lcn < prior.end_lcn {
+                return Err(NtfsBitmapError::OverlappingAllocationClaims {
+                    first_claim_index: prior.claim_index,
+                    second_claim_index: claim.claim_index,
+                    lcn: claim.start_lcn,
+                });
+            }
+        }
+        if let Some(lcn) = first_cluster_with_state(
+            bitmap,
+            claim.start_lcn,
+            claim.end_lcn,
+            ClusterAllocation::Free,
+        ) {
+            return Err(NtfsBitmapError::ClaimedClusterMarkedFree {
+                claim_index: claim.claim_index,
+                lcn,
+            });
+        }
+        claimed_clusters = claimed_clusters
+            .checked_add(claim.end_lcn - claim.start_lcn)
+            .ok_or(NtfsBitmapError::LengthCalculationOverflow {
+                cluster_count: bitmap.cluster_count,
+            })?;
+        previous = Some(*claim);
+    }
+
+    let unexplained_allocated_clusters = bitmap.allocated_clusters - claimed_clusters;
+    let first_unexplained_lcn = if unexplained_allocated_clusters == 0 {
+        None
+    } else {
+        first_unclaimed_allocated_cluster(bitmap, &ordered)
+    };
+    let report = NtfsAllocationReconciliation {
+        claim_count: claims.len(),
+        claimed_clusters,
+        unexplained_allocated_clusters,
+        first_unexplained_lcn,
+    };
+    if ownership_complete {
+        if let Some(lcn) = first_unexplained_lcn {
+            return Err(NtfsBitmapError::UnexplainedAllocatedCluster {
+                lcn,
+                unexplained_clusters: unexplained_allocated_clusters,
+            });
+        }
+        Ok(NtfsAllocationReconciliationEvidence::Complete(report))
+    } else {
+        Ok(NtfsAllocationReconciliationEvidence::IncompleteInventory(
+            report,
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OrderedClaim {
+    claim_index: usize,
+    start_lcn: u64,
+    end_lcn: u64,
+}
+
+fn first_unclaimed_allocated_cluster(
+    bitmap: &NtfsBitmap<'_>,
+    claims: &[OrderedClaim],
+) -> Option<u64> {
+    let mut cursor = 0_u64;
+    for claim in claims {
+        if let Some(lcn) = first_cluster_with_state(
+            bitmap,
+            cursor,
+            claim.start_lcn,
+            ClusterAllocation::Allocated,
+        ) {
+            return Some(lcn);
+        }
+        cursor = claim.end_lcn;
+    }
+    first_cluster_with_state(
+        bitmap,
+        cursor,
+        bitmap.cluster_count,
+        ClusterAllocation::Allocated,
+    )
+}
+
+fn first_cluster_with_state(
+    bitmap: &NtfsBitmap<'_>,
+    start_lcn: u64,
+    end_lcn: u64,
+    state: ClusterAllocation,
+) -> Option<u64> {
+    if start_lcn >= end_lcn {
+        return None;
+    }
+    let first_byte = usize::try_from(start_lcn >> 3).ok()?;
+    let last_byte = usize::try_from((end_lcn - 1) >> 3).ok()?;
+    for byte_index in first_byte..=last_byte {
+        let byte_start = u64::try_from(byte_index).ok()?.checked_mul(8)?;
+        let lower = start_lcn.saturating_sub(byte_start).min(8);
+        let upper = end_lcn.saturating_sub(byte_start).min(8);
+        let lower_shift = u32::try_from(lower).ok()?;
+        let width = u32::try_from(upper - lower).ok()?;
+        let range_mask = if width == 8 {
+            u8::MAX
+        } else {
+            u8::try_from((1_u16 << width) - 1).ok()?
+        } << lower_shift;
+        let matching = match state {
+            ClusterAllocation::Allocated => bitmap.bytes[byte_index] & range_mask,
+            ClusterAllocation::Free => !bitmap.bytes[byte_index] & range_mask,
+        };
+        if matching != 0 {
+            return byte_start.checked_add(u64::from(matching.trailing_zeros()));
+        }
+    }
+    None
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -528,6 +819,201 @@ mod tests {
                 allocated_bits: 0,
                 first_unallocated_bit: None,
             }
+        );
+    }
+
+    #[test]
+    fn reconciles_unsorted_disjoint_claims_exactly_across_byte_boundaries() {
+        let mut bytes = canonical_bytes(24, 0);
+        for lcn in [0_u64, 1, 7, 8, 9, 20, 21, 22] {
+            let index = usize::try_from(lcn / 8).unwrap();
+            bytes[index] |= 1 << (lcn % 8);
+        }
+        set_tail_allocated(24, &mut bytes);
+        let bitmap = parse_bitmap(24, &bytes).unwrap();
+        let evidence = reconcile_allocation_claims(
+            &bitmap,
+            &[
+                NtfsAllocationClaim {
+                    start_lcn: 20,
+                    cluster_count: 3,
+                },
+                NtfsAllocationClaim {
+                    start_lcn: 7,
+                    cluster_count: 3,
+                },
+                NtfsAllocationClaim {
+                    start_lcn: 0,
+                    cluster_count: 2,
+                },
+            ],
+            true,
+            NtfsReconciliationLimits { max_claims: 3 },
+        )
+        .unwrap();
+        assert_eq!(
+            evidence,
+            NtfsAllocationReconciliationEvidence::Complete(NtfsAllocationReconciliation {
+                claim_count: 3,
+                claimed_clusters: 8,
+                unexplained_allocated_clusters: 0,
+                first_unexplained_lcn: None,
+            })
+        );
+    }
+
+    #[test]
+    fn known_claim_on_free_cluster_fails_even_when_inventory_is_incomplete() {
+        let mut bytes = canonical_bytes(16, 0);
+        bytes[0] = 1;
+        set_tail_allocated(16, &mut bytes);
+        let bitmap = parse_bitmap(16, &bytes).unwrap();
+        assert_eq!(
+            reconcile_allocation_claims(
+                &bitmap,
+                &[NtfsAllocationClaim {
+                    start_lcn: 0,
+                    cluster_count: 2,
+                }],
+                false,
+                NtfsReconciliationLimits { max_claims: 1 },
+            ),
+            Err(NtfsBitmapError::ClaimedClusterMarkedFree {
+                claim_index: 0,
+                lcn: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn unexplained_allocation_fails_closed_only_for_exhaustive_inventory() {
+        let mut bytes = canonical_bytes(16, 0);
+        bytes[0] = 0b1000_0001;
+        set_tail_allocated(16, &mut bytes);
+        let bitmap = parse_bitmap(16, &bytes).unwrap();
+        let claims = [NtfsAllocationClaim {
+            start_lcn: 0,
+            cluster_count: 1,
+        }];
+        assert_eq!(
+            reconcile_allocation_claims(
+                &bitmap,
+                &claims,
+                true,
+                NtfsReconciliationLimits { max_claims: 1 },
+            ),
+            Err(NtfsBitmapError::UnexplainedAllocatedCluster {
+                lcn: 7,
+                unexplained_clusters: 1,
+            })
+        );
+        assert_eq!(
+            reconcile_allocation_claims(
+                &bitmap,
+                &claims,
+                false,
+                NtfsReconciliationLimits { max_claims: 1 },
+            ),
+            Ok(NtfsAllocationReconciliationEvidence::IncompleteInventory(
+                NtfsAllocationReconciliation {
+                    claim_count: 1,
+                    claimed_clusters: 1,
+                    unexplained_allocated_clusters: 1,
+                    first_unexplained_lcn: Some(7),
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn rejects_overlap_empty_out_of_range_overflow_and_invalid_caps() {
+        let bytes = canonical_bytes(64, 0xff);
+        let bitmap = parse_bitmap(64, &bytes).unwrap();
+        let valid = NtfsReconciliationLimits { max_claims: 2 };
+        assert_eq!(
+            reconcile_allocation_claims(
+                &bitmap,
+                &[],
+                true,
+                NtfsReconciliationLimits { max_claims: 0 }
+            ),
+            Err(NtfsBitmapError::ZeroReconciliationClaimLimit)
+        );
+        assert_eq!(
+            reconcile_allocation_claims(
+                &bitmap,
+                &[
+                    NtfsAllocationClaim {
+                        start_lcn: 0,
+                        cluster_count: 1
+                    },
+                    NtfsAllocationClaim {
+                        start_lcn: 2,
+                        cluster_count: 1
+                    },
+                ],
+                true,
+                NtfsReconciliationLimits { max_claims: 1 },
+            ),
+            Err(NtfsBitmapError::ReconciliationClaimLimitExceeded {
+                actual: 2,
+                maximum: 1
+            })
+        );
+        for (claim, error) in [
+            (
+                NtfsAllocationClaim {
+                    start_lcn: 1,
+                    cluster_count: 0,
+                },
+                NtfsBitmapError::EmptyAllocationClaim { claim_index: 0 },
+            ),
+            (
+                NtfsAllocationClaim {
+                    start_lcn: u64::MAX,
+                    cluster_count: 2,
+                },
+                NtfsBitmapError::AllocationClaimOverflow { claim_index: 0 },
+            ),
+            (
+                NtfsAllocationClaim {
+                    start_lcn: 63,
+                    cluster_count: 2,
+                },
+                NtfsBitmapError::AllocationClaimOutOfRange {
+                    claim_index: 0,
+                    start_lcn: 63,
+                    cluster_count: 2,
+                    volume_cluster_count: 64,
+                },
+            ),
+        ] {
+            assert_eq!(
+                reconcile_allocation_claims(&bitmap, &[claim], false, valid),
+                Err(error)
+            );
+        }
+        assert_eq!(
+            reconcile_allocation_claims(
+                &bitmap,
+                &[
+                    NtfsAllocationClaim {
+                        start_lcn: 8,
+                        cluster_count: 4
+                    },
+                    NtfsAllocationClaim {
+                        start_lcn: 10,
+                        cluster_count: 1
+                    },
+                ],
+                false,
+                valid,
+            ),
+            Err(NtfsBitmapError::OverlappingAllocationClaims {
+                first_claim_index: 0,
+                second_claim_index: 1,
+                lcn: 10,
+            })
         );
     }
 }

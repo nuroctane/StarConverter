@@ -10,8 +10,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui::{
-    self, Align, Button, Color32, FontId, Frame, Label, Layout, Margin, RichText, Stroke,
-    TextStyle, Vec2,
+    self, Align, Button, Color32, FontId, Frame, Layout, Margin, RichText, Stroke, TextStyle, Vec2,
+    WidgetInfo, WidgetType,
 };
 use starconverter_core::candidate_export::{
     CandidateExportError, CandidateExportEvidence, CandidateExportLimits,
@@ -50,6 +50,12 @@ const WARNING: Color32 = Color32::from_rgb(255, 200, 87);
 const DANGER: Color32 = Color32::from_rgb(255, 96, 119);
 const WORKING: Color32 = Color32::from_rgb(168, 216, 255);
 
+const WIDE_LAYOUT_MIN_WIDTH: f32 = 1_100.0;
+const COMPACT_LAYOUT_MAX_WIDTH: f32 = 760.0;
+const MIN_INTERACTION_SIZE: f32 = 44.0;
+const MIN_WINDOW_WIDTH: f32 = 360.0;
+const MIN_WINDOW_HEIGHT: f32 = 480.0;
+
 const SESSION_MAGIC: &str = "STARCONVERTER-SESSION/1";
 const SESSION_MAX_BYTES: usize = 32 * 1024;
 const SESSION_MAX_PATH_BYTES: usize = 4096;
@@ -69,6 +75,25 @@ const INTERRUPTED_EXPORT_GUIDANCE: &str = "[RECOVERY] Never rename or use a .sta
 [RECOVERY] If both final candidate and escrow exist, verify them here before mounting or copying data.\n\
 [RECOVERY] If only partial or escrow artifacts remain, confirm no export is running, preserve them if forensic review matters, then rerun to a new output name.\n\
 [SAFE] The original source was opened read-only; this screen cannot repair or activate a filesystem.";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceLayout {
+    Wide,
+    Medium,
+    Compact,
+}
+
+impl WorkspaceLayout {
+    fn for_width(width: f32) -> Self {
+        if width >= WIDE_LAYOUT_MIN_WIDTH {
+            Self::Wide
+        } else if width >= COMPACT_LAYOUT_MAX_WIDTH {
+            Self::Medium
+        } else {
+            Self::Compact
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionDocument {
@@ -556,7 +581,7 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(Vec2::new(1180.0, 760.0))
-            .with_min_inner_size(Vec2::new(760.0, 580.0)),
+            .with_min_inner_size(Vec2::new(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)),
         ..Default::default()
     };
 
@@ -1370,11 +1395,21 @@ impl eframe::App for StarConverterApp {
         if self.jobs.is_busy() {
             root.ctx().request_repaint_after(Duration::from_millis(75));
         }
-        Self::show_header(root);
-        self.show_footer(root);
-        self.show_source_rail(root);
-        self.show_activity_rail(root);
-        self.show_workbench(root);
+        let workspace_layout = WorkspaceLayout::for_width(root.available_width());
+        Self::show_header(root, workspace_layout);
+        self.show_footer(root, workspace_layout);
+        match workspace_layout {
+            WorkspaceLayout::Wide => {
+                self.show_source_rail(root);
+                self.show_activity_rail(root);
+                self.show_workbench(root, workspace_layout);
+            }
+            WorkspaceLayout::Medium => {
+                self.show_source_rail(root);
+                self.show_workbench(root, workspace_layout);
+            }
+            WorkspaceLayout::Compact => self.show_workbench(root, workspace_layout),
+        }
         if self.session_fingerprint() != session_before {
             self.session_dirty = true;
         }
@@ -1399,7 +1434,7 @@ impl eframe::App for StarConverterApp {
 }
 
 impl StarConverterApp {
-    fn show_header(root: &mut egui::Ui) {
+    fn show_header(root: &mut egui::Ui, workspace_layout: WorkspaceLayout) {
         egui::Panel::top("header")
             .frame(
                 Frame::new()
@@ -1408,23 +1443,18 @@ impl StarConverterApp {
                     .inner_margin(Margin::symmetric(20, 12)),
             )
             .show(root, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("[ STAR :: CONVERTER ]")
-                            .monospace()
-                            .size(18.0)
-                            .color(INK),
-                    );
-                    ui.label(RichText::new("::").monospace().color(FAINT));
-                    ui.label(
-                        RichText::new("FILESYSTEM TRANSFORMATION WORKBENCH")
-                            .monospace()
-                            .size(12.0)
-                            .color(MUTED),
-                    );
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        status_label(ui, "COPY-ONLY BUILD", WORKING);
-                    });
+                ui.horizontal_wrapped(|ui| {
+                    accessible_brand_label(ui);
+                    if workspace_layout != WorkspaceLayout::Compact {
+                        ui.label(RichText::new("::").monospace().color(FAINT));
+                        ui.label(
+                            RichText::new("FILESYSTEM TRANSFORMATION WORKBENCH")
+                                .monospace()
+                                .size(12.0)
+                                .color(MUTED),
+                        );
+                    }
+                    status_label(ui, "COPY-ONLY BUILD", WORKING);
                 });
             });
     }
@@ -1432,7 +1462,7 @@ impl StarConverterApp {
     // The footer intentionally keeps the complete job-state action cluster together so its
     // enabled/disabled labels cannot drift across helper boundaries.
     #[allow(clippy::too_many_lines)]
-    fn show_footer(&mut self, root: &mut egui::Ui) {
+    fn show_footer(&mut self, root: &mut egui::Ui, workspace_layout: WorkspaceLayout) {
         egui::Panel::bottom("footer")
             .frame(
                 Frame::new()
@@ -1441,46 +1471,29 @@ impl StarConverterApp {
                     .inner_margin(Margin::symmetric(20, 12)),
             )
             .show(root, |ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label(
                         RichText::new("[SAFE] SOURCE WRITES DISABLED")
                             .monospace()
                             .color(READY),
                     );
-                    ui.label(
-                        RichText::new(
-                            "Sources are read-only; exports create new files; device paths are refused.",
-                        )
-                        .monospace()
-                        .color(MUTED),
-                    );
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if workspace_layout != WorkspaceLayout::Compact {
+                        ui.label(
+                            RichText::new(
+                                "Sources are read-only; exports create new files; device paths are refused.",
+                            )
+                            .monospace()
+                            .color(MUTED),
+                        );
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
                         let progress = self.jobs.progress();
                         let cancel_requested = self.jobs.active().is_some_and(|job| {
                             job.cancel_requested.load(Ordering::Acquire)
                         });
                         let cancellable = progress.is_none_or(|value| value.cancellable);
-                        ui.add_enabled(false, Button::new("Convert"))
-                            .on_disabled_hover_text(
-                                "In-place and physical conversion remain locked behind activation gates.",
-                            );
                         let idle = !self.jobs.is_busy();
-                        let export_enabled = idle && self.mode != GuaranteeMode::ContentOnly;
-                        if ui
-                            .add_enabled(export_enabled, Button::new("Export new image"))
-                            .on_disabled_hover_text(
-                                "Content-only is preview-only; choose strict or escrow to export.",
-                            )
-                            .clicked()
-                        {
-                            self.export_new_image();
-                        }
-                        if ui
-                            .add_enabled(idle, Button::new("Preview exact"))
-                            .clicked()
-                        {
-                            self.preview_image();
-                        }
                         if ui
                             .add_enabled(idle, Button::new("Analyze source"))
                             .clicked()
@@ -1493,9 +1506,29 @@ impl StarConverterApp {
                                 self.analyze_image();
                             }
                         }
+                        if ui
+                            .add_enabled(idle, Button::new("Preview exact"))
+                            .clicked()
+                        {
+                            self.preview_image();
+                        }
+                        let export_enabled = idle && self.mode != GuaranteeMode::ContentOnly;
+                        if ui
+                            .add_enabled(export_enabled, Button::new("Export new image"))
+                            .on_disabled_hover_text(
+                                "Content-only is preview-only; choose strict or escrow to export.",
+                            )
+                            .clicked()
+                        {
+                            self.export_new_image();
+                        }
                         if ui.button("Save plan").clicked() {
                             self.save_plan();
                         }
+                        ui.add_enabled(false, Button::new("Convert"))
+                            .on_disabled_hover_text(
+                                "In-place and physical conversion remain locked behind activation gates.",
+                            );
                         if ui
                             .add_enabled(
                                 !idle && !cancel_requested && cancellable,
@@ -1537,7 +1570,6 @@ impl StarConverterApp {
                                     .color(color),
                             );
                         }
-                    });
                 });
             });
     }
@@ -1553,13 +1585,16 @@ impl StarConverterApp {
                     .inner_margin(Margin::same(16)),
             )
             .show(root, |ui| {
-                ui.add(
-                    Label::new(RichText::new(ASCII_MARK).monospace().size(13.0).color(INK))
-                        .selectable(false),
-                );
-                self.show_source_selector(ui);
-                self.show_source_identity(ui);
+                self.show_source_contents(ui, true);
             });
+    }
+
+    fn show_source_contents(&mut self, ui: &mut egui::Ui, show_ascii_mark: bool) {
+        if show_ascii_mark {
+            decorative_ascii_mark(ui);
+        }
+        self.show_source_selector(ui);
+        self.show_source_identity(ui);
     }
 
     fn show_source_selector(&mut self, ui: &mut egui::Ui) {
@@ -1685,45 +1720,51 @@ impl StarConverterApp {
                     .inner_margin(Margin::same(16)),
             )
             .show(root, |ui| {
-                section_label(ui, "SESSION RECOVERY");
-                ui.label(
-                    RichText::new(self.session_recovery_text())
-                        .monospace()
-                        .size(10.0)
-                        .color(self.session_recovery_color()),
-                );
-                if ui
-                    .add_enabled(
-                        self.session_store.is_some(),
-                        Button::new("Forget saved recovery data"),
-                    )
-                    .on_hover_text(
-                        "Delete only StarConverter's bounded session generations. Current fields remain visible.",
-                    )
-                    .clicked()
-                {
-                    self.clear_saved_session();
-                }
-                ui.label(
-                    RichText::new(
-                        "Only guarantee mode and explicit regular image/candidate/escrow/source fields are recoverable. Evidence and activity are never persisted.",
-                    )
-                    .monospace()
-                    .size(9.0)
-                    .color(MUTED),
-                );
-                ui.add_space(18.0);
-                section_label(ui, "ACTIVITY :: SESSION");
-                ui.add_space(10.0);
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        for entry in &self.activity {
-                            ui.label(RichText::new(entry).monospace().size(11.0).color(MUTED));
-                            ui.add_space(5.0);
-                        }
-                    });
+                self.show_activity_contents(ui, false);
             });
+    }
+
+    fn show_activity_contents(&mut self, ui: &mut egui::Ui, inline: bool) {
+        section_label(ui, "SESSION RECOVERY");
+        ui.label(
+            RichText::new(self.session_recovery_text())
+                .monospace()
+                .size(10.0)
+                .color(self.session_recovery_color()),
+        );
+        if ui
+            .add_enabled(
+                self.session_store.is_some(),
+                Button::new("Forget saved recovery data"),
+            )
+            .on_hover_text(
+                "Delete only StarConverter's bounded session generations. Current fields remain visible.",
+            )
+            .clicked()
+        {
+            self.clear_saved_session();
+        }
+        ui.label(
+            RichText::new(
+                "Only guarantee mode and explicit regular image/candidate/escrow/source fields are recoverable. Evidence and activity are never persisted.",
+            )
+            .monospace()
+            .size(9.0)
+            .color(MUTED),
+        );
+        ui.add_space(18.0);
+        section_label(ui, "ACTIVITY :: SESSION");
+        ui.add_space(10.0);
+        let mut activity_scroll = egui::ScrollArea::vertical().auto_shrink([false, false]);
+        if inline {
+            activity_scroll = activity_scroll.max_height(260.0);
+        }
+        activity_scroll.show(ui, |ui| {
+            for entry in &self.activity {
+                ui.label(RichText::new(entry).monospace().size(11.0).color(MUTED));
+                ui.add_space(5.0);
+            }
+        });
     }
 
     fn session_recovery_text(&self) -> String {
@@ -1752,25 +1793,41 @@ impl StarConverterApp {
         }
     }
 
-    fn show_workbench(&mut self, root: &mut egui::Ui) {
+    fn show_workbench(&mut self, root: &mut egui::Ui, workspace_layout: WorkspaceLayout) {
         egui::CentralPanel::default()
-            .frame(Frame::new().fill(VOID).inner_margin(Margin::same(24)))
+            .frame(Frame::new().fill(VOID).inner_margin(Margin::same(20)))
             .show(root, |ui| {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
+                        if workspace_layout == WorkspaceLayout::Compact {
+                            Frame::new()
+                                .fill(SURFACE)
+                                .stroke(Stroke::new(1.0, LINE))
+                                .inner_margin(Margin::same(14))
+                                .show(ui, |ui| self.show_source_contents(ui, false));
+                            ui.add_space(24.0);
+                        }
                         self.show_direction(ui);
                         self.show_modes(ui);
                         self.show_preflight(ui);
                         self.show_phases(ui);
                         self.show_exact_preview(ui);
                         self.show_export_verification(ui);
+                        if workspace_layout != WorkspaceLayout::Wide {
+                            Frame::new()
+                                .fill(SURFACE)
+                                .stroke(Stroke::new(1.0, LINE))
+                                .inner_margin(Margin::same(14))
+                                .show(ui, |ui| self.show_activity_contents(ui, true));
+                            ui.add_space(24.0);
+                        }
                     });
             });
     }
 
     fn show_direction(&self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.vertical(|ui| {
                 section_label(ui, "CONVERSION DIRECTION");
                 ui.add_space(6.0);
@@ -1781,14 +1838,12 @@ impl StarConverterApp {
                         .color(INK),
                 );
             });
-            ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
-                let (text, color) = if self.plan.is_ready() {
-                    ("PREFLIGHT READY", READY)
-                } else {
-                    ("PREFLIGHT BLOCKED", DANGER)
-                };
-                status_label(ui, text, color);
-            });
+            let (text, color) = if self.plan.is_ready() {
+                ("PREFLIGHT READY", READY)
+            } else {
+                ("PREFLIGHT BLOCKED", DANGER)
+            };
+            status_label(ui, text, color);
         });
     }
 
@@ -1797,29 +1852,55 @@ impl StarConverterApp {
         section_label(ui, "GUARANTEE MODE");
         ui.add_space(8.0);
         ui.add_enabled_ui(!self.jobs.is_busy(), |ui| {
-            ui.columns(3, |columns| {
+            if ui.available_width() < 560.0 {
                 mode_card(
-                    &mut columns[0],
+                    ui,
                     &mut self.mode,
                     GuaranteeMode::Strict,
                     "STRICT",
                     "Refuse anything that cannot round-trip natively.",
                 );
+                ui.add_space(6.0);
                 mode_card(
-                    &mut columns[1],
+                    ui,
                     &mut self.mode,
                     GuaranteeMode::Escrow,
                     "ESCROW",
                     "Keep source-only semantics in a durable capsule.",
                 );
+                ui.add_space(6.0);
                 mode_card(
-                    &mut columns[2],
+                    ui,
                     &mut self.mode,
                     GuaranteeMode::ContentOnly,
                     "CONTENT ONLY",
                     "Preserve bytes; report metadata downgrades.",
                 );
-            });
+            } else {
+                ui.columns(3, |columns| {
+                    mode_card(
+                        &mut columns[0],
+                        &mut self.mode,
+                        GuaranteeMode::Strict,
+                        "STRICT",
+                        "Refuse anything that cannot round-trip natively.",
+                    );
+                    mode_card(
+                        &mut columns[1],
+                        &mut self.mode,
+                        GuaranteeMode::Escrow,
+                        "ESCROW",
+                        "Keep source-only semantics in a durable capsule.",
+                    );
+                    mode_card(
+                        &mut columns[2],
+                        &mut self.mode,
+                        GuaranteeMode::ContentOnly,
+                        "CONTENT ONLY",
+                        "Preserve bytes; report metadata downgrades.",
+                    );
+                });
+            }
         });
         if self.mode != self.plan.mode {
             self.replan();
@@ -1897,7 +1978,7 @@ impl StarConverterApp {
             .max_height(190.0)
             .show(ui, |ui| {
                 for phase in &self.plan.phases {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label(
                             RichText::new(format!("{:02}", phase.number))
                                 .monospace()
@@ -2025,7 +2106,7 @@ impl StarConverterApp {
     }
 
     fn show_verification_actions(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let ready = !self.verification_candidate_path.trim().is_empty()
                 && !self.verification_escrow_path.trim().is_empty();
             if ui
@@ -2288,12 +2369,10 @@ fn verification_path_row(
     let label_response = ui.label(RichText::new(label).monospace().size(10.0).color(MUTED));
     let mut browse = false;
     let mut changed = false;
-    ui.horizontal(|ui| {
-        let browse_width = 124.0;
-        let path_width = (ui.available_width() - browse_width - 8.0).max(120.0);
+    if ui.available_width() < 460.0 {
         changed = ui
             .add_sized(
-                [path_width, 36.0],
+                [ui.available_width(), MIN_INTERACTION_SIZE],
                 egui::TextEdit::singleline(path)
                     .id_source(id_source)
                     .hint_text(hint),
@@ -2302,16 +2381,63 @@ fn verification_path_row(
             .on_hover_text("Regular file path only; device namespaces are rejected.")
             .changed();
         browse = ui
-            .add_sized([browse_width, 36.0], Button::new(browse_label))
+            .add_sized(
+                [ui.available_width(), MIN_INTERACTION_SIZE],
+                Button::new(browse_label),
+            )
             .clicked();
-    });
+    } else {
+        ui.horizontal(|ui| {
+            let browse_width = 124.0;
+            let path_width = (ui.available_width() - browse_width - 8.0).max(120.0);
+            changed = ui
+                .add_sized(
+                    [path_width, MIN_INTERACTION_SIZE],
+                    egui::TextEdit::singleline(path)
+                        .id_source(id_source)
+                        .hint_text(hint),
+                )
+                .labelled_by(label_response.id)
+                .on_hover_text("Regular file path only; device namespaces are rejected.")
+                .changed();
+            browse = ui
+                .add_sized(
+                    [browse_width, MIN_INTERACTION_SIZE],
+                    Button::new(browse_label),
+                )
+                .clicked();
+        });
+    }
     (browse, changed)
+}
+
+fn accessible_brand_label(ui: &mut egui::Ui) {
+    let galley = ui.painter().layout_no_wrap(
+        "[ STAR :: CONVERTER ]".to_owned(),
+        FontId::monospace(18.0),
+        INK,
+    );
+    let (rect, response) = ui.allocate_exact_size(galley.size(), egui::Sense::hover());
+    ui.painter().galley(rect.min, galley, INK);
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, "StarConverter"));
+}
+
+fn decorative_ascii_mark(ui: &mut egui::Ui) {
+    let galley = ui.painter().layout(
+        ASCII_MARK.to_owned(),
+        FontId::monospace(13.0),
+        INK,
+        ui.available_width(),
+    );
+    let (rect, _) = ui.allocate_exact_size(galley.size(), egui::Sense::hover());
+    ui.painter().galley(rect.min, galley, INK);
 }
 
 fn configure_style(context: &egui::Context) {
     let mut style = (*context.global_style()).clone();
     style.spacing.item_spacing = Vec2::new(8.0, 8.0);
     style.spacing.button_padding = Vec2::new(14.0, 10.0);
+    style.spacing.interact_size = Vec2::splat(MIN_INTERACTION_SIZE);
     style.visuals.dark_mode = true;
     style.visuals.panel_fill = VOID;
     style.visuals.window_fill = SURFACE;
@@ -2413,16 +2539,9 @@ fn mode_card(
 }
 
 fn preflight_row(ui: &mut egui::Ui, label: &str, value: &str, status: &str, color: Color32) {
-    ui.horizontal(|ui| {
-        ui.set_min_height(24.0);
-        ui.label(
-            RichText::new(format!("{label:<22}"))
-                .monospace()
-                .size(11.0)
-                .color(FAINT),
-        );
-        ui.label(RichText::new(value).monospace().size(11.0).color(MUTED));
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+    if ui.available_width() < 520.0 {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(label).monospace().size(11.0).color(FAINT));
             ui.label(
                 RichText::new(format!("[{status}]"))
                     .monospace()
@@ -2430,7 +2549,27 @@ fn preflight_row(ui: &mut egui::Ui, label: &str, value: &str, status: &str, colo
                     .color(color),
             );
         });
-    });
+        ui.label(RichText::new(value).monospace().size(11.0).color(MUTED));
+    } else {
+        ui.horizontal(|ui| {
+            ui.set_min_height(24.0);
+            ui.label(
+                RichText::new(format!("{label:<22}"))
+                    .monospace()
+                    .size(11.0)
+                    .color(FAINT),
+            );
+            ui.label(RichText::new(value).monospace().size(11.0).color(MUTED));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(
+                    RichText::new(format!("[{status}]"))
+                        .monospace()
+                        .size(10.0)
+                        .color(color),
+                );
+            });
+        });
+    }
     ui.separator();
 }
 
@@ -3078,5 +3217,102 @@ mod tests {
                 "{foreground:?} lacks 4.5:1 contrast on {SURFACE:?}"
             );
         }
+    }
+
+    #[test]
+    fn responsive_breakpoints_include_760px_and_200_percent_scaling() {
+        assert_eq!(
+            WorkspaceLayout::for_width(WIDE_LAYOUT_MIN_WIDTH),
+            WorkspaceLayout::Wide
+        );
+        assert_eq!(
+            WorkspaceLayout::for_width(COMPACT_LAYOUT_MAX_WIDTH),
+            WorkspaceLayout::Medium
+        );
+        assert_eq!(
+            WorkspaceLayout::for_width(COMPACT_LAYOUT_MAX_WIDTH - 1.0),
+            WorkspaceLayout::Compact
+        );
+
+        // At 200% scale, a 760 physical-pixel viewport is exposed to egui as
+        // 380 logical points. That must select the single-column layout.
+        assert_eq!(
+            WorkspaceLayout::for_width(COMPACT_LAYOUT_MAX_WIDTH / 2.0),
+            WorkspaceLayout::Compact
+        );
+    }
+
+    #[test]
+    fn global_and_explicit_interaction_targets_are_at_least_44_points() {
+        let context = egui::Context::default();
+        configure_style(&context);
+        let mut observed_sizes = Vec::new();
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(380.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let mut output = context.run_ui(raw_input, |ui| {
+            observed_sizes.push(ui.button("Analyze source").rect.size());
+            observed_sizes.push(source_button(ui, false, "DEMO", "exFAT").rect.size());
+            let mut path = String::new();
+            let _ = verification_path_row(
+                ui,
+                "FINAL CANDIDATE",
+                "target_test_path",
+                &mut path,
+                "candidate.img",
+                "Browse candidate",
+            );
+            let button = ui
+                .add_sized(
+                    [ui.available_width(), MIN_INTERACTION_SIZE],
+                    Button::new("Export new image"),
+                )
+                .rect
+                .size();
+            observed_sizes.push(button);
+        });
+        output.textures_delta.clear();
+
+        assert!(!observed_sizes.is_empty());
+        for size in observed_sizes {
+            assert!(
+                size.x >= MIN_INTERACTION_SIZE && size.y >= MIN_INTERACTION_SIZE,
+                "interaction target is smaller than 44x44 points: {size:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn accesskit_exposes_one_product_name_and_hides_decorative_ascii() {
+        assert!(ASCII_MARK.is_ascii());
+        let context = egui::Context::default();
+        context.enable_accesskit();
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| {
+            accessible_brand_label(ui);
+            decorative_ascii_mark(ui);
+        });
+        output.textures_delta.clear();
+        let update = output
+            .platform_output
+            .accesskit_update
+            .expect("AccessKit tree should be emitted when enabled");
+
+        let product_name_count = update
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.value() == Some("StarConverter"))
+            .count();
+        assert_eq!(product_name_count, 1);
+        assert!(update.nodes.iter().all(|(_, node)| {
+            node.value()
+                .is_none_or(|value| !value.contains("STAR :: CONVERTER"))
+                && node
+                    .label()
+                    .is_none_or(|label| !label.contains("STAR :: CONVERTER"))
+        }));
     }
 }

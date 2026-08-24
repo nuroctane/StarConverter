@@ -23,6 +23,10 @@ use crate::fs::exfat_region::{
     self, ExfatBootRegionComparison, ExfatBootRegionError, ExfatBootRegionsValidation,
 };
 use crate::fs::ntfs::{self, NtfsBootSector, NtfsBootSectorError};
+use crate::fs::ntfs_bitmap::{
+    NtfsAllocationClaim, NtfsAllocationReconciliation, NtfsAllocationReconciliationEvidence,
+    NtfsBitmapError, NtfsReconciliationLimits, parse_bitmap, reconcile_allocation_claims,
+};
 use crate::fs::ntfs_discovery::{
     NtfsDiscoveryError, NtfsDiscoveryLimits, NtfsSystemDiscovery, discover_system_records,
 };
@@ -39,8 +43,8 @@ use crate::fs::ntfs_secure::{
     NtfsSecureError, NtfsSecureLimits, NtfsSecureProfile, generate_ntfs_secure_metadata,
 };
 use crate::fs::ntfs_volume::{
-    NtfsBitmapEvidence, NtfsVolumeDiscovery, NtfsVolumeError, NtfsVolumeEvidence, NtfsVolumeLimits,
-    discover_volume_and_bitmap,
+    NtfsBitmapEvidence, NtfsMetadataIncompleteReason, NtfsVolumeDiscovery, NtfsVolumeError,
+    NtfsVolumeEvidence, NtfsVolumeLimits, discover_volume_and_bitmap,
 };
 use crate::image::{ImageError, ImageFile};
 use crate::object::ObjectGraphLimits;
@@ -86,7 +90,28 @@ struct InspectionEvidence {
     ntfs_discovery: Option<Box<NtfsSystemDiscovery>>,
     ntfs_volume: Option<Box<NtfsVolumeDiscovery>>,
     ntfs_inventory: Option<Box<NtfsInventory>>,
+    ntfs_allocation_reconciliation: Option<NtfsAllocationReconciliationStatus>,
     normalized_ntfs: Option<Box<NormalizedNtfs>>,
+}
+
+/// Exact NTFS `$Bitmap`/physical-owner comparison evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NtfsAllocationReconciliationStatus {
+    /// Every allocated cluster has exactly one inventoried owner.
+    Complete(NtfsAllocationReconciliation),
+    /// Known physical owners are consistent, but the bounded object inventory is incomplete.
+    IncompleteInventory(NtfsAllocationReconciliation),
+    /// `$Bitmap` itself could not be read completely, so ownership could not be compared.
+    IncompleteBitmap {
+        reason: NtfsMetadataIncompleteReason,
+    },
+}
+
+impl NtfsAllocationReconciliationStatus {
+    #[must_use]
+    pub const fn is_complete(self) -> bool {
+        matches!(self, Self::Complete(_))
+    }
 }
 
 /// Evidence produced by opening and parsing one regular image file.
@@ -101,6 +126,7 @@ pub struct ImageInspection {
     pub ntfs_discovery: Option<Box<NtfsSystemDiscovery>>,
     pub ntfs_volume: Option<Box<NtfsVolumeDiscovery>>,
     pub ntfs_inventory: Option<Box<NtfsInventory>>,
+    pub ntfs_allocation_reconciliation: Option<NtfsAllocationReconciliationStatus>,
     pub normalized_ntfs: Option<Box<NormalizedNtfs>>,
     pub image_bytes: u64,
     pub declared_volume_bytes: u64,
@@ -122,6 +148,7 @@ pub enum InspectionError {
     InvalidNtfsDiscovery(NtfsDiscoveryError),
     InvalidNtfsVolume(NtfsVolumeError),
     InvalidNtfsInventory(NtfsInventoryError),
+    InvalidNtfsAllocationReconciliation(NtfsBitmapError),
     InvalidNtfsNormalization(NtfsNormalizeError),
     InvalidNtfsSecurityProfile(NtfsSecureError),
     GeometryOverflow { calculation: &'static str },
@@ -166,6 +193,10 @@ impl fmt::Display for InspectionError {
             Self::InvalidNtfsInventory(error) => {
                 write!(formatter, "invalid NTFS object inventory: {error}")
             }
+            Self::InvalidNtfsAllocationReconciliation(error) => write!(
+                formatter,
+                "invalid NTFS allocation ownership reconciliation: {error}"
+            ),
             Self::InvalidNtfsNormalization(error) => {
                 write!(formatter, "invalid normalized NTFS object graph: {error}")
             }
@@ -197,6 +228,7 @@ impl std::error::Error for InspectionError {
             Self::InvalidNtfsDiscovery(error) => Some(error),
             Self::InvalidNtfsVolume(error) => Some(error),
             Self::InvalidNtfsInventory(error) => Some(error),
+            Self::InvalidNtfsAllocationReconciliation(error) => Some(error),
             Self::InvalidNtfsNormalization(error) => Some(error),
             Self::InvalidNtfsSecurityProfile(error) => Some(error),
             _ => None,
@@ -348,6 +380,7 @@ fn inspect_exfat(image: &ImageFile, prefix: &[u8]) -> Result<ImageInspection, In
             ntfs_discovery: None,
             ntfs_volume: None,
             ntfs_inventory: None,
+            ntfs_allocation_reconciliation: None,
             normalized_ntfs: None,
         },
     )
@@ -380,7 +413,8 @@ fn inspect_ntfs(image: &ImageFile, prefix: &[u8]) -> Result<ImageInspection, Ins
             .map_err(InspectionError::InvalidNtfsVolume)?;
     let inventory = inventory_ntfs(image, &boot, &discovery.mft, NtfsInventoryLimits::default())
         .map_err(InspectionError::InvalidNtfsInventory)?;
-    let normalized = if inventory.is_complete() {
+    let allocation_reconciliation = reconcile_ntfs_allocation(&boot, &volume, &inventory)?;
+    let normalized = if inventory.is_complete() && allocation_reconciliation.is_complete() {
         let mut normalized = normalize_ntfs(
             &inventory,
             image.len(),
@@ -420,9 +454,59 @@ fn inspect_ntfs(image: &ImageFile, prefix: &[u8]) -> Result<ImageInspection, Ins
             ntfs_discovery: Some(Box::new(discovery)),
             ntfs_volume: Some(Box::new(volume)),
             ntfs_inventory: Some(Box::new(inventory)),
+            ntfs_allocation_reconciliation: Some(allocation_reconciliation),
             normalized_ntfs: normalized,
         },
     )
+}
+
+fn reconcile_ntfs_allocation(
+    boot: &NtfsBootSector,
+    volume: &NtfsVolumeDiscovery,
+    inventory: &NtfsInventory,
+) -> Result<NtfsAllocationReconciliationStatus, InspectionError> {
+    let allocation = match &volume.bitmap {
+        NtfsBitmapEvidence::Complete(allocation) => allocation,
+        NtfsBitmapEvidence::Incomplete { reason } => {
+            return Ok(NtfsAllocationReconciliationStatus::IncompleteBitmap { reason: *reason });
+        }
+    };
+    let bitmap = parse_bitmap(boot.cluster_count, &allocation.canonical_bitmap)
+        .map_err(InspectionError::InvalidNtfsAllocationReconciliation)?;
+    let mut claims = Vec::new();
+    claims
+        .try_reserve_exact(inventory.physical_allocations.len())
+        .map_err(|_| {
+            InspectionError::InvalidNtfsAllocationReconciliation(
+                NtfsBitmapError::ReconciliationAllocationFailed,
+            )
+        })?;
+    claims.extend(
+        inventory
+            .physical_allocations
+            .iter()
+            .map(|allocation| NtfsAllocationClaim {
+                start_lcn: allocation.start_lcn,
+                cluster_count: allocation.cluster_count,
+            }),
+    );
+    let evidence = reconcile_allocation_claims(
+        &bitmap,
+        &claims,
+        inventory.is_complete(),
+        NtfsReconciliationLimits {
+            max_claims: NtfsInventoryLimits::default().max_extents,
+        },
+    )
+    .map_err(InspectionError::InvalidNtfsAllocationReconciliation)?;
+    Ok(match evidence {
+        NtfsAllocationReconciliationEvidence::Complete(report) => {
+            NtfsAllocationReconciliationStatus::Complete(report)
+        }
+        NtfsAllocationReconciliationEvidence::IncompleteInventory(report) => {
+            NtfsAllocationReconciliationStatus::IncompleteInventory(report)
+        }
+    })
 }
 
 fn inspect_ntfs_security_descriptors(
@@ -545,7 +629,7 @@ fn finish_inspection(
                 .map(|root| root.free_bytes)
                 .or_else(|| {
                     evidence.ntfs_volume.as_ref().and_then(|volume| {
-                        if let NtfsBitmapEvidence::Complete(allocation) = volume.bitmap {
+                        if let NtfsBitmapEvidence::Complete(allocation) = &volume.bitmap {
                             Some(allocation.free_bytes)
                         } else {
                             None
@@ -582,6 +666,7 @@ fn finish_inspection(
         ntfs_discovery: evidence.ntfs_discovery,
         ntfs_volume: evidence.ntfs_volume,
         ntfs_inventory: evidence.ntfs_inventory,
+        ntfs_allocation_reconciliation: evidence.ntfs_allocation_reconciliation,
         normalized_ntfs: evidence.normalized_ntfs,
         image_bytes: image.len(),
         declared_volume_bytes,
@@ -853,8 +938,7 @@ mod tests {
             put_u32(&mut record, attribute + 4, 56);
             put_u32(&mut record, attribute + 16, 32);
             put_u16(&mut record, attribute + 20, 24);
-            record[attribute + 24] = 0xff;
-            record[attribute + 25] = 0x03;
+            record[attribute + 24] = 0b0011_0000;
             record[attribute + 55] = 0x80;
             put_u32(&mut record, attribute + 56, u32::MAX);
             120
@@ -915,7 +999,7 @@ mod tests {
         assert_eq!(inspection.profile.filesystem, FileSystem::Ntfs);
         assert_eq!(inspection.profile.cluster_bytes, 4096);
         assert_eq!(inspection.profile.state.health, HealthState::Clean);
-        assert_eq!(inspection.profile.free_bytes, Some(245 * 4096));
+        assert_eq!(inspection.profile.free_bytes, Some(253 * 4096));
         assert!(inspection.profile.inventory_complete);
         assert!(inspection.ntfs_discovery.is_some());
         assert!(inspection.ntfs_volume.is_some());

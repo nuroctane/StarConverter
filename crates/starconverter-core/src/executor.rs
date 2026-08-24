@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
+use crate::capsule::TransactionPhase;
 use crate::conversion::{PreparedConversion, ReservedWrite, RollbackIntent, TransactionIntent};
 use crate::geometry::Relocation;
 use crate::image::{ImageError, ImageIdentity, reject_device_like_path};
@@ -97,26 +98,134 @@ impl FaultInjector for NoFault {
     }
 }
 
-/// Verified completion evidence. The executor deliberately does not record transaction
-/// checkpoints; a coordinator may consume this value only after independently matching the plan.
+/// Verified completion details sealed by the executor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExecutionEvidence {
-    pub kind: ExecutionKind,
-    pub operations: usize,
-    pub bytes_written: u64,
+    kind: ExecutionKind,
+    operations: usize,
+    bytes_written: u64,
     /// Domain-separated digest of exact ranges and verified destination bytes.
-    pub verified_digest: [u8; 32],
-    pub sync_data_completed: bool,
-    pub sync_all_completed: bool,
+    verified_digest: [u8; 32],
+    sync_data_completed: bool,
+    sync_all_completed: bool,
 }
 
-/// Result of executing a conservative rollback intent.
+impl ExecutionEvidence {
+    #[must_use]
+    pub const fn kind(&self) -> ExecutionKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn operations(&self) -> usize {
+        self.operations
+    }
+
+    #[must_use]
+    pub const fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
+
+    #[must_use]
+    pub const fn verified_digest(&self) -> [u8; 32] {
+        self.verified_digest
+    }
+
+    #[must_use]
+    pub const fn sync_data_completed(&self) -> bool {
+        self.sync_data_completed
+    }
+
+    #[must_use]
+    pub const fn sync_all_completed(&self) -> bool {
+        self.sync_all_completed
+    }
+}
+
+/// Opaque, plan-and-container-bound proof that one mutating intent reached both flush barriers.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ExecutedIntent {
+    evidence: ExecutionEvidence,
+    plan_digest: [u8; 32],
+    image_instance: [u8; 32],
+    completed_phase: TransactionPhase,
+}
+
+impl ExecutedIntent {
+    #[must_use]
+    pub const fn evidence(&self) -> &ExecutionEvidence {
+        &self.evidence
+    }
+
+    #[must_use]
+    pub const fn completed_phase(&self) -> TransactionPhase {
+        self.completed_phase
+    }
+
+    pub(crate) const fn into_checkpoint(
+        self,
+    ) -> (ExecutionEvidence, [u8; 32], [u8; 32], TransactionPhase) {
+        (
+            self.evidence,
+            self.plan_digest,
+            self.image_instance,
+            self.completed_phase,
+        )
+    }
+}
+
+type RollbackCheckpoint = (
+    bool,
+    Option<ExecutionEvidence>,
+    [u8; 32],
+    [u8; 32],
+    Option<[u8; 32]>,
+);
+
+/// Result of executing a conservative rollback intent. Construction remains executor-only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RollbackEvidence {
+enum RollbackOutcome {
     /// No source-visible bytes required restoration.
     StagingDiscarded,
     /// Exact before-images were written, verified, and durably flushed.
     SourceRestored(ExecutionEvidence),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ExecutedRollback {
+    outcome: RollbackOutcome,
+    plan_digest: [u8; 32],
+    image_instance: [u8; 32],
+    rollback_digest: Option<[u8; 32]>,
+}
+
+impl ExecutedRollback {
+    #[must_use]
+    pub const fn restored_source(&self) -> bool {
+        matches!(self.outcome, RollbackOutcome::SourceRestored(_))
+    }
+
+    #[must_use]
+    pub const fn evidence(&self) -> Option<&ExecutionEvidence> {
+        match &self.outcome {
+            RollbackOutcome::StagingDiscarded => None,
+            RollbackOutcome::SourceRestored(evidence) => Some(evidence),
+        }
+    }
+
+    pub(crate) const fn into_checkpoint(self) -> RollbackCheckpoint {
+        let (restored_source, evidence) = match self.outcome {
+            RollbackOutcome::StagingDiscarded => (false, None),
+            RollbackOutcome::SourceRestored(evidence) => (true, Some(evidence)),
+        };
+        (
+            restored_source,
+            evidence,
+            self.plan_digest,
+            self.image_instance,
+            self.rollback_digest,
+        )
+    }
 }
 
 /// Existing regular-image writer pinned to the identity established during inspection.
@@ -219,7 +328,7 @@ impl ImageExecutor {
         &self,
         prepared: &PreparedConversion,
         intent: TransactionIntent<'_>,
-    ) -> Result<ExecutionEvidence, ExecutorError> {
+    ) -> Result<ExecutedIntent, ExecutorError> {
         self.execute_intent_with_faults(prepared, intent, &mut NoFault)
     }
 
@@ -234,35 +343,45 @@ impl ImageExecutor {
         prepared: &PreparedConversion,
         intent: TransactionIntent<'_>,
         faults: &mut F,
-    ) -> Result<ExecutionEvidence, ExecutorError> {
+    ) -> Result<ExecutedIntent, ExecutorError> {
         if !prepared.matches_regular_image(&self.identity) {
             return Err(ExecutorError::PlanImageMismatch);
         }
-        match intent {
+        let (evidence, completed_phase) = match intent {
             TransactionIntent::Relocate(relocations) => {
                 if relocations != prepared.layout().relocations {
                     return Err(ExecutorError::IntentNotAuthorized);
                 }
                 self.copy_relocations(relocations, faults)
+                    .map(|evidence| (evidence, TransactionPhase::Relocating))
             }
             TransactionIntent::StageTarget(writes) => {
                 validate_exact_phase(prepared.target_staging_writes(), writes)?;
                 self.apply_reserved_writes(ExecutionKind::TargetStaging, writes, faults)
+                    .map(|evidence| (evidence, TransactionPhase::TargetStaged))
             }
             TransactionIntent::WriteBackupBoot(writes) => {
                 validate_exact_phase(prepared.backup_boot_writes(), writes)?;
                 self.apply_reserved_writes(ExecutionKind::BackupBoot, writes, faults)
+                    .map(|evidence| (evidence, TransactionPhase::BackupBootWritten))
             }
             TransactionIntent::Activate(writes) => {
                 validate_exact_phase(prepared.activation_writes(), writes)?;
                 self.apply_reserved_writes(ExecutionKind::Activation, writes, faults)
+                    .map(|evidence| (evidence, TransactionPhase::Activated))
             }
             TransactionIntent::Reserve(_)
             | TransactionIntent::VerifyStaging(_)
             | TransactionIntent::Verify(_)
             | TransactionIntent::Finalize
             | TransactionIntent::None => Err(ExecutorError::NonMutatingIntent),
-        }
+        }?;
+        Ok(ExecutedIntent {
+            evidence,
+            plan_digest: prepared.plan_digest(),
+            image_instance: self.identity.stable_container_token(),
+            completed_phase,
+        })
     }
 
     /// Applies a coordinator-produced rollback intent.
@@ -275,7 +394,7 @@ impl ImageExecutor {
         &self,
         prepared: &PreparedConversion,
         intent: RollbackIntent<'_>,
-    ) -> Result<RollbackEvidence, ExecutorError> {
+    ) -> Result<ExecutedRollback, ExecutorError> {
         self.execute_rollback_with_faults(prepared, intent, &mut NoFault)
     }
 
@@ -290,12 +409,12 @@ impl ImageExecutor {
         prepared: &PreparedConversion,
         intent: RollbackIntent<'_>,
         faults: &mut F,
-    ) -> Result<RollbackEvidence, ExecutorError> {
+    ) -> Result<ExecutedRollback, ExecutorError> {
         if !prepared.matches_regular_image(&self.identity) {
             return Err(ExecutorError::PlanImageMismatch);
         }
-        match intent {
-            RollbackIntent::DiscardStaging => Ok(RollbackEvidence::StagingDiscarded),
+        let (outcome, rollback_digest) = match intent {
+            RollbackIntent::DiscardStaging => Ok((RollbackOutcome::StagingDiscarded, None)),
             RollbackIntent::RestoreSource { writes, digest } => {
                 let authorized = [
                     prepared.staging_rollback_overlay().writes(),
@@ -308,9 +427,16 @@ impl ImageExecutor {
                     return Err(ExecutorError::IntentNotAuthorized);
                 }
                 self.apply_overlay_writes(ExecutionKind::Rollback, writes, faults)
-                    .map(RollbackEvidence::SourceRestored)
+                    .map(RollbackOutcome::SourceRestored)
+                    .map(|outcome| (outcome, Some(digest)))
             }
-        }
+        }?;
+        Ok(ExecutedRollback {
+            outcome,
+            plan_digest: prepared.plan_digest(),
+            image_instance: self.identity.stable_container_token(),
+            rollback_digest,
+        })
     }
 
     fn copy_relocations<F: FaultInjector>(

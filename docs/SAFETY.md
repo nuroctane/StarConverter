@@ -87,7 +87,10 @@ on other platforms); and accepts only a complete exact intent from an activation
 `PreparedConversion`. The plan's source identity is compared with a domain-separated token over the
 executor's canonical path, fixed length, and strongest stable platform container identity before
 any intent or rollback bytes are accepted. It verifies every destination chunk, executes both data
-and metadata flushes, and returns evidence without recording a checkpoint itself.
+and metadata flushes, and returns non-cloneable evidence bound to the exact plan, container, and
+completed phase. The coordinator's mutating checkpoint APIs accept only that opaque executor value;
+callers cannot construct generic completion records. Rollback acknowledgement has the same binding,
+including the authorized before-image digest whenever source-visible bytes were restored.
 
 The durable capsule store has a separate, explicit recovering-resume operation. Under its exclusive
 lock, it may shorten only bytes after a nonempty prefix that the redundant capsule parser proves is

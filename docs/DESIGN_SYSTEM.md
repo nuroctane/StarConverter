@@ -171,10 +171,10 @@ the exact affected feature count.
 - [ ] Default, hover, focus-visible, active, disabled, loading, and error states are implemented.
 - [ ] Keyboard-only flow can select an image, choose a mode, analyze, save a plan, and inspect logs.
 - [ ] Focus is always visible and follows the documented order.
-- [ ] Status remains understandable without color.
-- [ ] All hit targets are at least 44 x 44 px.
+- [x] Status remains understandable without color.
+- [x] All hit targets are at least 44 x 44 px.
 - [ ] Empty, loading, blocker, insufficient-space, and recovery-available states are tested.
-- [ ] Long paths, translated labels, narrow width, and 200% text do not hide critical controls.
+- [x] Long paths, translated labels, narrow width, and 200% text do not hide critical controls.
 - [ ] Reduced-motion mode does not remove progress information.
-- [ ] ASCII decoration is excluded from accessible names.
+- [x] ASCII decoration is excluded from accessible names.
 - [ ] Convert is absent or disabled until the safety gate and preflight contract are satisfied.

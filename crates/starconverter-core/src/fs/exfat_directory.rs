@@ -241,6 +241,11 @@ pub enum DirectoryError {
         length: u64,
         required: u64,
     },
+    BitmapTooLong {
+        index: usize,
+        length: u64,
+        required: u64,
+    },
     InvalidVolumeLabelLength {
         index: usize,
         length: u8,
@@ -388,6 +393,14 @@ impl fmt::Display for DirectoryError {
             } => write!(
                 formatter,
                 "allocation bitmap at {index} is {length} bytes; at least {required} are required"
+            ),
+            Self::BitmapTooLong {
+                index,
+                length,
+                required,
+            } => write!(
+                formatter,
+                "allocation bitmap at {index} is {length} bytes; exactly {required} are supported because reserved tail bytes cannot yet be preserved"
             ),
             Self::InvalidVolumeLabelLength { index, length } => write!(
                 formatter,
@@ -669,6 +682,13 @@ fn parse_bitmap(
     let required = u64::from(context.cluster_count).div_ceil(8);
     if data_length < required {
         return Err(DirectoryError::BitmapTooShort {
+            index,
+            length: data_length,
+            required,
+        });
+    }
+    if data_length > required {
+        return Err(DirectoryError::BitmapTooLong {
             index,
             length: data_length,
             required,
@@ -1399,6 +1419,27 @@ mod tests {
         assert_eq!(summary.allocation_bitmaps, 1);
         assert_eq!(summary.upcase_tables, 1);
         assert_eq!(summary.volume_labels, 1);
+    }
+
+    #[test]
+    fn refuses_unpreserved_allocation_bitmap_tail_bytes() {
+        for length in [126_u64, 4096] {
+            let mut bytes = vec![0_u8; ENTRY_BYTES * 3];
+            bytes[0] = TYPE_ALLOCATION_BITMAP;
+            put_u32(&mut bytes, 20, 2);
+            put_u64(&mut bytes, 24, length);
+            bytes[32] = TYPE_UPCASE_TABLE;
+            put_u32(&mut bytes, 52, 3);
+            put_u64(&mut bytes, 56, 256);
+            assert_eq!(
+                parse_directory(&bytes, context(true), |_| {}),
+                Err(DirectoryError::BitmapTooLong {
+                    index: 0,
+                    length,
+                    required: 125,
+                })
+            );
+        }
     }
 
     #[test]

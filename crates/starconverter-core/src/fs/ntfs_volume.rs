@@ -115,7 +115,7 @@ pub enum NtfsVolumeEvidence {
 }
 
 /// Validated allocation counts derived from the canonical `$Bitmap` data stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NtfsAllocationEvidence {
     pub bitmap_bytes: u64,
     pub allocated_clusters: u64,
@@ -123,10 +123,12 @@ pub struct NtfsAllocationEvidence {
     pub allocated_bytes: u64,
     pub free_bytes: u64,
     pub tail: TailEvidence,
+    /// Canonical validated bitmap bytes retained for independent ownership reconciliation.
+    pub(crate) canonical_bitmap: Vec<u8>,
 }
 
 /// `$Bitmap` evidence, preserving unsupported continuation or initialization state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NtfsBitmapEvidence {
     Complete(NtfsAllocationEvidence),
     Incomplete {
@@ -135,7 +137,7 @@ pub enum NtfsBitmapEvidence {
 }
 
 /// Combined bounded evidence from NTFS records 3 and 6.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NtfsVolumeDiscovery {
     pub volume: NtfsVolumeEvidence,
     pub bitmap: NtfsBitmapEvidence,
@@ -542,7 +544,7 @@ fn parse_bitmap_evidence(
             read_nonresident_stream(image, boot, &runlist, sizes.data)?
         }
     };
-    allocation_evidence(boot, &bytes).map(NtfsBitmapEvidence::Complete)
+    allocation_evidence(boot, bytes).map(NtfsBitmapEvidence::Complete)
 }
 
 fn ensure_bitmap_len(actual: u64, maximum: usize) -> Result<(), NtfsVolumeError> {
@@ -635,9 +637,9 @@ fn read_chunked(
 
 fn allocation_evidence(
     boot: &NtfsBootSector,
-    bytes: &[u8],
+    bytes: Vec<u8>,
 ) -> Result<NtfsAllocationEvidence, NtfsVolumeError> {
-    let bitmap = parse_bitmap(boot.cluster_count, bytes)?;
+    let bitmap = parse_bitmap(boot.cluster_count, &bytes)?;
     let allocated_bytes = bitmap
         .allocated_clusters()
         .checked_mul(boot.cluster_size_bytes)
@@ -657,6 +659,7 @@ fn allocation_evidence(
         allocated_bytes,
         free_bytes,
         tail: bitmap.tail_evidence(),
+        canonical_bitmap: bytes,
     })
 }
 

@@ -16,6 +16,7 @@ use crate::capsule::{
     CapsuleError, CapsuleIdentity, CapsuleLimits, HEADER_BYTES, TransactionPhase,
     append_generation, recover_capsule, scan_capsule,
 };
+use crate::executor::{ExecutedIntent, ExecutedRollback};
 use crate::extent::{ExtentKind, Placement};
 use crate::geometry::{
     ByteRange, DestinationReservation, LayoutError, LayoutLimits, LayoutPlan, Relocation,
@@ -581,7 +582,7 @@ impl PreparedConversion {
     /// # Errors
     ///
     /// Refuses skipped phases, stale completion evidence, invalid verification, or capsule errors.
-    pub fn record_phase(
+    fn record_phase(
         &self,
         capsule: &mut Vec<u8>,
         observed: ObservedImage,
@@ -624,6 +625,43 @@ impl PreparedConversion {
             self.capsule_limits,
         )?;
         Ok(())
+    }
+
+    /// Advances one mutating phase only from opaque executor evidence bound to this exact plan and
+    /// regular-image container.
+    ///
+    /// # Errors
+    ///
+    /// Refuses evidence from another plan/container, evidence without both flush barriers, an
+    /// unexpected phase, stale observation, or invalid staging-verification evidence.
+    pub fn record_execution(
+        &self,
+        capsule: &mut Vec<u8>,
+        observed: ObservedImage,
+        executed: ExecutedIntent,
+        staging_verification: Option<StagingVerificationEvidence>,
+    ) -> Result<(), ConversionError> {
+        let (evidence, plan_digest, image_instance, completed_phase) = executed.into_checkpoint();
+        if plan_digest != self.plan_digest
+            || image_instance != self.preflight.image.instance
+            || !evidence.sync_data_completed()
+            || !evidence.sync_all_completed()
+        {
+            return Err(ConversionError::InvalidExecutionEvidence);
+        }
+        self.record_phase(
+            capsule,
+            observed,
+            completed_phase,
+            PhaseCompletion {
+                image: self.preflight.image,
+                plan_digest: self.plan_digest,
+                health: self.preflight.health,
+                access: self.preflight.access,
+            },
+            staging_verification,
+            None,
+        )
     }
 
     /// Authorizes the backup-boot write intent only after the staged target overlay independently
@@ -691,7 +729,7 @@ impl PreparedConversion {
     /// # Errors
     ///
     /// Refuses stale identity/plan evidence, incorrect restored bytes, or a crossed boundary.
-    pub fn record_rollback(
+    fn record_rollback(
         &self,
         capsule: &mut Vec<u8>,
         observed: ObservedImage,
@@ -721,6 +759,49 @@ impl PreparedConversion {
             self.capsule_limits,
         )?;
         Ok(())
+    }
+
+    /// Records rollback only from opaque executor evidence bound to this plan and container.
+    ///
+    /// # Errors
+    ///
+    /// Refuses evidence from another plan/container, missing durable restoration evidence, stale
+    /// observations, invalid restoration digests, or a crossed rollback boundary.
+    pub fn record_executed_rollback(
+        &self,
+        capsule: &mut Vec<u8>,
+        observed: ObservedImage,
+        executed: ExecutedRollback,
+    ) -> Result<(), ConversionError> {
+        let (restored_source, evidence, plan_digest, image_instance, rollback_digest) =
+            executed.into_checkpoint();
+        let durable = evidence.as_ref().map_or_else(
+            || !restored_source && rollback_digest.is_none(),
+            |evidence| {
+                restored_source
+                    && evidence.kind() == crate::executor::ExecutionKind::Rollback
+                    && evidence.sync_data_completed()
+                    && evidence.sync_all_completed()
+                    && rollback_digest.is_some()
+            },
+        );
+        if !durable
+            || plan_digest != self.plan_digest
+            || image_instance != self.preflight.image.instance
+        {
+            return Err(ConversionError::InvalidExecutionEvidence);
+        }
+        self.record_rollback(
+            capsule,
+            observed,
+            RollbackCompletion {
+                image: self.preflight.image,
+                plan_digest: self.plan_digest,
+                applied_rollback_digest: rollback_digest,
+                health: self.preflight.health,
+                access: self.preflight.access,
+            },
+        )
     }
 
     fn intent_after(&self, phase: TransactionPhase) -> TransactionIntent<'_> {
@@ -925,6 +1006,7 @@ pub enum ConversionError {
     StagingVerificationIncomplete,
     StagingVerificationMismatch,
     UnexpectedVerificationEvidence,
+    InvalidExecutionEvidence,
     VerificationInventoryIncomplete,
     VerificationMismatch,
     RollbackBoundaryCrossed {
@@ -1089,6 +1171,8 @@ impl fmt::Display for ConversionError {
             ),
             Self::UnexpectedVerificationEvidence => formatter
                 .write_str("verification evidence is only valid for the Verified checkpoint"),
+            Self::InvalidExecutionEvidence => formatter
+                .write_str("executor evidence is not bound to this plan and image container"),
             Self::VerificationInventoryIncomplete => {
                 formatter.write_str("target verification inventory is incomplete")
             }
@@ -1841,6 +1925,10 @@ fn digest_overlay_writes(writes: &[OverlayWrite]) -> [u8; 32] {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use crate::executor::{ExecutorLimits, ImageExecutor};
     use crate::extent::{Extent, ExtentGraph, StreamId};
     use crate::object::{
         NamespaceEntry, ObjectGraphLimits, ObjectRecord, ObjectSemantics, ObjectStream, StreamFlags,
@@ -1851,6 +1939,7 @@ pub(crate) mod tests {
         instance: [7; 32],
         image_bytes: 16 * 1024,
     };
+    static NEXT_EXECUTION_TEMP: AtomicU64 = AtomicU64::new(0);
 
     fn graph(feature: bool) -> ObjectGraph {
         let extents = ExtentGraph::build(
@@ -2023,6 +2112,70 @@ pub(crate) mod tests {
 
     pub fn prepared() -> PreparedConversion {
         PreparedConversion::build(&graph(false), draft(), ConversionLimits::default()).unwrap()
+    }
+
+    #[test]
+    fn only_bound_executor_evidence_advances_mutation_and_rollback_phases() {
+        let sequence = NEXT_EXECUTION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "starconverter-conversion-execution-{}-{sequence}.img",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            vec![0x5a; usize::try_from(IMAGE.image_bytes).unwrap()],
+        )
+        .unwrap();
+        let image = crate::image::ImageFile::open(&path).unwrap();
+        let image_identity = image.identity().clone();
+        let mut plan = prepared();
+        plan.test_bind_regular_image(&image_identity);
+        let observed = ObservedImage {
+            image: plan.preflight.image,
+            source_evidence_digest: Some(plan.preflight.source_evidence_digest),
+        };
+        drop(image);
+
+        let mut capsule = Vec::new();
+        plan.begin_capsule(&mut capsule, observed).unwrap();
+        plan.record_phase(
+            &mut capsule,
+            observed,
+            TransactionPhase::Reserved,
+            PhaseCompletion {
+                image: plan.preflight.image,
+                plan_digest: plan.plan_digest,
+                health: HealthState::Clean,
+                access: AccessState::Offline,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+
+        let executor =
+            ImageExecutor::open(&path, &image_identity, ExecutorLimits::default()).unwrap();
+        let intent = plan.resume(&capsule, observed).unwrap().next;
+        let executed = executor.execute_intent(&plan, intent).unwrap();
+        assert_eq!(executed.completed_phase(), TransactionPhase::Relocating);
+        plan.record_execution(&mut capsule, observed, executed, None)
+            .unwrap();
+        assert_eq!(
+            plan.resume(&capsule, observed).unwrap().phase,
+            TransactionPhase::Relocating
+        );
+
+        let rollback_intent = plan.rollback_intent(TransactionPhase::Relocating).unwrap();
+        let rollback = executor.execute_rollback(&plan, rollback_intent).unwrap();
+        assert!(rollback.restored_source());
+        plan.record_executed_rollback(&mut capsule, observed, rollback)
+            .unwrap();
+        assert_eq!(
+            plan.resume(&capsule, observed).unwrap().phase,
+            TransactionPhase::RolledBack
+        );
+        drop(executor);
+        fs::remove_file(path).unwrap();
     }
     const fn observed() -> ObservedImage {
         ObservedImage {

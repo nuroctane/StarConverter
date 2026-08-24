@@ -145,6 +145,21 @@ pub struct NtfsInventoryExtent {
     pub placement: NtfsExtentPlacement,
 }
 
+/// One physical allocation claimed by a non-resident NTFS attribute mapping pair.
+///
+/// Unlike [`NtfsInventoryExtent`], this census covers every attribute type, including filesystem
+/// metadata such as `$INDEX_ALLOCATION`, `$BITMAP`, and `$ATTRIBUTE_LIST`. Sparse runs are omitted
+/// because they claim no physical clusters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NtfsPhysicalAllocation {
+    pub record_number: u64,
+    pub attribute_type: u32,
+    pub attribute_id: u16,
+    pub starting_vcn: u64,
+    pub start_lcn: u64,
+    pub cluster_count: u64,
+}
+
 /// Storage and size evidence for one named or unnamed `$DATA` stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NtfsStreamStorage {
@@ -232,6 +247,8 @@ pub struct NtfsInventory {
     pub volume_label: NtfsVolumeLabelEvidence,
     pub objects: Vec<NtfsObject>,
     pub extents: Vec<NtfsInventoryExtent>,
+    /// Complete physical-cluster ownership census when [`Self::is_complete`] is true.
+    pub physical_allocations: Vec<NtfsPhysicalAllocation>,
     pub scanned_records: u64,
     pub initialized_records: u64,
     pub in_use_base_records: u64,
@@ -682,6 +699,7 @@ pub fn inventory_ntfs(
     }
     let mut objects = Vec::new();
     let mut extents = Vec::new();
+    let mut physical_allocations = Vec::new();
     let mut extension_records = 0_u64;
     let mut bytes_read = 0_u64;
     let mut volume_label = NtfsVolumeLabelEvidence::Unavailable;
@@ -751,6 +769,7 @@ pub fn inventory_ntfs(
             limits,
             resolved.as_ref(),
             &mut extents,
+            &mut physical_allocations,
         )?;
         if record_number == NTFS_VOLUME_RECORD {
             volume_label = inventoried.volume_label.map_or(
@@ -781,6 +800,7 @@ pub fn inventory_ntfs(
         in_use_base_records: u64::try_from(objects.len()).unwrap_or(u64::MAX),
         objects,
         extents,
+        physical_allocations,
         scanned_records: scan_records,
         initialized_records,
         extension_records,
@@ -895,6 +915,7 @@ fn inventory_base_record(
     limits: NtfsInventoryLimits,
     resolved: Option<&ResolvedAttributeList>,
     all_extents: &mut Vec<NtfsInventoryExtent>,
+    physical_allocations: &mut Vec<NtfsPhysicalAllocation>,
 ) -> Result<InventoriedBaseRecord, NtfsInventoryError> {
     let base_attributes = parse_attribute_list(
         record.repaired_bytes(),
@@ -1017,6 +1038,13 @@ fn inventory_base_record(
             _ => {}
         }
     }
+    inventory_physical_allocations(
+        record_number,
+        attributes,
+        boot,
+        limits,
+        physical_allocations,
+    )?;
     let mut stream_groups: Vec<Vec<&NtfsAttribute<'_>>> = Vec::new();
     for attribute in attributes
         .iter()
@@ -1081,6 +1109,61 @@ fn inventory_base_record(
         },
         volume_label,
     })
+}
+
+fn inventory_physical_allocations(
+    record_number: u64,
+    attributes: &[NtfsAttribute<'_>],
+    boot: &NtfsBootSector,
+    limits: NtfsInventoryLimits,
+    output: &mut Vec<NtfsPhysicalAllocation>,
+) -> Result<(), NtfsInventoryError> {
+    for attribute in attributes {
+        let AttributeBody::NonResident(body) = &attribute.body else {
+            continue;
+        };
+        let runlist = parse_mapping_pairs(
+            body.mapping_pairs,
+            MappingPairsLimits {
+                starting_vcn: body.lowest_vcn,
+                expected_next_vcn: Some(body.expected_next_vcn),
+                volume_cluster_count: boot.cluster_count,
+                max_runs: limits.max_runs_per_stream,
+                max_decoded_clusters: boot.cluster_count,
+            },
+        )?;
+        let physical_count = runlist
+            .extents
+            .iter()
+            .filter(|extent| matches!(extent.location, ExtentLocation::Physical { .. }))
+            .count();
+        if output
+            .len()
+            .checked_add(physical_count)
+            .is_none_or(|count| count > limits.max_extents)
+        {
+            return Err(NtfsInventoryError::ExtentLimitExceeded {
+                maximum: limits.max_extents,
+            });
+        }
+        output
+            .try_reserve_exact(physical_count)
+            .map_err(|_| NtfsInventoryError::AllocationFailed)?;
+        for extent in runlist.extents {
+            let ExtentLocation::Physical { lcn } = extent.location else {
+                continue;
+            };
+            output.push(NtfsPhysicalAllocation {
+                record_number,
+                attribute_type: attribute.attribute_type,
+                attribute_id: attribute.id,
+                starting_vcn: extent.vcn,
+                start_lcn: lcn,
+                cluster_count: extent.length,
+            });
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2731,7 +2814,69 @@ mod tests {
         assert_eq!(extents[0].logical_offset, 0);
         assert_eq!(extents[1].logical_offset, 4096);
         assert_eq!(inventory.extents, *extents);
+        assert_eq!(
+            inventory.physical_allocations,
+            vec![
+                NtfsPhysicalAllocation {
+                    record_number: 0,
+                    attribute_type: DATA,
+                    attribute_id: 4,
+                    starting_vcn: 0,
+                    start_lcn: 8,
+                    cluster_count: 1,
+                },
+                NtfsPhysicalAllocation {
+                    record_number: 0,
+                    attribute_type: DATA,
+                    attribute_id: 5,
+                    starting_vcn: 1,
+                    start_lcn: 9,
+                    cluster_count: 1,
+                },
+            ]
+        );
         assert_eq!(inventory.bytes_read, 3072);
+    }
+
+    #[test]
+    fn physical_census_includes_metadata_and_omits_sparse_runs() {
+        let mut index = nonresident_attribute(
+            9,
+            0,
+            1,
+            0x8000,
+            4096,
+            8192,
+            8192,
+            4096,
+            &[0x11, 1, 8, 0x01, 1, 0],
+        );
+        index[0..4].copy_from_slice(&INDEX_ALLOCATION.to_le_bytes());
+        let parsed = parse_attribute(
+            &index,
+            attribute_limits(&boot(), NtfsInventoryLimits::default()),
+        )
+        .unwrap();
+        let mut allocations = Vec::new();
+        inventory_physical_allocations(
+            5,
+            &[parsed],
+            &boot(),
+            NtfsInventoryLimits::default(),
+            &mut allocations,
+        )
+        .unwrap();
+        assert_eq!(
+            allocations,
+            vec![NtfsPhysicalAllocation {
+                record_number: 5,
+                attribute_type: INDEX_ALLOCATION,
+                attribute_id: 9,
+                starting_vcn: 0,
+                start_lcn: 8,
+                cluster_count: 1,
+            }]
+        );
     }
 
     #[test]
