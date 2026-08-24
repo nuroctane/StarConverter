@@ -92,20 +92,26 @@ completed phase. The coordinator's mutating checkpoint APIs accept only that opa
 callers cannot construct generic completion records. Rollback acknowledgement has the same binding,
 including the authorized before-image digest whenever source-visible bytes were restored.
 
-Raw executor mutation methods are private. The crate-private preactivation coordinator opens the
+Raw executor mutation methods are private. The crate-private regular-image coordinator opens the
 image executor before the capsule store and owns both locks. It mints one-use leases bound to the
 current durable capsule generation and phase, refuses nonempty relocation before any image intent,
-requires executor read-back plus both flush barriers before appending the corresponding capsule
-generation, and stops at `TargetStaged`. It has no CLI/GUI entry point and cannot write backup boot
-or activation bytes. At `TargetStaged`, a crate-private bounded view is cloned from the already-open
-locked handle without reopening its path. Both filesystem parsers and logical stream hasher read
-through the exact prepared overlay only after every real staged range is proven byte-for-byte equal
-to its prepared write. The normalized graph and logical manifest must match the generation-zero
-`SCPREP01` authority, and the handle is revalidated afterward. Resume reconstructs the original
-source byte view by masking only the plan's conservative before-image ranges, so changes elsewhere
-remain digest-visible. An ambiguous executor/capsule operation poisons the coupled
-coordinator; exact before-image rollback and verified-prefix repair are idempotent under the
-retained locks.
+and requires executor read-back plus both flush barriers before appending the corresponding capsule
+generation. It has no CLI/GUI entry point. At restart boundaries, a bounded classifier borrows the
+sealed before/after ranges without cloning their payloads and labels the actual write group exact
+before, exact after, before/after-only mixed, or third-state. Backup boot may be safely rewritten
+from the first three states because the source primary boot is still active; activation continues
+only from exact before or exact after, while mixed or third-state activation is rollback-only.
+
+The lifetime-bound read view is cloned from the already-open locked handle without reopening its
+path. Before evidence is accepted, every real write group required by the current phase is proven
+byte-for-byte exact; both filesystem parsers and the logical stream hasher then read the complete
+prepared target. The normalized graph and logical manifest must match generation-zero `SCPREP01`
+authority, and the handle is revalidated afterward. Verification is explicitly separate from
+activation and still permits rollback. Finalization repeats the full audit and requires a private
+approval capability; production has no constructor for that capability. Resume reconstructs the
+original source view by masking only conservative before-image ranges, so changes elsewhere remain
+digest-visible. Ambiguous executor/capsule operations poison the coupled coordinator; exact
+before-image rollback is idempotent under the retained locks.
 
 New capsules embed the complete bounded, canonical forward plan and nested recovery bundle in their
 first generation. The coordinator can therefore discard all process memory, reacquire image then
@@ -113,11 +119,13 @@ capsule locks, reconstruct the plan, recompute its commitments, and re-audit `Ta
 `SCRECOV1`-only capsules require the exact external plan and are rollback-only; they cannot recreate
 forward authority.
 
-The durable capsule store has a separate, explicit recovering-resume operation. Under its exclusive
-lock, it may shorten only bytes after a nonempty prefix that the redundant capsule parser proves is
-an incomplete newest generation. It then flushes, rereads, and strict-scans the retained prefix
-before returning. Completed corruption, ambiguity, and an incomplete first generation are refused
-without repair.
+The durable capsule store has an explicit recovering-resume operation and a stricter poisoned-write
+reconciliation path. Under its exclusive lock, it adopts and flushes exactly one complete valid
+generation that an earlier append may have written despite returning an error. It shortens the file
+only when bounded recovery proves that the exact last verified checkpoint is followed by a torn
+newest generation, then flushes, rereads, and strict-scans the retained prefix. Identity changes,
+complete corruption, ambiguous multi-generation growth, and an incomplete first generation are
+refused without mutation.
 
 This is not physical-volume authorization. Serializer activation remains opaque and unavailable,
 and frontends expose no in-place conversion command. The create-new path below is a separate safety

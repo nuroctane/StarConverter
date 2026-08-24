@@ -66,6 +66,12 @@ filesystem tooling.
 14. A coordinator's read view must come from its already-open locked handle and be lifetime-bound to
     that lock. Reopening the path creates a substitution window and does not prove that parsing and
     mutation refer to the same container.
+15. An append error is not proof that a capsule generation is absent. Recovery must adopt one exact,
+    complete next generation and may truncate only when the prior checkpoint plus torn newest
+    suffix is independently proven.
+16. Activation and acceptance are different authority boundaries. Verification must remain
+    rollbackable, and finalization must repeat the complete real-byte and semantic audit while
+    requiring an explicit approval capability that production cannot mint accidentally.
 
 ## Independent interoperability gate
 

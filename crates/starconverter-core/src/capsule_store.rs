@@ -338,44 +338,97 @@ impl CapsuleStore {
         self.poisoned = true;
     }
 
-    /// Restores the exact last in-memory, fully verified prefix after an ambiguous append.
+    /// Reconciles the locked file with the last in-memory checkpoint after an ambiguous append.
     ///
     /// This is intentionally crate-private: only the regular-image coordinator may combine this
-    /// destructive capsule repair with conservative image rollback. The locked file identity is
-    /// checked before truncation and the retained prefix is reread and strictly scanned before the
-    /// poison is cleared.
+    /// repair with conservative image rollback. A complete, valid next generation is flushed and
+    /// adopted even when the append that wrote it returned an error. The file is truncated only
+    /// when capsule recovery proves that its exact prior checkpoint is followed by a torn newest
+    /// generation. Identity changes, corruption, and ambiguous or multi-generation growth fail
+    /// without changing the file.
     #[allow(dead_code)]
     pub(crate) fn restore_verified_prefix(&mut self) -> Result<(), CapsuleStoreError> {
         if !self.poisoned {
             return Ok(());
         }
         self.ensure_identity_with_minimum_length()?;
-        let retained =
-            u64::try_from(self.bytes.len()).map_err(|_| CapsuleStoreError::ArithmeticOverflow)?;
-        self.file
-            .set_len(retained)
-            .map_err(|source| CapsuleStoreError::io("discard ambiguous capsule suffix", source))?;
-        self.file
-            .sync_data()
-            .map_err(|source| CapsuleStoreError::io("flush restored capsule prefix", source))?;
-        let mut actual = vec![0_u8; self.bytes.len()];
+        let length = self
+            .file
+            .metadata()
+            .map_err(|source| CapsuleStoreError::io("inspect ambiguous capsule", source))?
+            .len();
+        let length = bounded_length(length, self.limits.max_capsule_bytes)?;
+        let mut actual = Vec::new();
+        actual
+            .try_reserve_exact(length)
+            .map_err(|_| CapsuleStoreError::AllocationFailed)?;
+        actual.resize(length, 0);
         read_exact_at(&self.file, 0, &mut actual)
-            .map_err(|source| CapsuleStoreError::io("verify restored capsule prefix", source))?;
-        if actual != self.bytes {
+            .map_err(|source| CapsuleStoreError::io("reread ambiguous capsule", source))?;
+        if !actual.starts_with(&self.bytes) {
             return Err(CapsuleStoreError::VerificationMismatch);
         }
-        let view = scan_capsule(&actual, self.limits).map_err(CapsuleStoreError::Capsule)?;
-        if view.validated_bytes() != actual.len()
-            || view.generations().len() != self.generation_count
-        {
-            return Err(CapsuleStoreError::VerificationMismatch);
+        match scan_capsule(&actual, self.limits) {
+            Ok(view) => {
+                let actual_generations = view.generations().len();
+                let expected_next = self
+                    .generation_count
+                    .checked_add(1)
+                    .ok_or(CapsuleStoreError::ArithmeticOverflow)?;
+                if view.validated_bytes() != actual.len()
+                    || !matches!(actual_generations, count if count == self.generation_count || count == expected_next)
+                {
+                    return Err(CapsuleStoreError::GenerationCount {
+                        expected: expected_next,
+                        actual: actual_generations,
+                    });
+                }
+                drop(view);
+                self.file.sync_data().map_err(|source| {
+                    CapsuleStoreError::io("flush reconciled capsule data", source)
+                })?;
+                self.file.sync_all().map_err(|source| {
+                    CapsuleStoreError::io("flush reconciled capsule data and metadata", source)
+                })?;
+                let mut durable = Vec::new();
+                durable
+                    .try_reserve_exact(actual.len())
+                    .map_err(|_| CapsuleStoreError::AllocationFailed)?;
+                durable.resize(actual.len(), 0);
+                read_exact_at(&self.file, 0, &mut durable)
+                    .map_err(|source| CapsuleStoreError::io("verify reconciled capsule", source))?;
+                if durable != actual {
+                    return Err(CapsuleStoreError::VerificationMismatch);
+                }
+                self.bytes = actual;
+                self.generation_count = actual_generations;
+                self.ensure_unchanged()?;
+                self.poisoned = false;
+                Ok(())
+            }
+            Err(strict_error) => {
+                let recovered =
+                    recover_capsule(&actual, self.limits).map_err(CapsuleStoreError::Capsule)?;
+                let retained = recovered.validated_bytes();
+                let recovered_generations = recovered.generations().len();
+                if retained != self.bytes.len()
+                    || recovered_generations != self.generation_count
+                    || retained >= actual.len()
+                    || actual[..retained] != self.bytes
+                {
+                    return Err(CapsuleStoreError::Capsule(strict_error));
+                }
+                drop(recovered);
+                let repaired_generations =
+                    repair_torn_suffix(&self.file, &mut actual, self.limits, strict_error)?;
+                if repaired_generations != self.generation_count || actual != self.bytes {
+                    return Err(CapsuleStoreError::VerificationMismatch);
+                }
+                self.ensure_unchanged()?;
+                self.poisoned = false;
+                Ok(())
+            }
         }
-        self.file.sync_all().map_err(|source| {
-            CapsuleStoreError::io("flush restored capsule data and metadata", source)
-        })?;
-        self.ensure_unchanged()?;
-        self.poisoned = false;
-        Ok(())
     }
 
     fn persist_suffix(
@@ -915,6 +968,7 @@ fn positional_write_loop(
 mod tests {
     use super::*;
     use crate::capsule::{CapsuleIdentity, HEADER_BYTES, TransactionPhase, append_generation};
+    use crc32fast::Hasher as Crc32;
     #[cfg(unix)]
     use std::io::Write as _;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -958,6 +1012,13 @@ mod tests {
         let path = dir.join("image.bin");
         fs::write(&path, b"regular image bytes").unwrap();
         path
+    }
+
+    fn read_store_file(store: &CapsuleStore) -> Vec<u8> {
+        let length = usize::try_from(store.file.metadata().unwrap().len()).unwrap();
+        let mut bytes = vec![0_u8; length];
+        read_exact_at(&store.file, 0, &mut bytes).unwrap();
+        bytes
     }
 
     fn initial_capsule() -> Vec<u8> {
@@ -1169,12 +1230,13 @@ mod tests {
     }
 
     #[test]
-    fn poisoned_store_refuses_append_until_exact_verified_prefix_is_restored() {
+    fn poisoned_store_recovers_every_torn_append_boundary() {
         let initial = initial_capsule();
         let complete = appended_capsule(2);
         let suffix = &complete[initial.len()..];
-        // Exercise every possible nonempty torn suffix and the complete-but-unadopted generation.
-        for cut in 1..=suffix.len() {
+        // Include the pre-write boundary and every nonempty torn prefix. The complete boundary is
+        // tested separately because it must be adopted rather than discarded.
+        for cut in 0..suffix.len() {
             let dir = TempDir::new();
             let image = image(&dir);
             let capsule = dir.join("poisoned.starcap");
@@ -1202,6 +1264,130 @@ mod tests {
             let evidence = store.append(&complete).unwrap();
             assert!(evidence.sync_data_completed && evidence.sync_all_completed);
         }
+    }
+
+    #[test]
+    fn complete_generation_is_adopted_after_an_ambiguous_append_error() {
+        let dir = TempDir::new();
+        let image = image(&dir);
+        let capsule = dir.join("complete-but-error.starcap");
+        let initial = initial_capsule();
+        let complete = appended_capsule(2);
+        let (mut store, _) =
+            CapsuleStore::create_new(&capsule, &image, &initial, limits()).unwrap();
+
+        write_all_at(
+            &store.file,
+            u64::try_from(initial.len()).unwrap(),
+            &complete[initial.len()..],
+        )
+        .unwrap();
+        store.file.sync_all().unwrap();
+        store.poison();
+
+        store.restore_verified_prefix().unwrap();
+        assert!(!store.is_poisoned());
+        assert_eq!(store.bytes(), complete);
+        assert_eq!(store.generation_count(), 2);
+        assert_eq!(read_store_file(&store), complete);
+
+        let next = appended_capsule(3);
+        assert_eq!(store.append(&next).unwrap().generation_count, 3);
+    }
+
+    #[test]
+    fn ambiguous_recovery_refuses_multiple_complete_generations_without_mutation() {
+        let dir = TempDir::new();
+        let image = image(&dir);
+        let capsule = dir.join("multiple-complete.starcap");
+        let initial = initial_capsule();
+        let multiple = appended_capsule(3);
+        let (mut store, _) =
+            CapsuleStore::create_new(&capsule, &image, &initial, limits()).unwrap();
+
+        write_all_at(
+            &store.file,
+            u64::try_from(initial.len()).unwrap(),
+            &multiple[initial.len()..],
+        )
+        .unwrap();
+        store.file.sync_all().unwrap();
+        store.poison();
+        let before = read_store_file(&store);
+
+        assert!(matches!(
+            store.restore_verified_prefix(),
+            Err(CapsuleStoreError::GenerationCount {
+                expected: 2,
+                actual: 3
+            })
+        ));
+        assert!(store.is_poisoned());
+        assert_eq!(read_store_file(&store), before);
+    }
+
+    #[test]
+    fn ambiguous_recovery_refuses_wrong_identity_without_mutation() {
+        let dir = TempDir::new();
+        let image = image(&dir);
+        let capsule = dir.join("wrong-identity.starcap");
+        let initial = initial_capsule();
+        let mut wrong_identity = appended_capsule(2);
+        let trailing = wrong_identity.len() - HEADER_BYTES;
+        for header in [initial.len(), trailing] {
+            wrong_identity[header + 48] ^= 0x80;
+            let mut crc = Crc32::new();
+            crc.update(&wrong_identity[header..header + 128]);
+            crc.update(&[0_u8; 4]);
+            crc.update(&wrong_identity[header + 132..header + HEADER_BYTES]);
+            wrong_identity[header + 128..header + 132]
+                .copy_from_slice(&crc.finalize().to_le_bytes());
+        }
+        assert!(matches!(
+            scan_capsule(&wrong_identity, limits()),
+            Err(CapsuleError::IdentityChanged)
+        ));
+
+        let (mut store, _) =
+            CapsuleStore::create_new(&capsule, &image, &initial, limits()).unwrap();
+        write_all_at(
+            &store.file,
+            u64::try_from(initial.len()).unwrap(),
+            &wrong_identity[initial.len()..],
+        )
+        .unwrap();
+        store.file.sync_all().unwrap();
+        store.poison();
+        let before = read_store_file(&store);
+
+        assert!(store.restore_verified_prefix().is_err());
+        assert!(store.is_poisoned());
+        assert_eq!(read_store_file(&store), before);
+    }
+
+    #[test]
+    fn ambiguous_recovery_refuses_complete_corruption_without_mutation() {
+        let dir = TempDir::new();
+        let image = image(&dir);
+        let capsule = dir.join("corrupt-complete.starcap");
+        let initial = initial_capsule();
+        let mut corrupt = appended_capsule(2);
+        corrupt[initial.len() + HEADER_BYTES] ^= 0x80;
+        let (mut store, _) =
+            CapsuleStore::create_new(&capsule, &image, &initial, limits()).unwrap();
+        write_all_at(
+            &store.file,
+            u64::try_from(initial.len()).unwrap(),
+            &corrupt[initial.len()..],
+        )
+        .unwrap();
+        store.file.sync_all().unwrap();
+        store.poison();
+        let before = read_store_file(&store);
+
+        assert!(store.restore_verified_prefix().is_err());
+        assert!(store.is_poisoned());
+        assert_eq!(read_store_file(&store), before);
     }
 
     #[test]

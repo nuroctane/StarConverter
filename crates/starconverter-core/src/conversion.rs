@@ -28,8 +28,9 @@ use crate::recovery::{RecoveryBundle, RecoveryError, RecoveryLimits, encode_reco
 use crate::verify::ManifestCommitment;
 use crate::{AccessState, FileSystem, HealthState, SemanticFeature};
 
-// Foundation remains intentionally unreachable until the coordinator itself can construct honest
-// initial observation evidence from its locked handle.
+// This internal foundation remains unreachable from frontends until trusted production preflight
+// creation and at least one destination serializer can mint activation authority.
+mod activation_bytes;
 mod prepared_envelope;
 #[allow(dead_code)]
 pub(crate) mod regular_image;
@@ -555,6 +556,16 @@ impl PreparedConversion {
         &self.writes.activation
     }
 
+    #[must_use]
+    pub(crate) fn backup_boot_before_images(&self) -> &[OverlayWrite] {
+        &self.writes.backup_boot_rollback
+    }
+
+    #[must_use]
+    pub(crate) fn activation_before_images(&self) -> &[OverlayWrite] {
+        &self.writes.activation_rollback
+    }
+
     /// Before-images that conservatively reconstruct the original source byte view at a durable
     /// checkpoint, including the possibly torn next source-visible write group.
     pub(crate) fn observation_rollback_writes(
@@ -838,6 +849,55 @@ impl PreparedConversion {
         )
     }
 
+    /// Durably records an independently inspected activated target.
+    ///
+    /// This remains crate-private because only the locked regular-image coordinator may construct
+    /// verification evidence from the exact image handle that owns the mutation lease.
+    pub(crate) fn record_verification(
+        &self,
+        capsule: &mut Vec<u8>,
+        observed: ObservedImage,
+        evidence: VerificationEvidence,
+    ) -> Result<(), ConversionError> {
+        self.record_phase(
+            capsule,
+            observed,
+            TransactionPhase::Verified,
+            PhaseCompletion {
+                image: self.preflight.image,
+                plan_digest: self.plan_digest,
+                health: self.preflight.health,
+                access: self.preflight.access,
+            },
+            None,
+            Some(evidence),
+        )
+    }
+
+    /// Accepts the already-verified target and crosses the rollback boundary.
+    ///
+    /// The coordinator must freshly re-audit the exact target bytes immediately before calling
+    /// this crate-private transition; callers outside the core cannot mint finalization authority.
+    pub(crate) fn record_finalization(
+        &self,
+        capsule: &mut Vec<u8>,
+        observed: ObservedImage,
+    ) -> Result<(), ConversionError> {
+        self.record_phase(
+            capsule,
+            observed,
+            TransactionPhase::Finalized,
+            PhaseCompletion {
+                image: self.preflight.image,
+                plan_digest: self.plan_digest,
+                health: self.preflight.health,
+                access: self.preflight.access,
+            },
+            None,
+            None,
+        )
+    }
+
     /// Authorizes the backup-boot write intent only after the staged target overlay independently
     /// parses and normalizes to the expected complete graph.
     ///
@@ -910,6 +970,10 @@ impl PreparedConversion {
         completion: RollbackCompletion,
     ) -> Result<(), ConversionError> {
         let current = self.resume_for_rollback(capsule, observed)?;
+        // Rollback completion is accepted only after the raw, current image again hashes to the
+        // sealed source view. This remains mandatory even when the pre-rollback phase no longer
+        // required source evidence (Activated or Verified).
+        self.validate_observed(observed, true)?;
         let validated_bytes = recover_capsule(capsule, self.capsule_limits)?.validated_bytes();
         let intent = self.rollback_intent(current.phase)?;
         self.validate_common_completion(
@@ -2745,10 +2809,7 @@ pub(crate) mod tests {
         let mut rollback_capsule = capsule.clone();
         plan.record_rollback(
             &mut rollback_capsule,
-            ObservedImage {
-                image: IMAGE,
-                source_evidence_digest: None,
-            },
+            observed(),
             RollbackCompletion {
                 image: IMAGE,
                 plan_digest: plan.plan_digest(),
@@ -2810,29 +2871,15 @@ pub(crate) mod tests {
             access: AccessState::Offline,
         };
         assert!(matches!(
-            plan.record_rollback(
-                &mut capsule,
-                ObservedImage {
-                    image: IMAGE,
-                    source_evidence_digest: None
-                },
-                bad
-            ),
+            plan.record_rollback(&mut capsule, observed(), bad),
             Err(ConversionError::InvalidRollbackEvidence)
         ));
         let good = RollbackCompletion {
             applied_rollback_digest: Some(plan.full_rollback_digest),
             ..bad
         };
-        plan.record_rollback(
-            &mut capsule,
-            ObservedImage {
-                image: IMAGE,
-                source_evidence_digest: None,
-            },
-            good,
-        )
-        .unwrap();
+        plan.record_rollback(&mut capsule, observed(), good)
+            .unwrap();
         assert_eq!(
             plan.resume(
                 &capsule,

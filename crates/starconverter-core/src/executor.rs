@@ -500,6 +500,14 @@ impl ImageExecutor {
                     TransactionPhase::Relocating,
                     TransactionIntent::StageTarget(_)
                 )
+                | (
+                    TransactionPhase::TargetStaged,
+                    TransactionIntent::WriteBackupBoot(_)
+                )
+                | (
+                    TransactionPhase::BackupBootWritten,
+                    TransactionIntent::Activate(_)
+                )
         );
         if !authorized {
             return Err(ExecutorError::LeaseIntentMismatch);

@@ -209,14 +209,15 @@ installed. CI always tests both language stacks.
 - [x] Byte-for-byte staged-range verification before overlay parsing can fill later phases
 - [x] Domain-separated full source-view digest with conservative virtual-original rollback masks
 - [x] Canonical bounded `SCPREP01` restart envelope embedded in capsule generation zero
-- [x] Plan reconstruction and staged re-audit from capsule plus locked image after process loss
+- [x] Plan reconstruction and exact phase re-audit from capsule plus locked image after process loss
 - [x] Legacy recovery-only capsules explicitly restricted from forward execution
 - [x] Pure resumable transaction coordinator with pre-activation overlay proof
 - [x] Phase-separated exFAT and NTFS structural destination serializers
 - [x] Exact regular-image preimage capture for every source-visible write phase
 - [x] Versioned capsule recovery bundle retaining exact phase before-images
 - [x] Bounded append-only capsule store with exclusive create/resume, one-generation growth,
-      read-back verification, flush evidence, and torn/changed-file refusal
+      read-back verification, flush evidence, complete ambiguous-append adoption, and provable
+      torn-suffix repair
 - [x] Bounded parser fuzz targets and CI smoke workflow
 - [x] Modeled crash campaign across every durable transaction barrier
 - [x] Every-byte capsule-tail and in-flight write-group recovery matrix
@@ -224,7 +225,9 @@ installed. CI always tests both language stacks.
 - [x] Module-sealed preflight/verification/completion evidence (no caller-forged clean state)
 - [x] Exact-intent regular-image executor with locking, read-back, flush, rollback, and fault cuts
 - [x] Opaque plan/container-bound executor completion evidence for mutation and rollback checkpoints
-- [x] Crate-private generation/phase execution leases and a non-activating durable coordinator through `TargetStaged`
+- [x] Crate-private generation/phase leases and an internal regular-image coordinator through
+      `Activated`, with bounded exact-byte restart classification, rollback through `Verified`, and
+      capability-gated finalization
 - [x] Deterministic parser mutation suite
 - [x] Real-image `inspect` command with evidence-aware blocking
 - [x] Real-image read-only `preview` with exact candidate phases and rollback bytes

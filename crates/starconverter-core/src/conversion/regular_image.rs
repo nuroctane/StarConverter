@@ -1,10 +1,12 @@
-//! Internal durable coordination for the non-activating regular-image slice.
+//! Internal durable coordination for one regular-image conversion transaction.
 //!
 //! There is deliberately no public or frontend entry point. This module acquires the image
-//! executor first and the capsule store second, owns both locks, and cannot advance beyond
-//! `TargetStaged`. Its candidate audit reads through a view borrowed from that already-locked
-//! executor. Resume observations are freshly derived from that locked handle, using conservative
-//! rollback before-images to reconstruct the original source view at mutating checkpoints.
+//! executor first and the capsule store second and owns both locks. Candidate audits read through a
+//! view borrowed from that already-locked executor. Resume observations are freshly derived from
+//! that locked handle, using conservative rollback before-images to reconstruct the original source
+//! view at mutating checkpoints. Backup-boot and activation remain crate-private and are reachable
+//! only through exact phase evidence and one-use leases. Verification is a separate operation, and
+//! the irreversible finalization boundary additionally requires an unforgeable approval capability.
 
 use std::borrow::Cow;
 use std::fmt;
@@ -18,7 +20,7 @@ use crate::executor::{
 };
 use crate::image::{BoundedImageReader, ImageIdentity};
 use crate::inspect::{InspectionError, inspect_overlay};
-use crate::overlay::OverlayError;
+use crate::overlay::{OverlayError, OverlayWrite};
 use crate::source_view::{
     SourceDigestLimits, SourceViewError, VirtualOriginalLimits, VirtualOriginalReader,
     digest_source_view,
@@ -27,9 +29,12 @@ use crate::verify::{
     VerificationError, VerificationLimits, VerificationManifest, build_manifest_with_reader,
 };
 
+use super::activation_bytes::{
+    ActivationByteError, ActivationByteLimits, ActivationByteState, classify_reserved_write_group,
+};
 use super::{
-    ConversionError, ObservedImage, PreparedConversion, StagingVerificationEvidence,
-    TransactionIntent,
+    ConversionError, ObservedImage, PreparedConversion, ReservedWrite, StagingVerificationEvidence,
+    TransactionIntent, VerificationEvidence,
 };
 
 const CANDIDATE_AUDIT_MAX_READ_BYTES: usize = 16 * 1024 * 1024;
@@ -39,6 +44,22 @@ const CANDIDATE_AUDIT_MAX_READ_BYTES: usize = 16 * 1024 * 1024;
 pub struct DurableCheckpoint {
     pub generation: u64,
     pub phase: TransactionPhase,
+}
+
+/// Capability required to cross the irreversible `Verified` -> `Finalized` boundary.
+///
+/// Production code deliberately has no constructor yet. A future frontend may create this only
+/// after its explicit user-acceptance policy is implemented and reviewed.
+#[derive(Debug, Clone, Copy)]
+pub struct FinalizationApproval {
+    _private: (),
+}
+
+#[cfg(test)]
+impl FinalizationApproval {
+    const fn for_test() -> Self {
+        Self { _private: () }
+    }
 }
 
 /// Locks and state for the deliberately bounded pre-activation transaction slice.
@@ -81,12 +102,7 @@ impl<'plan> RegularImageCoordinator<'plan> {
             prepared: Cow::Borrowed(prepared),
             poisoned: false,
         };
-        let checkpoint = coordinator.checkpoint()?;
-        if phase_after_target_staged(checkpoint.phase) {
-            return Err(RegularImageCoordinatorError::BeyondPreactivation {
-                phase: checkpoint.phase,
-            });
-        }
+        coordinator.checkpoint()?;
         Ok((coordinator, recovery))
     }
 
@@ -118,6 +134,80 @@ impl<'plan> RegularImageCoordinator<'plan> {
         }
     }
 
+    /// Advances a fully prepared no-relocation regular image through activation only.
+    ///
+    /// Every durable boundary is independently re-audited from the locked handle. Backup boot and
+    /// activation writes consume one-use leases. This helper deliberately stops at `Activated`,
+    /// while rollback is still available.
+    pub(crate) fn advance_to_activated(
+        &mut self,
+        verification_limits: VerificationLimits,
+    ) -> Result<DurableCheckpoint, RegularImageCoordinatorError> {
+        self.ensure_forward_ready()?;
+        if !self.prepared.layout().relocations.is_empty() {
+            return Err(RegularImageCoordinatorError::RelocationNotSupported);
+        }
+
+        loop {
+            let checkpoint = self.checkpoint()?;
+            match checkpoint.phase {
+                TransactionPhase::Discovered => self.append_reservation()?,
+                TransactionPhase::Reserved | TransactionPhase::Relocating => {
+                    self.execute_next_mutation(checkpoint)?;
+                }
+                TransactionPhase::TargetStaged => {
+                    self.write_backup_boot(checkpoint, verification_limits)?;
+                }
+                TransactionPhase::BackupBootWritten => {
+                    self.activate_target(checkpoint, verification_limits)?;
+                }
+                TransactionPhase::Activated => return Ok(checkpoint),
+                TransactionPhase::Verified
+                | TransactionPhase::Finalized
+                | TransactionPhase::RolledBack => {
+                    return Err(RegularImageCoordinatorError::ForwardUnavailable {
+                        phase: checkpoint.phase,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Independently re-audits an activated target and appends the durable `Verified` checkpoint.
+    /// Rollback remains available after this operation.
+    pub(crate) fn verify_activated_target(
+        &mut self,
+        verification_limits: VerificationLimits,
+    ) -> Result<DurableCheckpoint, RegularImageCoordinatorError> {
+        self.ensure_forward_ready()?;
+        let checkpoint = self.checkpoint()?;
+        if checkpoint.phase != TransactionPhase::Activated {
+            return Err(RegularImageCoordinatorError::ForwardUnavailable {
+                phase: checkpoint.phase,
+            });
+        }
+        self.append_verification(verification_limits)?;
+        self.checkpoint()
+    }
+
+    /// Repeats the complete activated-target audit and crosses the irreversible finalization
+    /// boundary only when the caller presents explicit acceptance authority.
+    pub(crate) fn finalize_verified_target(
+        &mut self,
+        _approval: FinalizationApproval,
+        verification_limits: VerificationLimits,
+    ) -> Result<DurableCheckpoint, RegularImageCoordinatorError> {
+        self.ensure_forward_ready()?;
+        let checkpoint = self.checkpoint()?;
+        if checkpoint.phase != TransactionPhase::Verified {
+            return Err(RegularImageCoordinatorError::ForwardUnavailable {
+                phase: checkpoint.phase,
+            });
+        }
+        self.append_finalization(verification_limits)?;
+        self.checkpoint()
+    }
+
     /// Parses and logically hashes the exact staged candidate through the prepared overlay.
     ///
     /// The base reader is cloned from the executor's already-open handle and cannot outlive its
@@ -137,6 +227,58 @@ impl<'plan> RegularImageCoordinator<'plan> {
             });
         }
 
+        let (object_graph_digest, manifest) =
+            self.audit_candidate(checkpoint.phase, verification_limits)?;
+        let expected = self.prepared.expected_staging_verification();
+        Ok((
+            StagingVerificationEvidence {
+                target_filesystem: expected.target_filesystem,
+                parser_validated: true,
+                inventory_complete: true,
+                object_graph_digest,
+                plan_digest: expected.plan_digest,
+                candidate_overlay_digest: expected.candidate_overlay_digest,
+            },
+            manifest,
+        ))
+    }
+
+    /// Re-audits an activated target using exact real bytes before verification or finalization.
+    fn audit_activated_candidate(
+        &mut self,
+        verification_limits: VerificationLimits,
+    ) -> Result<(VerificationEvidence, VerificationManifest), RegularImageCoordinatorError> {
+        self.ensure_forward_ready()?;
+        let checkpoint = self.checkpoint()?;
+        if !matches!(
+            checkpoint.phase,
+            TransactionPhase::Activated | TransactionPhase::Verified
+        ) {
+            return Err(RegularImageCoordinatorError::ActivatedAuditUnavailable {
+                phase: checkpoint.phase,
+            });
+        }
+        let (object_graph_digest, manifest) =
+            self.audit_candidate(checkpoint.phase, verification_limits)?;
+        let expected = self.prepared.expected_verification();
+        Ok((
+            VerificationEvidence {
+                target_filesystem: expected.target_filesystem,
+                inventory_complete: true,
+                object_graph_digest,
+                plan_digest: expected.plan_digest,
+            },
+            manifest,
+        ))
+    }
+
+    /// Parses and hashes the complete target overlay after proving every write group that should
+    /// already be durable is byte-for-byte present in the actual locked image.
+    fn audit_candidate(
+        &mut self,
+        phase: TransactionPhase,
+        verification_limits: VerificationLimits,
+    ) -> Result<([u8; 32], VerificationManifest), RegularImageCoordinatorError> {
         let view = match self.executor.locked_view(CANDIDATE_AUDIT_MAX_READ_BYTES) {
             Ok(view) => view,
             Err(error) => {
@@ -147,6 +289,20 @@ impl<'plan> RegularImageCoordinator<'plan> {
         let expected = self.prepared.expected_staging_verification();
         let audit = (|| {
             verify_actual_staging_bytes(&view, self.prepared.target_staging_writes())?;
+            if matches!(
+                phase,
+                TransactionPhase::BackupBootWritten
+                    | TransactionPhase::Activated
+                    | TransactionPhase::Verified
+            ) {
+                verify_actual_staging_bytes(&view, self.prepared.backup_boot_writes())?;
+            }
+            if matches!(
+                phase,
+                TransactionPhase::Activated | TransactionPhase::Verified
+            ) {
+                verify_actual_staging_bytes(&view, self.prepared.activation_writes())?;
+            }
             let inspection = inspect_overlay(
                 &view,
                 self.executor.identity(),
@@ -195,15 +351,7 @@ impl<'plan> RegularImageCoordinator<'plan> {
             {
                 return Err(RegularImageCoordinatorError::CandidateManifestMismatch);
             }
-            let evidence = StagingVerificationEvidence {
-                target_filesystem: expected.target_filesystem,
-                parser_validated: true,
-                inventory_complete: true,
-                object_graph_digest,
-                plan_digest: expected.plan_digest,
-                candidate_overlay_digest: expected.candidate_overlay_digest,
-            };
-            Ok((evidence, manifest))
+            Ok((object_graph_digest, manifest))
         })();
         let revalidation = view.post_operation_revalidate();
         drop(view);
@@ -226,20 +374,14 @@ impl<'plan> RegularImageCoordinator<'plan> {
                 .map_err(RegularImageCoordinatorError::CapsuleStore)?;
         }
         let checkpoint = self.checkpoint()?;
-        if matches!(
-            checkpoint.phase,
-            TransactionPhase::Finalized | TransactionPhase::RolledBack
-        ) {
+        if checkpoint.phase == TransactionPhase::RolledBack {
+            return Ok(checkpoint);
+        }
+        if checkpoint.phase == TransactionPhase::Finalized {
             return Err(RegularImageCoordinatorError::RollbackUnavailable {
                 phase: checkpoint.phase,
             });
         }
-        if phase_after_target_staged(checkpoint.phase) {
-            return Err(RegularImageCoordinatorError::BeyondPreactivation {
-                phase: checkpoint.phase,
-            });
-        }
-
         let intent = self
             .prepared
             .rollback_intent(checkpoint.phase)
@@ -268,6 +410,130 @@ impl<'plan> RegularImageCoordinator<'plan> {
             .record_reservation(&mut updated, observed)
             .map_err(RegularImageCoordinatorError::Conversion)?;
         self.append_capsule(&updated)
+    }
+
+    fn write_backup_boot(
+        &mut self,
+        checkpoint: DurableCheckpoint,
+        verification_limits: VerificationLimits,
+    ) -> Result<(), RegularImageCoordinatorError> {
+        let state = self.classify_backup_boot_bytes()?;
+        if state == ActivationByteState::ThirdState {
+            return Err(RegularImageCoordinatorError::BackupBootBytesUnsafe { state });
+        }
+        let (staging_evidence, _) = self.audit_staged_candidate(verification_limits)?;
+        let observed = self.observe_current()?;
+        let lease = self.lease(checkpoint);
+        let executed = {
+            let intent = self
+                .prepared
+                .authorize_backup_boot(self.store.bytes(), observed, staging_evidence)
+                .map_err(RegularImageCoordinatorError::Conversion)?;
+            self.executor
+                .execute_leased_intent(self.prepared.as_ref(), lease, intent)
+        };
+        let executed = match executed {
+            Ok(executed) => executed,
+            Err(error) => {
+                self.poison();
+                return Err(RegularImageCoordinatorError::Executor(error));
+            }
+        };
+        self.append_execution(checkpoint, executed, Some(staging_evidence))
+    }
+
+    fn activate_target(
+        &mut self,
+        checkpoint: DurableCheckpoint,
+        verification_limits: VerificationLimits,
+    ) -> Result<(), RegularImageCoordinatorError> {
+        let state = self.classify_activation_bytes()?;
+        if matches!(
+            state,
+            ActivationByteState::MixedBeforeAfter | ActivationByteState::ThirdState
+        ) {
+            return Err(RegularImageCoordinatorError::ActivationBytesAmbiguous { state });
+        }
+        // The target overlay must remain complete and logically identical immediately before the
+        // primary recognition/cutover write. At this phase, audit_candidate also proves all actual
+        // staging and backup-boot bytes.
+        self.audit_candidate(checkpoint.phase, verification_limits)?;
+        let observed = self.observe_current()?;
+        let resumed = self
+            .prepared
+            .resume(self.store.bytes(), observed)
+            .map_err(RegularImageCoordinatorError::Conversion)?;
+        if !matches!(resumed.next, TransactionIntent::Activate(_)) {
+            return Err(RegularImageCoordinatorError::LeaseStateChanged);
+        }
+        let lease = self.lease(checkpoint);
+        let executed =
+            self.executor
+                .execute_leased_intent(self.prepared.as_ref(), lease, resumed.next);
+        let executed = match executed {
+            Ok(executed) => executed,
+            Err(error) => {
+                self.poison();
+                return Err(RegularImageCoordinatorError::Executor(error));
+            }
+        };
+        self.append_execution(checkpoint, executed, None)
+    }
+
+    fn append_verification(
+        &mut self,
+        verification_limits: VerificationLimits,
+    ) -> Result<(), RegularImageCoordinatorError> {
+        let (evidence, _) = self.audit_activated_candidate(verification_limits)?;
+        let mut updated = self.store.bytes().to_vec();
+        let observed = self.observe_current()?;
+        self.prepared
+            .record_verification(&mut updated, observed, evidence)
+            .map_err(RegularImageCoordinatorError::Conversion)?;
+        self.append_capsule(&updated)
+    }
+
+    fn append_finalization(
+        &mut self,
+        verification_limits: VerificationLimits,
+    ) -> Result<(), RegularImageCoordinatorError> {
+        // Finalization crosses the rollback boundary, so repeat the full real-byte/parser/manifest
+        // audit instead of relying on evidence from the prior checkpoint.
+        self.audit_activated_candidate(verification_limits)?;
+        let mut updated = self.store.bytes().to_vec();
+        let observed = self.observe_current()?;
+        self.prepared
+            .record_finalization(&mut updated, observed)
+            .map_err(RegularImageCoordinatorError::Conversion)?;
+        self.append_capsule(&updated)
+    }
+
+    fn classify_backup_boot_bytes(
+        &mut self,
+    ) -> Result<ActivationByteState, RegularImageCoordinatorError> {
+        let classified = classify_prepared_write_group(
+            &self.executor,
+            self.prepared.backup_boot_before_images(),
+            self.prepared.backup_boot_writes(),
+        );
+        if classified.is_err() {
+            self.poison();
+        }
+        classified
+    }
+
+    fn classify_activation_bytes(
+        &mut self,
+    ) -> Result<ActivationByteState, RegularImageCoordinatorError> {
+        let classified = classify_prepared_write_group(
+            &self.executor,
+            self.prepared.activation_before_images(),
+            self.prepared.activation_writes(),
+        );
+        if classified.is_err() {
+            self.poison();
+        }
+        classified
     }
 
     fn execute_next_mutation(
@@ -302,13 +568,14 @@ impl<'plan> RegularImageCoordinator<'plan> {
                     return Err(RegularImageCoordinatorError::Executor(error));
                 }
             };
-        self.append_execution(checkpoint, executed)
+        self.append_execution(checkpoint, executed, None)
     }
 
     fn append_execution(
         &mut self,
         checkpoint: DurableCheckpoint,
         executed: LeasedIntent,
+        staging_verification: Option<StagingVerificationEvidence>,
     ) -> Result<(), RegularImageCoordinatorError> {
         let (executed, generation, phase) = executed.into_parts();
         if generation != checkpoint.generation || phase != checkpoint.phase {
@@ -317,9 +584,9 @@ impl<'plan> RegularImageCoordinator<'plan> {
         }
         let mut updated = self.store.bytes().to_vec();
         let observed = self.observe_current()?;
-        if let Err(error) = self
-            .prepared
-            .record_execution(&mut updated, observed, executed, None)
+        if let Err(error) =
+            self.prepared
+                .record_execution(&mut updated, observed, executed, staging_verification)
         {
             self.poison();
             return Err(RegularImageCoordinatorError::Conversion(error));
@@ -338,7 +605,9 @@ impl<'plan> RegularImageCoordinator<'plan> {
             return Err(RegularImageCoordinatorError::LeaseStateChanged);
         }
         let mut updated = self.store.bytes().to_vec();
-        let observed = self.observe_current()?;
+        // The executor has already restored every conservative before-image. Hash the raw current
+        // image as the source, without phase masks, before accepting `RolledBack`.
+        let observed = self.observe_phase(TransactionPhase::Discovered)?;
         if let Err(error) = self
             .prepared
             .record_executed_rollback(&mut updated, observed, executed)
@@ -476,6 +745,35 @@ impl<'plan> RegularImageCoordinator<'plan> {
     }
 }
 
+fn classify_prepared_write_group(
+    executor: &ImageExecutor,
+    before: &[OverlayWrite],
+    after: &[ReservedWrite],
+) -> Result<ActivationByteState, RegularImageCoordinatorError> {
+    let write_bytes = before
+        .iter()
+        .try_fold(0_usize, |total, write| total.checked_add(write.bytes.len()))
+        .ok_or(RegularImageCoordinatorError::CandidateRangeOverflow)?;
+    let view = executor
+        .locked_view(CANDIDATE_AUDIT_MAX_READ_BYTES)
+        .map_err(RegularImageCoordinatorError::Executor)?;
+    let classified = classify_reserved_write_group(
+        &view,
+        before,
+        after,
+        ActivationByteLimits {
+            write_count: before.len().max(1),
+            write_bytes: write_bytes.max(1),
+            read_bytes: CANDIDATE_AUDIT_MAX_READ_BYTES,
+        },
+    )
+    .map_err(RegularImageCoordinatorError::ActivationBytes);
+    let revalidation = view.post_operation_revalidate();
+    drop(view);
+    revalidation.map_err(RegularImageCoordinatorError::Executor)?;
+    classified
+}
+
 impl RegularImageCoordinator<'static> {
     /// Reconstructs the complete prepared plan from the capsule's generation-zero envelope after
     /// acquiring the image lock. Legacy recovery-only capsules fail closed because they cannot
@@ -503,12 +801,7 @@ impl RegularImageCoordinator<'static> {
             prepared: Cow::Owned(prepared),
             poisoned: false,
         };
-        let checkpoint = coordinator.checkpoint()?;
-        if phase_after_target_staged(checkpoint.phase) {
-            return Err(RegularImageCoordinatorError::BeyondPreactivation {
-                phase: checkpoint.phase,
-            });
-        }
+        coordinator.checkpoint()?;
         Ok((coordinator, recovery))
     }
 }
@@ -545,16 +838,6 @@ fn verify_actual_staging_bytes(
     Ok(())
 }
 
-const fn phase_after_target_staged(phase: TransactionPhase) -> bool {
-    matches!(
-        phase,
-        TransactionPhase::BackupBootWritten
-            | TransactionPhase::Activated
-            | TransactionPhase::Verified
-            | TransactionPhase::Finalized
-    )
-}
-
 /// Internal coordinator construction, state, mutation, or durability failure.
 #[derive(Debug)]
 pub enum RegularImageCoordinatorError {
@@ -565,6 +848,7 @@ pub enum RegularImageCoordinatorError {
     Overlay(OverlayError),
     Verification(VerificationError),
     SourceView(SourceViewError),
+    ActivationBytes(ActivationByteError),
     PlanImageMismatch,
     RelocationNotSupported,
     LeaseStateChanged,
@@ -577,7 +861,19 @@ pub enum RegularImageCoordinatorError {
     RollbackUnavailable {
         phase: TransactionPhase,
     },
+    ForwardUnavailable {
+        phase: TransactionPhase,
+    },
+    BackupBootBytesUnsafe {
+        state: ActivationByteState,
+    },
+    ActivationBytesAmbiguous {
+        state: ActivationByteState,
+    },
     CandidateAuditUnavailable {
+        phase: TransactionPhase,
+    },
+    ActivatedAuditUnavailable {
         phase: TransactionPhase,
     },
     CandidateFilesystemMismatch {
@@ -606,6 +902,9 @@ impl fmt::Display for RegularImageCoordinatorError {
                 write!(formatter, "candidate logical verification failed: {error}")
             }
             Self::SourceView(error) => write!(formatter, "source view rejected: {error}"),
+            Self::ActivationBytes(error) => {
+                write!(formatter, "activation-byte classification failed: {error}")
+            }
             Self::PlanImageMismatch => {
                 formatter.write_str("prepared conversion does not match the locked image")
             }
@@ -629,9 +928,27 @@ impl fmt::Display for RegularImageCoordinatorError {
             Self::RollbackUnavailable { phase } => {
                 write!(formatter, "rollback is unavailable from phase {phase:?}")
             }
+            Self::ForwardUnavailable { phase } => {
+                write!(
+                    formatter,
+                    "forward execution is unavailable from phase {phase:?}"
+                )
+            }
+            Self::BackupBootBytesUnsafe { state } => write!(
+                formatter,
+                "backup-boot bytes are in unsafe state {state:?}; rollback is required"
+            ),
+            Self::ActivationBytesAmbiguous { state } => write!(
+                formatter,
+                "activation bytes are in ambiguous state {state:?}; rollback is required"
+            ),
             Self::CandidateAuditUnavailable { phase } => write!(
                 formatter,
                 "candidate audit requires TargetStaged, found {phase:?}"
+            ),
+            Self::ActivatedAuditUnavailable { phase } => write!(
+                formatter,
+                "activated-target audit requires Activated or Verified, found {phase:?}"
             ),
             Self::CandidateFilesystemMismatch { expected, actual } => write!(
                 formatter,
@@ -670,6 +987,7 @@ impl std::error::Error for RegularImageCoordinatorError {
             Self::Overlay(error) => Some(error),
             Self::Verification(error) => Some(error),
             Self::SourceView(error) => Some(error),
+            Self::ActivationBytes(error) => Some(error),
             _ => None,
         }
     }
@@ -891,6 +1209,16 @@ mod tests {
         .unwrap();
         drop(store);
         (dir, image_path, capsule_path, prepared)
+    }
+
+    fn apply_reserved_writes(path: &Path, writes: &[super::super::ReservedWrite]) {
+        let mut image = fs::read(path).unwrap();
+        for reserved in writes {
+            let start = usize::try_from(reserved.write.offset).unwrap();
+            let end = start.checked_add(reserved.write.bytes.len()).unwrap();
+            image[start..end].copy_from_slice(&reserved.write.bytes);
+        }
+        fs::write(path, image).unwrap();
     }
 
     #[test]
@@ -1152,6 +1480,423 @@ mod tests {
         restarted
             .audit_staged_candidate(VerificationLimits::default())
             .unwrap();
+    }
+
+    #[test]
+    fn full_regular_image_transaction_reaudits_and_finalizes_exact_target() {
+        let (_dir, image_path, capsule_path, prepared) = valid_exfat_fixture();
+        let image = ImageFile::open(&image_path).unwrap();
+        let identity = image.identity().clone();
+        drop(image);
+        let (mut coordinator, _) = RegularImageCoordinator::resume_existing(
+            &prepared,
+            &image_path,
+            &identity,
+            &capsule_path,
+            ExecutorLimits::default(),
+        )
+        .unwrap();
+
+        let activated = coordinator
+            .advance_to_activated(VerificationLimits::default())
+            .unwrap();
+        assert_eq!(activated.phase, TransactionPhase::Activated);
+        let verified = coordinator
+            .verify_activated_target(VerificationLimits::default())
+            .unwrap();
+        assert_eq!(verified.phase, TransactionPhase::Verified);
+        let checkpoint = coordinator
+            .finalize_verified_target(
+                FinalizationApproval::for_test(),
+                VerificationLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            checkpoint,
+            DurableCheckpoint {
+                generation: 7,
+                phase: TransactionPhase::Finalized,
+            }
+        );
+        assert!(matches!(
+            coordinator.rollback(),
+            Err(RegularImageCoordinatorError::RollbackUnavailable {
+                phase: TransactionPhase::Finalized
+            })
+        ));
+        drop(coordinator);
+
+        let capsule = fs::read(&capsule_path).unwrap();
+        let view = recover_capsule(&capsule, prepared.capsule_limits).unwrap();
+        assert_eq!(view.newest().unwrap().phase, TransactionPhase::Finalized);
+        let inspection = crate::inspect::inspect_image(&image_path).unwrap();
+        assert_eq!(inspection.profile.filesystem, FileSystem::ExFat);
+        assert!(inspection.profile.inventory_complete);
+    }
+
+    #[test]
+    fn restart_after_each_recognition_boundary_reconstructs_and_finishes() {
+        let (_dir, image_path, capsule_path, prepared) = valid_exfat_fixture();
+        let capsule_policy = prepared.capsule_limits;
+        let image = ImageFile::open(&image_path).unwrap();
+        let identity = image.identity().clone();
+        drop(image);
+        let (mut coordinator, _) = RegularImageCoordinator::resume_existing(
+            &prepared,
+            &image_path,
+            &identity,
+            &capsule_path,
+            ExecutorLimits::default(),
+        )
+        .unwrap();
+        coordinator.advance_to_target_staged().unwrap();
+        let staged = coordinator.checkpoint().unwrap();
+        coordinator
+            .write_backup_boot(staged, VerificationLimits::default())
+            .unwrap();
+        assert_eq!(
+            coordinator.checkpoint().unwrap().phase,
+            TransactionPhase::BackupBootWritten
+        );
+        drop(coordinator);
+
+        let image = ImageFile::open(&image_path).unwrap();
+        let identity = image.identity().clone();
+        drop(image);
+        let (mut coordinator, _) = RegularImageCoordinator::resume_from_capsule(
+            &image_path,
+            &identity,
+            &capsule_path,
+            ExecutorLimits::default(),
+            capsule_policy,
+        )
+        .unwrap();
+        let backup = coordinator.checkpoint().unwrap();
+        coordinator
+            .activate_target(backup, VerificationLimits::default())
+            .unwrap();
+        assert_eq!(
+            coordinator.checkpoint().unwrap().phase,
+            TransactionPhase::Activated
+        );
+        drop(coordinator);
+
+        let image = ImageFile::open(&image_path).unwrap();
+        let identity = image.identity().clone();
+        drop(image);
+        let (mut coordinator, _) = RegularImageCoordinator::resume_from_capsule(
+            &image_path,
+            &identity,
+            &capsule_path,
+            ExecutorLimits::default(),
+            capsule_policy,
+        )
+        .unwrap();
+        coordinator
+            .verify_activated_target(VerificationLimits::default())
+            .unwrap();
+        assert_eq!(
+            coordinator.checkpoint().unwrap().phase,
+            TransactionPhase::Verified
+        );
+        drop(coordinator);
+
+        let image = ImageFile::open(&image_path).unwrap();
+        let identity = image.identity().clone();
+        drop(image);
+        let (mut coordinator, _) = RegularImageCoordinator::resume_from_capsule(
+            &image_path,
+            &identity,
+            &capsule_path,
+            ExecutorLimits::default(),
+            capsule_policy,
+        )
+        .unwrap();
+        let finalized = coordinator
+            .finalize_verified_target(
+                FinalizationApproval::for_test(),
+                VerificationLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(finalized.phase, TransactionPhase::Finalized);
+    }
+
+    #[test]
+    fn completed_uncheckpointed_backup_bytes_are_reaudited_and_adopted() {
+        let (_dir, image_path, capsule_path, prepared) = valid_exfat_fixture();
+        let image = ImageFile::open(&image_path).unwrap();
+        let identity = image.identity().clone();
+        drop(image);
+        let (mut coordinator, _) = RegularImageCoordinator::resume_existing(
+            &prepared,
+            &image_path,
+            &identity,
+            &capsule_path,
+            ExecutorLimits::default(),
+        )
+        .unwrap();
+        coordinator.advance_to_target_staged().unwrap();
+        drop(coordinator);
+
+        apply_reserved_writes(&image_path, prepared.backup_boot_writes());
+        let image = ImageFile::open(&image_path).unwrap();
+        let identity = image.identity().clone();
+        drop(image);
+        let (mut coordinator, _) = RegularImageCoordinator::resume_existing(
+            &prepared,
+            &image_path,
+            &identity,
+            &capsule_path,
+            ExecutorLimits::default(),
+        )
+        .unwrap();
+        let activated = coordinator
+            .advance_to_activated(VerificationLimits::default())
+            .unwrap();
+        assert_eq!(activated.phase, TransactionPhase::Activated);
+    }
+
+    #[test]
+    fn completed_uncheckpointed_activation_is_reaudited_before_adoption() {
+        let (_dir, image_path, capsule_path, prepared) = valid_exfat_fixture();
+        let image = ImageFile::open(&image_path).unwrap();
+        let identity = image.identity().clone();
+        drop(image);
+        let (mut coordinator, _) = RegularImageCoordinator::resume_existing(
+            &prepared,
+            &image_path,
+            &identity,
+            &capsule_path,
+            ExecutorLimits::default(),
+        )
+        .unwrap();
+        coordinator.advance_to_target_staged().unwrap();
+        let staged = coordinator.checkpoint().unwrap();
+        coordinator
+            .write_backup_boot(staged, VerificationLimits::default())
+            .unwrap();
+        drop(coordinator);
+
+        apply_reserved_writes(&image_path, prepared.activation_writes());
+        let image = ImageFile::open(&image_path).unwrap();
+        let identity = image.identity().clone();
+        drop(image);
+        let (mut coordinator, _) = RegularImageCoordinator::resume_existing(
+            &prepared,
+            &image_path,
+            &identity,
+            &capsule_path,
+            ExecutorLimits::default(),
+        )
+        .unwrap();
+        let activated = coordinator
+            .advance_to_activated(VerificationLimits::default())
+            .unwrap();
+        assert_eq!(activated.phase, TransactionPhase::Activated);
+    }
+
+    #[test]
+    fn third_state_backup_bytes_are_refused_and_source_is_rollbackable() {
+        let (_dir, image_path, capsule_path, prepared) = valid_exfat_fixture();
+        let image = ImageFile::open(&image_path).unwrap();
+        let identity = image.identity().clone();
+        drop(image);
+        let (mut coordinator, _) = RegularImageCoordinator::resume_existing(
+            &prepared,
+            &image_path,
+            &identity,
+            &capsule_path,
+            ExecutorLimits::default(),
+        )
+        .unwrap();
+        coordinator.advance_to_target_staged().unwrap();
+        drop(coordinator);
+
+        let before = &prepared.backup_boot_before_images()[0];
+        let after = &prepared.backup_boot_writes()[0].write;
+        let relative = before
+            .bytes
+            .iter()
+            .zip(&after.bytes)
+            .position(|(left, right)| left != right)
+            .expect("backup boot must change at least one byte");
+        let third = (0_u8..=u8::MAX)
+            .find(|value| *value != before.bytes[relative] && *value != after.bytes[relative])
+            .unwrap();
+        let mut image = fs::read(&image_path).unwrap();
+        image[usize::try_from(before.offset).unwrap() + relative] = third;
+        fs::write(&image_path, image).unwrap();
+
+        let image = ImageFile::open(&image_path).unwrap();
+        let identity = image.identity().clone();
+        drop(image);
+        let (mut coordinator, _) = RegularImageCoordinator::resume_existing(
+            &prepared,
+            &image_path,
+            &identity,
+            &capsule_path,
+            ExecutorLimits::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            coordinator.advance_to_activated(VerificationLimits::default()),
+            Err(RegularImageCoordinatorError::BackupBootBytesUnsafe {
+                state: ActivationByteState::ThirdState
+            })
+        ));
+        assert_eq!(
+            coordinator.rollback().unwrap().phase,
+            TransactionPhase::RolledBack
+        );
+    }
+
+    #[test]
+    fn mixed_activation_bytes_are_rollback_only_and_restore_exact_source() {
+        let (_dir, image_path, capsule_path, prepared) = valid_exfat_fixture();
+        let image = ImageFile::open(&image_path).unwrap();
+        let identity = image.identity().clone();
+        drop(image);
+        let (mut coordinator, _) = RegularImageCoordinator::resume_existing(
+            &prepared,
+            &image_path,
+            &identity,
+            &capsule_path,
+            ExecutorLimits::default(),
+        )
+        .unwrap();
+        coordinator.advance_to_target_staged().unwrap();
+        let staged = coordinator.checkpoint().unwrap();
+        coordinator
+            .write_backup_boot(staged, VerificationLimits::default())
+            .unwrap();
+        drop(coordinator);
+
+        let mut image = fs::read(&image_path).unwrap();
+        let mixed = prepared
+            .activation_before_images()
+            .iter()
+            .zip(prepared.activation_writes())
+            .find_map(|(before, after)| {
+                before
+                    .bytes
+                    .iter()
+                    .zip(&after.write.bytes)
+                    .position(|(left, right)| left != right)
+                    .map(|relative| (before.offset, relative, after.write.bytes[relative]))
+            })
+            .expect("activation must change at least one byte");
+        image[usize::try_from(mixed.0).unwrap() + mixed.1] = mixed.2;
+        fs::write(&image_path, image).unwrap();
+
+        let image = ImageFile::open(&image_path).unwrap();
+        let identity = image.identity().clone();
+        drop(image);
+        let (mut coordinator, _) = RegularImageCoordinator::resume_existing(
+            &prepared,
+            &image_path,
+            &identity,
+            &capsule_path,
+            ExecutorLimits::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            coordinator.advance_to_activated(VerificationLimits::default()),
+            Err(RegularImageCoordinatorError::ActivationBytesAmbiguous {
+                state: ActivationByteState::MixedBeforeAfter
+            })
+        ));
+        let rolled_back = coordinator.rollback().unwrap();
+        assert_eq!(rolled_back.phase, TransactionPhase::RolledBack);
+    }
+
+    #[test]
+    fn activated_corruption_is_rejected_before_verified_and_can_rollback() {
+        let (_dir, image_path, capsule_path, prepared) = valid_exfat_fixture();
+        let image = ImageFile::open(&image_path).unwrap();
+        let identity = image.identity().clone();
+        drop(image);
+        let (mut coordinator, _) = RegularImageCoordinator::resume_existing(
+            &prepared,
+            &image_path,
+            &identity,
+            &capsule_path,
+            ExecutorLimits::default(),
+        )
+        .unwrap();
+        coordinator.advance_to_target_staged().unwrap();
+        let staged = coordinator.checkpoint().unwrap();
+        coordinator
+            .write_backup_boot(staged, VerificationLimits::default())
+            .unwrap();
+        let backup = coordinator.checkpoint().unwrap();
+        coordinator
+            .activate_target(backup, VerificationLimits::default())
+            .unwrap();
+        drop(coordinator);
+
+        let corrupt_offset = prepared.target_staging_writes()[0].write.offset;
+        let mut image = fs::read(&image_path).unwrap();
+        image[usize::try_from(corrupt_offset).unwrap()] ^= 0xff;
+        fs::write(&image_path, image).unwrap();
+
+        let image = ImageFile::open(&image_path).unwrap();
+        let identity = image.identity().clone();
+        drop(image);
+        let (mut coordinator, _) = RegularImageCoordinator::resume_existing(
+            &prepared,
+            &image_path,
+            &identity,
+            &capsule_path,
+            ExecutorLimits::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            coordinator.verify_activated_target(VerificationLimits::default()),
+            Err(RegularImageCoordinatorError::CandidateStagingBytesMismatch { offset })
+                if offset == corrupt_offset
+        ));
+        assert_eq!(
+            coordinator.rollback().unwrap().phase,
+            TransactionPhase::RolledBack
+        );
+    }
+
+    #[test]
+    fn verified_target_can_rollback_and_rolled_back_retry_is_idempotent() {
+        let (_dir, image_path, capsule_path, prepared) = valid_exfat_fixture();
+        let image = ImageFile::open(&image_path).unwrap();
+        let identity = image.identity().clone();
+        drop(image);
+        let (mut coordinator, _) = RegularImageCoordinator::resume_existing(
+            &prepared,
+            &image_path,
+            &identity,
+            &capsule_path,
+            ExecutorLimits::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            coordinator
+                .advance_to_activated(VerificationLimits::default())
+                .unwrap()
+                .phase,
+            TransactionPhase::Activated
+        );
+        assert_eq!(
+            coordinator
+                .verify_activated_target(VerificationLimits::default())
+                .unwrap()
+                .phase,
+            TransactionPhase::Verified
+        );
+        let first = coordinator.rollback().unwrap();
+        let capsule_after_first = coordinator.store.bytes().to_vec();
+        let second = coordinator.rollback().unwrap();
+
+        assert_eq!(first.phase, TransactionPhase::RolledBack);
+        assert_eq!(second, first);
+        assert_eq!(coordinator.store.bytes(), capsule_after_first);
     }
 
     #[test]

@@ -57,13 +57,15 @@ operating-system or GUI dependency. Implemented foundations include:
   read-after-write verification, durable flushes, rollback, and deterministic fault injection. Raw
   unleased mutators are private. A lifetime-bound read view is cloned from the already-open locked
   handle for coordinator inspection; it exposes no raw-device or arbitrary-range write API.
-- `conversion/regular_image`: internal image-then-capsule lock ownership and durable preactivation
-  sequencing through `TargetStaged` only. Resume observations hash the complete locked source view,
-  virtually restoring only the conservative phase rollback ranges. At `TargetStaged` it first
-  proves the real staged ranges equal the planned bytes, then reparses and logically hashes the
-  candidate overlay against the sealed graph and source-manifest commitment. It can reconstruct an
-  owned plan from capsule plus image after process loss. It still refuses relocation, backup boot,
-  activation, and all frontend access;
+- `conversion/regular_image`: internal image-then-capsule lock ownership and durable sequencing
+  through `Activated`. Resume observations hash the complete locked source view, virtually
+  restoring only conservative phase rollback ranges. Before backup-boot or activation retry, a
+  bounded zero-copy classifier proves the relevant real bytes are exact before-images, exact
+  after-images, a before/after-only mixture, or an unsafe third state. The coordinator rechecks
+  real staged/backup/activation bytes, reparses, and logically hashes the target against the sealed
+  graph and source-manifest commitment at every applicable boundary. It reconstructs an owned plan
+  from capsule plus image after process loss, refuses relocation and all frontend access, separates
+  verification from activation, and requires a private approval capability to finalize;
 - `candidate_export`: create-new-only full image copy, exact preview application, independent target
   reinspection, logical manifest equality, validated escrow persistence, and source SHA-256
   stability proof. It cannot overwrite or authorize in-place activation.
@@ -74,12 +76,14 @@ candidate-overlay verification before backup boot, final verification, and rollb
 verified phase. Rollback selection is conservative across the checkpoint acknowledgement window:
 it restores the possibly in-flight next write group as well as every completed group. Pure
 structural destination serializers and read-only preimage capture now exist. The internal
-regular-image coordinator proves image-before-capsule durability and rollback through the inactive
-`TargetStaged` boundary, constructs fresh resume observations from its locked handle, and can audit
-that staged view against the durable source commitment after reconstructing its plan from capsule
-generation zero. It remains unreachable from production because trusted initial preflight/capsule
-creation and serializer qualification are unfinished. Neither serializer qualifies for activation. There is
-intentionally no executable in-place conversion command and no physical-device backend. The
+regular-image coordinator proves image-before-capsule durability and rollback through `Verified`,
+constructs fresh resume observations from its locked handle, and can reconcile and audit every
+regular-image recognition boundary through activation after reconstructing its plan from capsule
+generation zero. Finalization is a separate, capability-gated operation that repeats the complete
+target audit immediately before crossing the rollback boundary. This remains unreachable from
+production because trusted initial preflight/capsule creation and serializer qualification are
+unfinished. Neither serializer qualifies for activation. There is intentionally no executable
+in-place conversion command and no physical-device backend. The
 separate copy-based exporter can
 produce a complete target only in a brand-new regular file, so it does not consume or weaken that
 authorization boundary.
