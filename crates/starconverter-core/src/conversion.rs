@@ -25,10 +25,12 @@ use crate::object::{ObjectGraph, ObjectKind, StreamStorage};
 use crate::overlay::{OverlayError, OverlayLimits, OverlayPlan, OverlayWrite};
 use crate::phase::ActivationAuthorizedWrites;
 use crate::recovery::{RecoveryBundle, RecoveryError, RecoveryLimits, encode_recovery_bundle};
+use crate::verify::ManifestCommitment;
 use crate::{AccessState, FileSystem, HealthState, SemanticFeature};
 
 // Foundation remains intentionally unreachable until the coordinator itself can construct honest
 // initial observation evidence from its locked handle.
+mod prepared_envelope;
 #[allow(dead_code)]
 pub(crate) mod regular_image;
 
@@ -68,6 +70,7 @@ pub struct PreflightEvidence {
     image: ImageIdentity,
     source_filesystem: FileSystem,
     source_evidence_digest: [u8; 32],
+    source_manifest_commitment: ManifestCommitment,
     sector_bytes: u32,
     allocation_alignment: u64,
     inventory_complete: bool,
@@ -263,6 +266,7 @@ pub struct PreparedConversion {
     identity: CapsuleIdentity,
     preflight: PreflightEvidence,
     target_filesystem: FileSystem,
+    target_features: Vec<FeatureCompatibility>,
     graph_digest: [u8; 32],
     plan_digest: [u8; 32],
     candidate_overlay_digest: [u8; 32],
@@ -277,6 +281,7 @@ pub struct PreparedConversion {
     preactivation_rollback_overlay: OverlayPlan,
     full_rollback_overlay: OverlayPlan,
     recovery_payload: Vec<u8>,
+    prepared_envelope: Vec<u8>,
     capsule_limits: CapsuleLimits,
 }
 
@@ -396,17 +401,17 @@ impl PreparedConversion {
                 max_bytes: limits.max_total_write_bytes,
             },
         )?;
-        validate_initial_capsule_generation(recovery_payload.len(), limits.capsule)?;
         let candidate_overlay_digest = digest_overlay_writes(candidate_overlay.writes());
         let identity = CapsuleIdentity {
             transaction_id: draft.transaction_id,
             source_digest: digest_source_identity(draft.preflight, graph_digest),
         };
 
-        Ok(Self {
+        let mut prepared = Self {
             identity,
             preflight: draft.preflight,
             target_filesystem: draft.target.filesystem,
+            target_features: draft.target.features,
             graph_digest,
             plan_digest,
             candidate_overlay_digest,
@@ -421,8 +426,11 @@ impl PreparedConversion {
             preactivation_rollback_overlay,
             full_rollback_overlay,
             recovery_payload,
+            prepared_envelope: Vec::new(),
             capsule_limits: limits.capsule,
-        })
+        };
+        prepared.refresh_durable_envelope()?;
+        Ok(prepared)
     }
 
     #[must_use]
@@ -440,14 +448,63 @@ impl PreparedConversion {
         self.plan_digest
     }
 
+    pub(crate) const fn source_manifest_commitment(&self) -> ManifestCommitment {
+        self.preflight.source_manifest_commitment
+    }
+
     /// Proves that the executor's pinned regular file is the container used by trusted preflight.
     pub(crate) fn matches_regular_image(&self, identity: &crate::image::ImageIdentity) -> bool {
         self.preflight.image == ImageIdentity::from_regular_image(identity)
     }
 
     #[cfg(test)]
-    pub(crate) fn test_bind_regular_image(&mut self, identity: &crate::image::ImageIdentity) {
+    pub(crate) fn test_bind_regular_image(
+        &mut self,
+        identity: &crate::image::ImageIdentity,
+        source_evidence_digest: [u8; 32],
+    ) {
         self.preflight.image = ImageIdentity::from_regular_image(identity);
+        self.preflight.source_evidence_digest = source_evidence_digest;
+        self.plan_digest = digest_plan(
+            self.preflight,
+            self.target_filesystem,
+            &self.target_features,
+            &self.reservations,
+            &self.layout,
+            &self.writes,
+            self.graph_digest,
+        );
+        self.identity.source_digest = digest_source_identity(self.preflight, self.graph_digest);
+        let recovery_write_count = self
+            .writes
+            .target_staging_rollback
+            .len()
+            .saturating_add(self.writes.backup_boot_rollback.len())
+            .saturating_add(self.writes.activation_rollback.len());
+        let recovery_bytes = self
+            .writes
+            .target_staging_rollback
+            .iter()
+            .chain(&self.writes.backup_boot_rollback)
+            .chain(&self.writes.activation_rollback)
+            .fold(0_usize, |total, write| {
+                total.saturating_add(write.bytes.len())
+            });
+        self.recovery_payload = encode_recovery_bundle(
+            &RecoveryBundle {
+                plan_digest: self.plan_digest,
+                target_staging: self.writes.target_staging_rollback.clone(),
+                backup_boot: self.writes.backup_boot_rollback.clone(),
+                activation: self.writes.activation_rollback.clone(),
+            },
+            RecoveryLimits {
+                max_writes: recovery_write_count.max(1),
+                max_bytes: recovery_bytes.max(1),
+            },
+        )
+        .expect("test regular image recovery payload remains bounded");
+        self.refresh_durable_envelope()
+            .expect("test regular image durable envelope remains bounded");
     }
 
     #[must_use]
@@ -498,10 +555,67 @@ impl PreparedConversion {
         &self.writes.activation
     }
 
+    /// Before-images that conservatively reconstruct the original source byte view at a durable
+    /// checkpoint, including the possibly torn next source-visible write group.
+    pub(crate) fn observation_rollback_writes(
+        &self,
+        phase: TransactionPhase,
+    ) -> Option<&[OverlayWrite]> {
+        match phase {
+            TransactionPhase::Discovered
+            | TransactionPhase::Reserved
+            | TransactionPhase::Finalized
+            | TransactionPhase::RolledBack => None,
+            TransactionPhase::Relocating => Some(self.staging_rollback_overlay.writes()),
+            TransactionPhase::TargetStaged => Some(self.preactivation_rollback_overlay.writes()),
+            TransactionPhase::BackupBootWritten
+            | TransactionPhase::Activated
+            | TransactionPhase::Verified => Some(self.full_rollback_overlay.writes()),
+        }
+    }
+
     /// Versioned exact before-images written into the first durable capsule generation.
     #[must_use]
     pub fn recovery_payload(&self) -> &[u8] {
         &self.recovery_payload
+    }
+
+    fn refresh_durable_envelope(&mut self) -> Result<(), ConversionError> {
+        let limits = prepared_envelope::PreparedEnvelopeLimits::default();
+        let encoded = prepared_envelope::encode_prepared_envelope(self, limits)?;
+        validate_initial_capsule_generation(encoded.len(), self.capsule_limits)?;
+        self.prepared_envelope = encoded;
+        Ok(())
+    }
+
+    /// Reconstructs complete execution and rollback authority from a new-format capsule alone.
+    /// Legacy recovery-only capsules are deliberately refused without their external plan.
+    pub(crate) fn from_restart_capsule(
+        capsule: &[u8],
+        policy: CapsuleLimits,
+    ) -> Result<Self, ConversionError> {
+        let view = recover_capsule(capsule, policy)?;
+        let first = view
+            .generations()
+            .first()
+            .ok_or(ConversionError::CapsuleNotStarted)?;
+        let decoded = prepared_envelope::decode_prepared_envelope(
+            first.payload,
+            prepared_envelope::PreparedEnvelopeLimits::default(),
+        )?;
+        let mut prepared = decoded.prepared;
+        if prepared.capsule_limits.max_capsule_bytes > policy.max_capsule_bytes
+            || prepared.capsule_limits.max_generation_bytes > policy.max_generation_bytes
+            || prepared.capsule_limits.max_generations > policy.max_generations
+        {
+            return Err(ConversionError::EnvelopeRaisesCapsuleLimits);
+        }
+        if first.identity != prepared.identity {
+            return Err(ConversionError::TransactionIdentityChanged);
+        }
+        prepared.prepared_envelope = first.payload.to_vec();
+        prepared.resume_without_observation(capsule)?;
+        Ok(prepared)
     }
 
     #[must_use]
@@ -541,7 +655,7 @@ impl PreparedConversion {
             capsule,
             self.identity,
             TransactionPhase::Discovered,
-            &self.recovery_payload,
+            &self.prepared_envelope,
             self.capsule_limits,
         )?;
         Ok(())
@@ -557,6 +671,23 @@ impl PreparedConversion {
         capsule: &[u8],
         observed: ObservedImage,
     ) -> Result<ResumePoint<'a>, ConversionError> {
+        let resumed = self.resume_without_observation(capsule)?;
+        if self.is_legacy_capsule(capsule)? {
+            return Err(ConversionError::LegacyCapsuleRollbackOnly);
+        }
+        let require_source = phase_requires_source_evidence(resumed.phase);
+        self.validate_observed(observed, require_source)?;
+        Ok(resumed)
+    }
+
+    /// Validates capsule framing and its exact plan binding before a locked coordinator constructs
+    /// a fresh observation of the current image bytes. This deliberately remains crate-private:
+    /// callers must still pass the resulting checkpoint through [`Self::resume`] before any intent
+    /// is authorized.
+    pub(crate) fn resume_without_observation<'a>(
+        &'a self,
+        capsule: &[u8],
+    ) -> Result<ResumePoint<'a>, ConversionError> {
         let view = recover_capsule(capsule, self.capsule_limits)?;
         let newest = view.newest().ok_or(ConversionError::CapsuleNotStarted)?;
         if newest.identity != self.identity {
@@ -566,19 +697,36 @@ impl PreparedConversion {
             .generations()
             .first()
             .ok_or(ConversionError::CapsuleNotStarted)?;
-        if first.payload != self.recovery_payload {
+        if first.payload != self.prepared_envelope && first.payload != self.recovery_payload {
             return Err(ConversionError::PlanChanged);
         }
         if newest.generation != 0 && newest.payload != self.checkpoint_payload() {
             return Err(ConversionError::PlanChanged);
         }
-        let require_source = phase_requires_source_evidence(newest.phase);
-        self.validate_observed(observed, require_source)?;
         Ok(ResumePoint {
             generation: newest.generation,
             phase: newest.phase,
             next: self.intent_after(newest.phase),
         })
+    }
+
+    fn is_legacy_capsule(&self, capsule: &[u8]) -> Result<bool, ConversionError> {
+        let view = recover_capsule(capsule, self.capsule_limits)?;
+        let first = view
+            .generations()
+            .first()
+            .ok_or(ConversionError::CapsuleNotStarted)?;
+        Ok(first.payload == self.recovery_payload)
+    }
+
+    fn resume_for_rollback<'a>(
+        &'a self,
+        capsule: &[u8],
+        observed: ObservedImage,
+    ) -> Result<ResumePoint<'a>, ConversionError> {
+        let resumed = self.resume_without_observation(capsule)?;
+        self.validate_observed(observed, phase_requires_source_evidence(resumed.phase))?;
+        Ok(resumed)
     }
 
     /// Records completion of exactly the next phase; this never executes the emitted intent.
@@ -761,7 +909,7 @@ impl PreparedConversion {
         observed: ObservedImage,
         completion: RollbackCompletion,
     ) -> Result<(), ConversionError> {
-        let current = self.resume(capsule, observed)?;
+        let current = self.resume_for_rollback(capsule, observed)?;
         let validated_bytes = recover_capsule(capsule, self.capsule_limits)?.validated_bytes();
         let intent = self.rollback_intent(current.phase)?;
         self.validate_common_completion(
@@ -1012,6 +1160,8 @@ pub enum ConversionError {
     RollbackRangeMismatch,
     CapsuleAlreadyStarted,
     CapsuleNotStarted,
+    LegacyCapsuleRollbackOnly,
+    EnvelopeRaisesCapsuleLimits,
     TransactionIdentityChanged,
     ImageIdentityChanged,
     StaleSourceEvidence,
@@ -1044,6 +1194,7 @@ pub enum ConversionError {
     Overlay(OverlayError),
     Capsule(CapsuleError),
     Recovery(RecoveryError),
+    PreparedEnvelopeInvalid,
 }
 
 impl fmt::Display for ConversionError {
@@ -1158,6 +1309,11 @@ impl fmt::Display for ConversionError {
             Self::CapsuleNotStarted => {
                 formatter.write_str("transaction capsule has no discovered checkpoint")
             }
+            Self::LegacyCapsuleRollbackOnly => formatter
+                .write_str("legacy recovery-only capsule cannot authorize forward execution"),
+            Self::EnvelopeRaisesCapsuleLimits => formatter.write_str(
+                "prepared envelope attempts to raise the caller's capsule policy limits",
+            ),
             Self::TransactionIdentityChanged => {
                 formatter.write_str("capsule transaction or source identity changed")
             }
@@ -1217,6 +1373,9 @@ impl fmt::Display for ConversionError {
             Self::Recovery(error) => {
                 write!(formatter, "recovery bundle validation failed: {error}")
             }
+            Self::PreparedEnvelopeInvalid => {
+                formatter.write_str("prepared envelope validation failed")
+            }
         }
     }
 }
@@ -1252,6 +1411,15 @@ impl From<CapsuleError> for ConversionError {
 impl From<RecoveryError> for ConversionError {
     fn from(value: RecoveryError) -> Self {
         Self::Recovery(value)
+    }
+}
+
+impl From<prepared_envelope::PreparedEnvelopeError> for ConversionError {
+    fn from(value: prepared_envelope::PreparedEnvelopeError) -> Self {
+        match value {
+            prepared_envelope::PreparedEnvelopeError::Capsule(error) => Self::Capsule(error),
+            _ => Self::PreparedEnvelopeInvalid,
+        }
     }
 }
 
@@ -1782,6 +1950,15 @@ fn digest_source_identity(evidence: PreflightEvidence, graph_digest: [u8; 32]) -
     hasher.update(evidence.image.instance);
     put_u64(&mut hasher, evidence.image.image_bytes);
     hasher.update(evidence.source_evidence_digest);
+    hasher.update(evidence.source_manifest_commitment.digest());
+    put_u64(
+        &mut hasher,
+        evidence.source_manifest_commitment.logical_bytes_hashed(),
+    );
+    put_u64(
+        &mut hasher,
+        evidence.source_manifest_commitment.object_count(),
+    );
     hasher.update(graph_digest);
     finish(hasher)
 }
@@ -1892,6 +2069,15 @@ fn digest_plan(
     put_u64(&mut hasher, evidence.image.image_bytes);
     hasher.update(evidence.sector_bytes.to_le_bytes());
     put_u64(&mut hasher, evidence.allocation_alignment);
+    hasher.update(evidence.source_manifest_commitment.digest());
+    put_u64(
+        &mut hasher,
+        evidence.source_manifest_commitment.logical_bytes_hashed(),
+    );
+    put_u64(
+        &mut hasher,
+        evidence.source_manifest_commitment.object_count(),
+    );
     for feature in features {
         hasher.update([feature_key(feature.feature)]);
         match feature.method {
@@ -2043,6 +2229,9 @@ pub(crate) mod tests {
                 image: IMAGE,
                 source_filesystem: FileSystem::ExFat,
                 source_evidence_digest: [9; 32],
+                source_manifest_commitment: ManifestCommitment::from_validated_parts(
+                    [0x4d; 32], 1, 2,
+                ),
                 sector_bytes: 512,
                 allocation_alignment: 512,
                 inventory_complete: true,
@@ -2155,7 +2344,8 @@ pub(crate) mod tests {
         let image = crate::image::ImageFile::open(&path).unwrap();
         let image_identity = image.identity().clone();
         let mut plan = prepared();
-        plan.test_bind_regular_image(&image_identity);
+        let source_evidence_digest = plan.preflight.source_evidence_digest;
+        plan.test_bind_regular_image(&image_identity, source_evidence_digest);
         let observed = ObservedImage {
             image: plan.preflight.image,
             source_evidence_digest: Some(plan.preflight.source_evidence_digest),
@@ -2274,7 +2464,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn first_capsule_generation_durably_contains_exact_recovery_bytes() {
+    fn first_capsule_generation_durably_contains_restart_plan_and_exact_recovery_bytes() {
         let plan = prepared();
         let decoded = decode_recovery_bundle(
             plan.recovery_payload(),
@@ -2292,7 +2482,38 @@ pub(crate) mod tests {
         let mut capsule = Vec::new();
         plan.begin_capsule(&mut capsule, observed()).unwrap();
         let view = scan_capsule(&capsule, CapsuleLimits::default()).unwrap();
-        assert_eq!(view.newest().unwrap().payload, plan.recovery_payload());
+        assert_eq!(view.newest().unwrap().payload, plan.prepared_envelope);
+        assert_eq!(&view.newest().unwrap().payload[..8], b"SCPREP01");
+        let restored =
+            PreparedConversion::from_restart_capsule(&capsule, CapsuleLimits::default()).unwrap();
+        assert_eq!(restored, plan);
+    }
+
+    #[test]
+    fn legacy_recovery_only_capsule_cannot_recreate_forward_authority() {
+        let plan = prepared();
+        let mut legacy = Vec::new();
+        append_generation(
+            &mut legacy,
+            plan.identity(),
+            TransactionPhase::Discovered,
+            plan.recovery_payload(),
+            CapsuleLimits::default(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            plan.resume(&legacy, observed()),
+            Err(ConversionError::LegacyCapsuleRollbackOnly)
+        ));
+        assert_eq!(
+            plan.resume_for_rollback(&legacy, observed()).unwrap().phase,
+            TransactionPhase::Discovered
+        );
+        assert!(matches!(
+            PreparedConversion::from_restart_capsule(&legacy, CapsuleLimits::default()),
+            Err(ConversionError::PreparedEnvelopeInvalid)
+        ));
     }
 
     #[test]

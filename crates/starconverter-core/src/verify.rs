@@ -16,6 +16,7 @@ use crate::object::{
 };
 
 static ZEROES: [u8; 64 * 1024] = [0; 64 * 1024];
+const MANIFEST_COMMITMENT_DOMAIN: &[u8] = b"starconverter/logical-manifest-commitment/v1\0";
 
 /// Resource bounds for one manifest operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +77,74 @@ impl VerificationManifest {
     #[must_use]
     pub fn equivalent_to(&self, other: &Self) -> bool {
         self.metadata_sha256 == other.metadata_sha256 && self.objects == other.objects
+    }
+}
+
+/// Compact, versioned commitment to a complete logical verification manifest.
+///
+/// This is crate-private because possession is evidence, not caller-supplied input. The committed
+/// metadata digest already covers every path, semantic flag, stream size, and logical content
+/// hash; the explicit counts prevent a decoder from discarding the manifest's bounded-work facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ManifestCommitment {
+    digest: [u8; 32],
+    logical_bytes_hashed: u64,
+    object_count: u64,
+}
+
+impl ManifestCommitment {
+    /// Commits to one fully built manifest using a domain-separated canonical encoding.
+    pub(crate) fn from_manifest(
+        manifest: &VerificationManifest,
+    ) -> Result<Self, VerificationError> {
+        let object_count = u64::try_from(manifest.objects.len()).map_err(|_| {
+            VerificationError::ArithmeticOverflow {
+                calculation: "manifest commitment object count",
+            }
+        })?;
+        let mut hasher = Sha256::new();
+        hasher.update(MANIFEST_COMMITMENT_DOMAIN);
+        hasher.update(manifest.metadata_sha256);
+        hasher.update(manifest.logical_bytes_hashed.to_le_bytes());
+        hasher.update(object_count.to_le_bytes());
+        Ok(Self {
+            digest: hasher.finalize().into(),
+            logical_bytes_hashed: manifest.logical_bytes_hashed,
+            object_count,
+        })
+    }
+
+    /// Recomputes the commitment instead of trusting separately supplied manifest fields.
+    pub(crate) fn matches(
+        self,
+        manifest: &VerificationManifest,
+    ) -> Result<bool, VerificationError> {
+        Ok(self == Self::from_manifest(manifest)?)
+    }
+
+    pub(crate) const fn digest(self) -> [u8; 32] {
+        self.digest
+    }
+
+    pub(crate) const fn logical_bytes_hashed(self) -> u64 {
+        self.logical_bytes_hashed
+    }
+
+    pub(crate) const fn object_count(self) -> u64 {
+        self.object_count
+    }
+
+    /// Reconstructs only after a durable decoder has validated the schema and all bounds.
+    pub(crate) const fn from_validated_parts(
+        digest: [u8; 32],
+        logical_bytes_hashed: u64,
+        object_count: u64,
+    ) -> Self {
+        Self {
+            digest,
+            logical_bytes_hashed,
+            object_count,
+        }
     }
 }
 

@@ -3,8 +3,10 @@
 //! There is deliberately no public or frontend entry point. This module acquires the image
 //! executor first and the capsule store second, owns both locks, and cannot advance beyond
 //! `TargetStaged`. Its candidate audit reads through a view borrowed from that already-locked
-//! executor; honest construction of the initial sealed [`ObservedImage`] remains future work.
+//! executor. Resume observations are freshly derived from that locked handle, using conservative
+//! rollback before-images to reconstruct the original source view at mutating checkpoints.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::path::Path;
 
@@ -14,9 +16,13 @@ use crate::capsule_store::{CapsuleRecoveryEvidence, CapsuleStore, CapsuleStoreEr
 use crate::executor::{
     ExecutionLease, ExecutorError, ExecutorLimits, ImageExecutor, LeasedIntent, LeasedRollback,
 };
-use crate::image::ImageIdentity;
+use crate::image::{BoundedImageReader, ImageIdentity};
 use crate::inspect::{InspectionError, inspect_overlay};
 use crate::overlay::OverlayError;
+use crate::source_view::{
+    SourceDigestLimits, SourceViewError, VirtualOriginalLimits, VirtualOriginalReader,
+    digest_source_view,
+};
 use crate::verify::{
     VerificationError, VerificationLimits, VerificationManifest, build_manifest_with_reader,
 };
@@ -43,8 +49,7 @@ pub struct DurableCheckpoint {
 pub struct RegularImageCoordinator<'plan> {
     store: CapsuleStore,
     executor: ImageExecutor,
-    prepared: &'plan PreparedConversion,
-    observed: ObservedImage,
+    prepared: Cow<'plan, PreparedConversion>,
     poisoned: bool,
 }
 
@@ -52,11 +57,10 @@ impl<'plan> RegularImageCoordinator<'plan> {
     /// Opens the image executor before opening/recovering the capsule store, then binds both to the
     /// exact sealed plan and current capsule generation.
     ///
-    /// This remains crate-private because no production locked inspector can yet construct the
-    /// required `ObservedImage` honestly.
+    /// The sealed observation is constructed internally from the locked image; callers cannot
+    /// supply or replay source evidence.
     pub fn resume_existing(
         prepared: &'plan PreparedConversion,
-        observed: ObservedImage,
         image_path: impl AsRef<Path>,
         expected_image: &ImageIdentity,
         capsule_path: impl AsRef<Path>,
@@ -74,8 +78,7 @@ impl<'plan> RegularImageCoordinator<'plan> {
         let coordinator = Self {
             store,
             executor,
-            prepared,
-            observed,
+            prepared: Cow::Borrowed(prepared),
             poisoned: false,
         };
         let checkpoint = coordinator.checkpoint()?;
@@ -118,10 +121,9 @@ impl<'plan> RegularImageCoordinator<'plan> {
     /// Parses and logically hashes the exact staged candidate through the prepared overlay.
     ///
     /// The base reader is cloned from the executor's already-open handle and cannot outlive its
-    /// lock. The normalized graph must match the plan before staging evidence is returned. The
-    /// logical manifest is diagnostic evidence only until a future durable plan envelope commits
-    /// to the expected source manifest; this method never appends `Verified` or activates a boot
-    /// sector.
+    /// lock. Actual staged ranges must still equal the planned bytes before the overlay parser can
+    /// fill later write groups. The normalized graph and logical manifest commitment must both
+    /// match the plan; this method never appends `Verified` or activates a boot sector.
     pub(crate) fn audit_staged_candidate(
         &mut self,
         verification_limits: VerificationLimits,
@@ -144,6 +146,7 @@ impl<'plan> RegularImageCoordinator<'plan> {
         };
         let expected = self.prepared.expected_staging_verification();
         let audit = (|| {
+            verify_actual_staging_bytes(&view, self.prepared.target_staging_writes())?;
             let inspection = inspect_overlay(
                 &view,
                 self.executor.identity(),
@@ -184,6 +187,14 @@ impl<'plan> RegularImageCoordinator<'plan> {
                 .map_err(RegularImageCoordinatorError::Overlay)?;
             let manifest = build_manifest_with_reader(&overlay_reader, graph, verification_limits)
                 .map_err(RegularImageCoordinatorError::Verification)?;
+            if !self
+                .prepared
+                .source_manifest_commitment()
+                .matches(&manifest)
+                .map_err(RegularImageCoordinatorError::Verification)?
+            {
+                return Err(RegularImageCoordinatorError::CandidateManifestMismatch);
+            }
             let evidence = StagingVerificationEvidence {
                 target_filesystem: expected.target_filesystem,
                 parser_validated: true,
@@ -234,16 +245,17 @@ impl<'plan> RegularImageCoordinator<'plan> {
             .rollback_intent(checkpoint.phase)
             .map_err(RegularImageCoordinatorError::Conversion)?;
         let lease = self.lease(checkpoint);
-        let executed = match self
-            .executor
-            .execute_leased_rollback(self.prepared, lease, intent)
-        {
-            Ok(executed) => executed,
-            Err(error) => {
-                self.poison();
-                return Err(RegularImageCoordinatorError::Executor(error));
-            }
-        };
+        let executed =
+            match self
+                .executor
+                .execute_leased_rollback(self.prepared.as_ref(), lease, intent)
+            {
+                Ok(executed) => executed,
+                Err(error) => {
+                    self.poison();
+                    return Err(RegularImageCoordinatorError::Executor(error));
+                }
+            };
         self.append_rollback(checkpoint, executed)?;
         self.poisoned = false;
         self.checkpoint()
@@ -251,8 +263,9 @@ impl<'plan> RegularImageCoordinator<'plan> {
 
     fn append_reservation(&mut self) -> Result<(), RegularImageCoordinatorError> {
         let mut updated = self.store.bytes().to_vec();
+        let observed = self.observe_current()?;
         self.prepared
-            .record_reservation(&mut updated, self.observed)
+            .record_reservation(&mut updated, observed)
             .map_err(RegularImageCoordinatorError::Conversion)?;
         self.append_capsule(&updated)
     }
@@ -261,9 +274,10 @@ impl<'plan> RegularImageCoordinator<'plan> {
         &mut self,
         checkpoint: DurableCheckpoint,
     ) -> Result<(), RegularImageCoordinatorError> {
+        let observed = self.observe_current()?;
         let resumed = self
             .prepared
-            .resume(self.store.bytes(), self.observed)
+            .resume(self.store.bytes(), observed)
             .map_err(RegularImageCoordinatorError::Conversion)?;
         let authorized = matches!(
             (&resumed.next, checkpoint.phase),
@@ -277,16 +291,17 @@ impl<'plan> RegularImageCoordinator<'plan> {
             return Err(RegularImageCoordinatorError::LeaseStateChanged);
         }
         let lease = self.lease(checkpoint);
-        let executed = match self
-            .executor
-            .execute_leased_intent(self.prepared, lease, resumed.next)
-        {
-            Ok(executed) => executed,
-            Err(error) => {
-                self.poison();
-                return Err(RegularImageCoordinatorError::Executor(error));
-            }
-        };
+        let executed =
+            match self
+                .executor
+                .execute_leased_intent(self.prepared.as_ref(), lease, resumed.next)
+            {
+                Ok(executed) => executed,
+                Err(error) => {
+                    self.poison();
+                    return Err(RegularImageCoordinatorError::Executor(error));
+                }
+            };
         self.append_execution(checkpoint, executed)
     }
 
@@ -301,9 +316,10 @@ impl<'plan> RegularImageCoordinator<'plan> {
             return Err(RegularImageCoordinatorError::LeaseStateChanged);
         }
         let mut updated = self.store.bytes().to_vec();
-        if let Err(error) =
-            self.prepared
-                .record_execution(&mut updated, self.observed, executed, None)
+        let observed = self.observe_current()?;
+        if let Err(error) = self
+            .prepared
+            .record_execution(&mut updated, observed, executed, None)
         {
             self.poison();
             return Err(RegularImageCoordinatorError::Conversion(error));
@@ -322,9 +338,10 @@ impl<'plan> RegularImageCoordinator<'plan> {
             return Err(RegularImageCoordinatorError::LeaseStateChanged);
         }
         let mut updated = self.store.bytes().to_vec();
-        if let Err(error) =
-            self.prepared
-                .record_executed_rollback(&mut updated, self.observed, executed)
+        let observed = self.observe_current()?;
+        if let Err(error) = self
+            .prepared
+            .record_executed_rollback(&mut updated, observed, executed)
         {
             self.poison();
             return Err(RegularImageCoordinatorError::Conversion(error));
@@ -350,10 +367,18 @@ impl<'plan> RegularImageCoordinator<'plan> {
     }
 
     fn checkpoint(&self) -> Result<DurableCheckpoint, RegularImageCoordinatorError> {
+        let unobserved = self
+            .prepared
+            .resume_without_observation(self.store.bytes())
+            .map_err(RegularImageCoordinatorError::Conversion)?;
+        let observed = self.observe_phase(unobserved.phase)?;
         let resumed = self
             .prepared
-            .resume(self.store.bytes(), self.observed)
+            .resume_for_rollback(self.store.bytes(), observed)
             .map_err(RegularImageCoordinatorError::Conversion)?;
+        if resumed.generation != unobserved.generation || resumed.phase != unobserved.phase {
+            return Err(RegularImageCoordinatorError::LeaseStateChanged);
+        }
         let count = u64::try_from(self.store.generation_count())
             .map_err(|_| RegularImageCoordinatorError::GenerationOverflow)?;
         if count != resumed.generation.saturating_add(1) {
@@ -362,6 +387,69 @@ impl<'plan> RegularImageCoordinator<'plan> {
         Ok(DurableCheckpoint {
             generation: resumed.generation,
             phase: resumed.phase,
+        })
+    }
+
+    fn observe_current(&self) -> Result<ObservedImage, RegularImageCoordinatorError> {
+        let checkpoint = self
+            .prepared
+            .resume_without_observation(self.store.bytes())
+            .map_err(RegularImageCoordinatorError::Conversion)?;
+        self.observe_phase(checkpoint.phase)
+    }
+
+    fn observe_phase(
+        &self,
+        phase: TransactionPhase,
+    ) -> Result<ObservedImage, RegularImageCoordinatorError> {
+        let source_evidence_digest = if super::phase_requires_source_evidence(phase) {
+            let view = self
+                .executor
+                .locked_view(CANDIDATE_AUDIT_MAX_READ_BYTES)
+                .map_err(RegularImageCoordinatorError::Executor)?;
+            let rollback = self.prepared.observation_rollback_writes(phase);
+            let digest = if let Some(writes) = rollback {
+                let masked_bytes = writes
+                    .iter()
+                    .try_fold(0_usize, |total, write| total.checked_add(write.bytes.len()));
+                let masked_bytes =
+                    masked_bytes.ok_or(RegularImageCoordinatorError::CandidateRangeOverflow)?;
+                let virtual_original = VirtualOriginalReader::new(
+                    &view,
+                    writes,
+                    VirtualOriginalLimits {
+                        max_writes: writes.len().max(1),
+                        max_masked_bytes: masked_bytes.max(1),
+                    },
+                )
+                .map_err(RegularImageCoordinatorError::SourceView)?;
+                digest_source_view(
+                    &virtual_original,
+                    SourceDigestLimits {
+                        max_image_bytes: self.prepared.preflight.image.image_bytes,
+                        chunk_bytes: CANDIDATE_AUDIT_MAX_READ_BYTES,
+                    },
+                )
+                .map_err(RegularImageCoordinatorError::SourceView)?
+            } else {
+                digest_source_view(
+                    &view,
+                    SourceDigestLimits {
+                        max_image_bytes: self.prepared.preflight.image.image_bytes,
+                        chunk_bytes: CANDIDATE_AUDIT_MAX_READ_BYTES,
+                    },
+                )
+                .map_err(RegularImageCoordinatorError::SourceView)?
+            };
+            view.post_operation_revalidate()
+                .map_err(RegularImageCoordinatorError::Executor)?;
+            Some(digest)
+        } else {
+            None
+        };
+        Ok(ObservedImage {
+            image: super::ImageIdentity::from_regular_image(self.executor.identity()),
+            source_evidence_digest,
         })
     }
 
@@ -388,6 +476,75 @@ impl<'plan> RegularImageCoordinator<'plan> {
     }
 }
 
+impl RegularImageCoordinator<'static> {
+    /// Reconstructs the complete prepared plan from the capsule's generation-zero envelope after
+    /// acquiring the image lock. Legacy recovery-only capsules fail closed because they cannot
+    /// recreate forward execution authority.
+    pub fn resume_from_capsule(
+        image_path: impl AsRef<Path>,
+        expected_image: &ImageIdentity,
+        capsule_path: impl AsRef<Path>,
+        executor_limits: ExecutorLimits,
+        capsule_policy: crate::capsule::CapsuleLimits,
+    ) -> Result<(Self, CapsuleRecoveryEvidence), RegularImageCoordinatorError> {
+        let executor = ImageExecutor::open(image_path.as_ref(), expected_image, executor_limits)
+            .map_err(RegularImageCoordinatorError::Executor)?;
+        let (store, recovery) =
+            CapsuleStore::resume_recovering(capsule_path, image_path, capsule_policy)
+                .map_err(RegularImageCoordinatorError::CapsuleStore)?;
+        let prepared = PreparedConversion::from_restart_capsule(store.bytes(), capsule_policy)
+            .map_err(RegularImageCoordinatorError::Conversion)?;
+        if !prepared.matches_regular_image(executor.identity()) {
+            return Err(RegularImageCoordinatorError::PlanImageMismatch);
+        }
+        let coordinator = Self {
+            store,
+            executor,
+            prepared: Cow::Owned(prepared),
+            poisoned: false,
+        };
+        let checkpoint = coordinator.checkpoint()?;
+        if phase_after_target_staged(checkpoint.phase) {
+            return Err(RegularImageCoordinatorError::BeyondPreactivation {
+                phase: checkpoint.phase,
+            });
+        }
+        Ok((coordinator, recovery))
+    }
+}
+
+fn verify_actual_staging_bytes(
+    reader: &dyn BoundedImageReader,
+    writes: &[super::ReservedWrite],
+) -> Result<(), RegularImageCoordinatorError> {
+    let chunk_bytes = reader.max_read_bytes().min(CANDIDATE_AUDIT_MAX_READ_BYTES);
+    if chunk_bytes == 0 {
+        return Err(RegularImageCoordinatorError::CandidateReadLimitInvalid);
+    }
+    for reserved in writes {
+        for (index, expected) in reserved.write.bytes.chunks(chunk_bytes).enumerate() {
+            let relative = index
+                .checked_mul(chunk_bytes)
+                .and_then(|value| u64::try_from(value).ok())
+                .ok_or(RegularImageCoordinatorError::CandidateRangeOverflow)?;
+            let offset = reserved
+                .write
+                .offset
+                .checked_add(relative)
+                .ok_or(RegularImageCoordinatorError::CandidateRangeOverflow)?;
+            let actual = reader
+                .read_exact_at(offset, expected.len())
+                .map_err(|error| {
+                    RegularImageCoordinatorError::Executor(ExecutorError::Image(error))
+                })?;
+            if actual != expected {
+                return Err(RegularImageCoordinatorError::CandidateStagingBytesMismatch { offset });
+            }
+        }
+    }
+    Ok(())
+}
+
 const fn phase_after_target_staged(phase: TransactionPhase) -> bool {
     matches!(
         phase,
@@ -407,6 +564,7 @@ pub enum RegularImageCoordinatorError {
     Inspection(InspectionError),
     Overlay(OverlayError),
     Verification(VerificationError),
+    SourceView(SourceViewError),
     PlanImageMismatch,
     RelocationNotSupported,
     LeaseStateChanged,
@@ -428,6 +586,12 @@ pub enum RegularImageCoordinatorError {
     },
     CandidateInventoryIncomplete,
     CandidateGraphMismatch,
+    CandidateManifestMismatch,
+    CandidateStagingBytesMismatch {
+        offset: u64,
+    },
+    CandidateReadLimitInvalid,
+    CandidateRangeOverflow,
 }
 
 impl fmt::Display for RegularImageCoordinatorError {
@@ -441,6 +605,7 @@ impl fmt::Display for RegularImageCoordinatorError {
             Self::Verification(error) => {
                 write!(formatter, "candidate logical verification failed: {error}")
             }
+            Self::SourceView(error) => write!(formatter, "source view rejected: {error}"),
             Self::PlanImageMismatch => {
                 formatter.write_str("prepared conversion does not match the locked image")
             }
@@ -478,6 +643,19 @@ impl fmt::Display for RegularImageCoordinatorError {
             Self::CandidateGraphMismatch => {
                 formatter.write_str("candidate object graph does not match the prepared plan")
             }
+            Self::CandidateManifestMismatch => {
+                formatter.write_str("candidate logical manifest does not match the prepared source")
+            }
+            Self::CandidateStagingBytesMismatch { offset } => write!(
+                formatter,
+                "actual staged bytes differ from the prepared write at image offset {offset}"
+            ),
+            Self::CandidateReadLimitInvalid => {
+                formatter.write_str("candidate reader reported a zero byte limit")
+            }
+            Self::CandidateRangeOverflow => {
+                formatter.write_str("candidate staged byte range overflowed")
+            }
         }
     }
 }
@@ -491,6 +669,7 @@ impl std::error::Error for RegularImageCoordinatorError {
             Self::Inspection(error) => Some(error),
             Self::Overlay(error) => Some(error),
             Self::Verification(error) => Some(error),
+            Self::SourceView(error) => Some(error),
             _ => None,
         }
     }
@@ -518,6 +697,7 @@ mod tests {
     };
     use crate::phase::{ActivationAuthorizedWrites, preview_exfat_phase_writes};
     use crate::preimage::PreimageLimits;
+    use crate::verify::{ManifestCommitment, build_manifest};
 
     use super::super::{
         ConversionDraft, ConversionLimits, ImageIdentity as ConversionImageIdentity,
@@ -553,19 +733,30 @@ mod tests {
         }
     }
 
-    fn fixture() -> (TempDir, PathBuf, PathBuf, PreparedConversion, ObservedImage) {
+    fn fixture() -> (TempDir, PathBuf, PathBuf, PreparedConversion) {
         let dir = TempDir::new();
         let image_path = dir.join("source.img");
         let capsule_path = dir.join("transaction.starcap");
         let mut prepared = super::super::tests::prepared();
-        fs::write(
-            &image_path,
-            vec![0x5a; usize::try_from(prepared.preflight.image.image_bytes).unwrap()],
-        )
-        .unwrap();
+        let mut source_bytes =
+            vec![0x5a; usize::try_from(prepared.preflight.image.image_bytes).unwrap()];
+        for rollback in prepared.rollback_overlay().writes() {
+            let start = usize::try_from(rollback.offset).unwrap();
+            let end = start.checked_add(rollback.bytes.len()).unwrap();
+            source_bytes[start..end].copy_from_slice(&rollback.bytes);
+        }
+        fs::write(&image_path, source_bytes).unwrap();
         let image = ImageFile::open(&image_path).unwrap();
         let identity = image.identity().clone();
-        prepared.test_bind_regular_image(&identity);
+        let source_evidence_digest = digest_source_view(
+            &image,
+            SourceDigestLimits {
+                max_image_bytes: image.len(),
+                chunk_bytes: CANDIDATE_AUDIT_MAX_READ_BYTES,
+            },
+        )
+        .unwrap();
+        prepared.test_bind_regular_image(&identity, source_evidence_digest);
         let observed = ObservedImage {
             image: prepared.preflight.image,
             source_evidence_digest: Some(prepared.preflight.source_evidence_digest),
@@ -581,7 +772,7 @@ mod tests {
         )
         .unwrap();
         drop(store);
-        (dir, image_path, capsule_path, prepared, observed)
+        (dir, image_path, capsule_path, prepared)
     }
 
     fn empty_graph(image_bytes: u64) -> ObjectGraph {
@@ -606,7 +797,7 @@ mod tests {
         .unwrap()
     }
 
-    fn valid_exfat_fixture() -> (TempDir, PathBuf, PathBuf, PreparedConversion, ObservedImage) {
+    fn valid_exfat_fixture() -> (TempDir, PathBuf, PathBuf, PreparedConversion) {
         const IMAGE_BYTES: u64 = 4 * 1024 * 1024;
 
         let dir = TempDir::new();
@@ -637,7 +828,18 @@ mod tests {
         let preview =
             preview_exfat_phase_writes(&image, &serializer, PreimageLimits::default()).unwrap();
         let source_identity = ConversionImageIdentity::from_regular_image(image.identity());
-        let source_evidence_digest = [0x6a; 32];
+        let source_evidence_digest = digest_source_view(
+            &image,
+            SourceDigestLimits {
+                max_image_bytes: IMAGE_BYTES,
+                chunk_bytes: CANDIDATE_AUDIT_MAX_READ_BYTES,
+            },
+        )
+        .unwrap();
+        let source_manifest =
+            build_manifest(&image, &graph, VerificationLimits::default()).unwrap();
+        let source_manifest_commitment =
+            ManifestCommitment::from_manifest(&source_manifest).unwrap();
         let mut reservations = serializer.reservations.clone();
         reservations.push(DestinationReservation {
             range: ByteRange {
@@ -652,6 +854,7 @@ mod tests {
                 image: source_identity,
                 source_filesystem: FileSystem::Ntfs,
                 source_evidence_digest,
+                source_manifest_commitment,
                 sector_bytes: 512,
                 allocation_alignment: 512,
                 inventory_complete: true,
@@ -687,19 +890,18 @@ mod tests {
         )
         .unwrap();
         drop(store);
-        (dir, image_path, capsule_path, prepared, observed)
+        (dir, image_path, capsule_path, prepared)
     }
 
     #[test]
     fn stages_only_through_target_staged_and_flushes_capsule_after_image() {
-        let (_dir, image_path, capsule_path, prepared, observed) = fixture();
+        let (_dir, image_path, capsule_path, prepared) = fixture();
         assert!(prepared.layout().relocations.is_empty());
         let image = ImageFile::open(&image_path).unwrap();
         let identity = image.identity().clone();
         drop(image);
         let (mut coordinator, recovery) = RegularImageCoordinator::resume_existing(
             &prepared,
-            observed,
             &image_path,
             &identity,
             &capsule_path,
@@ -721,7 +923,7 @@ mod tests {
         let image_bytes = fs::read(&image_path).unwrap();
         assert_eq!(&image_bytes[2048..2560], &[0x20; 512]);
         assert_eq!(&image_bytes[2560..3072], &[0x30; 512]);
-        assert_eq!(&image_bytes[1024..1536], &[0x5a; 512]);
+        assert_eq!(&image_bytes[1024..1536], &[0x10; 512]);
         let capsule_bytes = fs::read(&capsule_path).unwrap();
         let view = recover_capsule(&capsule_bytes, prepared.capsule_limits).unwrap();
         assert_eq!(view.newest().unwrap().phase, TransactionPhase::TargetStaged);
@@ -729,13 +931,12 @@ mod tests {
 
     #[test]
     fn target_staged_rollback_restores_exact_before_images_and_is_durable() {
-        let (_dir, image_path, capsule_path, prepared, observed) = fixture();
+        let (_dir, image_path, capsule_path, prepared) = fixture();
         let image = ImageFile::open(&image_path).unwrap();
         let identity = image.identity().clone();
         drop(image);
         let (mut coordinator, _) = RegularImageCoordinator::resume_existing(
             &prepared,
-            observed,
             &image_path,
             &identity,
             &capsule_path,
@@ -758,13 +959,12 @@ mod tests {
 
     #[test]
     fn staged_candidate_audit_fails_closed_without_mutating_image_or_capsule() {
-        let (_dir, image_path, capsule_path, prepared, observed) = fixture();
+        let (_dir, image_path, capsule_path, prepared) = fixture();
         let image = ImageFile::open(&image_path).unwrap();
         let identity = image.identity().clone();
         drop(image);
         let (mut coordinator, _) = RegularImageCoordinator::resume_existing(
             &prepared,
-            observed,
             &image_path,
             &identity,
             &capsule_path,
@@ -801,13 +1001,12 @@ mod tests {
 
     #[test]
     fn staged_candidate_audit_parses_and_hashes_the_plan_overlay() {
-        let (_dir, image_path, capsule_path, prepared, observed) = valid_exfat_fixture();
+        let (_dir, image_path, capsule_path, prepared) = valid_exfat_fixture();
         let image = ImageFile::open(&image_path).unwrap();
         let identity = image.identity().clone();
         drop(image);
         let (mut coordinator, _) = RegularImageCoordinator::resume_existing(
             &prepared,
-            observed,
             &image_path,
             &identity,
             &capsule_path,
@@ -838,8 +1037,126 @@ mod tests {
     }
 
     #[test]
+    fn staged_candidate_audit_rejects_corruption_hidden_by_the_overlay() {
+        let (_dir, image_path, capsule_path, prepared) = valid_exfat_fixture();
+        let image = ImageFile::open(&image_path).unwrap();
+        let identity = image.identity().clone();
+        drop(image);
+        let (mut coordinator, _) = RegularImageCoordinator::resume_existing(
+            &prepared,
+            &image_path,
+            &identity,
+            &capsule_path,
+            ExecutorLimits::default(),
+        )
+        .unwrap();
+        coordinator.advance_to_target_staged().unwrap();
+        drop(coordinator);
+
+        let corrupt_offset = prepared.target_staging_writes()[0].write.offset;
+        let mut bytes = fs::read(&image_path).unwrap();
+        bytes[usize::try_from(corrupt_offset).unwrap()] ^= 0xff;
+        fs::write(&image_path, bytes).unwrap();
+
+        let image = ImageFile::open(&image_path).unwrap();
+        let identity = image.identity().clone();
+        drop(image);
+        let (mut coordinator, _) = RegularImageCoordinator::resume_existing(
+            &prepared,
+            &image_path,
+            &identity,
+            &capsule_path,
+            ExecutorLimits::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            coordinator.audit_staged_candidate(VerificationLimits::default()),
+            Err(
+                RegularImageCoordinatorError::CandidateStagingBytesMismatch { offset }
+            ) if offset == corrupt_offset
+        ));
+    }
+
+    #[test]
+    fn target_staged_restart_rejects_change_outside_authorized_masks() {
+        let (_dir, image_path, capsule_path, prepared) = fixture();
+        let image = ImageFile::open(&image_path).unwrap();
+        let identity = image.identity().clone();
+        drop(image);
+        let (mut coordinator, _) = RegularImageCoordinator::resume_existing(
+            &prepared,
+            &image_path,
+            &identity,
+            &capsule_path,
+            ExecutorLimits::default(),
+        )
+        .unwrap();
+        coordinator.advance_to_target_staged().unwrap();
+        drop(coordinator);
+
+        let mut bytes = fs::read(&image_path).unwrap();
+        bytes[15_000] ^= 0xff;
+        fs::write(&image_path, bytes).unwrap();
+        let image = ImageFile::open(&image_path).unwrap();
+        let changed_identity = image.identity().clone();
+        drop(image);
+        assert!(matches!(
+            RegularImageCoordinator::resume_existing(
+                &prepared,
+                &image_path,
+                &changed_identity,
+                &capsule_path,
+                ExecutorLimits::default(),
+            ),
+            Err(RegularImageCoordinatorError::Conversion(
+                ConversionError::StaleSourceEvidence
+            ))
+        ));
+    }
+
+    #[test]
+    fn target_staged_restart_reconstructs_plan_from_capsule_envelope() {
+        let (_dir, image_path, capsule_path, prepared) = valid_exfat_fixture();
+        let capsule_policy = prepared.capsule_limits;
+        let image = ImageFile::open(&image_path).unwrap();
+        let identity = image.identity().clone();
+        drop(image);
+        let (mut coordinator, _) = RegularImageCoordinator::resume_existing(
+            &prepared,
+            &image_path,
+            &identity,
+            &capsule_path,
+            ExecutorLimits::default(),
+        )
+        .unwrap();
+        coordinator.advance_to_target_staged().unwrap();
+        drop(coordinator);
+        drop(prepared);
+        let image = ImageFile::open(&image_path).unwrap();
+        let restarted_identity = image.identity().clone();
+        drop(image);
+
+        let (mut restarted, recovery) = RegularImageCoordinator::resume_from_capsule(
+            &image_path,
+            &restarted_identity,
+            &capsule_path,
+            ExecutorLimits::default(),
+            capsule_policy,
+        )
+        .unwrap();
+        assert_eq!(recovery.discarded_torn_bytes, 0);
+        assert_eq!(
+            restarted.checkpoint().unwrap().phase,
+            TransactionPhase::TargetStaged
+        );
+        restarted
+            .audit_staged_candidate(VerificationLimits::default())
+            .unwrap();
+    }
+
+    #[test]
     fn nonempty_relocation_is_refused_before_image_or_capsule_changes() {
-        let (_dir, image_path, capsule_path, mut prepared, observed) = fixture();
+        let (_dir, image_path, capsule_path, mut prepared) = fixture();
         prepared.layout.relocations.push(Relocation {
             stream: StreamId(7),
             logical_offset: 0,
@@ -859,7 +1176,6 @@ mod tests {
         drop(image);
         let (mut coordinator, _) = RegularImageCoordinator::resume_existing(
             &prepared,
-            observed,
             &image_path,
             &identity,
             &capsule_path,

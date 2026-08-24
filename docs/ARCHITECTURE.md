@@ -43,7 +43,9 @@ operating-system or GUI dependency. Implemented foundations include:
 - `object` and `extent`: normalized namespace/stream model plus physical ownership validation;
 - `geometry`: deterministic destination reservations and conflict relocation;
 - `capsule`: duplicated append-only generation headers, CRCs, SHA-256 payload identity, phase
-  monotonicity, and a versioned first-generation recovery bundle containing exact before-images;
+  monotonicity, and a canonical first-generation `SCPREP01` plan envelope. The envelope commits the
+  complete forward plan, source logical manifest, target feature rules, operational limits, and a
+  nested versioned recovery bundle containing exact before-images;
 - `overlay`: immutable sector-aligned candidate writes over a crate-private bounded reader, with no
   path, handle, identity, seek, or mutation capability;
 - `phase` and `preimage`: activation-gated serializer composition plus bounded capture of exact
@@ -56,10 +58,12 @@ operating-system or GUI dependency. Implemented foundations include:
   unleased mutators are private. A lifetime-bound read view is cloned from the already-open locked
   handle for coordinator inspection; it exposes no raw-device or arbitrary-range write API.
 - `conversion/regular_image`: internal image-then-capsule lock ownership and durable preactivation
-  sequencing through `TargetStaged` only. At that boundary it reparses the staged filesystem and
-  hashes its logical streams through the prepared overlay, requires the normalized graph to match
-  the sealed plan, then revalidates the same locked container. It refuses relocation, backup boot,
-  activation, and all frontend access while initial observation and restart commitments are absent;
+  sequencing through `TargetStaged` only. Resume observations hash the complete locked source view,
+  virtually restoring only the conservative phase rollback ranges. At `TargetStaged` it first
+  proves the real staged ranges equal the planned bytes, then reparses and logically hashes the
+  candidate overlay against the sealed graph and source-manifest commitment. It can reconstruct an
+  owned plan from capsule plus image after process loss. It still refuses relocation, backup boot,
+  activation, and all frontend access;
 - `candidate_export`: create-new-only full image copy, exact preview application, independent target
   reinspection, logical manifest equality, validated escrow persistence, and source SHA-256
   stability proof. It cannot overwrite or authorize in-place activation.
@@ -71,9 +75,10 @@ verified phase. Rollback selection is conservative across the checkpoint acknowl
 it restores the possibly in-flight next write group as well as every completed group. Pure
 structural destination serializers and read-only preimage capture now exist. The internal
 regular-image coordinator proves image-before-capsule durability and rollback through the inactive
-`TargetStaged` boundary and can audit that staged view through its locked handle, but remains
-unreachable from production because it cannot yet construct the initial sealed observation evidence
-or compare the logical manifest with a durable source commitment. Neither serializer qualifies for activation. There is
+`TargetStaged` boundary, constructs fresh resume observations from its locked handle, and can audit
+that staged view against the durable source commitment after reconstructing its plan from capsule
+generation zero. It remains unreachable from production because trusted initial preflight/capsule
+creation and serializer qualification are unfinished. Neither serializer qualifies for activation. There is
 intentionally no executable in-place conversion command and no physical-device backend. The
 separate copy-based exporter can
 produce a complete target only in a brand-new regular file, so it does not consume or weaken that

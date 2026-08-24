@@ -99,11 +99,19 @@ requires executor read-back plus both flush barriers before appending the corres
 generation, and stops at `TargetStaged`. It has no CLI/GUI entry point and cannot write backup boot
 or activation bytes. At `TargetStaged`, a crate-private bounded view is cloned from the already-open
 locked handle without reopening its path. Both filesystem parsers and logical stream hasher read
-through the exact prepared overlay; the normalized graph must match the plan, and the handle is
-revalidated afterward. The resulting manifest is diagnostic until the durable plan envelope also
-commits to the expected source manifest. An ambiguous executor/capsule operation poisons the coupled
+through the exact prepared overlay only after every real staged range is proven byte-for-byte equal
+to its prepared write. The normalized graph and logical manifest must match the generation-zero
+`SCPREP01` authority, and the handle is revalidated afterward. Resume reconstructs the original
+source byte view by masking only the plan's conservative before-image ranges, so changes elsewhere
+remain digest-visible. An ambiguous executor/capsule operation poisons the coupled
 coordinator; exact before-image rollback and verified-prefix repair are idempotent under the
 retained locks.
+
+New capsules embed the complete bounded, canonical forward plan and nested recovery bundle in their
+first generation. The coordinator can therefore discard all process memory, reacquire image then
+capsule locks, reconstruct the plan, recompute its commitments, and re-audit `TargetStaged`. Older
+`SCRECOV1`-only capsules require the exact external plan and are rollback-only; they cannot recreate
+forward authority.
 
 The durable capsule store has a separate, explicit recovering-resume operation. Under its exclusive
 lock, it may shorten only bytes after a nonempty prefix that the redundant capsule parser proves is

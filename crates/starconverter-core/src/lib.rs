@@ -21,6 +21,7 @@ pub mod phase;
 pub mod preimage;
 pub mod preservation;
 pub mod recovery;
+mod source_view;
 pub mod validation_vhd;
 pub mod verify;
 pub mod windows_validation;

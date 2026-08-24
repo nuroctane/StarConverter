@@ -1552,7 +1552,7 @@ mod tests {
         let substitute = TempImage::new(&vec![0x22; 8192]);
         let source_image = crate::image::ImageFile::open(&source.0).unwrap();
         let mut plan = crate::conversion::tests::prepared();
-        plan.test_bind_regular_image(source_image.identity());
+        plan.test_bind_regular_image(source_image.identity(), [9; 32]);
         drop(source_image);
 
         let executor = open_executor(&substitute, 512);

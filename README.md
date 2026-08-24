@@ -206,6 +206,11 @@ installed. CI always tests both language stacks.
 - [x] Logical stream/content manifest verifier over regular images
 - [x] Shared bounded-reader path for exFAT/NTFS candidate parsing and logical hashing
 - [x] Lifetime-bound staged-candidate audit through the executor's already-locked image handle
+- [x] Byte-for-byte staged-range verification before overlay parsing can fill later phases
+- [x] Domain-separated full source-view digest with conservative virtual-original rollback masks
+- [x] Canonical bounded `SCPREP01` restart envelope embedded in capsule generation zero
+- [x] Plan reconstruction and staged re-audit from capsule plus locked image after process loss
+- [x] Legacy recovery-only capsules explicitly restricted from forward execution
 - [x] Pure resumable transaction coordinator with pre-activation overlay proof
 - [x] Phase-separated exFAT and NTFS structural destination serializers
 - [x] Exact regular-image preimage capture for every source-visible write phase
