@@ -44,18 +44,22 @@ operating-system or GUI dependency. Implemented foundations include:
 - `geometry`: deterministic destination reservations and conflict relocation;
 - `capsule`: duplicated append-only generation headers, CRCs, SHA-256 payload identity, phase
   monotonicity, and a versioned first-generation recovery bundle containing exact before-images;
-- `overlay`: immutable sector-aligned candidate writes over a read-only regular image;
+- `overlay`: immutable sector-aligned candidate writes over a crate-private bounded reader, with no
+  path, handle, identity, seek, or mutation capability;
 - `phase` and `preimage`: activation-gated serializer composition plus bounded capture of exact
   regular-image before-images for every staged, backup-boot, and primary-boot replacement;
 - `verify`: deterministic UTF-16 namespace and logical stream SHA-256 manifests, including sparse
-  and uninitialized-zero semantics, over read-only regular images;
+  and uninitialized-zero semantics, over regular images or the exact selected candidate overlay;
 - `executor`: fixed-size regular-image-only execution under crate-private one-use
   generation/phase/plan/container leases, with exclusive locking, bounded positional writes,
   read-after-write verification, durable flushes, rollback, and deterministic fault injection. Raw
-  unleased mutators are private; it exposes no raw-device or arbitrary-range write API.
+  unleased mutators are private. A lifetime-bound read view is cloned from the already-open locked
+  handle for coordinator inspection; it exposes no raw-device or arbitrary-range write API.
 - `conversion/regular_image`: internal image-then-capsule lock ownership and durable preactivation
-  sequencing through `TargetStaged` only. It refuses relocation, backup boot, activation, and all
-  frontend access until trusted locked inspection and overlay verification exist;
+  sequencing through `TargetStaged` only. At that boundary it reparses the staged filesystem and
+  hashes its logical streams through the prepared overlay, requires the normalized graph to match
+  the sealed plan, then revalidates the same locked container. It refuses relocation, backup boot,
+  activation, and all frontend access while initial observation and restart commitments are absent;
 - `candidate_export`: create-new-only full image copy, exact preview application, independent target
   reinspection, logical manifest equality, validated escrow persistence, and source SHA-256
   stability proof. It cannot overwrite or authorize in-place activation.
@@ -67,8 +71,9 @@ verified phase. Rollback selection is conservative across the checkpoint acknowl
 it restores the possibly in-flight next write group as well as every completed group. Pure
 structural destination serializers and read-only preimage capture now exist. The internal
 regular-image coordinator proves image-before-capsule durability and rollback through the inactive
-`TargetStaged` boundary, but remains unreachable from production because no locked inspector can
-yet construct sealed observation evidence. Neither serializer qualifies for activation. There is
+`TargetStaged` boundary and can audit that staged view through its locked handle, but remains
+unreachable from production because it cannot yet construct the initial sealed observation evidence
+or compare the logical manifest with a durable source commitment. Neither serializer qualifies for activation. There is
 intentionally no executable in-place conversion command and no physical-device backend. The
 separate copy-based exporter can
 produce a complete target only in a brand-new regular file, so it does not consume or weaken that

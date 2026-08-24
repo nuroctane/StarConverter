@@ -1,21 +1,32 @@
 //! Internal durable coordination for the non-activating regular-image slice.
 //!
-//! There is deliberately no public or frontend entry point. A future locked inspector must supply
-//! the sealed [`ObservedImage`] before this foundation can be wired into production. This module
-//! acquires the image executor first and the capsule store second, owns both locks, and cannot
-//! advance beyond `TargetStaged`.
+//! There is deliberately no public or frontend entry point. This module acquires the image
+//! executor first and the capsule store second, owns both locks, and cannot advance beyond
+//! `TargetStaged`. Its candidate audit reads through a view borrowed from that already-locked
+//! executor; honest construction of the initial sealed [`ObservedImage`] remains future work.
 
 use std::fmt;
 use std::path::Path;
 
+use crate::FileSystem;
 use crate::capsule::TransactionPhase;
 use crate::capsule_store::{CapsuleRecoveryEvidence, CapsuleStore, CapsuleStoreError};
 use crate::executor::{
     ExecutionLease, ExecutorError, ExecutorLimits, ImageExecutor, LeasedIntent, LeasedRollback,
 };
 use crate::image::ImageIdentity;
+use crate::inspect::{InspectionError, inspect_overlay};
+use crate::overlay::OverlayError;
+use crate::verify::{
+    VerificationError, VerificationLimits, VerificationManifest, build_manifest_with_reader,
+};
 
-use super::{ConversionError, ObservedImage, PreparedConversion, TransactionIntent};
+use super::{
+    ConversionError, ObservedImage, PreparedConversion, StagingVerificationEvidence,
+    TransactionIntent,
+};
+
+const CANDIDATE_AUDIT_MAX_READ_BYTES: usize = 16 * 1024 * 1024;
 
 /// Last checkpoint known to have been durably appended by this coordinator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +113,94 @@ impl<'plan> RegularImageCoordinator<'plan> {
                 }
             }
         }
+    }
+
+    /// Parses and logically hashes the exact staged candidate through the prepared overlay.
+    ///
+    /// The base reader is cloned from the executor's already-open handle and cannot outlive its
+    /// lock. The normalized graph must match the plan before staging evidence is returned. The
+    /// logical manifest is diagnostic evidence only until a future durable plan envelope commits
+    /// to the expected source manifest; this method never appends `Verified` or activates a boot
+    /// sector.
+    pub(crate) fn audit_staged_candidate(
+        &mut self,
+        verification_limits: VerificationLimits,
+    ) -> Result<(StagingVerificationEvidence, VerificationManifest), RegularImageCoordinatorError>
+    {
+        self.ensure_forward_ready()?;
+        let checkpoint = self.checkpoint()?;
+        if checkpoint.phase != TransactionPhase::TargetStaged {
+            return Err(RegularImageCoordinatorError::CandidateAuditUnavailable {
+                phase: checkpoint.phase,
+            });
+        }
+
+        let view = match self.executor.locked_view(CANDIDATE_AUDIT_MAX_READ_BYTES) {
+            Ok(view) => view,
+            Err(error) => {
+                self.poison();
+                return Err(RegularImageCoordinatorError::Executor(error));
+            }
+        };
+        let expected = self.prepared.expected_staging_verification();
+        let audit = (|| {
+            let inspection = inspect_overlay(
+                &view,
+                self.executor.identity(),
+                self.prepared.candidate_overlay(),
+                self.prepared.candidate_overlay_digest(),
+            )
+            .map_err(RegularImageCoordinatorError::Inspection)?;
+            if inspection.profile.filesystem != expected.target_filesystem {
+                return Err(RegularImageCoordinatorError::CandidateFilesystemMismatch {
+                    expected: expected.target_filesystem,
+                    actual: inspection.profile.filesystem,
+                });
+            }
+            if !inspection.profile.inventory_complete {
+                return Err(RegularImageCoordinatorError::CandidateInventoryIncomplete);
+            }
+            let graph = match expected.target_filesystem {
+                FileSystem::ExFat => inspection
+                    .normalized_exfat
+                    .as_deref()
+                    .map(|normalized| &normalized.graph),
+                FileSystem::Ntfs => inspection
+                    .normalized_ntfs
+                    .as_deref()
+                    .map(|normalized| &normalized.graph),
+                FileSystem::Unknown => None,
+            }
+            .ok_or(RegularImageCoordinatorError::CandidateInventoryIncomplete)?;
+            let object_graph_digest = super::digest_graph(graph);
+            if object_graph_digest != expected.object_graph_digest {
+                return Err(RegularImageCoordinatorError::CandidateGraphMismatch);
+            }
+
+            let overlay_reader = self
+                .prepared
+                .candidate_overlay()
+                .reader(&view)
+                .map_err(RegularImageCoordinatorError::Overlay)?;
+            let manifest = build_manifest_with_reader(&overlay_reader, graph, verification_limits)
+                .map_err(RegularImageCoordinatorError::Verification)?;
+            let evidence = StagingVerificationEvidence {
+                target_filesystem: expected.target_filesystem,
+                parser_validated: true,
+                inventory_complete: true,
+                object_graph_digest,
+                plan_digest: expected.plan_digest,
+                candidate_overlay_digest: expected.candidate_overlay_digest,
+            };
+            Ok((evidence, manifest))
+        })();
+        let revalidation = view.post_operation_revalidate();
+        drop(view);
+        if let Err(error) = revalidation {
+            self.poison();
+            return Err(RegularImageCoordinatorError::Executor(error));
+        }
+        audit
     }
 
     /// Reapplies the plan's conservative before-images and durably records `RolledBack`.
@@ -305,14 +404,30 @@ pub enum RegularImageCoordinatorError {
     Executor(ExecutorError),
     CapsuleStore(CapsuleStoreError),
     Conversion(ConversionError),
+    Inspection(InspectionError),
+    Overlay(OverlayError),
+    Verification(VerificationError),
     PlanImageMismatch,
     RelocationNotSupported,
     LeaseStateChanged,
     CapsuleDurabilityMissing,
     Poisoned,
     GenerationOverflow,
-    BeyondPreactivation { phase: TransactionPhase },
-    RollbackUnavailable { phase: TransactionPhase },
+    BeyondPreactivation {
+        phase: TransactionPhase,
+    },
+    RollbackUnavailable {
+        phase: TransactionPhase,
+    },
+    CandidateAuditUnavailable {
+        phase: TransactionPhase,
+    },
+    CandidateFilesystemMismatch {
+        expected: FileSystem,
+        actual: FileSystem,
+    },
+    CandidateInventoryIncomplete,
+    CandidateGraphMismatch,
 }
 
 impl fmt::Display for RegularImageCoordinatorError {
@@ -321,6 +436,11 @@ impl fmt::Display for RegularImageCoordinatorError {
             Self::Executor(error) => write!(formatter, "image executor failed: {error}"),
             Self::CapsuleStore(error) => write!(formatter, "capsule store failed: {error}"),
             Self::Conversion(error) => write!(formatter, "conversion state rejected: {error}"),
+            Self::Inspection(error) => write!(formatter, "candidate inspection failed: {error}"),
+            Self::Overlay(error) => write!(formatter, "candidate overlay failed: {error}"),
+            Self::Verification(error) => {
+                write!(formatter, "candidate logical verification failed: {error}")
+            }
             Self::PlanImageMismatch => {
                 formatter.write_str("prepared conversion does not match the locked image")
             }
@@ -344,6 +464,20 @@ impl fmt::Display for RegularImageCoordinatorError {
             Self::RollbackUnavailable { phase } => {
                 write!(formatter, "rollback is unavailable from phase {phase:?}")
             }
+            Self::CandidateAuditUnavailable { phase } => write!(
+                formatter,
+                "candidate audit requires TargetStaged, found {phase:?}"
+            ),
+            Self::CandidateFilesystemMismatch { expected, actual } => write!(
+                formatter,
+                "candidate filesystem mismatch: expected {expected}, found {actual}"
+            ),
+            Self::CandidateInventoryIncomplete => {
+                formatter.write_str("candidate filesystem inventory is incomplete")
+            }
+            Self::CandidateGraphMismatch => {
+                formatter.write_str("candidate object graph does not match the prepared plan")
+            }
         }
     }
 }
@@ -354,6 +488,9 @@ impl std::error::Error for RegularImageCoordinatorError {
             Self::Executor(error) => Some(error),
             Self::CapsuleStore(error) => Some(error),
             Self::Conversion(error) => Some(error),
+            Self::Inspection(error) => Some(error),
+            Self::Overlay(error) => Some(error),
+            Self::Verification(error) => Some(error),
             _ => None,
         }
     }
@@ -367,9 +504,25 @@ mod tests {
 
     use crate::capsule::recover_capsule;
     use crate::capsule_store::CapsuleStore;
-    use crate::extent::StreamId;
-    use crate::geometry::{ByteRange, Relocation};
-    use crate::image::ImageFile;
+    use crate::extent::{ExtentGraph, StreamId};
+    use crate::fs::exfat_inventory::ExfatPreservationEvidence;
+    use crate::fs::exfat_serialize::{
+        ExfatSerializeLimits, ExfatSerializeOptions, ExfatVolumeProfile,
+        non_interoperable_ascii_test_upcase_table, serialize_exfat_destination,
+    };
+    use crate::fs::exfat_upcase::table_checksum;
+    use crate::geometry::{ByteRange, DestinationReservation, Relocation, ReservationKind};
+    use crate::image::{BoundedImageReader, ImageFile};
+    use crate::object::{
+        ObjectGraph, ObjectGraphLimits, ObjectId, ObjectKind, ObjectRecord, ObjectSemantics,
+    };
+    use crate::phase::{ActivationAuthorizedWrites, preview_exfat_phase_writes};
+    use crate::preimage::PreimageLimits;
+
+    use super::super::{
+        ConversionDraft, ConversionLimits, ImageIdentity as ConversionImageIdentity,
+        PreflightEvidence, TargetCapabilities,
+    };
 
     use super::*;
 
@@ -416,6 +569,112 @@ mod tests {
         let observed = ObservedImage {
             image: prepared.preflight.image,
             source_evidence_digest: Some(prepared.preflight.source_evidence_digest),
+        };
+        let mut capsule = Vec::new();
+        prepared.begin_capsule(&mut capsule, observed).unwrap();
+        drop(image);
+        let (store, _) = CapsuleStore::create_new(
+            &capsule_path,
+            &image_path,
+            &capsule,
+            prepared.capsule_limits,
+        )
+        .unwrap();
+        drop(store);
+        (dir, image_path, capsule_path, prepared, observed)
+    }
+
+    fn empty_graph(image_bytes: u64) -> ObjectGraph {
+        ObjectGraph::build(
+            ObjectId(1),
+            vec![ObjectRecord {
+                id: ObjectId(1),
+                kind: ObjectKind::Directory,
+                link_count: 0,
+                semantics: ObjectSemantics::default(),
+                streams: Vec::new(),
+            }],
+            Vec::new(),
+            ExtentGraph::build(Vec::new(), image_bytes, 8).unwrap(),
+            ObjectGraphLimits {
+                max_objects: 8,
+                max_entries: 8,
+                max_streams: 8,
+                max_name_code_units: 255,
+            },
+        )
+        .unwrap()
+    }
+
+    fn valid_exfat_fixture() -> (TempDir, PathBuf, PathBuf, PreparedConversion, ObservedImage) {
+        const IMAGE_BYTES: u64 = 4 * 1024 * 1024;
+
+        let dir = TempDir::new();
+        let image_path = dir.join("valid-source.img");
+        let capsule_path = dir.join("valid-transaction.starcap");
+        fs::write(
+            &image_path,
+            vec![0_u8; usize::try_from(IMAGE_BYTES).unwrap()],
+        )
+        .unwrap();
+        let image = ImageFile::open(&image_path).unwrap();
+        let graph = empty_graph(IMAGE_BYTES);
+        let upcase = non_interoperable_ascii_test_upcase_table();
+        let serializer = serialize_exfat_destination(
+            &graph,
+            &[],
+            ExfatVolumeProfile {
+                volume_label: None,
+                encoded_upcase_table: &upcase,
+                upcase_checksum: table_checksum(&upcase),
+                source_preservation: ExfatPreservationEvidence::default(),
+                allocated_bad_clusters: 0,
+            },
+            ExfatSerializeOptions::default(),
+            ExfatSerializeLimits::default(),
+        )
+        .unwrap();
+        let preview =
+            preview_exfat_phase_writes(&image, &serializer, PreimageLimits::default()).unwrap();
+        let source_identity = ConversionImageIdentity::from_regular_image(image.identity());
+        let source_evidence_digest = [0x6a; 32];
+        let mut reservations = serializer.reservations.clone();
+        reservations.push(DestinationReservation {
+            range: ByteRange {
+                offset: IMAGE_BYTES - 512,
+                length: 512,
+            },
+            kind: ReservationKind::Capsule,
+        });
+        let draft = ConversionDraft {
+            transaction_id: [0x3c; 16],
+            preflight: PreflightEvidence {
+                image: source_identity,
+                source_filesystem: FileSystem::Ntfs,
+                source_evidence_digest,
+                sector_bytes: 512,
+                allocation_alignment: 512,
+                inventory_complete: true,
+                allocation_map_complete: true,
+                health: crate::HealthState::Clean,
+                access: crate::AccessState::Offline,
+            },
+            target: TargetCapabilities {
+                filesystem: FileSystem::ExFat,
+                features: Vec::new(),
+            },
+            source_allocations: serializer.source_allocations,
+            reservations,
+            writes: ActivationAuthorizedWrites::test_only(
+                FileSystem::ExFat,
+                preview.writes().clone(),
+            ),
+        };
+        let prepared =
+            PreparedConversion::build(&graph, draft, ConversionLimits::default()).unwrap();
+        let observed = ObservedImage {
+            image: source_identity,
+            source_evidence_digest: Some(source_evidence_digest),
         };
         let mut capsule = Vec::new();
         prepared.begin_capsule(&mut capsule, observed).unwrap();
@@ -495,6 +754,87 @@ mod tests {
         let capsule_bytes = fs::read(&capsule_path).unwrap();
         let view = recover_capsule(&capsule_bytes, prepared.capsule_limits).unwrap();
         assert_eq!(view.newest().unwrap().phase, TransactionPhase::RolledBack);
+    }
+
+    #[test]
+    fn staged_candidate_audit_fails_closed_without_mutating_image_or_capsule() {
+        let (_dir, image_path, capsule_path, prepared, observed) = fixture();
+        let image = ImageFile::open(&image_path).unwrap();
+        let identity = image.identity().clone();
+        drop(image);
+        let (mut coordinator, _) = RegularImageCoordinator::resume_existing(
+            &prepared,
+            observed,
+            &image_path,
+            &identity,
+            &capsule_path,
+            ExecutorLimits::default(),
+        )
+        .unwrap();
+        coordinator.advance_to_target_staged().unwrap();
+        let image_before = coordinator
+            .executor
+            .locked_view(CANDIDATE_AUDIT_MAX_READ_BYTES)
+            .unwrap()
+            .read_exact_at(
+                0,
+                usize::try_from(coordinator.executor.identity().length()).unwrap(),
+            )
+            .unwrap();
+        let capsule_before = coordinator.store.bytes().to_vec();
+
+        assert!(matches!(
+            coordinator.audit_staged_candidate(VerificationLimits::default()),
+            Err(RegularImageCoordinatorError::Inspection(
+                InspectionError::UnrecognizedFileSystem
+            ))
+        ));
+        let image_after = coordinator
+            .executor
+            .locked_view(CANDIDATE_AUDIT_MAX_READ_BYTES)
+            .unwrap()
+            .read_exact_at(0, image_before.len())
+            .unwrap();
+        assert_eq!(image_after, image_before);
+        assert_eq!(coordinator.store.bytes(), capsule_before);
+    }
+
+    #[test]
+    fn staged_candidate_audit_parses_and_hashes_the_plan_overlay() {
+        let (_dir, image_path, capsule_path, prepared, observed) = valid_exfat_fixture();
+        let image = ImageFile::open(&image_path).unwrap();
+        let identity = image.identity().clone();
+        drop(image);
+        let (mut coordinator, _) = RegularImageCoordinator::resume_existing(
+            &prepared,
+            observed,
+            &image_path,
+            &identity,
+            &capsule_path,
+            ExecutorLimits::default(),
+        )
+        .unwrap();
+        coordinator.advance_to_target_staged().unwrap();
+        let capsule_before = coordinator.store.bytes().to_vec();
+
+        let (evidence, manifest) = coordinator
+            .audit_staged_candidate(VerificationLimits::default())
+            .unwrap();
+
+        assert_eq!(
+            evidence.target_filesystem,
+            prepared.expected_staging_verification().target_filesystem
+        );
+        assert!(evidence.parser_validated);
+        assert!(evidence.inventory_complete);
+        assert_eq!(evidence.object_graph_digest, prepared.graph_digest());
+        assert_eq!(evidence.plan_digest, prepared.plan_digest());
+        assert_eq!(
+            evidence.candidate_overlay_digest,
+            prepared.candidate_overlay_digest()
+        );
+        assert_eq!(manifest.logical_bytes_hashed, 0);
+        assert_eq!(coordinator.store.bytes(), capsule_before);
     }
 
     #[test]

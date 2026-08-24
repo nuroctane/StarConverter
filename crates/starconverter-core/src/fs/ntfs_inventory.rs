@@ -14,9 +14,12 @@ use crate::fs::ntfs_attribute::{
     parse_attribute_list,
 };
 use crate::fs::ntfs_attribute_list::{
-    AttributeListError, AttributeListLimits, ResolvedAttributeList, resolve_attribute_list,
+    AttributeListError, AttributeListLimits, ResolvedAttributeList,
+    resolve_attribute_list_with_reader,
 };
-use crate::fs::ntfs_discovery::{MftBootstrap, NtfsDiscoveryError, read_mft_record_for_inventory};
+use crate::fs::ntfs_discovery::{
+    MftBootstrap, NtfsDiscoveryError, read_mft_record_for_inventory_with_reader,
+};
 use crate::fs::ntfs_index::{
     FileNameNamespace, NtfsFileReference, NtfsIndexError, NtfsIndexLimits, NtfsIndexRoot,
     parse_index_block, parse_index_root,
@@ -26,7 +29,7 @@ use crate::fs::ntfs_runlist::{
     ExtentLocation, MappingPairsError, MappingPairsLimits, NtfsExtent, NtfsRunlist,
     parse_mapping_pairs,
 };
-use crate::image::{ImageError, ImageFile};
+use crate::image::{BoundedImageReader, ImageError, ImageFile};
 
 const STANDARD_INFORMATION: u32 = 0x10;
 const ATTRIBUTE_LIST: u32 = 0x20;
@@ -646,6 +649,16 @@ pub fn inventory_ntfs(
     mft: &MftBootstrap,
     limits: NtfsInventoryLimits,
 ) -> Result<NtfsInventory, NtfsInventoryError> {
+    inventory_ntfs_with_reader(image, boot, mft, limits)
+}
+
+#[allow(clippy::too_many_lines)]
+pub(crate) fn inventory_ntfs_with_reader(
+    image: &dyn BoundedImageReader,
+    boot: &NtfsBootSector,
+    mft: &MftBootstrap,
+    limits: NtfsInventoryLimits,
+) -> Result<NtfsInventory, NtfsInventoryError> {
     validate_limits(limits)?;
     let record_bytes = boot.mft_record_size.bytes;
     if mft.initialized_bytes > mft.data_bytes {
@@ -716,7 +729,13 @@ pub fn inventory_ntfs(
                 maximum: limits.max_bytes,
             });
         }
-        let record = read_mft_record_for_inventory(image, boot, mft, record_number, record_bytes)?;
+        let record = read_mft_record_for_inventory_with_reader(
+            image,
+            boot,
+            mft,
+            record_number,
+            record_bytes,
+        )?;
         bytes_read = requested_total;
         if !record.flags.is_in_use() {
             continue;
@@ -737,7 +756,7 @@ pub fn inventory_ntfs(
             if remaining == 0 {
                 incomplete.insert(NtfsInventoryIncompleteReason::AttributeListContinuationRequired);
             } else {
-                match resolve_attribute_list(
+                match resolve_attribute_list_with_reader(
                     image,
                     boot,
                     mft,
@@ -1483,7 +1502,7 @@ fn parse_file_name(
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn inventory_directory(
-    image: &ImageFile,
+    image: &dyn BoundedImageReader,
     boot: &NtfsBootSector,
     record_number: u64,
     record: &NtfsFileRecord,
@@ -1734,7 +1753,7 @@ fn parse_index_allocation(
 }
 
 fn read_attribute_value(
-    image: &ImageFile,
+    image: &dyn BoundedImageReader,
     attribute: &NtfsAttribute<'_>,
     boot: &NtfsBootSector,
     limits: NtfsInventoryLimits,
@@ -1833,7 +1852,7 @@ fn index_child_offset(
 
 #[allow(clippy::too_many_arguments)]
 fn read_runlist_range(
-    image: &ImageFile,
+    image: &dyn BoundedImageReader,
     runlist: &NtfsRunlist,
     logical_offset: u64,
     length: usize,
@@ -1922,7 +1941,7 @@ fn find_extent(extents: &[NtfsExtent], logical: u64, cluster_bytes: u64) -> Opti
 }
 
 fn read_chunked(
-    image: &ImageFile,
+    image: &dyn BoundedImageReader,
     mut offset: u64,
     mut output: &mut [u8],
 ) -> Result<(), ImageError> {
@@ -2041,6 +2060,7 @@ mod tests {
     use crate::fs::ntfs::{NtfsBootSector, RecordSize};
     use crate::fs::ntfs_normalize::{NtfsNormalizeLimits, normalize_inventory};
     use crate::object::ObjectGraphLimits;
+    use crate::overlay::{OverlayLimits, OverlayPlan, OverlayWrite};
     use crate::preservation::{
         FieldDisposition, NtfsVolumeIdentity, NtfsVolumeLabelIdentity, PreservationField,
         PreservationLimits, decode_escrow, evaluate_ntfs,
@@ -2836,6 +2856,47 @@ mod tests {
             ]
         );
         assert_eq!(inventory.bytes_read, 3072);
+    }
+
+    #[test]
+    fn overlay_extension_record_is_used_by_inventory_continuation_resolution() {
+        let bytes = continued_stream_image(2, (0, 1));
+        let extension_offset = 4 * 4096 + 1024;
+        let mut replacement = bytes[extension_offset..extension_offset + 512].to_vec();
+        replacement[16..18].copy_from_slice(&3_u16.to_le_bytes());
+        let temp = TempImage::create(&bytes);
+        let image = ImageFile::open(&temp.0).unwrap();
+        let plan = OverlayPlan::build(
+            u64::try_from(bytes.len()).unwrap(),
+            512,
+            vec![OverlayWrite {
+                offset: u64::try_from(extension_offset).unwrap(),
+                bytes: replacement,
+            }],
+            OverlayLimits {
+                max_writes: 1,
+                max_replacement_bytes: 512,
+                max_read_bytes: 4096,
+            },
+        )
+        .unwrap();
+        let reader = plan.reader(&image).unwrap();
+
+        assert!(matches!(
+            inventory_ntfs_with_reader(
+                &reader,
+                &boot(),
+                &bootstrap(2048),
+                NtfsInventoryLimits::default()
+            ),
+            Err(NtfsInventoryError::AttributeList(
+                AttributeListError::RecordSequenceMismatch {
+                    record_number: 1,
+                    expected: 2,
+                    found: 3
+                }
+            ))
+        ));
     }
 
     #[test]

@@ -27,8 +27,8 @@ use crate::phase::ActivationAuthorizedWrites;
 use crate::recovery::{RecoveryBundle, RecoveryError, RecoveryLimits, encode_recovery_bundle};
 use crate::{AccessState, FileSystem, HealthState, SemanticFeature};
 
-// Foundation remains intentionally unreachable until a locked inspector can construct honest
-// observation evidence.
+// Foundation remains intentionally unreachable until the coordinator itself can construct honest
+// initial observation evidence from its locked handle.
 #[allow(dead_code)]
 pub(crate) mod regular_image;
 

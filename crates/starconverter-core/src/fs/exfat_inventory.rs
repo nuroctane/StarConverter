@@ -20,16 +20,17 @@ use super::exfat_directory::{
     FileEntry, UpcaseTableEntry, VolumeLabelEntry, parse_directory,
 };
 use super::exfat_discovery::{
-    ExfatDiscoveryError, ExfatDiscoveryLimits, ExfatRootDiscovery, discover_root,
+    ExfatDiscoveryError, ExfatDiscoveryLimits, ExfatRootDiscovery, discover_root_with_reader,
 };
 use super::exfat_image::{
-    ExfatImageError, FatIndex, StreamReadLimits, read_chain_to_end, read_stream,
+    ExfatImageError, FatIndex, StreamReadLimits, read_chain_to_end_with_reader,
+    read_stream_with_reader,
 };
 use super::exfat_upcase::{
     DuplicateError, DuplicateLimits, MAX_FILE_NAME_CODE_UNITS, NameError, UpcaseTable,
 };
 use crate::extent::{Extent, ExtentGraph, ExtentGraphError, ExtentKind, Placement, StreamId};
-use crate::image::{ImageError, ImageFile};
+use crate::image::{BoundedImageReader, ImageError, ImageFile};
 
 const ROOT_STREAM: StreamId = StreamId(1);
 const RESERVED_STREAM: StreamId = StreamId(u64::MAX);
@@ -414,7 +415,7 @@ struct PendingDirectory {
 
 #[derive(Debug)]
 struct InventoryState<'a> {
-    image: &'a ImageFile,
+    image: &'a dyn BoundedImageReader,
     boot: &'a ExfatBootSector,
     bitmap: &'a [u8],
     upcase: &'a UpcaseTable,
@@ -443,10 +444,19 @@ pub fn inventory_image(
     boot: &ExfatBootSector,
     limits: ExfatInventoryLimits,
 ) -> Result<ExfatInventory, ExfatInventoryError> {
+    inventory_image_with_reader(image, boot, limits)
+}
+
+#[allow(clippy::too_many_lines)]
+pub(crate) fn inventory_image_with_reader(
+    image: &dyn BoundedImageReader,
+    boot: &ExfatBootSector,
+    limits: ExfatInventoryLimits,
+) -> Result<ExfatInventory, ExfatInventoryError> {
     validate_limits(boot, limits)?;
-    let root =
-        discover_root(image, boot, limits.discovery).map_err(ExfatInventoryError::Discovery)?;
-    let bitmap_stream = read_stream(
+    let root = discover_root_with_reader(image, boot, limits.discovery)
+        .map_err(ExfatInventoryError::Discovery)?;
+    let bitmap_stream = read_stream_with_reader(
         image,
         boot,
         root.active_bitmap.first_cluster,
@@ -455,7 +465,7 @@ pub fn inventory_image(
         limits.discovery.system_stream,
     )
     .map_err(ExfatInventoryError::DirectoryStream)?;
-    let root_stream = read_chain_to_end(
+    let root_stream = read_chain_to_end_with_reader(
         image,
         boot,
         boot.root_directory_cluster,
@@ -518,7 +528,7 @@ pub fn inventory_image(
     state.process_children(ROOT_STREAM, 0, &[], root_files)?;
 
     while let Some(directory) = state.pending.pop_front() {
-        let stream = read_stream(
+        let stream = read_stream_with_reader(
             image,
             boot,
             directory.first_cluster,

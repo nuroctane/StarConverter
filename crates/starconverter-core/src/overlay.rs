@@ -6,7 +6,7 @@
 
 use std::fmt;
 
-use crate::image::{ImageError, ImageFile};
+use crate::image::{BoundedImageReader, ImageError, ImageFile};
 
 /// One final replacement range in a candidate image.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +41,17 @@ pub struct OverlayPlan {
     writes: Vec<OverlayWrite>,
     replacement_bytes: u64,
     max_read_bytes: usize,
+}
+
+/// Crate-owned read-only view of one validated overlay over its pinned regular-file base.
+///
+/// Construction proves the base length matches the plan. The capability exposes no identity,
+/// handle, path, seek state, or mutation API, so parsers can consume candidate bytes without being
+/// able to manufacture trusted conversion evidence.
+#[derive(Debug)]
+pub(crate) struct OverlayReader<'a> {
+    base: &'a dyn BoundedImageReader,
+    plan: &'a OverlayPlan,
 }
 
 impl OverlayPlan {
@@ -149,6 +160,20 @@ impl OverlayPlan {
         self.replacement_bytes
     }
 
+    /// Creates a bounded candidate reader after binding this plan to an equal-length base image.
+    pub(crate) fn reader<'a>(
+        &'a self,
+        base: &'a dyn BoundedImageReader,
+    ) -> Result<OverlayReader<'a>, OverlayError> {
+        if base.len() != self.image_bytes {
+            return Err(OverlayError::ImageLengthChanged {
+                expected: self.image_bytes,
+                actual: base.len(),
+            });
+        }
+        Ok(OverlayReader { base, plan: self })
+    }
+
     /// Reads candidate bytes by copying the base image, then applying intersecting replacements.
     ///
     /// # Errors
@@ -185,6 +210,16 @@ impl OverlayPlan {
             });
         }
         let mut output = image.read_exact_at(offset, length)?;
+        self.apply_intersections(offset, end, &mut output)?;
+        Ok(output)
+    }
+
+    fn apply_intersections(
+        &self,
+        offset: u64,
+        end: u64,
+        output: &mut [u8],
+    ) -> Result<(), OverlayError> {
         for write in &self.writes {
             let write_length =
                 u64::try_from(write.bytes.len()).map_err(|_| OverlayError::ArithmeticOverflow)?;
@@ -206,6 +241,58 @@ impl OverlayPlan {
             output[output_start..output_start + count]
                 .copy_from_slice(&write.bytes[write_start..write_start + count]);
         }
+        Ok(())
+    }
+}
+
+impl BoundedImageReader for OverlayReader<'_> {
+    fn len(&self) -> u64 {
+        self.plan.image_bytes
+    }
+
+    fn max_read_bytes(&self) -> usize {
+        self.base.max_read_bytes().min(self.plan.max_read_bytes)
+    }
+
+    fn read_exact_at(&self, offset: u64, length: usize) -> Result<Vec<u8>, ImageError> {
+        if self.base.len() != self.plan.image_bytes {
+            return Err(ImageError::SourceChanged);
+        }
+        let maximum = self.max_read_bytes();
+        if length > maximum {
+            return Err(ImageError::ReadTooLarge {
+                requested: length,
+                maximum,
+            });
+        }
+        let length_u64 = u64::try_from(length).map_err(|_| ImageError::RangeOverflow {
+            offset,
+            length: u64::MAX,
+        })?;
+        let end = offset
+            .checked_add(length_u64)
+            .ok_or(ImageError::RangeOverflow {
+                offset,
+                length: length_u64,
+            })?;
+        if end > self.plan.image_bytes {
+            return Err(ImageError::OutOfRange {
+                offset,
+                length: length_u64,
+                image_length: self.plan.image_bytes,
+            });
+        }
+
+        let mut output = self.base.read_exact_at(offset, length)?;
+        self.plan
+            .apply_intersections(offset, end, &mut output)
+            .map_err(|error| match error {
+                OverlayError::ArithmeticOverflow => ImageError::RangeOverflow {
+                    offset,
+                    length: length_u64,
+                },
+                _ => ImageError::SourceChanged,
+            })?;
         Ok(output)
     }
 }
@@ -413,6 +500,55 @@ mod tests {
         assert_eq!(&read[768..1280], &[0x11; 512]);
         assert_eq!(&read[1280..], &[0x33; 256]);
         assert_eq!(fs::read(&temp.0).unwrap(), original);
+    }
+
+    #[test]
+    fn bounded_reader_merges_candidate_bytes_and_enforces_effective_cap() {
+        let original = vec![0x11_u8; 2048];
+        let temp = TempImage::create(&original);
+        let image = ImageFile::open_with_limit(&temp.0, 1024).unwrap();
+        let plan = OverlayPlan::build(
+            2048,
+            512,
+            vec![
+                OverlayWrite {
+                    offset: 512,
+                    bytes: vec![0x22; 512],
+                },
+                OverlayWrite {
+                    offset: 1536,
+                    bytes: vec![0x33; 512],
+                },
+            ],
+            OverlayLimits {
+                max_read_bytes: 768,
+                ..limits()
+            },
+        )
+        .unwrap();
+        let reader = plan.reader(&image).unwrap();
+        assert_eq!(reader.max_read_bytes(), 768);
+        let read = reader.read_exact_at(256, 768).unwrap();
+        assert_eq!(&read[..256], &[0x11; 256]);
+        assert_eq!(&read[256..], &[0x22; 512]);
+        assert!(matches!(
+            reader.read_exact_at(0, 769),
+            Err(ImageError::ReadTooLarge {
+                requested: 769,
+                maximum: 768
+            })
+        ));
+        assert_eq!(fs::read(&temp.0).unwrap(), original);
+
+        let short = TempImage::create(&vec![0_u8; 1024]);
+        let short_image = ImageFile::open(&short.0).unwrap();
+        assert!(matches!(
+            plan.reader(&short_image),
+            Err(OverlayError::ImageLengthChanged {
+                expected: 2048,
+                actual: 1024
+            })
+        ));
     }
 
     #[test]

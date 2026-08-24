@@ -8,7 +8,7 @@ use std::fmt;
 
 use super::exfat::ExfatBootSector;
 use super::exfat_allocation::{ExfatAllocationError, FatEntry, cluster_byte_offset};
-use crate::image::{ImageError, ImageFile};
+use crate::image::{BoundedImageReader, ImageError, ImageFile};
 
 /// Explicit resource limits for one exFAT stream read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,7 +211,25 @@ pub fn read_stream(
     no_fat_chain: bool,
     limits: StreamReadLimits,
 ) -> Result<ExfatStream, ExfatImageError> {
-    read_stream_from_fat(
+    read_stream_with_reader(
+        image,
+        geometry,
+        first_cluster,
+        data_length,
+        no_fat_chain,
+        limits,
+    )
+}
+
+pub(crate) fn read_stream_with_reader(
+    image: &dyn BoundedImageReader,
+    geometry: &ExfatBootSector,
+    first_cluster: u32,
+    data_length: u64,
+    no_fat_chain: bool,
+    limits: StreamReadLimits,
+) -> Result<ExfatStream, ExfatImageError> {
+    read_stream_from_fat_with_reader(
         image,
         geometry,
         FatIndex::active(geometry),
@@ -233,6 +251,26 @@ pub fn read_stream(
 /// cap violations, malformed chains, overflow, allocation failure, or bounded image-read failure.
 pub fn read_stream_from_fat(
     image: &ImageFile,
+    geometry: &ExfatBootSector,
+    fat: FatIndex,
+    first_cluster: u32,
+    data_length: u64,
+    no_fat_chain: bool,
+    limits: StreamReadLimits,
+) -> Result<ExfatStream, ExfatImageError> {
+    read_stream_from_fat_with_reader(
+        image,
+        geometry,
+        fat,
+        first_cluster,
+        data_length,
+        no_fat_chain,
+        limits,
+    )
+}
+
+pub(crate) fn read_stream_from_fat_with_reader(
+    image: &dyn BoundedImageReader,
     geometry: &ExfatBootSector,
     fat: FatIndex,
     first_cluster: u32,
@@ -308,7 +346,16 @@ pub fn read_chain_to_end(
     first_cluster: u32,
     limits: StreamReadLimits,
 ) -> Result<ExfatStream, ExfatImageError> {
-    read_chain_to_end_from_fat(
+    read_chain_to_end_with_reader(image, geometry, first_cluster, limits)
+}
+
+pub(crate) fn read_chain_to_end_with_reader(
+    image: &dyn BoundedImageReader,
+    geometry: &ExfatBootSector,
+    first_cluster: u32,
+    limits: StreamReadLimits,
+) -> Result<ExfatStream, ExfatImageError> {
+    read_chain_to_end_from_fat_with_reader(
         image,
         geometry,
         FatIndex::active(geometry),
@@ -325,6 +372,16 @@ pub fn read_chain_to_end(
 /// malformed or cyclic chains, cap violations, overflow, allocation failure, or image failure.
 pub fn read_chain_to_end_from_fat(
     image: &ImageFile,
+    geometry: &ExfatBootSector,
+    fat: FatIndex,
+    first_cluster: u32,
+    limits: StreamReadLimits,
+) -> Result<ExfatStream, ExfatImageError> {
+    read_chain_to_end_from_fat_with_reader(image, geometry, fat, first_cluster, limits)
+}
+
+pub(crate) fn read_chain_to_end_from_fat_with_reader(
+    image: &dyn BoundedImageReader,
     geometry: &ExfatBootSector,
     fat: FatIndex,
     first_cluster: u32,
@@ -417,7 +474,7 @@ fn contiguous_clusters(
 }
 
 fn exact_fat_chain(
-    image: &ImageFile,
+    image: &dyn BoundedImageReader,
     geometry: &ExfatBootSector,
     fat: FatIndex,
     first_cluster: u32,
@@ -453,7 +510,7 @@ fn exact_fat_chain(
 }
 
 fn fat_chain_to_end(
-    image: &ImageFile,
+    image: &dyn BoundedImageReader,
     geometry: &ExfatBootSector,
     fat: FatIndex,
     first_cluster: u32,
@@ -500,7 +557,7 @@ fn validate_new_cluster(
 }
 
 fn read_fat_entry(
-    image: &ImageFile,
+    image: &dyn BoundedImageReader,
     geometry: &ExfatBootSector,
     fat: FatIndex,
     cluster: u32,
@@ -534,7 +591,7 @@ fn read_fat_entry(
 }
 
 fn read_clusters(
-    image: &ImageFile,
+    image: &dyn BoundedImageReader,
     geometry: &ExfatBootSector,
     clusters: &[u32],
     data_length: u64,

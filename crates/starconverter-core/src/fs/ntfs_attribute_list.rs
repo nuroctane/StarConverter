@@ -14,12 +14,12 @@ use crate::fs::ntfs_attribute::{
     AttributeBody, AttributeLimits, AttributeName, NtfsAttribute, NtfsAttributeError,
     parse_attribute_list,
 };
-use crate::fs::ntfs_discovery::{MftBootstrap, NtfsDiscoveryError, read_mft_record};
+use crate::fs::ntfs_discovery::{MftBootstrap, NtfsDiscoveryError, read_mft_record_with_reader};
 use crate::fs::ntfs_record::{MftReference, NtfsFileRecord};
 use crate::fs::ntfs_runlist::{
     ExtentLocation, MappingPairsError, MappingPairsLimits, NtfsRunlist, parse_mapping_pairs,
 };
-use crate::image::{ImageError, ImageFile};
+use crate::image::{BoundedImageReader, ImageError, ImageFile};
 
 const ATTRIBUTE_LIST_TYPE: u32 = 0x20;
 const ENTRY_HEADER_LEN: usize = 26;
@@ -585,6 +585,18 @@ pub fn resolve_attribute_list(
     base_record: &NtfsFileRecord,
     limits: AttributeListLimits,
 ) -> Result<ResolvedAttributeList, AttributeListError> {
+    resolve_attribute_list_with_reader(image, boot, mft, base_record_number, base_record, limits)
+}
+
+#[allow(clippy::too_many_lines)]
+pub(crate) fn resolve_attribute_list_with_reader(
+    image: &dyn BoundedImageReader,
+    boot: &NtfsBootSector,
+    mft: &MftBootstrap,
+    base_record_number: u64,
+    base_record: &NtfsFileRecord,
+    limits: AttributeListLimits,
+) -> Result<ResolvedAttributeList, AttributeListError> {
     validate_limits(limits)?;
     if let Some(found) = base_record.record_number {
         if u64::from(found) != base_record_number {
@@ -679,7 +691,13 @@ pub fn resolve_attribute_list(
     }
     for (&record_number, &expected_sequence) in &expected_sequences {
         budget.charge(boot.mft_record_size.bytes)?;
-        let record = read_mft_record(image, boot, mft, record_number, boot.mft_record_size.bytes)?;
+        let record = read_mft_record_with_reader(
+            image,
+            boot,
+            mft,
+            record_number,
+            boot.mft_record_size.bytes,
+        )?;
         if record.sequence_number != expected_sequence {
             return Err(AttributeListError::RecordSequenceMismatch {
                 record_number,
@@ -828,7 +846,7 @@ fn parse_record_attributes(
 }
 
 fn read_list_value(
-    image: &ImageFile,
+    image: &dyn BoundedImageReader,
     boot: &NtfsBootSector,
     attribute: &NtfsAttribute<'_>,
     limits: AttributeListLimits,
@@ -903,7 +921,7 @@ fn read_list_value(
 }
 
 fn read_stream(
-    image: &ImageFile,
+    image: &dyn BoundedImageReader,
     boot: &NtfsBootSector,
     runlist: &NtfsRunlist,
     count: usize,
@@ -971,7 +989,7 @@ fn read_stream(
 }
 
 fn read_chunked(
-    image: &ImageFile,
+    image: &dyn BoundedImageReader,
     mut offset: u64,
     mut destination: &mut [u8],
 ) -> Result<(), AttributeListError> {

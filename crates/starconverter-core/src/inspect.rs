@@ -10,11 +10,11 @@ use std::path::Path;
 
 use crate::fs::exfat::{self, ExfatBootSector, ExfatBootSectorError};
 use crate::fs::exfat_discovery::{
-    ExfatDiscoveryError, ExfatDiscoveryLimits, ExfatRootDiscovery, discover_root,
+    ExfatDiscoveryError, ExfatDiscoveryLimits, ExfatRootDiscovery, discover_root_with_reader,
 };
 use crate::fs::exfat_image::StreamReadLimits;
 use crate::fs::exfat_inventory::{
-    ExfatInventory, ExfatInventoryError, ExfatInventoryLimits, inventory_image,
+    ExfatInventory, ExfatInventoryError, ExfatInventoryLimits, inventory_image_with_reader,
 };
 use crate::fs::exfat_normalize::{
     ExfatNormalizeError, ExfatNormalizeLimits, NormalizedExfat, normalize_inventory,
@@ -28,12 +28,12 @@ use crate::fs::ntfs_bitmap::{
     NtfsBitmapError, NtfsReconciliationLimits, parse_bitmap, reconcile_allocation_claims,
 };
 use crate::fs::ntfs_discovery::{
-    NtfsDiscoveryError, NtfsDiscoveryLimits, NtfsSystemDiscovery, discover_system_records,
-    read_mft_record_for_inventory,
+    NtfsDiscoveryError, NtfsDiscoveryLimits, NtfsSystemDiscovery,
+    discover_system_records_with_reader, read_mft_record_for_inventory_with_reader,
 };
 use crate::fs::ntfs_inventory::{
     NtfsExtentPlacement, NtfsInventory, NtfsInventoryError, NtfsInventoryLimits, NtfsStreamStorage,
-    inventory_ntfs,
+    inventory_ntfs_with_reader,
 };
 use crate::fs::ntfs_normalize::{
     NormalizedNtfs, NtfsNormalizeError, NtfsNormalizeLimits, NtfsSecurityDescriptorEvidence,
@@ -45,10 +45,11 @@ use crate::fs::ntfs_secure::{
 };
 use crate::fs::ntfs_volume::{
     NtfsBitmapEvidence, NtfsMetadataIncompleteReason, NtfsMftBitmapEvidence, NtfsVolumeDiscovery,
-    NtfsVolumeError, NtfsVolumeEvidence, NtfsVolumeLimits, discover_volume_and_bitmap,
+    NtfsVolumeError, NtfsVolumeEvidence, NtfsVolumeLimits, discover_volume_and_bitmap_with_reader,
 };
-use crate::image::{ImageError, ImageFile};
+use crate::image::{BoundedImageReader, ImageError, ImageFile, ImageIdentity};
 use crate::object::ObjectGraphLimits;
+use crate::overlay::OverlayPlan;
 use crate::{AccessState, FileSystem, HealthState, VolumeProfile, VolumeRole, VolumeState};
 
 const BOOT_PREFIX_BYTES: usize = 512;
@@ -94,6 +95,28 @@ struct InspectionEvidence {
     ntfs_allocation_reconciliation: Option<NtfsAllocationReconciliationStatus>,
     ntfs_mft_record_reconciliation: Option<NtfsMftRecordReconciliationStatus>,
     normalized_ntfs: Option<Box<NormalizedNtfs>>,
+}
+
+/// Presentation/provenance supplied separately from the byte-reader capability.
+///
+/// Keeping this sealed prevents a generic reader from impersonating a pinned regular image. The
+/// conversion coordinator remains responsible for proving that an overlay digest belongs to its
+/// exact prepared plan before it may mint staging-verification evidence.
+#[derive(Debug, Clone, Copy)]
+enum InspectionOrigin<'a> {
+    Regular(&'a ImageIdentity),
+    Overlay {
+        base: &'a ImageIdentity,
+        overlay_digest: [u8; 32],
+    },
+}
+
+impl<'a> InspectionOrigin<'a> {
+    const fn base_identity(self) -> &'a ImageIdentity {
+        match self {
+            Self::Regular(identity) | Self::Overlay { base: identity, .. } => identity,
+        }
+    }
 }
 
 /// Exact NTFS `$Bitmap`/physical-owner comparison evidence.
@@ -354,20 +377,55 @@ pub fn inspect_image(path: impl AsRef<Path>) -> Result<ImageInspection, Inspecti
 /// Returns [`InspectionError`] when a bounded read fails, the filesystem is unrecognized, or any
 /// filesystem structure is invalid or incomplete.
 pub fn inspect_open_image(image: &ImageFile) -> Result<ImageInspection, InspectionError> {
+    inspect_with_reader(image, InspectionOrigin::Regular(image.identity()))
+}
+
+/// Inspects the immutable candidate bytes produced by a validated overlay without mutating or
+/// reopening its regular-file base.
+///
+/// This remains crate-private and returns ordinary inspection evidence only. The conversion
+/// coordinator must independently bind `overlay_digest` to its prepared plan before constructing
+/// any sealed staging-verification evidence.
+pub(crate) fn inspect_overlay(
+    base: &dyn BoundedImageReader,
+    base_identity: &ImageIdentity,
+    overlay: &OverlayPlan,
+    overlay_digest: [u8; 32],
+) -> Result<ImageInspection, InspectionError> {
+    let reader = overlay
+        .reader(base)
+        .map_err(|_| InspectionError::Image(ImageError::SourceChanged))?;
+    inspect_with_reader(
+        &reader,
+        InspectionOrigin::Overlay {
+            base: base_identity,
+            overlay_digest,
+        },
+    )
+}
+
+fn inspect_with_reader(
+    image: &dyn BoundedImageReader,
+    origin: InspectionOrigin<'_>,
+) -> Result<ImageInspection, InspectionError> {
     let prefix = image.read_prefix(BOOT_PREFIX_BYTES)?;
     let identifier = &prefix[3..11];
 
     if identifier == EXFAT_NAME {
-        inspect_exfat(image, &prefix)
+        inspect_exfat(image, origin, &prefix)
     } else if identifier == NTFS_NAME {
-        inspect_ntfs(image, &prefix)
+        inspect_ntfs(image, origin, &prefix)
     } else {
         Err(InspectionError::UnrecognizedFileSystem)
     }
 }
 
 #[allow(clippy::too_many_lines)]
-fn inspect_exfat(image: &ImageFile, prefix: &[u8]) -> Result<ImageInspection, InspectionError> {
+fn inspect_exfat(
+    image: &dyn BoundedImageReader,
+    origin: InspectionOrigin<'_>,
+    prefix: &[u8],
+) -> Result<ImageInspection, InspectionError> {
     let sector_shift = prefix[108];
     if !(9..=12).contains(&sector_shift) {
         return exfat::parse_boot_sector(prefix)
@@ -414,9 +472,9 @@ fn inspect_exfat(image: &ImageFile, prefix: &[u8]) -> Result<ImageInspection, In
         max_directory_entries: EXFAT_DIRECTORY_MAX_ENTRIES,
         max_secondary_entries: u8::MAX,
     };
-    let root =
-        discover_root(image, &boot, discovery_limits).map_err(InspectionError::InvalidExFatRoot)?;
-    let inventory = inventory_image(
+    let root = discover_root_with_reader(image, &boot, discovery_limits)
+        .map_err(InspectionError::InvalidExFatRoot)?;
+    let inventory = inventory_image_with_reader(
         image,
         &boot,
         ExfatInventoryLimits {
@@ -453,6 +511,7 @@ fn inspect_exfat(image: &ImageFile, prefix: &[u8]) -> Result<ImageInspection, In
     .map_err(InspectionError::InvalidExFatNormalization)?;
     finish_inspection(
         image,
+        origin,
         FileSystem::ExFat,
         boot.bytes_per_cluster,
         declared_volume_bytes,
@@ -473,7 +532,11 @@ fn inspect_exfat(image: &ImageFile, prefix: &[u8]) -> Result<ImageInspection, In
     )
 }
 
-fn inspect_ntfs(image: &ImageFile, prefix: &[u8]) -> Result<ImageInspection, InspectionError> {
+fn inspect_ntfs(
+    image: &dyn BoundedImageReader,
+    origin: InspectionOrigin<'_>,
+    prefix: &[u8],
+) -> Result<ImageInspection, InspectionError> {
     let boot = ntfs::parse_boot_sector(prefix).map_err(InspectionError::InvalidNtfs)?;
     boot.validate_image_size(image.len())
         .map_err(InspectionError::InvalidNtfs)?;
@@ -493,13 +556,19 @@ fn inspect_ntfs(image: &ImageFile, prefix: &[u8]) -> Result<ImageInspection, Ins
     let boot_redundancy =
         ntfs_region::validate_boot_region(&primary, &backup, image.len(), backup_offset)
             .map_err(InspectionError::InvalidNtfsBootRegion)?;
-    let discovery = discover_system_records(image, &boot, NtfsDiscoveryLimits::default())
-        .map_err(InspectionError::InvalidNtfsDiscovery)?;
-    let volume =
-        discover_volume_and_bitmap(image, &boot, &discovery.mft, NtfsVolumeLimits::default())
-            .map_err(InspectionError::InvalidNtfsVolume)?;
-    let inventory = inventory_ntfs(image, &boot, &discovery.mft, NtfsInventoryLimits::default())
-        .map_err(InspectionError::InvalidNtfsInventory)?;
+    let discovery =
+        discover_system_records_with_reader(image, &boot, NtfsDiscoveryLimits::default())
+            .map_err(InspectionError::InvalidNtfsDiscovery)?;
+    let volume = discover_volume_and_bitmap_with_reader(
+        image,
+        &boot,
+        &discovery.mft,
+        NtfsVolumeLimits::default(),
+    )
+    .map_err(InspectionError::InvalidNtfsVolume)?;
+    let inventory =
+        inventory_ntfs_with_reader(image, &boot, &discovery.mft, NtfsInventoryLimits::default())
+            .map_err(InspectionError::InvalidNtfsInventory)?;
     let allocation_reconciliation = reconcile_ntfs_allocation(&boot, &volume, &inventory)?;
     let mft_record_reconciliation =
         reconcile_ntfs_mft_records(image, &boot, &discovery, &volume, &inventory)?;
@@ -531,6 +600,7 @@ fn inspect_ntfs(image: &ImageFile, prefix: &[u8]) -> Result<ImageInspection, Ins
     };
     finish_inspection(
         image,
+        origin,
         FileSystem::Ntfs,
         u32::try_from(boot.cluster_size_bytes).map_err(|_| InspectionError::GeometryOverflow {
             calculation: "NTFS cluster size conversion",
@@ -603,7 +673,7 @@ fn reconcile_ntfs_allocation(
 }
 
 fn reconcile_ntfs_mft_records(
-    image: &ImageFile,
+    image: &dyn BoundedImageReader,
     boot: &NtfsBootSector,
     discovery: &NtfsSystemDiscovery,
     volume: &NtfsVolumeDiscovery,
@@ -634,7 +704,7 @@ fn reconcile_ntfs_mft_records(
 
     let mut in_use_records = 0_u64;
     for record_number in 0..inventory.scanned_records {
-        let record = read_mft_record_for_inventory(
+        let record = read_mft_record_for_inventory_with_reader(
             image,
             boot,
             &discovery.mft,
@@ -718,7 +788,7 @@ fn first_set_mft_bitmap_bit(bitmap: &[u8], start: u64) -> Option<u64> {
 }
 
 fn inspect_ntfs_security_descriptors(
-    image: &ImageFile,
+    image: &dyn BoundedImageReader,
     inventory: &NtfsInventory,
 ) -> Result<NtfsSecurityDescriptorEvidence, InspectionError> {
     const SECURE_RECORD: u64 = 9;
@@ -802,7 +872,8 @@ fn inspect_ntfs_security_descriptors(
 }
 
 fn finish_inspection(
-    image: &ImageFile,
+    image: &dyn BoundedImageReader,
+    origin: InspectionOrigin<'_>,
     filesystem: FileSystem,
     cluster_bytes: u32,
     declared_volume_bytes: u64,
@@ -815,7 +886,7 @@ fn finish_inspection(
             image: image.len(),
         });
     }
-    let canonical_path = image.identity().canonical_path();
+    let canonical_path = origin.base_identity().canonical_path();
     let display_name = canonical_path.file_name().map_or_else(
         || canonical_path.display().to_string(),
         |name| name.to_string_lossy().into(),
@@ -828,7 +899,7 @@ fn finish_inspection(
     Ok(ImageInspection {
         profile: VolumeProfile {
             display_name,
-            stable_id: format!("image:{}#length={}", canonical_path.display(), image.len()),
+            stable_id: inspection_stable_id(origin, image.len()),
             filesystem,
             capacity_bytes: declared_volume_bytes,
             free_bytes: evidence
@@ -883,6 +954,27 @@ fn finish_inspection(
     })
 }
 
+fn inspection_stable_id(origin: InspectionOrigin<'_>, image_bytes: u64) -> String {
+    let path = origin.base_identity().canonical_path();
+    match origin {
+        InspectionOrigin::Regular(_) => {
+            format!("image:{}#length={image_bytes}", path.display())
+        }
+        InspectionOrigin::Overlay { overlay_digest, .. } => {
+            use std::fmt::Write as _;
+
+            let mut digest = String::with_capacity(64);
+            for byte in overlay_digest {
+                write!(&mut digest, "{byte:02x}").expect("writing to a String cannot fail");
+            }
+            format!(
+                "overlay:{}#length={image_bytes}#sha256={digest}",
+                path.display()
+            )
+        }
+    }
+}
+
 const fn exfat_health(volume_flags: u16, comparison: ExfatBootRegionComparison) -> HealthState {
     if matches!(comparison, ExfatBootRegionComparison::Divergent { .. }) {
         HealthState::Unknown
@@ -910,6 +1002,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
+    use crate::overlay::{OverlayLimits, OverlayWrite};
 
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
@@ -1205,6 +1298,65 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn overlay_inspection_uses_candidate_boot_regions_without_mutating_base() {
+        let valid = exfat_image();
+        let mut invalid_base = valid.clone();
+        invalid_base[3] = b'X';
+        let temp = TempImage::write(&invalid_base);
+        let image = ImageFile::open(&temp.0).unwrap();
+        assert!(matches!(
+            inspect_open_image(&image),
+            Err(InspectionError::UnrecognizedFileSystem)
+        ));
+        let overlay = OverlayPlan::build(
+            u64::try_from(valid.len()).unwrap(),
+            512,
+            vec![OverlayWrite {
+                offset: 0,
+                bytes: valid[..24 * 512].to_vec(),
+            }],
+            OverlayLimits::default(),
+        )
+        .unwrap();
+
+        let inspection = inspect_overlay(&image, image.identity(), &overlay, [0x42; 32]).unwrap();
+        assert_eq!(inspection.profile.filesystem, FileSystem::ExFat);
+        assert!(inspection.profile.inventory_complete);
+        assert!(inspection.profile.stable_id.starts_with("overlay:"));
+        assert!(inspection.profile.stable_id.ends_with(&"42".repeat(32)));
+        assert_eq!(fs::read(&temp.0).unwrap(), invalid_base);
+    }
+
+    #[test]
+    fn overlay_corruption_cannot_fall_back_to_valid_ntfs_base_boot() {
+        let valid = ntfs_image();
+        let temp = TempImage::write(&valid);
+        let image = ImageFile::open(&temp.0).unwrap();
+        inspect_open_image(&image).expect("base NTFS image is valid");
+        let backup_offset = valid.len() - 512;
+        let mut corrupt_backup = valid[backup_offset..].to_vec();
+        corrupt_backup[100] ^= 1;
+        let overlay = OverlayPlan::build(
+            u64::try_from(valid.len()).unwrap(),
+            512,
+            vec![OverlayWrite {
+                offset: u64::try_from(backup_offset).unwrap(),
+                bytes: corrupt_backup,
+            }],
+            OverlayLimits::default(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            inspect_overlay(&image, image.identity(), &overlay, [0x24; 32]),
+            Err(InspectionError::InvalidNtfsBootRegion(
+                NtfsBootRegionError::BootSectorsDiffer { offset: 100, .. }
+            ))
+        ));
+        assert_eq!(fs::read(&temp.0).unwrap(), valid);
     }
 
     #[test]

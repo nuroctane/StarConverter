@@ -11,9 +11,11 @@ use super::exfat_directory::{
     AllocationBitmapEntry, DirectoryContext, DirectoryError, DirectoryRecord, DirectorySummary,
     UpcaseTableEntry, parse_directory,
 };
-use super::exfat_image::{ExfatImageError, StreamReadLimits, read_chain_to_end, read_stream};
+use super::exfat_image::{
+    ExfatImageError, StreamReadLimits, read_chain_to_end_with_reader, read_stream_with_reader,
+};
 use super::exfat_upcase::{UpcaseError, UpcaseLimits, UpcaseTable};
-use crate::image::ImageFile;
+use crate::image::{BoundedImageReader, ImageFile};
 
 /// Explicit caps for read-only root discovery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,11 +128,20 @@ pub fn discover_root(
     boot: &ExfatBootSector,
     limits: ExfatDiscoveryLimits,
 ) -> Result<ExfatRootDiscovery, ExfatDiscoveryError> {
+    discover_root_with_reader(image, boot, limits)
+}
+
+pub(crate) fn discover_root_with_reader(
+    image: &dyn BoundedImageReader,
+    boot: &ExfatBootSector,
+    limits: ExfatDiscoveryLimits,
+) -> Result<ExfatRootDiscovery, ExfatDiscoveryError> {
     if limits.max_directory_entries == 0 || limits.max_secondary_entries == 0 {
         return Err(ExfatDiscoveryError::InvalidLimits);
     }
-    let root = read_chain_to_end(image, boot, boot.root_directory_cluster, limits.root_stream)
-        .map_err(ExfatDiscoveryError::RootStream)?;
+    let root =
+        read_chain_to_end_with_reader(image, boot, boot.root_directory_cluster, limits.root_stream)
+            .map_err(ExfatDiscoveryError::RootStream)?;
     let active_identifier = u8::try_from(boot.volume_flags & 1).map_err(|_| {
         ExfatDiscoveryError::ArithmeticOverflow {
             calculation: "active bitmap identifier",
@@ -163,7 +174,7 @@ pub fn discover_root(
         identifier: active_identifier,
     })?;
     let upcase_table = upcase_table.ok_or(ExfatDiscoveryError::MissingUpcaseTable)?;
-    let bitmap = read_stream(
+    let bitmap = read_stream_with_reader(
         image,
         boot,
         active_bitmap.first_cluster,
@@ -174,7 +185,7 @@ pub fn discover_root(
     .map_err(ExfatDiscoveryError::BitmapStream)?;
     let allocation = summarize_allocation_bitmap(&bitmap.bytes, boot)
         .map_err(ExfatDiscoveryError::Allocation)?;
-    let upcase = read_stream(
+    let upcase = read_stream_with_reader(
         image,
         boot,
         upcase_table.first_cluster,

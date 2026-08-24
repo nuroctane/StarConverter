@@ -204,6 +204,8 @@ installed. CI always tests both language stacks.
 - [x] Redundant append-only recovery capsule format
 - [x] Immutable overlay view for candidate metadata validation
 - [x] Logical stream/content manifest verifier over regular images
+- [x] Shared bounded-reader path for exFAT/NTFS candidate parsing and logical hashing
+- [x] Lifetime-bound staged-candidate audit through the executor's already-locked image handle
 - [x] Pure resumable transaction coordinator with pre-activation overlay proof
 - [x] Phase-separated exFAT and NTFS structural destination serializers
 - [x] Exact regular-image preimage capture for every source-visible write phase

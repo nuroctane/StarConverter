@@ -97,8 +97,13 @@ image executor before the capsule store and owns both locks. It mints one-use le
 current durable capsule generation and phase, refuses nonempty relocation before any image intent,
 requires executor read-back plus both flush barriers before appending the corresponding capsule
 generation, and stops at `TargetStaged`. It has no CLI/GUI entry point and cannot write backup boot
-or activation bytes. An ambiguous executor/capsule operation poisons the coupled coordinator; exact
-before-image rollback and verified-prefix repair are idempotent under the retained locks.
+or activation bytes. At `TargetStaged`, a crate-private bounded view is cloned from the already-open
+locked handle without reopening its path. Both filesystem parsers and logical stream hasher read
+through the exact prepared overlay; the normalized graph must match the plan, and the handle is
+revalidated afterward. The resulting manifest is diagnostic until the durable plan envelope also
+commits to the expected source manifest. An ambiguous executor/capsule operation poisons the coupled
+coordinator; exact before-image rollback and verified-prefix repair are idempotent under the
+retained locks.
 
 The durable capsule store has a separate, explicit recovering-resume operation. Under its exclusive
 lock, it may shorten only bytes after a nonempty prefix that the redundant capsule parser proves is

@@ -14,6 +14,32 @@ use sha2::{Digest, Sha256};
 /// Default upper bound for one allocation-backed image read (16 MiB).
 pub const DEFAULT_MAX_READ_BYTES: usize = 16 * 1024 * 1024;
 
+/// Crate-internal capability for bounded positional reads from a fixed-size image view.
+///
+/// The contract deliberately excludes paths, handles, identity, seek state, and mutation. Public
+/// APIs continue to accept [`ImageFile`] directly; this object-safe boundary only lets the same
+/// parsers consume core-owned immutable views such as a validated candidate overlay.
+pub(crate) trait BoundedImageReader: fmt::Debug {
+    /// Fixed logical length of this view.
+    fn len(&self) -> u64;
+
+    /// Maximum allocation-backed request accepted by one read.
+    fn max_read_bytes(&self) -> usize;
+
+    /// Reads one exact absolute range after enforcing the view's length and allocation cap.
+    fn read_exact_at(&self, offset: u64, length: usize) -> Result<Vec<u8>, ImageError>;
+
+    /// Reads an exact prefix of the view.
+    fn read_prefix(&self, length: usize) -> Result<Vec<u8>, ImageError> {
+        self.read_exact_at(0, length)
+    }
+
+    /// Reads the first logical sector using already-validated geometry.
+    fn read_first_sector(&self, sector_bytes: usize) -> Result<Vec<u8>, ImageError> {
+        self.read_prefix(sector_bytes)
+    }
+}
+
 /// Open-time identity used to detect replacement, truncation, or modification of an image.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageIdentity {
@@ -390,6 +416,20 @@ impl ImageFile {
         } else {
             Err(ImageError::SourceChanged)
         }
+    }
+}
+
+impl BoundedImageReader for ImageFile {
+    fn len(&self) -> u64 {
+        Self::len(self)
+    }
+
+    fn max_read_bytes(&self) -> usize {
+        Self::max_read_bytes(self)
+    }
+
+    fn read_exact_at(&self, offset: u64, length: usize) -> Result<Vec<u8>, ImageError> {
+        Self::read_exact_at(self, offset, length)
     }
 }
 

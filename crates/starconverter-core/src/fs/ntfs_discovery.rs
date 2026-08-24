@@ -17,7 +17,7 @@ use crate::fs::ntfs_record::{
 use crate::fs::ntfs_runlist::{
     ExtentLocation, MappingPairsError, MappingPairsLimits, NtfsRunlist, parse_mapping_pairs,
 };
-use crate::image::{ImageError, ImageFile};
+use crate::image::{BoundedImageReader, ImageError, ImageFile};
 
 const DATA_ATTRIBUTE_TYPE: u32 = 0x80;
 const SYSTEM_RECORDS: [SystemRecordKind; 3] = [
@@ -301,6 +301,14 @@ pub fn discover_system_records(
     boot: &NtfsBootSector,
     limits: NtfsDiscoveryLimits,
 ) -> Result<NtfsSystemDiscovery, NtfsDiscoveryError> {
+    discover_system_records_with_reader(image, boot, limits)
+}
+
+pub(crate) fn discover_system_records_with_reader(
+    image: &dyn BoundedImageReader,
+    boot: &NtfsBootSector,
+    limits: NtfsDiscoveryLimits,
+) -> Result<NtfsSystemDiscovery, NtfsDiscoveryError> {
     validate_limits(limits)?;
     let record_size = record_size(boot)?;
     let mut budget = ReadBudget::new(limits.max_bytes);
@@ -384,6 +392,16 @@ pub fn read_mft_record(
     record_number: u64,
     max_bytes: u64,
 ) -> Result<NtfsFileRecord, NtfsDiscoveryError> {
+    read_mft_record_with_reader(image, boot, mft, record_number, max_bytes)
+}
+
+pub(crate) fn read_mft_record_with_reader(
+    image: &dyn BoundedImageReader,
+    boot: &NtfsBootSector,
+    mft: &MftBootstrap,
+    record_number: u64,
+    max_bytes: u64,
+) -> Result<NtfsFileRecord, NtfsDiscoveryError> {
     if max_bytes == 0 {
         return Err(NtfsDiscoveryError::InvalidLimit { field: "max_bytes" });
     }
@@ -395,13 +413,13 @@ pub fn read_mft_record(
     Ok(record)
 }
 
-/// Reads one record for a sequential inventory scan.
+/// Reads one record for a sequential inventory scan through a bounded image view.
 ///
 /// NTFS formatters may leave the embedded record-number field at zero in records that have never
 /// been allocated. Those bytes carry no identity while the in-use flag is clear, and inventory
 /// ignores the rest of such a record. In-use records still require an exact embedded identity.
-pub(crate) fn read_mft_record_for_inventory(
-    image: &ImageFile,
+pub(crate) fn read_mft_record_for_inventory_with_reader(
+    image: &dyn BoundedImageReader,
     boot: &NtfsBootSector,
     mft: &MftBootstrap,
     record_number: u64,
@@ -612,7 +630,7 @@ fn record_is_mapped(
 }
 
 fn read_mft_record_inner(
-    image: &ImageFile,
+    image: &dyn BoundedImageReader,
     boot: &NtfsBootSector,
     mft: &MftBootstrap,
     record_number: u64,
@@ -680,7 +698,7 @@ fn read_mft_record_inner(
 }
 
 fn read_chunked(
-    image: &ImageFile,
+    image: &dyn BoundedImageReader,
     mut offset: u64,
     mut destination: &mut [u8],
 ) -> Result<(), NtfsDiscoveryError> {

@@ -10,7 +10,7 @@ use std::fmt;
 use sha2::{Digest, Sha256};
 
 use crate::extent::{Extent, Placement, StreamId};
-use crate::image::{ImageError, ImageFile};
+use crate::image::{BoundedImageReader, ImageError, ImageFile};
 use crate::object::{
     ObjectGraph, ObjectId, ObjectKind, ObjectSemantics, StreamFlags, StreamStorage,
 };
@@ -184,6 +184,19 @@ pub fn build_manifest(
     graph: &ObjectGraph,
     limits: VerificationLimits,
 ) -> Result<VerificationManifest, VerificationError> {
+    build_manifest_with_reader(image, graph, limits)
+}
+
+/// Hashes every logical stream through one crate-owned bounded image view.
+///
+/// This keeps the public regular-file API unchanged while allowing internal verification to hash
+/// the bytes selected by a validated immutable overlay rather than accidentally reading its base
+/// file directly.
+pub(crate) fn build_manifest_with_reader(
+    image: &dyn BoundedImageReader,
+    graph: &ObjectGraph,
+    limits: VerificationLimits,
+) -> Result<VerificationManifest, VerificationError> {
     validate_limits(limits)?;
     if graph.objects().len() > limits.max_objects {
         return Err(VerificationError::ObjectLimitExceeded {
@@ -341,7 +354,7 @@ fn enumerate_paths(
 }
 
 fn hash_extent_stream(
-    image: &ImageFile,
+    image: &dyn BoundedImageReader,
     stream: StreamId,
     logical_bytes: u64,
     initialized_bytes: u64,
@@ -391,18 +404,30 @@ fn hash_extent_stream(
 }
 
 fn hash_physical(
-    image: &ImageFile,
+    image: &dyn BoundedImageReader,
     hasher: &mut Sha256,
     mut offset: u64,
     mut length: u64,
     chunk_bytes: usize,
 ) -> Result<(), VerificationError> {
+    let reader_max = u64::try_from(image.max_read_bytes()).map_err(|_| {
+        VerificationError::ArithmeticOverflow {
+            calculation: "reader chunk limit conversion",
+        }
+    })?;
+    if reader_max == 0 {
+        return Err(VerificationError::InvalidLimit {
+            field: "reader.max_read_bytes",
+        });
+    }
     while length != 0 {
-        let take = length.min(u64::try_from(chunk_bytes).map_err(|_| {
-            VerificationError::ArithmeticOverflow {
-                calculation: "verification chunk conversion",
-            }
-        })?);
+        let take = length
+            .min(
+                u64::try_from(chunk_bytes).map_err(|_| VerificationError::ArithmeticOverflow {
+                    calculation: "verification chunk conversion",
+                })?,
+            )
+            .min(reader_max);
         let take_usize =
             usize::try_from(take).map_err(|_| VerificationError::ArithmeticOverflow {
                 calculation: "verification read length conversion",
@@ -493,6 +518,7 @@ mod tests {
     use super::*;
     use crate::extent::{ExtentGraph, ExtentKind};
     use crate::object::{NamespaceEntry, ObjectGraphLimits, ObjectRecord, ObjectStream};
+    use crate::overlay::{OverlayLimits, OverlayPlan, OverlayWrite};
 
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
@@ -640,6 +666,59 @@ mod tests {
 
         assert!(a.equivalent_to(&b));
         assert!(!a.equivalent_to(&changed));
+    }
+
+    #[test]
+    fn reader_manifest_hashes_overlay_payload_without_changing_base_file() {
+        let original = b"xxxxAAAAxxxxxxxx";
+        let temp = TempImage::write(original);
+        let image = ImageFile::open(&temp.0).expect("open overlay verification fixture");
+        let graph = graph();
+        let base = build_manifest(&image, &graph, VerificationLimits::default())
+            .expect("hash base image through public wrapper");
+        let plan = OverlayPlan::build(
+            image.len(),
+            1,
+            vec![OverlayWrite {
+                offset: 4,
+                bytes: vec![b'B'],
+            }],
+            OverlayLimits {
+                max_writes: 1,
+                max_replacement_bytes: 1,
+                max_read_bytes: 2,
+            },
+        )
+        .expect("build one-byte overlay");
+        let overlaid = {
+            let reader = plan.reader(&image).expect("bind overlay reader");
+            build_manifest_with_reader(
+                &reader,
+                &graph,
+                VerificationLimits {
+                    read_chunk_bytes: 4,
+                    ..VerificationLimits::default()
+                },
+            )
+            .expect("hash logical stream through overlay reader")
+        };
+
+        let unnamed_digest = |manifest: &VerificationManifest| {
+            manifest
+                .objects
+                .iter()
+                .find(|object| object.kind == ObjectKind::File)
+                .and_then(|object| object.streams.iter().find(|stream| stream.name.is_none()))
+                .map(|stream| stream.sha256)
+                .expect("unnamed file stream")
+        };
+        let base_expected: [u8; 32] = Sha256::digest(b"AAAA\0\0\0").into();
+        let overlay_expected: [u8; 32] = Sha256::digest(b"BAAA\0\0\0").into();
+        assert_eq!(unnamed_digest(&base), base_expected);
+        assert_eq!(unnamed_digest(&overlaid), overlay_expected);
+        assert_ne!(unnamed_digest(&base), unnamed_digest(&overlaid));
+        drop(image);
+        assert_eq!(fs::read(&temp.0).expect("reread base image"), original);
     }
 
     #[test]

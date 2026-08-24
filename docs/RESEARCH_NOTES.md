@@ -59,6 +59,13 @@ filesystem tooling.
 12. A Windows mount/check gate must use a disposable VHD wrapper around a copied candidate image,
     followed by `chkdsk` and namespace/content comparison. It must never attach the user's source
     image or a physical drive.
+13. Candidate validation must share one capability-limited reader from boot parsing through
+    allocation discovery, recursive inventory, normalization, and logical stream hashing. Mixing an
+    overlay boot read with later base-image reads can create a false proof even when each parser is
+    locally correct.
+14. A coordinator's read view must come from its already-open locked handle and be lifetime-bound to
+    that lock. Reopening the path creates a substitution window and does not prove that parsing and
+    mutation refer to the same container.
 
 ## Independent interoperability gate
 

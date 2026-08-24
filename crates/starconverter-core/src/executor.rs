@@ -15,7 +15,9 @@ use sha2::{Digest, Sha256};
 use crate::capsule::TransactionPhase;
 use crate::conversion::{PreparedConversion, ReservedWrite, RollbackIntent, TransactionIntent};
 use crate::geometry::Relocation;
-use crate::image::{ImageError, ImageIdentity, reject_device_like_path};
+use crate::image::{
+    BoundedImageReader, ImageError, ImageFile, ImageIdentity, reject_device_like_path,
+};
 use crate::overlay::OverlayWrite;
 
 /// Default maximum allocation and I/O size for each executor chunk (1 MiB).
@@ -322,6 +324,48 @@ pub struct ImageExecutor {
     lock_strength: LockStrength,
 }
 
+/// Read-only view cloned from an executor's already-open, exclusively locked regular file.
+///
+/// The borrow prevents the view from outliving the executor and therefore the lock. Construction
+/// is crate-private, retains no independently supplied path, and never reopens the image namespace.
+#[derive(Debug)]
+pub(crate) struct LockedImageView<'a> {
+    image: ImageFile,
+    executor: &'a ImageExecutor,
+}
+
+impl LockedImageView<'_> {
+    /// Revalidates both the locked executor container and this pinned read handle after an
+    /// inspection or verification operation.
+    pub(crate) fn post_operation_revalidate(&self) -> Result<(), ExecutorError> {
+        self.executor.ensure_same_container()?;
+        self.image
+            .read_exact_at(0, 0)
+            .map_err(ExecutorError::Image)?;
+        if self.image.len() != self.executor.identity.length()
+            || self.image.identity().stable_container_token()
+                != self.executor.identity.stable_container_token()
+        {
+            return Err(ExecutorError::IdentityMismatch);
+        }
+        Ok(())
+    }
+}
+
+impl BoundedImageReader for LockedImageView<'_> {
+    fn len(&self) -> u64 {
+        self.image.len()
+    }
+
+    fn max_read_bytes(&self) -> usize {
+        self.image.max_read_bytes()
+    }
+
+    fn read_exact_at(&self, offset: u64, length: usize) -> Result<Vec<u8>, ImageError> {
+        self.image.read_exact_at(offset, length)
+    }
+}
+
 impl ImageExecutor {
     /// Opens an existing image for verified in-place writes.
     ///
@@ -396,6 +440,29 @@ impl ImageExecutor {
     #[must_use]
     pub const fn identity(&self) -> &ImageIdentity {
         &self.identity
+    }
+
+    /// Clones this already-open locked handle into a lifetime-bound bounded reader.
+    ///
+    /// The canonical path is retained only as identity evidence for the cloned [`ImageFile`]; it
+    /// is never resolved or reopened by this operation.
+    pub(crate) fn locked_view(
+        &self,
+        max_read_bytes: usize,
+    ) -> Result<LockedImageView<'_>, ExecutorError> {
+        self.ensure_same_container()?;
+        let image = ImageFile::from_open_regular_file(
+            &self.file,
+            self.canonical_path.clone(),
+            max_read_bytes,
+        )
+        .map_err(ExecutorError::Image)?;
+        let view = LockedImageView {
+            image,
+            executor: self,
+        };
+        view.post_operation_revalidate()?;
+        Ok(view)
     }
 
     /// Executes one mutating intent emitted for `prepared`.
@@ -1191,6 +1258,67 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn locked_view_borrows_executor_identity_and_reads_without_writing() {
+        let original: Vec<u8> = (0_u8..64).collect();
+        let temp = TempImage::new(&original);
+        let executor = open_executor(&temp, 8);
+        let executor_token = executor.identity().stable_container_token();
+
+        // The returned type is `LockedImageView<'a>` where `'a` is this executor borrow; moving
+        // it outside the executor's lifetime is therefore rejected by the type system.
+        let view = executor.locked_view(7).expect("clone locked read handle");
+        assert_eq!(
+            BoundedImageReader::len(&view),
+            u64::try_from(original.len()).unwrap()
+        );
+        assert_eq!(BoundedImageReader::max_read_bytes(&view), 7);
+        assert_eq!(
+            view.image.identity().stable_container_token(),
+            executor_token
+        );
+        assert_eq!(
+            BoundedImageReader::read_exact_at(&view, 5, 7).unwrap(),
+            original[5..12]
+        );
+        view.post_operation_revalidate().unwrap();
+        drop(view);
+        drop(executor);
+
+        assert_eq!(fs::read(&temp.0).unwrap(), original);
+    }
+
+    #[test]
+    fn locked_view_refuses_invalid_read_limit_without_writing() {
+        let original = vec![0x5a; 64];
+        let temp = TempImage::new(&original);
+        let executor = open_executor(&temp, 8);
+        assert!(matches!(
+            executor.locked_view(0),
+            Err(ExecutorError::Image(ImageError::InvalidReadLimit))
+        ));
+        drop(executor);
+        assert_eq!(fs::read(&temp.0).unwrap(), original);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn locked_view_refuses_container_length_change_under_advisory_lock() {
+        let original = vec![0x33; 64];
+        let temp = TempImage::new(&original);
+        let executor = open_executor(&temp, 8);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&temp.0)
+            .unwrap()
+            .write_all(&[0x44])
+            .unwrap();
+        assert!(matches!(
+            executor.locked_view(8),
+            Err(ExecutorError::IdentityMismatch)
+        ));
     }
 
     #[test]

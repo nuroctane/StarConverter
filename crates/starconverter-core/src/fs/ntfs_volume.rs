@@ -11,12 +11,12 @@ use crate::fs::ntfs_attribute::{
     AttributeBody, AttributeLimits, NtfsAttributeError, parse_attribute_list,
 };
 use crate::fs::ntfs_bitmap::{NtfsBitmapError, TailEvidence, parse_bitmap};
-use crate::fs::ntfs_discovery::{MftBootstrap, NtfsDiscoveryError, read_mft_record};
+use crate::fs::ntfs_discovery::{MftBootstrap, NtfsDiscoveryError, read_mft_record_with_reader};
 use crate::fs::ntfs_record::NtfsFileRecord;
 use crate::fs::ntfs_runlist::{
     ExtentLocation, MappingPairsError, MappingPairsLimits, NtfsRunlist, parse_mapping_pairs,
 };
-use crate::image::{ImageError, ImageFile};
+use crate::image::{BoundedImageReader, ImageError, ImageFile};
 
 const ATTRIBUTE_LIST_TYPE: u32 = 0x20;
 const VOLUME_INFORMATION_TYPE: u32 = 0x70;
@@ -332,6 +332,15 @@ pub fn discover_volume_and_bitmap(
     mft: &MftBootstrap,
     limits: NtfsVolumeLimits,
 ) -> Result<NtfsVolumeDiscovery, NtfsVolumeError> {
+    discover_volume_and_bitmap_with_reader(image, boot, mft, limits)
+}
+
+pub(crate) fn discover_volume_and_bitmap_with_reader(
+    image: &dyn BoundedImageReader,
+    boot: &NtfsBootSector,
+    mft: &MftBootstrap,
+    limits: NtfsVolumeLimits,
+) -> Result<NtfsVolumeDiscovery, NtfsVolumeError> {
     validate_limits(limits)?;
     let records_bytes =
         boot.mft_record_size
@@ -343,7 +352,7 @@ pub fn discover_volume_and_bitmap(
     let mut budget = ReadBudget::new(limits.max_bytes);
     budget.charge(records_bytes)?;
 
-    let mft_record = read_mft_record(
+    let mft_record = read_mft_record_with_reader(
         image,
         boot,
         mft,
@@ -355,7 +364,7 @@ pub fn discover_volume_and_bitmap(
     let mft_bitmap =
         parse_mft_bitmap_evidence(image, boot, &mft_attributes.attributes, limits, &mut budget)?;
 
-    let volume_record = read_mft_record(
+    let volume_record = read_mft_record_with_reader(
         image,
         boot,
         mft,
@@ -366,7 +375,7 @@ pub fn discover_volume_and_bitmap(
     let volume_attributes = attributes(&volume_record, boot, limits)?;
     let volume = parse_volume_evidence(&volume_attributes.attributes)?;
 
-    let bitmap_record = read_mft_record(
+    let bitmap_record = read_mft_record_with_reader(
         image,
         boot,
         mft,
@@ -499,7 +508,7 @@ fn parse_volume_evidence(
 }
 
 fn parse_mft_bitmap_evidence(
-    image: &ImageFile,
+    image: &dyn BoundedImageReader,
     boot: &NtfsBootSector,
     attributes: &[crate::fs::ntfs_attribute::NtfsAttribute<'_>],
     limits: NtfsVolumeLimits,
@@ -617,7 +626,7 @@ fn ensure_mft_bitmap_len(actual: u64, maximum: usize) -> Result<(), NtfsVolumeEr
 }
 
 fn parse_bitmap_evidence(
-    image: &ImageFile,
+    image: &dyn BoundedImageReader,
     boot: &NtfsBootSector,
     attributes: &[crate::fs::ntfs_attribute::NtfsAttribute<'_>],
     limits: NtfsVolumeLimits,
@@ -726,7 +735,7 @@ fn ensure_bitmap_len(actual: u64, maximum: usize) -> Result<(), NtfsVolumeError>
 }
 
 fn read_nonresident_stream(
-    image: &ImageFile,
+    image: &dyn BoundedImageReader,
     boot: &NtfsBootSector,
     runlist: &NtfsRunlist,
     data_bytes: u64,
@@ -782,7 +791,7 @@ fn read_nonresident_stream(
 }
 
 fn read_mft_bitmap_stream(
-    image: &ImageFile,
+    image: &dyn BoundedImageReader,
     boot: &NtfsBootSector,
     runlist: &NtfsRunlist,
     data_bytes: u64,
@@ -846,7 +855,7 @@ fn read_mft_bitmap_stream(
 }
 
 fn read_chunked(
-    image: &ImageFile,
+    image: &dyn BoundedImageReader,
     mut offset: u64,
     mut destination: &mut [u8],
 ) -> Result<(), NtfsVolumeError> {
