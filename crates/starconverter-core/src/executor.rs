@@ -235,6 +235,9 @@ impl ImageExecutor {
         intent: TransactionIntent<'_>,
         faults: &mut F,
     ) -> Result<ExecutionEvidence, ExecutorError> {
+        if !prepared.matches_regular_image(&self.identity) {
+            return Err(ExecutorError::PlanImageMismatch);
+        }
         match intent {
             TransactionIntent::Relocate(relocations) => {
                 if relocations != prepared.layout().relocations {
@@ -288,6 +291,9 @@ impl ImageExecutor {
         intent: RollbackIntent<'_>,
         faults: &mut F,
     ) -> Result<RollbackEvidence, ExecutorError> {
+        if !prepared.matches_regular_image(&self.identity) {
+            return Err(ExecutorError::PlanImageMismatch);
+        }
         match intent {
             RollbackIntent::DiscardStaging => Ok(RollbackEvidence::StagingDiscarded),
             RollbackIntent::RestoreSource { writes, digest } => {
@@ -556,6 +562,7 @@ pub enum ExecutorError {
     },
     InvalidChunkLimit,
     IdentityMismatch,
+    PlanImageMismatch,
     IntentNotAuthorized,
     NonMutatingIntent,
     InvalidRelocation {
@@ -590,6 +597,8 @@ impl fmt::Display for ExecutorError {
             Self::IdentityMismatch => {
                 formatter.write_str("regular image identity or fixed length changed")
             }
+            Self::PlanImageMismatch => formatter
+                .write_str("prepared conversion belongs to a different regular image container"),
             Self::IntentNotAuthorized => {
                 formatter.write_str("intent is not authorized by the prepared conversion")
             }
@@ -1121,6 +1130,27 @@ mod tests {
             validate_exact_phase(&expected, &mixed),
             Err(ExecutorError::IntentNotAuthorized)
         ));
+    }
+
+    #[test]
+    fn prepared_plan_cannot_mutate_a_different_same_length_image() {
+        let source = TempImage::new(&vec![0x11; 8192]);
+        let substitute = TempImage::new(&vec![0x22; 8192]);
+        let source_image = crate::image::ImageFile::open(&source.0).unwrap();
+        let mut plan = crate::conversion::tests::prepared();
+        plan.test_bind_regular_image(source_image.identity());
+        drop(source_image);
+
+        let executor = open_executor(&substitute, 512);
+        let intent = plan
+            .rollback_intent(crate::capsule::TransactionPhase::Relocating)
+            .unwrap();
+        assert!(matches!(
+            executor.execute_rollback(&plan, intent),
+            Err(ExecutorError::PlanImageMismatch)
+        ));
+        drop(executor);
+        assert_eq!(fs::read(&substitute.0).unwrap(), vec![0x22; 8192]);
     }
 
     #[cfg(windows)]

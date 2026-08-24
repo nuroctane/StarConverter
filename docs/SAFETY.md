@@ -84,8 +84,16 @@ The image executor opens only an existing canonical regular file. It never creat
 resizes; lexically rejects Windows device namespaces and Unix `/dev`; checks the inspection identity
 and fixed length before mutation; takes Windows deny-share plus a whole-file lock (advisory locking
 on other platforms); and accepts only a complete exact intent from an activation-authorized
-`PreparedConversion`. It verifies every destination chunk, executes both data and metadata flushes,
-and returns evidence without recording a checkpoint itself.
+`PreparedConversion`. The plan's source identity is compared with a domain-separated token over the
+executor's canonical path, fixed length, and strongest stable platform container identity before
+any intent or rollback bytes are accepted. It verifies every destination chunk, executes both data
+and metadata flushes, and returns evidence without recording a checkpoint itself.
+
+The durable capsule store has a separate, explicit recovering-resume operation. Under its exclusive
+lock, it may shorten only bytes after a nonempty prefix that the redundant capsule parser proves is
+an incomplete newest generation. It then flushes, rereads, and strict-scans the retained prefix
+before returning. Completed corruption, ambiguity, and an incomplete first generation are refused
+without repair.
 
 This is not physical-volume authorization. Serializer activation remains opaque and unavailable,
 and frontends expose no in-place conversion command. The create-new path below is a separate safety

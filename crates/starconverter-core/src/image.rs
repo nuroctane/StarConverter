@@ -9,6 +9,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use sha2::{Digest, Sha256};
+
 /// Default upper bound for one allocation-backed image read (16 MiB).
 pub const DEFAULT_MAX_READ_BYTES: usize = 16 * 1024 * 1024;
 
@@ -79,6 +81,63 @@ impl ImageIdentity {
             && self.created == metadata.created().ok()
             && same_platform_file(&self.platform, metadata)
     }
+
+    /// Domain-separated token for binding a conversion plan to this exact regular-file
+    /// container. Mutable content timestamps are deliberately excluded because authorized writes
+    /// change them; canonical path, fixed length, and the strongest stable platform identity
+    /// exposed by the standard library remain bound.
+    pub(crate) fn stable_container_token(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"starconverter/regular-container/v1\0");
+        update_path_digest(&mut hasher, &self.canonical_path);
+        hasher.update(self.length.to_le_bytes());
+        match self.platform {
+            #[cfg(unix)]
+            PlatformFileIdentity::Unix { device, inode } => {
+                hasher.update(b"unix\0");
+                hasher.update(device.to_le_bytes());
+                hasher.update(inode.to_le_bytes());
+            }
+            #[cfg(windows)]
+            PlatformFileIdentity::Windows {
+                file_attributes,
+                creation_time,
+                ..
+            } => {
+                hasher.update(b"windows\0");
+                hasher.update(file_attributes.to_le_bytes());
+                hasher.update(creation_time.to_le_bytes());
+            }
+            #[cfg(not(any(unix, windows)))]
+            PlatformFileIdentity::Unavailable => hasher.update(b"unavailable\0"),
+        }
+        hasher.finalize().into()
+    }
+}
+
+#[cfg(unix)]
+fn update_path_digest(hasher: &mut Sha256, path: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = path.as_os_str().as_bytes();
+    hasher.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+    hasher.update(bytes);
+}
+
+#[cfg(windows)]
+fn update_path_digest(hasher: &mut Sha256, path: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+    let units: Vec<_> = path.as_os_str().encode_wide().collect();
+    hasher.update(u64::try_from(units.len()).unwrap_or(u64::MAX).to_le_bytes());
+    for unit in units {
+        hasher.update(unit.to_le_bytes());
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn update_path_digest(hasher: &mut Sha256, path: &Path) {
+    let text = path.as_os_str().to_string_lossy();
+    hasher.update(u64::try_from(text.len()).unwrap_or(u64::MAX).to_le_bytes());
+    hasher.update(text.as_bytes());
 }
 
 /// Stable file-identity fields exposed by the host platform's standard library.
@@ -639,6 +698,20 @@ mod tests {
         assert_eq!(image.read_prefix(4).unwrap(), b"0123");
         assert_eq!(image.read_first_sector(8).unwrap(), b"01234567");
         assert_eq!(image.read_sector(2, 4).unwrap(), b"89ab");
+    }
+
+    #[test]
+    fn stable_container_token_distinguishes_same_length_files_and_survives_reopen() {
+        let first = TempEntry::file(b"same length");
+        let second = TempEntry::file(b"other data!");
+        let first_open = ImageFile::open(&first.path).unwrap();
+        let first_token = first_open.identity().stable_container_token();
+        drop(first_open);
+
+        let reopened = ImageFile::open(&first.path).unwrap();
+        let other = ImageFile::open(&second.path).unwrap();
+        assert_eq!(reopened.identity().stable_container_token(), first_token);
+        assert_ne!(other.identity().stable_container_token(), first_token);
     }
 
     #[test]

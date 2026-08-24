@@ -9,7 +9,7 @@ use std::fs::{self, File, Metadata, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::capsule::{CapsuleError, CapsuleLimits, scan_capsule};
+use crate::capsule::{CapsuleError, CapsuleLimits, recover_capsule, scan_capsule};
 use crate::image::{ImageError, reject_device_like_path};
 
 /// Strength of the exclusion held for the store lifetime.
@@ -47,6 +47,18 @@ pub struct CapsuleSyncEvidence {
     pub sync_data_completed: bool,
     pub sync_all_completed: bool,
     pub namespace_durability: NamespaceDurability,
+}
+
+/// Evidence that opening a durable capsule either required no repair or discarded only a suffix
+/// proven to be an incomplete newest generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapsuleRecoveryEvidence {
+    pub original_bytes: u64,
+    pub retained_bytes: u64,
+    pub discarded_torn_bytes: u64,
+    pub generation_count: usize,
+    pub repair_sync_data_completed: bool,
+    pub repair_sync_all_completed: bool,
 }
 
 /// An exclusively locked, bounded, append-only regular-file capsule.
@@ -133,9 +145,39 @@ impl CapsuleStore {
         image_path: impl AsRef<Path>,
         limits: CapsuleLimits,
     ) -> Result<Self, CapsuleStoreError> {
+        Self::resume_internal(capsule_path.as_ref(), image_path.as_ref(), limits, false)
+            .map(|(store, _)| store)
+    }
+
+    /// Opens an existing capsule and repairs only a provably torn newest append.
+    ///
+    /// The file is exclusively opened and locked before inspection. Complete corruption,
+    /// ambiguous framing, an incomplete first generation, and every error that cannot be reduced
+    /// to one validated nonempty prefix are refused without changing the file. When a torn suffix
+    /// is proven, the file is shortened to that prefix, durably flushed, reread, and strict-scanned
+    /// before the store is returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same path, identity, limit, lock, and I/O failures as [`Self::resume`]. Capsule
+    /// corruption is repairable only when [`recover_capsule`] proves the exact retained prefix.
+    pub fn resume_recovering(
+        capsule_path: impl AsRef<Path>,
+        image_path: impl AsRef<Path>,
+        limits: CapsuleLimits,
+    ) -> Result<(Self, CapsuleRecoveryEvidence), CapsuleStoreError> {
+        Self::resume_internal(capsule_path.as_ref(), image_path.as_ref(), limits, true)
+    }
+
+    fn resume_internal(
+        capsule_path: &Path,
+        image_path: &Path,
+        limits: CapsuleLimits,
+        recover_torn_tail: bool,
+    ) -> Result<(Self, CapsuleRecoveryEvidence), CapsuleStoreError> {
         validate_limits_without_allocating(limits)?;
-        let image = canonical_regular_image(image_path.as_ref())?;
-        let requested = capsule_path.as_ref();
+        let image = canonical_regular_image(image_path)?;
+        let requested = capsule_path;
         reject_device_like_path(requested).map_err(CapsuleStoreError::ImagePath)?;
         let canonical_path = fs::canonicalize(requested)
             .map_err(|source| CapsuleStoreError::io("canonicalize capsule path", source))?;
@@ -169,12 +211,24 @@ impl CapsuleStore {
         bytes.resize(length, 0);
         read_exact_at(&file, 0, &mut bytes)
             .map_err(|source| CapsuleStoreError::io("read capsule", source))?;
-        let view = scan_capsule(&bytes, limits).map_err(CapsuleStoreError::Capsule)?;
-        if view.generations().is_empty() || view.validated_bytes() != bytes.len() {
-            return Err(CapsuleStoreError::EmptyCapsule);
-        }
-        let generation_count = view.generations().len();
-        drop(view);
+        let original_bytes = metadata.len();
+        let mut repair_sync_data_completed = false;
+        let mut repair_sync_all_completed = false;
+        let generation_count = match scan_capsule(&bytes, limits) {
+            Ok(view) => {
+                if view.generations().is_empty() || view.validated_bytes() != bytes.len() {
+                    return Err(CapsuleStoreError::EmptyCapsule);
+                }
+                view.generations().len()
+            }
+            Err(strict_error) if recover_torn_tail => {
+                let generations = repair_torn_suffix(&file, &mut bytes, limits, strict_error)?;
+                repair_sync_data_completed = true;
+                repair_sync_all_completed = true;
+                generations
+            }
+            Err(error) => return Err(CapsuleStoreError::Capsule(error)),
+        };
 
         let store = Self {
             file,
@@ -186,7 +240,21 @@ impl CapsuleStore {
             lock_strength: platform_lock_strength(),
         };
         store.ensure_unchanged()?;
-        Ok(store)
+        let retained_bytes =
+            u64::try_from(store.bytes.len()).map_err(|_| CapsuleStoreError::ArithmeticOverflow)?;
+        Ok((
+            store,
+            CapsuleRecoveryEvidence {
+                original_bytes,
+                retained_bytes,
+                discarded_torn_bytes: original_bytes
+                    .checked_sub(retained_bytes)
+                    .ok_or(CapsuleStoreError::ArithmeticOverflow)?,
+                generation_count,
+                repair_sync_data_completed,
+                repair_sync_all_completed,
+            },
+        ))
     }
 
     /// Appends exactly one already-encoded generation from a complete updated capsule buffer.
@@ -330,6 +398,42 @@ impl CapsuleStore {
             .map_err(|source| CapsuleStoreError::io("reinspect capsule path", source))?;
         validate_same_file(self.identity, &path, expected_length)
     }
+}
+
+fn repair_torn_suffix(
+    file: &File,
+    bytes: &mut Vec<u8>,
+    limits: CapsuleLimits,
+    strict_error: CapsuleError,
+) -> Result<usize, CapsuleStoreError> {
+    let recovered = recover_capsule(bytes, limits).map_err(CapsuleStoreError::Capsule)?;
+    let retained = recovered.validated_bytes();
+    if recovered.generations().is_empty() || retained == 0 || retained >= bytes.len() {
+        return Err(CapsuleStoreError::Capsule(strict_error));
+    }
+    let generations = recovered.generations().len();
+    drop(recovered);
+    let retained_u64 =
+        u64::try_from(retained).map_err(|_| CapsuleStoreError::ArithmeticOverflow)?;
+    file.set_len(retained_u64)
+        .map_err(|source| CapsuleStoreError::io("discard proven torn capsule suffix", source))?;
+    file.sync_data()
+        .map_err(|source| CapsuleStoreError::io("flush recovered capsule data", source))?;
+    bytes.truncate(retained);
+    let mut reread = vec![0_u8; retained];
+    read_exact_at(file, 0, &mut reread)
+        .map_err(|source| CapsuleStoreError::io("reread recovered capsule", source))?;
+    if reread != *bytes {
+        return Err(CapsuleStoreError::VerificationMismatch);
+    }
+    let strict = scan_capsule(&reread, limits).map_err(CapsuleStoreError::Capsule)?;
+    if strict.generations().len() != generations || strict.validated_bytes() != reread.len() {
+        return Err(CapsuleStoreError::VerificationMismatch);
+    }
+    file.sync_all().map_err(|source| {
+        CapsuleStoreError::io("flush recovered capsule data and metadata", source)
+    })?;
+    Ok(generations)
 }
 
 impl Drop for CapsuleStore {
@@ -700,7 +804,7 @@ fn positional_write_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capsule::{CapsuleIdentity, TransactionPhase, append_generation};
+    use crate::capsule::{CapsuleIdentity, HEADER_BYTES, TransactionPhase, append_generation};
     #[cfg(unix)]
     use std::io::Write as _;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -816,6 +920,78 @@ mod tests {
         assert_eq!(resumed.generation_count(), 2);
         drop(resumed);
         assert_eq!(fs::read(capsule).unwrap(), updated);
+    }
+
+    #[test]
+    fn recovering_resume_repairs_every_cut_of_only_the_newest_append() {
+        let complete = appended_capsule(2);
+        let durable = initial_capsule();
+        for cut in durable.len() + 1..complete.len() {
+            let dir = TempDir::new();
+            let image = image(&dir);
+            let capsule = dir.join("cut.starcap");
+            fs::write(&capsule, &complete[..cut]).unwrap();
+
+            assert!(CapsuleStore::resume(&capsule, &image, limits()).is_err());
+            let (store, evidence) =
+                CapsuleStore::resume_recovering(&capsule, &image, limits()).unwrap();
+            assert_eq!(store.bytes(), durable);
+            assert_eq!(store.generation_count(), 1);
+            assert_eq!(evidence.original_bytes, u64::try_from(cut).unwrap());
+            assert_eq!(
+                evidence.retained_bytes,
+                u64::try_from(durable.len()).unwrap()
+            );
+            assert_eq!(
+                evidence.discarded_torn_bytes,
+                u64::try_from(cut - durable.len()).unwrap()
+            );
+            assert!(evidence.repair_sync_data_completed && evidence.repair_sync_all_completed);
+            drop(store);
+            assert_eq!(fs::read(&capsule).unwrap(), durable);
+
+            let mut store = CapsuleStore::resume(&capsule, &image, limits()).unwrap();
+            let appended = store.append(&complete).unwrap();
+            assert_eq!(appended.generation_count, 2);
+            drop(store);
+            assert_eq!(fs::read(capsule).unwrap(), complete);
+        }
+    }
+
+    #[test]
+    fn recovering_resume_is_a_noop_for_a_complete_capsule() {
+        let dir = TempDir::new();
+        let image = image(&dir);
+        let capsule = dir.join("complete.starcap");
+        let complete = appended_capsule(2);
+        fs::write(&capsule, &complete).unwrap();
+
+        let (store, evidence) =
+            CapsuleStore::resume_recovering(&capsule, &image, limits()).unwrap();
+        assert_eq!(store.bytes(), complete);
+        assert_eq!(evidence.discarded_torn_bytes, 0);
+        assert!(!evidence.repair_sync_data_completed);
+        assert!(!evidence.repair_sync_all_completed);
+        drop(store);
+        assert_eq!(fs::read(capsule).unwrap(), complete);
+    }
+
+    #[test]
+    fn recovering_resume_never_repairs_complete_corruption_or_a_torn_first_generation() {
+        let dir = TempDir::new();
+        let image = image(&dir);
+        let capsule = dir.join("corrupt.starcap");
+        let mut corrupt = appended_capsule(2);
+        corrupt[initial_capsule().len() + HEADER_BYTES] ^= 0x80;
+        fs::write(&capsule, &corrupt).unwrap();
+        assert!(CapsuleStore::resume_recovering(&capsule, &image, limits()).is_err());
+        assert_eq!(fs::read(&capsule).unwrap(), corrupt);
+
+        let first = initial_capsule();
+        let torn_first = &first[..first.len() - 1];
+        fs::write(&capsule, torn_first).unwrap();
+        assert!(CapsuleStore::resume_recovering(&capsule, &image, limits()).is_err());
+        assert_eq!(fs::read(capsule).unwrap(), torn_first);
     }
 
     #[test]

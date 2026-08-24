@@ -36,6 +36,15 @@ pub struct ImageIdentity {
     pub image_bytes: u64,
 }
 
+impl ImageIdentity {
+    pub(crate) fn from_regular_image(identity: &crate::image::ImageIdentity) -> Self {
+        Self {
+            instance: identity.stable_container_token(),
+            image_bytes: identity.length(),
+        }
+    }
+}
+
 /// Independently established facts required before any conversion can be coordinated.
 ///
 /// Fields are module-private so callers cannot manufacture clean/offline/complete evidence. A
@@ -424,6 +433,16 @@ impl PreparedConversion {
     #[must_use]
     pub const fn plan_digest(&self) -> [u8; 32] {
         self.plan_digest
+    }
+
+    /// Proves that the executor's pinned regular file is the container used by trusted preflight.
+    pub(crate) fn matches_regular_image(&self, identity: &crate::image::ImageIdentity) -> bool {
+        self.preflight.image == ImageIdentity::from_regular_image(identity)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_bind_regular_image(&mut self, identity: &crate::image::ImageIdentity) {
+        self.preflight.image = ImageIdentity::from_regular_image(identity);
     }
 
     #[must_use]
@@ -1820,7 +1839,7 @@ fn digest_overlay_writes(writes: &[OverlayWrite]) -> [u8; 32] {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::extent::{Extent, ExtentGraph, StreamId};
     use crate::object::{
@@ -2002,7 +2021,7 @@ mod tests {
         }
     }
 
-    fn prepared() -> PreparedConversion {
+    pub fn prepared() -> PreparedConversion {
         PreparedConversion::build(&graph(false), draft(), ConversionLimits::default()).unwrap()
     }
     const fn observed() -> ObservedImage {
