@@ -95,6 +95,77 @@ impl WorkspaceLayout {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct WorkspaceSemantics {
+    source: egui::Id,
+    direction: egui::Id,
+    guarantee: egui::Id,
+    preflight: egui::Id,
+    action: egui::Id,
+    activity: egui::Id,
+}
+
+impl WorkspaceSemantics {
+    /// Build the accessibility landmarks in task order before any visual panel is painted.
+    ///
+    /// egui panels must be submitted in docking order, which differs from the task order on
+    /// wide layouts (the persistent action footer is submitted before the central workbench).
+    /// Visual scopes are re-parented to these stable landmarks, so AccessKit traversal does not
+    /// inherit that implementation detail.
+    fn install(root: &mut egui::Ui) -> Self {
+        root.scope_builder(
+            egui::UiBuilder::new().id_salt("workspace_accessibility_order"),
+            |semantic_root| {
+                set_accessibility_group(
+                    semantic_root,
+                    semantic_root.unique_id(),
+                    "Conversion workspace",
+                );
+                Self {
+                    source: install_accessibility_group(semantic_root, "source", "Source"),
+                    direction: install_accessibility_group(semantic_root, "direction", "Direction"),
+                    guarantee: install_accessibility_group(semantic_root, "guarantee", "Guarantee"),
+                    preflight: install_accessibility_group(semantic_root, "preflight", "Preflight"),
+                    action: install_accessibility_group(semantic_root, "action", "Action"),
+                    activity: install_accessibility_group(semantic_root, "activity", "Activity"),
+                }
+            },
+        )
+        .inner
+    }
+}
+
+fn install_accessibility_group(ui: &mut egui::Ui, id_salt: &str, label: &str) -> egui::Id {
+    ui.scope_builder(egui::UiBuilder::new().id_salt(id_salt), |group| {
+        let id = group.unique_id();
+        set_accessibility_group(group, id, label);
+        id
+    })
+    .inner
+}
+
+fn set_accessibility_group(ui: &egui::Ui, id: egui::Id, label: &str) {
+    ui.ctx().accesskit_node_builder(id, |node| {
+        node.set_role(egui::accesskit::Role::Group);
+        node.set_label(label);
+    });
+}
+
+fn accessibility_scope<R>(
+    ui: &mut egui::Ui,
+    parent: egui::Id,
+    id_salt: &str,
+    contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .id_salt(id_salt)
+            .accessibility_parent(parent),
+        contents,
+    )
+    .inner
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionDocument {
     saved_unix_seconds: u64,
@@ -1396,19 +1467,22 @@ impl eframe::App for StarConverterApp {
             root.ctx().request_repaint_after(Duration::from_millis(75));
         }
         let workspace_layout = WorkspaceLayout::for_width(root.available_width());
+        let semantics = WorkspaceSemantics::install(root);
         Self::show_header(root, workspace_layout);
-        self.show_footer(root, workspace_layout);
+        self.show_footer(root, workspace_layout, semantics.action);
         match workspace_layout {
             WorkspaceLayout::Wide => {
-                self.show_source_rail(root);
-                self.show_activity_rail(root);
-                self.show_workbench(root, workspace_layout);
+                self.show_source_rail(root, semantics.source);
+                self.show_activity_rail(root, semantics.activity);
+                self.show_workbench(root, workspace_layout, semantics);
             }
             WorkspaceLayout::Medium => {
-                self.show_source_rail(root);
-                self.show_workbench(root, workspace_layout);
+                self.show_source_rail(root, semantics.source);
+                self.show_workbench(root, workspace_layout, semantics);
             }
-            WorkspaceLayout::Compact => self.show_workbench(root, workspace_layout),
+            WorkspaceLayout::Compact => {
+                self.show_workbench(root, workspace_layout, semantics);
+            }
         }
         if self.session_fingerprint() != session_before {
             self.session_dirty = true;
@@ -1462,7 +1536,12 @@ impl StarConverterApp {
     // The footer intentionally keeps the complete job-state action cluster together so its
     // enabled/disabled labels cannot drift across helper boundaries.
     #[allow(clippy::too_many_lines)]
-    fn show_footer(&mut self, root: &mut egui::Ui, workspace_layout: WorkspaceLayout) {
+    fn show_footer(
+        &mut self,
+        root: &mut egui::Ui,
+        workspace_layout: WorkspaceLayout,
+        accessibility_parent: egui::Id,
+    ) {
         egui::Panel::bottom("footer")
             .frame(
                 Frame::new()
@@ -1471,23 +1550,24 @@ impl StarConverterApp {
                     .inner_margin(Margin::symmetric(20, 12)),
             )
             .show(root, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        RichText::new("[SAFE] SOURCE WRITES DISABLED")
-                            .monospace()
-                            .color(READY),
-                    );
-                    if workspace_layout != WorkspaceLayout::Compact {
+                accessibility_scope(ui, accessibility_parent, "footer_action_contents", |ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label(
-                            RichText::new(
-                                "Sources are read-only; exports create new files; device paths are refused.",
-                            )
-                            .monospace()
-                            .color(MUTED),
+                            RichText::new("[SAFE] SOURCE WRITES DISABLED")
+                                .monospace()
+                                .color(READY),
                         );
-                    }
-                });
-                ui.horizontal_wrapped(|ui| {
+                        if workspace_layout != WorkspaceLayout::Compact {
+                            ui.label(
+                                RichText::new(
+                                    "Sources are read-only; exports create new files; device paths are refused.",
+                                )
+                                .monospace()
+                                .color(MUTED),
+                            );
+                        }
+                    });
+                    ui.horizontal_wrapped(|ui| {
                         let progress = self.jobs.progress();
                         let cancel_requested = self.jobs.active().is_some_and(|job| {
                             job.cancel_requested.load(Ordering::Acquire)
@@ -1570,11 +1650,12 @@ impl StarConverterApp {
                                     .color(color),
                             );
                         }
+                    });
                 });
             });
     }
 
-    fn show_source_rail(&mut self, root: &mut egui::Ui) {
+    fn show_source_rail(&mut self, root: &mut egui::Ui, accessibility_parent: egui::Id) {
         egui::Panel::left("source_rail")
             .resizable(false)
             .exact_size(270.0)
@@ -1585,7 +1666,9 @@ impl StarConverterApp {
                     .inner_margin(Margin::same(16)),
             )
             .show(root, |ui| {
-                self.show_source_contents(ui, true);
+                accessibility_scope(ui, accessibility_parent, "source_rail_contents", |ui| {
+                    self.show_source_contents(ui, true);
+                });
             });
     }
 
@@ -1707,7 +1790,7 @@ impl StarConverterApp {
         );
     }
 
-    fn show_activity_rail(&mut self, root: &mut egui::Ui) {
+    fn show_activity_rail(&mut self, root: &mut egui::Ui, accessibility_parent: egui::Id) {
         egui::Panel::right("activity_rail")
             .resizable(true)
             .default_size(315.0)
@@ -1720,7 +1803,9 @@ impl StarConverterApp {
                     .inner_margin(Margin::same(16)),
             )
             .show(root, |ui| {
-                self.show_activity_contents(ui, false);
+                accessibility_scope(ui, accessibility_parent, "activity_rail_contents", |ui| {
+                    self.show_activity_contents(ui, false);
+                });
             });
     }
 
@@ -1793,7 +1878,12 @@ impl StarConverterApp {
         }
     }
 
-    fn show_workbench(&mut self, root: &mut egui::Ui, workspace_layout: WorkspaceLayout) {
+    fn show_workbench(
+        &mut self,
+        root: &mut egui::Ui,
+        workspace_layout: WorkspaceLayout,
+        semantics: WorkspaceSemantics,
+    ) {
         egui::CentralPanel::default()
             .frame(Frame::new().fill(VOID).inner_margin(Margin::same(20)))
             .show(root, |ui| {
@@ -1801,25 +1891,45 @@ impl StarConverterApp {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         if workspace_layout == WorkspaceLayout::Compact {
-                            Frame::new()
-                                .fill(SURFACE)
-                                .stroke(Stroke::new(1.0, LINE))
-                                .inner_margin(Margin::same(14))
-                                .show(ui, |ui| self.show_source_contents(ui, false));
+                            accessibility_scope(
+                                ui,
+                                semantics.source,
+                                "compact_source_contents",
+                                |ui| {
+                                    Frame::new()
+                                        .fill(SURFACE)
+                                        .stroke(Stroke::new(1.0, LINE))
+                                        .inner_margin(Margin::same(14))
+                                        .show(ui, |ui| self.show_source_contents(ui, false));
+                                },
+                            );
                             ui.add_space(24.0);
                         }
-                        self.show_direction(ui);
-                        self.show_modes(ui);
-                        self.show_preflight(ui);
-                        self.show_phases(ui);
-                        self.show_exact_preview(ui);
-                        self.show_export_verification(ui);
+                        accessibility_scope(ui, semantics.direction, "direction_contents", |ui| {
+                            self.show_direction(ui);
+                        });
+                        accessibility_scope(ui, semantics.guarantee, "guarantee_contents", |ui| {
+                            self.show_modes(ui);
+                        });
+                        accessibility_scope(ui, semantics.preflight, "preflight_contents", |ui| {
+                            self.show_preflight(ui);
+                            self.show_phases(ui);
+                            self.show_exact_preview(ui);
+                            self.show_export_verification(ui);
+                        });
                         if workspace_layout != WorkspaceLayout::Wide {
-                            Frame::new()
-                                .fill(SURFACE)
-                                .stroke(Stroke::new(1.0, LINE))
-                                .inner_margin(Margin::same(14))
-                                .show(ui, |ui| self.show_activity_contents(ui, true));
+                            accessibility_scope(
+                                ui,
+                                semantics.activity,
+                                "inline_activity_contents",
+                                |ui| {
+                                    Frame::new()
+                                        .fill(SURFACE)
+                                        .stroke(Stroke::new(1.0, LINE))
+                                        .inner_margin(Margin::same(14))
+                                        .show(ui, |ui| self.show_activity_contents(ui, true));
+                                },
+                            );
                             ui.add_space(24.0);
                         }
                     });
@@ -2466,12 +2576,16 @@ fn configure_style(context: &egui::Context) {
 }
 
 fn section_label(ui: &mut egui::Ui, text: &str) {
-    ui.label(
+    let response = ui.label(
         RichText::new(format!("[ {text} ]"))
             .monospace()
             .size(11.0)
             .color(MUTED),
     );
+    ui.ctx().accesskit_node_builder(response.id, |node| {
+        node.set_role(egui::accesskit::Role::Heading);
+        node.set_level(2);
+    });
 }
 
 fn status_label(ui: &mut egui::Ui, text: &str, color: Color32) {
@@ -3314,5 +3428,156 @@ mod tests {
                     .label()
                     .is_none_or(|label| !label.contains("STAR :: CONVERTER"))
         }));
+    }
+
+    #[test]
+    fn accesskit_section_labels_are_level_two_headings() {
+        let context = egui::Context::default();
+        context.enable_accesskit();
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| {
+            section_label(ui, "PREFLIGHT REPORT");
+        });
+        output.textures_delta.clear();
+        let update = output
+            .platform_output
+            .accesskit_update
+            .expect("AccessKit tree should be emitted when enabled");
+        let (heading_id, heading) = update
+            .nodes
+            .iter()
+            .find(|(_, node)| node.role() == egui::accesskit::Role::Heading)
+            .expect("section heading must be present");
+        assert_eq!(heading.role(), egui::accesskit::Role::Heading);
+        assert_eq!(heading.level(), Some(2));
+        assert!(accesskit_subtree_contains_value(
+            &update.nodes,
+            *heading_id,
+            "[ PREFLIGHT REPORT ]"
+        ));
+    }
+
+    #[test]
+    fn accesskit_task_order_is_stable_across_responsive_panel_orders() {
+        const EXPECTED_GROUPS: [&str; 6] = [
+            "Source",
+            "Direction",
+            "Guarantee",
+            "Preflight",
+            "Action",
+            "Activity",
+        ];
+
+        for (width, expected_layout) in [
+            (1_200.0, WorkspaceLayout::Wide),
+            (900.0, WorkspaceLayout::Medium),
+            (380.0, WorkspaceLayout::Compact),
+        ] {
+            let context = egui::Context::default();
+            context.enable_accesskit();
+            let raw_input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(width, 900.0),
+                )),
+                ..Default::default()
+            };
+            let mut output = context.run_ui(raw_input, |ui| {
+                let layout = WorkspaceLayout::for_width(ui.available_width());
+                assert_eq!(layout, expected_layout);
+                let semantics = WorkspaceSemantics::install(ui);
+
+                // Match production docking order: the persistent action footer is built before
+                // the visually docked rails and workbench. Re-parenting must keep this paint
+                // order from becoming assistive-technology traversal order.
+                accessibility_scope(ui, semantics.action, "test_action", |ui| {
+                    ui.label("marker-action");
+                });
+                match layout {
+                    WorkspaceLayout::Wide => {
+                        accessibility_scope(ui, semantics.source, "test_source", |ui| {
+                            ui.label("marker-source");
+                        });
+                        accessibility_scope(ui, semantics.activity, "test_activity", |ui| {
+                            ui.label("marker-activity");
+                        });
+                    }
+                    WorkspaceLayout::Medium => {
+                        accessibility_scope(ui, semantics.source, "test_source", |ui| {
+                            ui.label("marker-source");
+                        });
+                    }
+                    WorkspaceLayout::Compact => {
+                        accessibility_scope(ui, semantics.source, "test_source", |ui| {
+                            ui.label("marker-source");
+                        });
+                    }
+                }
+                accessibility_scope(ui, semantics.direction, "test_direction", |ui| {
+                    ui.label("marker-direction");
+                });
+                accessibility_scope(ui, semantics.guarantee, "test_guarantee", |ui| {
+                    ui.label("marker-guarantee");
+                });
+                accessibility_scope(ui, semantics.preflight, "test_preflight", |ui| {
+                    ui.label("marker-preflight");
+                });
+                if layout != WorkspaceLayout::Wide {
+                    accessibility_scope(ui, semantics.activity, "test_activity", |ui| {
+                        ui.label("marker-activity");
+                    });
+                }
+            });
+            output.textures_delta.clear();
+            let update = output
+                .platform_output
+                .accesskit_update
+                .expect("AccessKit tree should be emitted when enabled");
+            let (_, semantic_root) = update
+                .nodes
+                .iter()
+                .find(|(_, node)| node.label() == Some("Conversion workspace"))
+                .expect("semantic workspace root must be present");
+            let ordered_labels = semantic_root
+                .children()
+                .iter()
+                .map(|child_id| {
+                    update
+                        .nodes
+                        .iter()
+                        .find(|(node_id, _)| node_id == child_id)
+                        .and_then(|(_, node)| node.label())
+                        .expect("each semantic workspace child must be a labelled group")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(ordered_labels, EXPECTED_GROUPS);
+
+            for group in EXPECTED_GROUPS {
+                let (group_id, _) = update
+                    .nodes
+                    .iter()
+                    .find(|(_, node)| node.label() == Some(group))
+                    .expect("semantic group must be present");
+                let marker = format!("marker-{}", group.to_ascii_lowercase());
+                assert!(
+                    accesskit_subtree_contains_value(&update.nodes, *group_id, &marker),
+                    "{group} group did not own its visual content at {width} points"
+                );
+            }
+        }
+    }
+
+    fn accesskit_subtree_contains_value(
+        nodes: &[(egui::accesskit::NodeId, egui::accesskit::Node)],
+        root: egui::accesskit::NodeId,
+        expected: &str,
+    ) -> bool {
+        let Some((_, node)) = nodes.iter().find(|(node_id, _)| *node_id == root) else {
+            return false;
+        };
+        node.value() == Some(expected)
+            || node
+                .children()
+                .iter()
+                .any(|child| accesskit_subtree_contains_value(nodes, *child, expected))
     }
 }

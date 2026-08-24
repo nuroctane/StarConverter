@@ -29,6 +29,7 @@ use crate::fs::ntfs_bitmap::{
 };
 use crate::fs::ntfs_discovery::{
     NtfsDiscoveryError, NtfsDiscoveryLimits, NtfsSystemDiscovery, discover_system_records,
+    read_mft_record_for_inventory,
 };
 use crate::fs::ntfs_inventory::{
     NtfsExtentPlacement, NtfsInventory, NtfsInventoryError, NtfsInventoryLimits, NtfsStreamStorage,
@@ -43,8 +44,8 @@ use crate::fs::ntfs_secure::{
     NtfsSecureError, NtfsSecureLimits, NtfsSecureProfile, generate_ntfs_secure_metadata,
 };
 use crate::fs::ntfs_volume::{
-    NtfsBitmapEvidence, NtfsMetadataIncompleteReason, NtfsVolumeDiscovery, NtfsVolumeError,
-    NtfsVolumeEvidence, NtfsVolumeLimits, discover_volume_and_bitmap,
+    NtfsBitmapEvidence, NtfsMetadataIncompleteReason, NtfsMftBitmapEvidence, NtfsVolumeDiscovery,
+    NtfsVolumeError, NtfsVolumeEvidence, NtfsVolumeLimits, discover_volume_and_bitmap,
 };
 use crate::image::{ImageError, ImageFile};
 use crate::object::ObjectGraphLimits;
@@ -91,6 +92,7 @@ struct InspectionEvidence {
     ntfs_volume: Option<Box<NtfsVolumeDiscovery>>,
     ntfs_inventory: Option<Box<NtfsInventory>>,
     ntfs_allocation_reconciliation: Option<NtfsAllocationReconciliationStatus>,
+    ntfs_mft_record_reconciliation: Option<NtfsMftRecordReconciliationStatus>,
     normalized_ntfs: Option<Box<NormalizedNtfs>>,
 }
 
@@ -114,6 +116,83 @@ impl NtfsAllocationReconciliationStatus {
     }
 }
 
+/// Exact `$MFT::$BITMAP` versus `FILE`-header reconciliation counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NtfsMftRecordReconciliation {
+    pub compared_records: u64,
+    pub in_use_records: u64,
+    pub free_records: u64,
+}
+
+/// Whether the bounded record census proves every initialized MFT record's allocation state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NtfsMftRecordReconciliationStatus {
+    Complete(NtfsMftRecordReconciliation),
+    IncompleteInventory(NtfsMftRecordReconciliation),
+    IncompleteBitmap {
+        reason: NtfsMetadataIncompleteReason,
+    },
+}
+
+impl NtfsMftRecordReconciliationStatus {
+    #[must_use]
+    pub const fn is_complete(self) -> bool {
+        matches!(self, Self::Complete(_))
+    }
+}
+
+/// A contradiction between `$MFT::$BITMAP`, initialized `$MFT` length, and `FILE` flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NtfsMftRecordReconciliationError {
+    BitmapTooShort {
+        initialized_records: u64,
+        available_bits: u64,
+    },
+    RecordStateMismatch {
+        record_number: u64,
+        bitmap_in_use: bool,
+        file_record_in_use: bool,
+    },
+    AllocatedRecordBeyondInitialized {
+        record_number: u64,
+    },
+    GeometryOverflow {
+        calculation: &'static str,
+    },
+}
+
+impl fmt::Display for NtfsMftRecordReconciliationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BitmapTooShort {
+                initialized_records,
+                available_bits,
+            } => write!(
+                formatter,
+                "$MFT::$BITMAP exposes {available_bits} bits for {initialized_records} initialized records"
+            ),
+            Self::RecordStateMismatch {
+                record_number,
+                bitmap_in_use,
+                file_record_in_use,
+            } => write!(
+                formatter,
+                "$MFT record {record_number} allocation mismatch: bitmap={bitmap_in_use}, FILE.in_use={file_record_in_use}"
+            ),
+            Self::AllocatedRecordBeyondInitialized { record_number } => write!(
+                formatter,
+                "$MFT::$BITMAP marks record {record_number} allocated beyond initialized $MFT data"
+            ),
+            Self::GeometryOverflow { calculation } => write!(
+                formatter,
+                "$MFT record reconciliation overflow while calculating {calculation}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for NtfsMftRecordReconciliationError {}
+
 /// Evidence produced by opening and parsing one regular image file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageInspection {
@@ -127,6 +206,7 @@ pub struct ImageInspection {
     pub ntfs_volume: Option<Box<NtfsVolumeDiscovery>>,
     pub ntfs_inventory: Option<Box<NtfsInventory>>,
     pub ntfs_allocation_reconciliation: Option<NtfsAllocationReconciliationStatus>,
+    pub ntfs_mft_record_reconciliation: Option<NtfsMftRecordReconciliationStatus>,
     pub normalized_ntfs: Option<Box<NormalizedNtfs>>,
     pub image_bytes: u64,
     pub declared_volume_bytes: u64,
@@ -149,6 +229,7 @@ pub enum InspectionError {
     InvalidNtfsVolume(NtfsVolumeError),
     InvalidNtfsInventory(NtfsInventoryError),
     InvalidNtfsAllocationReconciliation(NtfsBitmapError),
+    InvalidNtfsMftRecordReconciliation(NtfsMftRecordReconciliationError),
     InvalidNtfsNormalization(NtfsNormalizeError),
     InvalidNtfsSecurityProfile(NtfsSecureError),
     GeometryOverflow { calculation: &'static str },
@@ -197,6 +278,10 @@ impl fmt::Display for InspectionError {
                 formatter,
                 "invalid NTFS allocation ownership reconciliation: {error}"
             ),
+            Self::InvalidNtfsMftRecordReconciliation(error) => write!(
+                formatter,
+                "invalid NTFS MFT-record allocation reconciliation: {error}"
+            ),
             Self::InvalidNtfsNormalization(error) => {
                 write!(formatter, "invalid normalized NTFS object graph: {error}")
             }
@@ -229,6 +314,7 @@ impl std::error::Error for InspectionError {
             Self::InvalidNtfsVolume(error) => Some(error),
             Self::InvalidNtfsInventory(error) => Some(error),
             Self::InvalidNtfsAllocationReconciliation(error) => Some(error),
+            Self::InvalidNtfsMftRecordReconciliation(error) => Some(error),
             Self::InvalidNtfsNormalization(error) => Some(error),
             Self::InvalidNtfsSecurityProfile(error) => Some(error),
             _ => None,
@@ -381,6 +467,7 @@ fn inspect_exfat(image: &ImageFile, prefix: &[u8]) -> Result<ImageInspection, In
             ntfs_volume: None,
             ntfs_inventory: None,
             ntfs_allocation_reconciliation: None,
+            ntfs_mft_record_reconciliation: None,
             normalized_ntfs: None,
         },
     )
@@ -414,7 +501,12 @@ fn inspect_ntfs(image: &ImageFile, prefix: &[u8]) -> Result<ImageInspection, Ins
     let inventory = inventory_ntfs(image, &boot, &discovery.mft, NtfsInventoryLimits::default())
         .map_err(InspectionError::InvalidNtfsInventory)?;
     let allocation_reconciliation = reconcile_ntfs_allocation(&boot, &volume, &inventory)?;
-    let normalized = if inventory.is_complete() && allocation_reconciliation.is_complete() {
+    let mft_record_reconciliation =
+        reconcile_ntfs_mft_records(image, &boot, &discovery, &volume, &inventory)?;
+    let normalized = if inventory.is_complete()
+        && allocation_reconciliation.is_complete()
+        && mft_record_reconciliation.is_complete()
+    {
         let mut normalized = normalize_ntfs(
             &inventory,
             image.len(),
@@ -455,6 +547,7 @@ fn inspect_ntfs(image: &ImageFile, prefix: &[u8]) -> Result<ImageInspection, Ins
             ntfs_volume: Some(Box::new(volume)),
             ntfs_inventory: Some(Box::new(inventory)),
             ntfs_allocation_reconciliation: Some(allocation_reconciliation),
+            ntfs_mft_record_reconciliation: Some(mft_record_reconciliation),
             normalized_ntfs: normalized,
         },
     )
@@ -507,6 +600,121 @@ fn reconcile_ntfs_allocation(
             NtfsAllocationReconciliationStatus::IncompleteInventory(report)
         }
     })
+}
+
+fn reconcile_ntfs_mft_records(
+    image: &ImageFile,
+    boot: &NtfsBootSector,
+    discovery: &NtfsSystemDiscovery,
+    volume: &NtfsVolumeDiscovery,
+    inventory: &NtfsInventory,
+) -> Result<NtfsMftRecordReconciliationStatus, InspectionError> {
+    let mft_bitmap = match &volume.mft_bitmap {
+        NtfsMftBitmapEvidence::Complete(bitmap) => &bitmap.canonical_bitmap,
+        NtfsMftBitmapEvidence::Incomplete { reason } => {
+            return Ok(NtfsMftRecordReconciliationStatus::IncompleteBitmap { reason: *reason });
+        }
+    };
+    let available_bits = u64::try_from(mft_bitmap.len())
+        .ok()
+        .and_then(|bytes| bytes.checked_mul(8))
+        .ok_or(InspectionError::InvalidNtfsMftRecordReconciliation(
+            NtfsMftRecordReconciliationError::GeometryOverflow {
+                calculation: "$MFT::$BITMAP bit count",
+            },
+        ))?;
+    if available_bits < inventory.initialized_records {
+        return Err(InspectionError::InvalidNtfsMftRecordReconciliation(
+            NtfsMftRecordReconciliationError::BitmapTooShort {
+                initialized_records: inventory.initialized_records,
+                available_bits,
+            },
+        ));
+    }
+
+    let mut in_use_records = 0_u64;
+    for record_number in 0..inventory.scanned_records {
+        let record = read_mft_record_for_inventory(
+            image,
+            boot,
+            &discovery.mft,
+            record_number,
+            boot.mft_record_size.bytes,
+        )
+        .map_err(InspectionError::InvalidNtfsDiscovery)?;
+        let bitmap_in_use = mft_bitmap_bit(mft_bitmap, record_number);
+        let file_record_in_use = record.flags.is_in_use();
+        if bitmap_in_use != file_record_in_use {
+            return Err(InspectionError::InvalidNtfsMftRecordReconciliation(
+                NtfsMftRecordReconciliationError::RecordStateMismatch {
+                    record_number,
+                    bitmap_in_use,
+                    file_record_in_use,
+                },
+            ));
+        }
+        in_use_records = in_use_records
+            .checked_add(u64::from(file_record_in_use))
+            .ok_or(InspectionError::InvalidNtfsMftRecordReconciliation(
+                NtfsMftRecordReconciliationError::GeometryOverflow {
+                    calculation: "in-use MFT record count",
+                },
+            ))?;
+    }
+    if let Some(record_number) = first_set_mft_bitmap_bit(mft_bitmap, inventory.initialized_records)
+    {
+        return Err(InspectionError::InvalidNtfsMftRecordReconciliation(
+            NtfsMftRecordReconciliationError::AllocatedRecordBeyondInitialized { record_number },
+        ));
+    }
+    let report = NtfsMftRecordReconciliation {
+        compared_records: inventory.scanned_records,
+        in_use_records,
+        free_records: inventory
+            .scanned_records
+            .checked_sub(in_use_records)
+            .ok_or(InspectionError::InvalidNtfsMftRecordReconciliation(
+                NtfsMftRecordReconciliationError::GeometryOverflow {
+                    calculation: "free MFT record count",
+                },
+            ))?,
+    };
+    Ok(if inventory.is_complete() {
+        NtfsMftRecordReconciliationStatus::Complete(report)
+    } else {
+        NtfsMftRecordReconciliationStatus::IncompleteInventory(report)
+    })
+}
+
+fn mft_bitmap_bit(bitmap: &[u8], record_number: u64) -> bool {
+    let byte = usize::try_from(record_number / 8).expect("validated bitmap index fits usize");
+    bitmap[byte] & (1 << (record_number % 8)) != 0
+}
+
+fn first_set_mft_bitmap_bit(bitmap: &[u8], start: u64) -> Option<u64> {
+    let mut byte_index = usize::try_from(start / 8).ok()?;
+    if byte_index >= bitmap.len() {
+        return None;
+    }
+    let first_bit = u8::try_from(start % 8).ok()?;
+    let first = bitmap[byte_index] & (u8::MAX << first_bit);
+    if first != 0 {
+        return u64::try_from(byte_index)
+            .ok()?
+            .checked_mul(8)?
+            .checked_add(u64::from(first.trailing_zeros()));
+    }
+    byte_index = byte_index.checked_add(1)?;
+    for (offset, byte) in bitmap[byte_index..].iter().copied().enumerate() {
+        if byte != 0 {
+            let index = byte_index.checked_add(offset)?;
+            return u64::try_from(index)
+                .ok()?
+                .checked_mul(8)?
+                .checked_add(u64::from(byte.trailing_zeros()));
+        }
+    }
+    None
 }
 
 fn inspect_ntfs_security_descriptors(
@@ -667,6 +875,7 @@ fn finish_inspection(
         ntfs_volume: evidence.ntfs_volume,
         ntfs_inventory: evidence.ntfs_inventory,
         ntfs_allocation_reconciliation: evidence.ntfs_allocation_reconciliation,
+        ntfs_mft_record_reconciliation: evidence.ntfs_mft_record_reconciliation,
         normalized_ntfs: evidence.normalized_ntfs,
         image_bytes: image.len(),
         declared_volume_bytes,
@@ -876,8 +1085,15 @@ mod tests {
             put_i64(&mut record, attribute + 48, 8192);
             put_i64(&mut record, attribute + 56, 8192);
             record[attribute + 64..attribute + 68].copy_from_slice(&[0x11, 2, 4, 0]);
-            put_u32(&mut record, attribute + 72, u32::MAX);
-            136
+            let bitmap = attribute + 72;
+            put_u32(&mut record, bitmap, 0xb0);
+            put_u32(&mut record, bitmap + 4, 32);
+            put_u16(&mut record, bitmap + 14, 1);
+            put_u32(&mut record, bitmap + 16, 1);
+            put_u16(&mut record, bitmap + 20, 24);
+            record[bitmap + 24] = 0b0110_1011;
+            put_u32(&mut record, bitmap + 32, u32::MAX);
+            168
         } else if record_number == 3 {
             let attribute = 56;
             put_u32(&mut record, attribute, 0x70);
@@ -1006,7 +1222,82 @@ mod tests {
         let inventory = inspection.ntfs_inventory.as_ref().expect("NTFS inventory");
         assert_eq!(inventory.scanned_records, 8);
         assert!(inventory.is_complete());
+        assert_eq!(
+            inspection.ntfs_mft_record_reconciliation,
+            Some(NtfsMftRecordReconciliationStatus::Complete(
+                NtfsMftRecordReconciliation {
+                    compared_records: 8,
+                    in_use_records: 5,
+                    free_records: 3,
+                }
+            ))
+        );
         assert!(inspection.normalized_ntfs.is_some());
+    }
+
+    #[test]
+    fn rejects_mft_bitmap_bit_that_contradicts_file_in_use_flag() {
+        let mut bytes = ntfs_image();
+        let mft_bitmap_value = 4 * 4096 + 56 + 72 + 24;
+        bytes[mft_bitmap_value] |= 1 << 2;
+        let temp = TempImage::write(&bytes);
+
+        assert!(matches!(
+            inspect_image(&temp.0),
+            Err(InspectionError::InvalidNtfsMftRecordReconciliation(
+                NtfsMftRecordReconciliationError::RecordStateMismatch {
+                    record_number: 2,
+                    bitmap_in_use: true,
+                    file_record_in_use: false,
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn rejects_mft_bitmap_allocation_beyond_initialized_data() {
+        let mut bytes = ntfs_image();
+        let mft_bitmap = 4 * 4096 + 56 + 72;
+        put_u32(&mut bytes, mft_bitmap + 16, 2);
+        bytes[mft_bitmap + 25] = 1;
+        let temp = TempImage::write(&bytes);
+
+        assert!(matches!(
+            inspect_image(&temp.0),
+            Err(InspectionError::InvalidNtfsMftRecordReconciliation(
+                NtfsMftRecordReconciliationError::AllocatedRecordBeyondInitialized {
+                    record_number: 8,
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn bounded_mft_record_census_is_explicitly_incomplete() {
+        let mut bytes = ntfs_image();
+        let mft_data = 4 * 4096 + 56;
+        put_i64(&mut bytes, mft_data + 40, 16_384);
+        put_i64(&mut bytes, mft_data + 48, 16_384);
+        put_i64(&mut bytes, mft_data + 56, 16_384);
+        let mft_bitmap = mft_data + 72;
+        put_u32(&mut bytes, mft_bitmap + 16, 2);
+        bytes[mft_bitmap + 25] = 0;
+        let temp = TempImage::write(&bytes);
+
+        let inspection = inspect_image(&temp.0).expect("retain bounded incomplete record census");
+
+        assert!(!inspection.profile.inventory_complete);
+        assert!(inspection.normalized_ntfs.is_none());
+        assert_eq!(
+            inspection.ntfs_mft_record_reconciliation,
+            Some(NtfsMftRecordReconciliationStatus::IncompleteInventory(
+                NtfsMftRecordReconciliation {
+                    compared_records: 8,
+                    in_use_records: 5,
+                    free_records: 3,
+                }
+            ))
+        );
     }
 
     #[test]

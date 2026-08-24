@@ -71,6 +71,9 @@ pub struct CapsuleStore {
     generation_count: usize,
     limits: CapsuleLimits,
     lock_strength: CapsuleLockStrength,
+    /// Set as soon as an append crosses its first possibly mutating I/O boundary and cleared only
+    /// after the complete generation is read back, flushed, and adopted in memory.
+    poisoned: bool,
 }
 
 impl CapsuleStore {
@@ -124,6 +127,7 @@ impl CapsuleStore {
             generation_count: 0,
             limits,
             lock_strength: platform_lock_strength(),
+            poisoned: false,
         };
         let mut evidence = store.persist_suffix(
             encoded_capsule,
@@ -238,6 +242,7 @@ impl CapsuleStore {
             generation_count,
             limits,
             lock_strength: platform_lock_strength(),
+            poisoned: false,
         };
         store.ensure_unchanged()?;
         let retained_bytes =
@@ -271,6 +276,9 @@ impl CapsuleStore {
         &mut self,
         updated_capsule: &[u8],
     ) -> Result<CapsuleSyncEvidence, CapsuleStoreError> {
+        if self.poisoned {
+            return Err(CapsuleStoreError::Poisoned);
+        }
         if updated_capsule.len() <= self.bytes.len()
             || !updated_capsule.starts_with(self.bytes.as_slice())
         {
@@ -317,6 +325,59 @@ impl CapsuleStore {
         self.lock_strength
     }
 
+    /// Whether a prior append may have changed bytes without returning durable completion proof.
+    #[must_use]
+    #[allow(dead_code)]
+    pub(crate) const fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    /// Conservatively prevents further appends after a coupled operation becomes ambiguous.
+    #[allow(dead_code)]
+    pub(crate) const fn poison(&mut self) {
+        self.poisoned = true;
+    }
+
+    /// Restores the exact last in-memory, fully verified prefix after an ambiguous append.
+    ///
+    /// This is intentionally crate-private: only the regular-image coordinator may combine this
+    /// destructive capsule repair with conservative image rollback. The locked file identity is
+    /// checked before truncation and the retained prefix is reread and strictly scanned before the
+    /// poison is cleared.
+    #[allow(dead_code)]
+    pub(crate) fn restore_verified_prefix(&mut self) -> Result<(), CapsuleStoreError> {
+        if !self.poisoned {
+            return Ok(());
+        }
+        self.ensure_identity_with_minimum_length()?;
+        let retained =
+            u64::try_from(self.bytes.len()).map_err(|_| CapsuleStoreError::ArithmeticOverflow)?;
+        self.file
+            .set_len(retained)
+            .map_err(|source| CapsuleStoreError::io("discard ambiguous capsule suffix", source))?;
+        self.file
+            .sync_data()
+            .map_err(|source| CapsuleStoreError::io("flush restored capsule prefix", source))?;
+        let mut actual = vec![0_u8; self.bytes.len()];
+        read_exact_at(&self.file, 0, &mut actual)
+            .map_err(|source| CapsuleStoreError::io("verify restored capsule prefix", source))?;
+        if actual != self.bytes {
+            return Err(CapsuleStoreError::VerificationMismatch);
+        }
+        let view = scan_capsule(&actual, self.limits).map_err(CapsuleStoreError::Capsule)?;
+        if view.validated_bytes() != actual.len()
+            || view.generations().len() != self.generation_count
+        {
+            return Err(CapsuleStoreError::VerificationMismatch);
+        }
+        self.file.sync_all().map_err(|source| {
+            CapsuleStoreError::io("flush restored capsule data and metadata", source)
+        })?;
+        self.ensure_unchanged()?;
+        self.poisoned = false;
+        Ok(())
+    }
+
     fn persist_suffix(
         &mut self,
         suffix: &[u8],
@@ -350,24 +411,30 @@ impl CapsuleStore {
             u64::try_from(total).map_err(|_| CapsuleStoreError::ArithmeticOverflow)?;
 
         let offset = previous_bytes;
-        write_all_at(&self.file, offset, suffix)
-            .map_err(|source| CapsuleStoreError::io("append capsule bytes", source))?;
-        self.file
-            .sync_data()
-            .map_err(|source| CapsuleStoreError::io("flush capsule data", source))?;
+        self.poisoned = true;
+        let persisted = (|| {
+            write_all_at(&self.file, offset, suffix)
+                .map_err(|source| CapsuleStoreError::io("append capsule bytes", source))?;
+            self.file
+                .sync_data()
+                .map_err(|source| CapsuleStoreError::io("flush capsule data", source))?;
 
-        read_exact_at(&self.file, offset, &mut actual)
-            .map_err(|source| CapsuleStoreError::io("verify appended capsule bytes", source))?;
-        if actual != suffix {
-            return Err(CapsuleStoreError::VerificationMismatch);
-        }
-        self.file
-            .sync_all()
-            .map_err(|source| CapsuleStoreError::io("flush capsule data and metadata", source))?;
+            read_exact_at(&self.file, offset, &mut actual)
+                .map_err(|source| CapsuleStoreError::io("verify appended capsule bytes", source))?;
+            if actual != suffix {
+                return Err(CapsuleStoreError::VerificationMismatch);
+            }
+            self.file.sync_all().map_err(|source| {
+                CapsuleStoreError::io("flush capsule data and metadata", source)
+            })?;
+            Ok(())
+        })();
+        persisted?;
 
         self.bytes.extend_from_slice(suffix);
         self.generation_count = generation_count;
         self.ensure_unchanged()?;
+        self.poisoned = false;
         Ok(CapsuleSyncEvidence {
             previous_bytes,
             bytes_appended,
@@ -397,6 +464,26 @@ impl CapsuleStore {
         let path = fs::metadata(&canonical_now)
             .map_err(|source| CapsuleStoreError::io("reinspect capsule path", source))?;
         validate_same_file(self.identity, &path, expected_length)
+    }
+
+    #[allow(dead_code)]
+    fn ensure_identity_with_minimum_length(&self) -> Result<(), CapsuleStoreError> {
+        let minimum =
+            u64::try_from(self.bytes.len()).map_err(|_| CapsuleStoreError::ArithmeticOverflow)?;
+        let handle = self
+            .file
+            .metadata()
+            .map_err(|source| CapsuleStoreError::io("reinspect capsule handle", source))?;
+        validate_same_file_minimum(self.identity, &handle, minimum)?;
+        let canonical_now = fs::canonicalize(&self.canonical_path)
+            .map_err(|source| CapsuleStoreError::io("recanonicalize capsule path", source))?;
+        reject_device_like_path(&canonical_now).map_err(CapsuleStoreError::ImagePath)?;
+        if canonical_now != self.canonical_path {
+            return Err(CapsuleStoreError::IdentityChanged);
+        }
+        let path = fs::metadata(&canonical_now)
+            .map_err(|source| CapsuleStoreError::io("reinspect capsule path", source))?;
+        validate_same_file_minimum(self.identity, &path, minimum)
     }
 }
 
@@ -460,6 +547,8 @@ pub enum CapsuleStoreError {
         path: PathBuf,
     },
     NotAppendOnly,
+    /// A prior append crossed a mutating I/O boundary without complete durability evidence.
+    Poisoned,
     IdentityChanged,
     UnexpectedLength {
         expected: u64,
@@ -507,6 +596,9 @@ impl fmt::Display for CapsuleStoreError {
             }
             Self::NotAppendOnly => formatter.write_str(
                 "updated capsule must preserve every existing byte and append non-empty bytes",
+            ),
+            Self::Poisoned => formatter.write_str(
+                "capsule store is poisoned after an ambiguous append and must be conservatively recovered",
             ),
             Self::IdentityChanged => {
                 formatter.write_str("capsule file identity or path changed while locked")
@@ -654,6 +746,24 @@ fn validate_same_file(
     if metadata.len() != expected_length {
         return Err(CapsuleStoreError::UnexpectedLength {
             expected: expected_length,
+            actual: metadata.len(),
+        });
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn validate_same_file_minimum(
+    expected: PlatformIdentity,
+    metadata: &Metadata,
+    minimum_length: u64,
+) -> Result<(), CapsuleStoreError> {
+    if !metadata.is_file() || platform_identity(metadata) != expected {
+        return Err(CapsuleStoreError::IdentityChanged);
+    }
+    if metadata.len() < minimum_length {
+        return Err(CapsuleStoreError::UnexpectedLength {
+            expected: minimum_length,
             actual: metadata.len(),
         });
     }
@@ -1056,6 +1166,42 @@ mod tests {
         assert_eq!(store.bytes(), initial);
         drop(store);
         assert_eq!(fs::read(capsule).unwrap(), initial);
+    }
+
+    #[test]
+    fn poisoned_store_refuses_append_until_exact_verified_prefix_is_restored() {
+        let initial = initial_capsule();
+        let complete = appended_capsule(2);
+        let suffix = &complete[initial.len()..];
+        // Exercise every possible nonempty torn suffix and the complete-but-unadopted generation.
+        for cut in 1..=suffix.len() {
+            let dir = TempDir::new();
+            let image = image(&dir);
+            let capsule = dir.join("poisoned.starcap");
+            let (mut store, _) =
+                CapsuleStore::create_new(&capsule, &image, &initial, limits()).unwrap();
+            write_all_at(
+                &store.file,
+                u64::try_from(initial.len()).unwrap(),
+                &suffix[..cut],
+            )
+            .unwrap();
+            store.file.sync_data().unwrap();
+            store.poison();
+            assert!(matches!(
+                store.append(&complete),
+                Err(CapsuleStoreError::Poisoned)
+            ));
+
+            store.restore_verified_prefix().unwrap();
+            assert!(!store.is_poisoned());
+            assert_eq!(store.file.metadata().unwrap().len(), initial.len() as u64);
+            let mut actual = vec![0_u8; initial.len()];
+            read_exact_at(&store.file, 0, &mut actual).unwrap();
+            assert_eq!(actual, initial);
+            let evidence = store.append(&complete).unwrap();
+            assert!(evidence.sync_data_completed && evidence.sync_all_completed);
+        }
     }
 
     #[test]

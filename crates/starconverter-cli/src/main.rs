@@ -1360,8 +1360,15 @@ mod tests {
             put_i64(&mut record, attribute + 48, 8192);
             put_i64(&mut record, attribute + 56, 8192);
             record[attribute + 64..attribute + 68].copy_from_slice(&[0x11, 2, 4, 0]);
-            put_u32(&mut record, attribute + 72, u32::MAX);
-            136
+            let bitmap = attribute + 72;
+            put_u32(&mut record, bitmap, 0xb0);
+            put_u32(&mut record, bitmap + 4, 32);
+            put_u16(&mut record, bitmap + 14, 1);
+            put_u32(&mut record, bitmap + 16, 1);
+            put_u16(&mut record, bitmap + 20, 24);
+            record[bitmap + 24] = 0b0110_1011;
+            put_u32(&mut record, bitmap + 32, u32::MAX);
+            bitmap + 40
         } else if record_number == 3 {
             let attribute = 56;
             put_u32(&mut record, attribute, 0x70);

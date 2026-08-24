@@ -92,6 +92,14 @@ completed phase. The coordinator's mutating checkpoint APIs accept only that opa
 callers cannot construct generic completion records. Rollback acknowledgement has the same binding,
 including the authorized before-image digest whenever source-visible bytes were restored.
 
+Raw executor mutation methods are private. The crate-private preactivation coordinator opens the
+image executor before the capsule store and owns both locks. It mints one-use leases bound to the
+current durable capsule generation and phase, refuses nonempty relocation before any image intent,
+requires executor read-back plus both flush barriers before appending the corresponding capsule
+generation, and stops at `TargetStaged`. It has no CLI/GUI entry point and cannot write backup boot
+or activation bytes. An ambiguous executor/capsule operation poisons the coupled coordinator; exact
+before-image rollback and verified-prefix repair are idempotent under the retained locks.
+
 The durable capsule store has a separate, explicit recovering-resume operation. Under its exclusive
 lock, it may shorten only bytes after a nonempty prefix that the redundant capsule parser proves is
 an incomplete newest generation. It then flushes, rereads, and strict-scans the retained prefix

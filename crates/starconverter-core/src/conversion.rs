@@ -2,11 +2,10 @@
 //!
 //! This module deliberately has no path, device, or mutation API. It validates preflight evidence,
 //! composes normalized object, allocation, relocation, capsule, and overlay proofs, and emits
-//! explicit intents for a future privileged executor. Filesystem serializers remain external:
-//! callers must supply complete opaque, sector-aligned write sets and later provide independent
-//! the filesystem-specific phase adapters must authorize complete, sector-aligned write sets before
-//! this coordinator will accept them. Callers later provide independent completion and verification
-//! evidence.
+//! explicit intents for the internal regular-image executor. Filesystem serializers remain
+//! external: filesystem-specific phase adapters must authorize complete, sector-aligned write sets
+//! before this coordinator accepts them. Independent completion and verification evidence remains
+//! mandatory at the corresponding transaction boundaries.
 
 use std::fmt;
 
@@ -27,6 +26,11 @@ use crate::overlay::{OverlayError, OverlayLimits, OverlayPlan, OverlayWrite};
 use crate::phase::ActivationAuthorizedWrites;
 use crate::recovery::{RecoveryBundle, RecoveryError, RecoveryLimits, encode_recovery_bundle};
 use crate::{AccessState, FileSystem, HealthState, SemanticFeature};
+
+// Foundation remains intentionally unreachable until a locked inspector can construct honest
+// observation evidence.
+#[allow(dead_code)]
+pub(crate) mod regular_image;
 
 const CHECKPOINT_MAGIC: &[u8; 8] = b"SCORCH1\0";
 
@@ -625,6 +629,28 @@ impl PreparedConversion {
             self.capsule_limits,
         )?;
         Ok(())
+    }
+
+    /// Records the pure reservation checkpoint for the locked regular-image coordinator.
+    #[allow(dead_code)]
+    pub(crate) fn record_reservation(
+        &self,
+        capsule: &mut Vec<u8>,
+        observed: ObservedImage,
+    ) -> Result<(), ConversionError> {
+        self.record_phase(
+            capsule,
+            observed,
+            TransactionPhase::Reserved,
+            PhaseCompletion {
+                image: self.preflight.image,
+                plan_digest: self.plan_digest,
+                health: self.preflight.health,
+                access: self.preflight.access,
+            },
+            None,
+            None,
+        )
     }
 
     /// Advances one mutating phase only from opaque executor evidence bound to this exact plan and
@@ -1928,7 +1954,7 @@ pub(crate) mod tests {
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use crate::executor::{ExecutorLimits, ImageExecutor};
+    use crate::executor::{ExecutionLease, ExecutorLimits, ImageExecutor};
     use crate::extent::{Extent, ExtentGraph, StreamId};
     use crate::object::{
         NamespaceEntry, ObjectGraphLimits, ObjectRecord, ObjectSemantics, ObjectStream, StreamFlags,
@@ -2156,7 +2182,18 @@ pub(crate) mod tests {
         let executor =
             ImageExecutor::open(&path, &image_identity, ExecutorLimits::default()).unwrap();
         let intent = plan.resume(&capsule, observed).unwrap().next;
-        let executed = executor.execute_intent(&plan, intent).unwrap();
+        let lease = ExecutionLease::new(
+            1,
+            TransactionPhase::Reserved,
+            plan.plan_digest(),
+            image_identity.stable_container_token(),
+        );
+        let leased = executor
+            .execute_leased_intent(&plan, lease, intent)
+            .unwrap();
+        let (executed, generation, phase) = leased.into_parts();
+        assert_eq!(generation, 1);
+        assert_eq!(phase, TransactionPhase::Reserved);
         assert_eq!(executed.completed_phase(), TransactionPhase::Relocating);
         plan.record_execution(&mut capsule, observed, executed, None)
             .unwrap();
@@ -2166,7 +2203,18 @@ pub(crate) mod tests {
         );
 
         let rollback_intent = plan.rollback_intent(TransactionPhase::Relocating).unwrap();
-        let rollback = executor.execute_rollback(&plan, rollback_intent).unwrap();
+        let lease = ExecutionLease::new(
+            2,
+            TransactionPhase::Relocating,
+            plan.plan_digest(),
+            image_identity.stable_container_token(),
+        );
+        let leased = executor
+            .execute_leased_rollback(&plan, lease, rollback_intent)
+            .unwrap();
+        let (rollback, generation, phase) = leased.into_parts();
+        assert_eq!(generation, 2);
+        assert_eq!(phase, TransactionPhase::Relocating);
         assert!(rollback.restored_source());
         plan.record_executed_rollback(&mut capsule, observed, rollback)
             .unwrap();

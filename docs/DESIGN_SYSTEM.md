@@ -170,7 +170,8 @@ the exact affected feature count.
 - [ ] Canvas, surfaces, text, and all statuses use semantic tokens.
 - [ ] Default, hover, focus-visible, active, disabled, loading, and error states are implemented.
 - [ ] Keyboard-only flow can select an image, choose a mode, analyze, save a plan, and inspect logs.
-- [ ] Focus is always visible and follows the documented order.
+- [ ] Focus is always visible during the complete installed keyboard-only flow.
+- [x] The generated accessibility tree follows the documented section order at every breakpoint.
 - [x] Status remains understandable without color.
 - [x] All hit targets are at least 44 x 44 px.
 - [ ] Empty, loading, blocker, insufficient-space, and recovery-available states are tested.

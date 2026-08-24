@@ -151,6 +151,90 @@ pub struct ExecutedIntent {
     completed_phase: TransactionPhase,
 }
 
+/// One-use authorization for exactly one durable capsule generation and phase.
+///
+/// Construction and use are crate-private so only the durable regular-image coordinator can bind
+/// executor work to the capsule lock it owns. The value is deliberately neither `Clone` nor
+/// `Copy`.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ExecutionLease {
+    capsule_generation: u64,
+    current_phase: TransactionPhase,
+    plan_digest: [u8; 32],
+    image_instance: [u8; 32],
+    one_use: LeaseSeal,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct LeaseSeal;
+
+#[allow(dead_code)]
+impl ExecutionLease {
+    pub(crate) const fn new(
+        capsule_generation: u64,
+        current_phase: TransactionPhase,
+        plan_digest: [u8; 32],
+        image_instance: [u8; 32],
+    ) -> Self {
+        Self {
+            capsule_generation,
+            current_phase,
+            plan_digest,
+            image_instance,
+            one_use: LeaseSeal,
+        }
+    }
+
+    const fn into_parts(self) -> (u64, TransactionPhase, [u8; 32], [u8; 32]) {
+        let Self {
+            capsule_generation,
+            current_phase,
+            plan_digest,
+            image_instance,
+            one_use: _,
+        } = self;
+        (
+            capsule_generation,
+            current_phase,
+            plan_digest,
+            image_instance,
+        )
+    }
+}
+
+/// Executor completion retaining the exact capsule checkpoint that authorized it.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct LeasedIntent {
+    executed: ExecutedIntent,
+    capsule_generation: u64,
+    current_phase: TransactionPhase,
+}
+
+#[allow(dead_code)]
+impl LeasedIntent {
+    pub(crate) const fn into_parts(self) -> (ExecutedIntent, u64, TransactionPhase) {
+        (self.executed, self.capsule_generation, self.current_phase)
+    }
+}
+
+/// Rollback completion retaining the exact durable checkpoint that authorized restoration.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct LeasedRollback {
+    executed: ExecutedRollback,
+    capsule_generation: u64,
+    current_phase: TransactionPhase,
+}
+
+#[allow(dead_code)]
+impl LeasedRollback {
+    pub(crate) const fn into_parts(self) -> (ExecutedRollback, u64, TransactionPhase) {
+        (self.executed, self.capsule_generation, self.current_phase)
+    }
+}
+
 impl ExecutedIntent {
     #[must_use]
     pub const fn evidence(&self) -> &ExecutionEvidence {
@@ -324,12 +408,41 @@ impl ImageExecutor {
     ///
     /// Refuses an intent not authorized by `prepared`, non-mutating intents, changed image
     /// identity/length, verification mismatches, arithmetic overflow, and I/O failures.
-    pub fn execute_intent(
+    fn execute_intent(
         &self,
         prepared: &PreparedConversion,
         intent: TransactionIntent<'_>,
     ) -> Result<ExecutedIntent, ExecutorError> {
         self.execute_intent_with_faults(prepared, intent, &mut NoFault)
+    }
+
+    /// Executes exactly the forward mutation authorized by one current capsule checkpoint.
+    #[allow(dead_code)]
+    pub(crate) fn execute_leased_intent(
+        &self,
+        prepared: &PreparedConversion,
+        lease: ExecutionLease,
+        intent: TransactionIntent<'_>,
+    ) -> Result<LeasedIntent, ExecutorError> {
+        let (capsule_generation, current_phase, plan_digest, image_instance) = lease.into_parts();
+        self.validate_lease(prepared, plan_digest, image_instance)?;
+        let authorized = matches!(
+            (current_phase, &intent),
+            (TransactionPhase::Reserved, TransactionIntent::Relocate(_))
+                | (
+                    TransactionPhase::Relocating,
+                    TransactionIntent::StageTarget(_)
+                )
+        );
+        if !authorized {
+            return Err(ExecutorError::LeaseIntentMismatch);
+        }
+        let executed = self.execute_intent(prepared, intent)?;
+        Ok(LeasedIntent {
+            executed,
+            capsule_generation,
+            current_phase,
+        })
     }
 
     /// Executes one mutating intent with deterministic crash injection.
@@ -338,7 +451,7 @@ impl ImageExecutor {
     ///
     /// Returns [`ExecutorError::InjectedFault`] at a requested boundary, or the same failures as
     /// [`Self::execute_intent`]. No completion evidence is returned before both durable flushes.
-    pub fn execute_intent_with_faults<F: FaultInjector>(
+    fn execute_intent_with_faults<F: FaultInjector>(
         &self,
         prepared: &PreparedConversion,
         intent: TransactionIntent<'_>,
@@ -390,12 +503,52 @@ impl ImageExecutor {
     ///
     /// Refuses restoration bytes that are not exactly one of `prepared`'s conservative rollback
     /// overlays, or returns the mutation/I/O failures documented by [`Self::execute_intent`].
-    pub fn execute_rollback(
+    fn execute_rollback(
         &self,
         prepared: &PreparedConversion,
         intent: RollbackIntent<'_>,
     ) -> Result<ExecutedRollback, ExecutorError> {
         self.execute_rollback_with_faults(prepared, intent, &mut NoFault)
+    }
+
+    /// Executes rollback bound to one current durable capsule checkpoint.
+    #[allow(dead_code)]
+    pub(crate) fn execute_leased_rollback(
+        &self,
+        prepared: &PreparedConversion,
+        lease: ExecutionLease,
+        intent: RollbackIntent<'_>,
+    ) -> Result<LeasedRollback, ExecutorError> {
+        let (capsule_generation, current_phase, plan_digest, image_instance) = lease.into_parts();
+        self.validate_lease(prepared, plan_digest, image_instance)?;
+        if matches!(
+            current_phase,
+            TransactionPhase::Finalized | TransactionPhase::RolledBack
+        ) {
+            return Err(ExecutorError::LeaseIntentMismatch);
+        }
+        let executed = self.execute_rollback(prepared, intent)?;
+        Ok(LeasedRollback {
+            executed,
+            capsule_generation,
+            current_phase,
+        })
+    }
+
+    #[allow(dead_code)]
+    fn validate_lease(
+        &self,
+        prepared: &PreparedConversion,
+        plan_digest: [u8; 32],
+        image_instance: [u8; 32],
+    ) -> Result<(), ExecutorError> {
+        if plan_digest != prepared.plan_digest()
+            || image_instance != self.identity.stable_container_token()
+            || !prepared.matches_regular_image(&self.identity)
+        {
+            return Err(ExecutorError::InvalidExecutionLease);
+        }
+        Ok(())
     }
 
     /// Applies rollback with deterministic crash injection.
@@ -404,7 +557,7 @@ impl ImageExecutor {
     ///
     /// Returns [`ExecutorError::InjectedFault`] at requested boundaries and otherwise the same
     /// errors as [`Self::execute_rollback`].
-    pub fn execute_rollback_with_faults<F: FaultInjector>(
+    fn execute_rollback_with_faults<F: FaultInjector>(
         &self,
         prepared: &PreparedConversion,
         intent: RollbackIntent<'_>,
@@ -689,6 +842,8 @@ pub enum ExecutorError {
     InvalidChunkLimit,
     IdentityMismatch,
     PlanImageMismatch,
+    InvalidExecutionLease,
+    LeaseIntentMismatch,
     IntentNotAuthorized,
     NonMutatingIntent,
     InvalidRelocation {
@@ -725,6 +880,11 @@ impl fmt::Display for ExecutorError {
             }
             Self::PlanImageMismatch => formatter
                 .write_str("prepared conversion belongs to a different regular image container"),
+            Self::InvalidExecutionLease => formatter.write_str(
+                "execution lease belongs to a different plan or regular image container",
+            ),
+            Self::LeaseIntentMismatch => formatter
+                .write_str("execution lease does not authorize this capsule phase or intent"),
             Self::IntentNotAuthorized => {
                 formatter.write_str("intent is not authorized by the prepared conversion")
             }

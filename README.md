@@ -198,6 +198,7 @@ installed. CI always tests both language stacks.
 - [x] Bounded NTFS volume bitmap and object/stream/directory inventory
 - [x] Exact NTFS bitmap-to-runlist ownership reconciliation, including metadata attributes
 - [x] Complete bounded NTFS attribute census and sparse-only `$BadClus:$Bad` proof
+- [x] Exact `$MFT::$BITMAP` versus FILE-record in-use reconciliation before normalization
 - [x] `$ATTRIBUTE_LIST` continuation resolution and NTFS-to-neutral normalization
 - [x] Exact relocation geometry solver
 - [x] Redundant append-only recovery capsule format
@@ -216,6 +217,7 @@ installed. CI always tests both language stacks.
 - [x] Module-sealed preflight/verification/completion evidence (no caller-forged clean state)
 - [x] Exact-intent regular-image executor with locking, read-back, flush, rollback, and fault cuts
 - [x] Opaque plan/container-bound executor completion evidence for mutation and rollback checkpoints
+- [x] Crate-private generation/phase execution leases and a non-activating durable coordinator through `TargetStaged`
 - [x] Deterministic parser mutation suite
 - [x] Real-image `inspect` command with evidence-aware blocking
 - [x] Real-image read-only `preview` with exact candidate phases and rollback bytes
@@ -232,6 +234,7 @@ installed. CI always tests both language stacks.
       pre-publication checkpoint, with truthful non-cancellable publication reporting
 - [x] Bounded desktop session recovery with stale/corrupt/raw-device refusal and keyboard/contrast regressions
 - [x] Deterministic wide/medium/compact desktop layouts, 44-point targets, and screen-reader-safe ASCII branding
+- [x] Stable responsive accessibility traversal from Source through Activity, independent of panel paint order
 - [x] Create-new exFAT→NTFS and NTFS→exFAT export with reinspection, manifest equality, source re-hash, and escrow sidecar
 - [x] Independently mount both exported rich cross-format candidates read-only and verify exact payload hashes
 - [x] Read-only candidate/source/sidecar verifier and candidate-bound escrow envelope
