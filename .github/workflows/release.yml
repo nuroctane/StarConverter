@@ -246,6 +246,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          if [[ "$TARGET_TRIPLE" == *-pc-windows-msvc ]]; then
+            # lld-link otherwise stamps the PE and CodeView identity with build-time entropy.
+            export RUSTFLAGS="$RUSTFLAGS -C link-arg=/Brepro"
+          fi
           cargo "+$RUST_TOOLCHAIN" build --locked --release --target "$TARGET_TRIPLE" \
             --package starconverter-cli --package starconverter-gui
           test -f "target/$TARGET_TRIPLE/release/starconverter$EXE_SUFFIX"
@@ -344,6 +348,140 @@ jobs:
             --source-date-epoch "$SOURCE_DATE_EPOCH" \
             --repository-root . \
             --verify-inventory "$inventory"
+
+      - name: Inspect packaged Windows executables with native tools
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+
+          $archive = Join-Path $PWD "dist/starconverter-$env:RELEASE_ID-$env:TARGET_TRIPLE.zip"
+          $inspection = Join-Path $env:RUNNER_TEMP 'starconverter-windows-package-inspection'
+          if (Test-Path -LiteralPath $inspection) {
+            throw "Refusing pre-existing inspection directory: $inspection"
+          }
+          New-Item -ItemType Directory -Path $inspection | Out-Null
+          Expand-Archive -LiteralPath $archive -DestinationPath $inspection
+          $bundle = Join-Path $inspection "starconverter-$env:RELEASE_ID-$env:TARGET_TRIPLE"
+          $cli = Join-Path $bundle 'starconverter.exe'
+          $gui = Join-Path $bundle 'starconverter-gui.exe'
+          $cargoManifest = [System.IO.File]::ReadAllText((Join-Path $PWD 'Cargo.toml'))
+          $versionMatch = [regex]::Match(
+            $cargoManifest,
+            '(?m)^version = "([0-9]+)\.([0-9]+)\.([0-9]+)"$'
+          )
+          if (-not $versionMatch.Success) {
+            throw 'Could not read the workspace package version from Cargo.toml'
+          }
+          $expectedVersion = '{0}.{1}.{2}.0' -f `
+            $versionMatch.Groups[1].Value, `
+            $versionMatch.Groups[2].Value, `
+            $versionMatch.Groups[3].Value
+
+          function Get-PeFacts([string] $Path) {
+            $bytes = [System.IO.File]::ReadAllBytes($Path)
+            if ($bytes.Length -lt 512 -or $bytes[0] -ne 0x4d -or $bytes[1] -ne 0x5a) {
+              throw "$Path is not a complete PE executable"
+            }
+            $pe = [BitConverter]::ToInt32($bytes, 0x3c)
+            if ($pe -lt 0 -or $pe + 176 -gt $bytes.Length) {
+              throw "$Path has an invalid PE header offset"
+            }
+            $optional = $pe + 24
+            [pscustomobject]@{
+              Machine = [BitConverter]::ToUInt16($bytes, $pe + 4)
+              Magic = [BitConverter]::ToUInt16($bytes, $optional)
+              Subsystem = [BitConverter]::ToUInt16($bytes, $optional + 68)
+              CertificateOffset = [BitConverter]::ToUInt32($bytes, $optional + 144)
+              CertificateSize = [BitConverter]::ToUInt32($bytes, $optional + 148)
+            }
+          }
+
+          function Assert-WindowsIdentity(
+            [string] $Path,
+            [string] $Description,
+            [string] $InternalName,
+            [string] $OriginalFilename,
+            [int] $Subsystem
+          ) {
+            $facts = Get-PeFacts $Path
+            if ($facts.Machine -ne 0x8664 -or $facts.Magic -ne 0x20b) {
+              throw "$OriginalFilename is not PE32+ x64"
+            }
+            if ($facts.Subsystem -ne $Subsystem) {
+              throw "$OriginalFilename has subsystem $($facts.Subsystem), expected $Subsystem"
+            }
+            if ($facts.CertificateOffset -ne 0 -or $facts.CertificateSize -ne 0) {
+              throw "$OriginalFilename unexpectedly has an Authenticode certificate table"
+            }
+
+            $version = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($Path)
+            $expected = [ordered]@{
+              CompanyName = 'Nur Octane'
+              FileDescription = $Description
+              FileVersion = $expectedVersion
+              InternalName = $InternalName
+              LegalCopyright = 'Copyright (c) 2026 Nur Octane'
+              OriginalFilename = $OriginalFilename
+              ProductName = 'StarConverter'
+              ProductVersion = $expectedVersion
+            }
+            foreach ($field in $expected.Keys) {
+              if ($version.$field -cne $expected[$field]) {
+                throw "$OriginalFilename has incorrect $field metadata"
+              }
+            }
+            if (-not $version.IsPreRelease) {
+              throw "$OriginalFilename is missing the pre-release VERSIONINFO flag"
+            }
+            $signature = Get-AuthenticodeSignature -LiteralPath $Path
+            if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::NotSigned) {
+              throw "$OriginalFilename must remain unsigned in the engineering channel"
+            }
+          }
+
+          Assert-WindowsIdentity $cli 'StarConverter command-line utility' `
+            'starconverter' 'starconverter.exe' 3
+          Assert-WindowsIdentity $gui 'StarConverter desktop utility' `
+            'starconverter-gui' 'starconverter-gui.exe' 2
+
+          $kits = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits/10/bin'
+          $mt = Get-ChildItem -LiteralPath $kits -Filter mt.exe -File -Recurse |
+            Where-Object { $_.FullName -match '[\\/]x64[\\/]mt\.exe$' } |
+            Sort-Object -Property FullName -Descending |
+            Select-Object -First 1
+          if ($null -eq $mt) { throw 'Windows SDK x64 mt.exe was not found' }
+
+          foreach ($item in @(
+            @{ Path = $cli; Name = 'starconverter' },
+            @{ Path = $gui; Name = 'starconverter-gui' }
+          )) {
+            $manifestPath = Join-Path $inspection "$($item.Name).manifest"
+            & $mt.FullName "-inputresource:$($item.Path);#1" "-out:$manifestPath"
+            if ($LASTEXITCODE -ne 0) { throw "mt.exe could not extract $($item.Name) manifest" }
+            [xml] $manifest = Get-Content -LiteralPath $manifestPath -Raw
+            $identity = $manifest.SelectSingleNode("//*[local-name()='assemblyIdentity']")
+            $description = $manifest.SelectSingleNode("//*[local-name()='description']")
+            $level = $manifest.SelectSingleNode("//*[local-name()='requestedExecutionLevel']")
+            $supported = $manifest.SelectSingleNode("//*[local-name()='supportedOS']")
+            $longPath = $manifest.SelectSingleNode("//*[local-name()='longPathAware']")
+            if (
+              $identity.name -cne "io.github.nuroctane.$($item.Name)" -or
+              $identity.version -cne $expectedVersion -or
+              $description.InnerText -cne 'StarConverter unsigned engineering pre-alpha' -or
+              $level.level -cne 'asInvoker' -or $level.uiAccess -cne 'false' -or
+              $supported.Id -cne '{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}' -or
+              $longPath.InnerText -cne 'true'
+            ) {
+              throw "$($item.Name) manifest differs from Windows release policy"
+            }
+          }
+
+          $smoke = & $cli demo 2>&1
+          if ($LASTEXITCODE -ne 0 -or -not ($smoke -match '\[READ-ONLY\]')) {
+            throw 'The CLI extracted from the Windows ZIP failed its read-only smoke test'
+          }
 
       - name: Build and validate unsigned macOS application bundle
         if: runner.os == 'macOS'

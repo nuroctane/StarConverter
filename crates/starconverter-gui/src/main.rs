@@ -1,9 +1,11 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -12,8 +14,10 @@ use eframe::egui::{
     TextStyle, Vec2,
 };
 use starconverter_core::candidate_export::{
-    CandidateExportEvidence, CandidateExportLimits, CandidateVerificationEvidence,
-    CandidateVerificationLimits, export_candidate_image, verify_bound_export,
+    CandidateExportError, CandidateExportEvidence, CandidateExportLimits,
+    CandidateVerificationEvidence, CandidateVerificationLimits, CandidateWorkControl,
+    CandidateWorkPhase, CandidateWorkProgress, export_candidate_image_with_progress,
+    verify_bound_export_with_progress,
 };
 use starconverter_core::cross_format::{
     ExfatToNtfsLimits, ExfatToNtfsOptions, NtfsToExfatLimits, NtfsToExfatOptions,
@@ -356,7 +360,14 @@ enum JobOutcome {
     Preview(PreviewJobSuccess),
     Export(ExportJobSuccess),
     Verification(CandidateVerificationEvidence),
-    Failed { kind: JobKind, message: String },
+    Cancelled {
+        kind: JobKind,
+        phase: CandidateWorkPhase,
+    },
+    Failed {
+        kind: JobKind,
+        message: String,
+    },
 }
 
 #[derive(Debug)]
@@ -369,7 +380,8 @@ struct JobMessage {
 struct ActiveJob {
     id: u64,
     kind: JobKind,
-    cancelled: Arc<AtomicBool>,
+    cancel_requested: Arc<AtomicBool>,
+    progress: Arc<Mutex<Option<CandidateWorkProgress>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -378,12 +390,71 @@ enum JobResultDisposition {
     IgnoreStale,
 }
 
-fn job_result_disposition(active: Option<&ActiveJob>, message_id: u64) -> JobResultDisposition {
+const fn job_result_disposition(
+    active: Option<&ActiveJob>,
+    message_id: u64,
+) -> JobResultDisposition {
     match active {
-        Some(job) if job.id == message_id && !job.cancelled.load(Ordering::Acquire) => {
-            JobResultDisposition::Apply
-        }
+        Some(job) if job.id == message_id => JobResultDisposition::Apply,
         Some(_) | None => JobResultDisposition::IgnoreStale,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct JobControl {
+    cancel_requested: Arc<AtomicBool>,
+    progress: Arc<Mutex<Option<CandidateWorkProgress>>>,
+}
+
+impl JobControl {
+    fn is_cancel_requested(&self) -> bool {
+        self.cancel_requested.load(Ordering::Acquire)
+    }
+
+    fn observe(&self, progress: CandidateWorkProgress) -> CandidateWorkControl {
+        *self
+            .progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(progress);
+        if progress.cancellable && self.is_cancel_requested() {
+            CandidateWorkControl::Cancel
+        } else {
+            CandidateWorkControl::Continue
+        }
+    }
+
+    fn checkpoint(&self, phase: CandidateWorkPhase) -> Result<(), CandidateWorkPhase> {
+        let progress = CandidateWorkProgress {
+            phase,
+            completed_bytes: 0,
+            total_bytes: None,
+            cancellable: true,
+        };
+        if self.observe(progress) == CandidateWorkControl::Cancel {
+            Err(phase)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn run_coarse_cancellable_job<F>(
+    kind: JobKind,
+    phase: CandidateWorkPhase,
+    control: &JobControl,
+    work: F,
+) -> JobOutcome
+where
+    F: FnOnce() -> JobOutcome,
+{
+    if control.checkpoint(phase).is_err() {
+        return JobOutcome::Cancelled { kind, phase };
+    }
+    let outcome = work();
+    if control.checkpoint(phase).is_err() && !matches!(&outcome, JobOutcome::Failed { .. }) {
+        JobOutcome::Cancelled { kind, phase }
+    } else {
+        outcome
     }
 }
 
@@ -416,15 +487,19 @@ impl BackgroundJobs {
 
     fn start<F>(&mut self, kind: JobKind, work: F) -> Result<u64, String>
     where
-        F: FnOnce() -> JobOutcome + Send + 'static,
+        F: FnOnce(JobControl) -> JobOutcome + Send + 'static,
     {
         if self.is_busy() {
             return Err("another background job is already active".into());
         }
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(1);
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let worker_cancelled = Arc::clone(&cancelled);
+        let cancel_requested = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new(Mutex::new(None));
+        let control = JobControl {
+            cancel_requested: Arc::clone(&cancel_requested),
+            progress: Arc::clone(&progress),
+        };
         let sender = self.sender.clone();
         thread::Builder::new()
             .name(format!(
@@ -432,29 +507,36 @@ impl BackgroundJobs {
                 kind.label().replace(' ', "-")
             ))
             .spawn(move || {
-                if worker_cancelled.load(Ordering::Acquire) {
-                    return;
-                }
-                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
-                    .unwrap_or_else(|_| JobOutcome::Failed {
-                        kind,
-                        message: "background worker panicked; no result was accepted".into(),
-                    });
+                let outcome =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(control)))
+                        .unwrap_or_else(|_| JobOutcome::Failed {
+                            kind,
+                            message: "background worker panicked; no result was accepted".into(),
+                        });
                 let _ = sender.send(JobMessage { id, outcome });
             })
             .map_err(|error| format!("could not start {} worker: {error}", kind.label()))?;
         self.active = Some(ActiveJob {
             id,
             kind,
-            cancelled,
+            cancel_requested,
+            progress,
         });
         Ok(id)
     }
 
-    fn cancel(&mut self) -> Option<JobKind> {
-        let active = self.active.take()?;
-        active.cancelled.store(true, Ordering::Release);
+    fn request_cancel(&self) -> Option<JobKind> {
+        let active = self.active.as_ref()?;
+        active.cancel_requested.store(true, Ordering::Release);
         Some(active.kind)
+    }
+
+    fn progress(&self) -> Option<CandidateWorkProgress> {
+        let active = self.active.as_ref()?;
+        *active
+            .progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn take_ready(&mut self) -> Option<JobOutcome> {
@@ -485,6 +567,12 @@ fn main() -> eframe::Result {
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseIntent {
+    RemainOpen,
+    CloseAfterJob,
+}
+
 #[derive(Debug)]
 struct StarConverterApp {
     source: VolumeProfile,
@@ -507,6 +595,7 @@ struct StarConverterApp {
     session_recovery: SessionRecoveryState,
     session_dirty: bool,
     session_last_save_attempt: Instant,
+    close_intent: CloseIntent,
 }
 
 impl StarConverterApp {
@@ -588,6 +677,7 @@ impl StarConverterApp {
             session_recovery,
             session_dirty: false,
             session_last_save_attempt: Instant::now(),
+            close_intent: CloseIntent::RemainOpen,
         }
     }
 
@@ -664,7 +754,7 @@ impl StarConverterApp {
 
     fn start_background_job<F>(&mut self, kind: JobKind, work: F)
     where
-        F: FnOnce() -> JobOutcome + Send + 'static,
+        F: FnOnce(JobControl) -> JobOutcome + Send + 'static,
     {
         match self.jobs.start(kind, work) {
             Ok(id) => self.activity.push(format!(
@@ -682,23 +772,23 @@ impl StarConverterApp {
     }
 
     fn cancel_background_job(&mut self) {
-        let Some(kind) = self.jobs.cancel() else {
+        let Some(kind) = self.jobs.request_cancel() else {
             return;
         };
         let message = format!(
-            "{} result detached; an already-running worker may finish safely in the background",
+            "{} cancellation requested; waiting for a safe checkpoint",
             kind.label()
         );
         self.activity
-            .push(format!("00:00:00  [DETACHED] {message}"));
+            .push(format!("00:00:00  [CANCELLING] {message}"));
         match kind {
             JobKind::VerifyExport => {
                 self.verification_ok = false;
                 self.verification_report = None;
-                self.verification_status = format!("Cancelled: {message}.");
+                self.verification_status = format!("Cancellation requested: {message}.");
             }
             JobKind::Inspect | JobKind::Preview | JobKind::Export => {
-                self.inspection_status = format!("Cancelled: {message}.");
+                self.inspection_status = format!("Cancellation requested: {message}.");
             }
         }
     }
@@ -777,28 +867,62 @@ impl StarConverterApp {
                     evidence.candidate_path.display()
                 ));
             }
-            JobOutcome::Failed { kind, message } => {
-                self.activity.push(format!(
-                    "00:00:00  [BLOCKED] {} failed :: {message}",
-                    kind.label()
-                ));
-                match kind {
-                    JobKind::VerifyExport => {
-                        self.verification_ok = false;
-                        self.verification_status = format!("Verification failed: {message}");
-                        self.verification_report = Some(verification_failure_report(&message));
-                    }
-                    JobKind::Inspect => {
-                        self.real_source = false;
-                        self.inspection_status = message;
-                    }
-                    JobKind::Preview => {
-                        self.exact_preview = None;
-                        self.inspection_status = message;
-                    }
-                    JobKind::Export => self.inspection_status = message,
-                }
+            JobOutcome::Cancelled { kind, phase } => {
+                self.apply_cancelled_job(kind, phase);
             }
+            JobOutcome::Failed { kind, message } => {
+                self.apply_failed_job(kind, message);
+            }
+        }
+    }
+
+    fn apply_cancelled_job(&mut self, kind: JobKind, phase: CandidateWorkPhase) {
+        let message = match kind {
+            JobKind::Export => format!(
+                "candidate export cancelled safely during {}; no final artifact was published",
+                phase.label()
+            ),
+            JobKind::VerifyExport => format!(
+                "read-only verification cancelled during {}; all files remain unchanged",
+                phase.label()
+            ),
+            JobKind::Inspect | JobKind::Preview => format!(
+                "{} cancelled during {}; no writes were performed",
+                kind.label(),
+                phase.label()
+            ),
+        };
+        self.activity
+            .push(format!("00:00:00  [CANCELLED] {message}"));
+        if kind == JobKind::VerifyExport {
+            self.verification_ok = false;
+            self.verification_report = None;
+            self.verification_status = message;
+        } else {
+            self.inspection_status = message;
+        }
+    }
+
+    fn apply_failed_job(&mut self, kind: JobKind, message: String) {
+        self.activity.push(format!(
+            "00:00:00  [BLOCKED] {} failed :: {message}",
+            kind.label()
+        ));
+        match kind {
+            JobKind::VerifyExport => {
+                self.verification_ok = false;
+                self.verification_status = format!("Verification failed: {message}");
+                self.verification_report = Some(verification_failure_report(&message));
+            }
+            JobKind::Inspect => {
+                self.real_source = false;
+                self.inspection_status = message;
+            }
+            JobKind::Preview => {
+                self.exact_preview = None;
+                self.inspection_status = message;
+            }
+            JobKind::Export => self.inspection_status = message,
         }
     }
 
@@ -839,14 +963,21 @@ impl StarConverterApp {
             return;
         }
         self.inspection_status = "Read-only image inspection is running in the background.".into();
-        self.start_background_job(JobKind::Inspect, move || match inspect_image(&path) {
-            Ok(inspection) => JobOutcome::Inspection(InspectionJobSuccess {
-                profile: inspection.profile,
-            }),
-            Err(error) => JobOutcome::Failed {
-                kind: JobKind::Inspect,
-                message: error.to_string(),
-            },
+        self.start_background_job(JobKind::Inspect, move |control| {
+            run_coarse_cancellable_job(
+                JobKind::Inspect,
+                CandidateWorkPhase::InspectSource,
+                &control,
+                || match inspect_image(&path) {
+                    Ok(inspection) => JobOutcome::Inspection(InspectionJobSuccess {
+                        profile: inspection.profile,
+                    }),
+                    Err(error) => JobOutcome::Failed {
+                        kind: JobKind::Inspect,
+                        message: error.to_string(),
+                    },
+                },
+            )
         });
     }
 
@@ -901,14 +1032,19 @@ impl StarConverterApp {
         let mode = self.mode;
         self.exact_preview = None;
         self.inspection_status = "Exact preview is being built in the background.".into();
-        self.start_background_job(JobKind::Preview, move || {
-            match build_exact_preview(&source_path, mode) {
-                Ok(success) => JobOutcome::Preview(success),
-                Err(message) => JobOutcome::Failed {
-                    kind: JobKind::Preview,
-                    message,
+        self.start_background_job(JobKind::Preview, move |control| {
+            run_coarse_cancellable_job(
+                JobKind::Preview,
+                CandidateWorkPhase::BuildExpectedManifest,
+                &control,
+                || match build_exact_preview(&source_path, mode) {
+                    Ok(success) => JobOutcome::Preview(success),
+                    Err(message) => JobOutcome::Failed {
+                        kind: JobKind::Preview,
+                        message,
+                    },
                 },
-            }
+            )
         });
     }
 
@@ -931,15 +1067,21 @@ impl StarConverterApp {
 
         let mode = self.mode;
         self.inspection_status = "Create-new candidate export is running in the background.".into();
-        self.start_background_job(JobKind::Export, move || {
-            match build_candidate_export(&source_path, &output_path, mode) {
+        self.start_background_job(
+            JobKind::Export,
+            move |control| match build_candidate_export(&source_path, &output_path, mode, &control)
+            {
                 Ok(success) => JobOutcome::Export(success),
-                Err(message) => JobOutcome::Failed {
+                Err(ControlledJobError::Cancelled(phase)) => JobOutcome::Cancelled {
+                    kind: JobKind::Export,
+                    phase,
+                },
+                Err(ControlledJobError::Failed(message)) => JobOutcome::Failed {
                     kind: JobKind::Export,
                     message,
                 },
-            }
-        });
+            },
+        );
     }
 
     fn choose_verification_candidate(&mut self) {
@@ -994,15 +1136,20 @@ impl StarConverterApp {
         self.verification_ok = false;
         self.verification_report = None;
         self.verification_status = "Read-only bound export verification is running.".into();
-        self.start_background_job(JobKind::VerifyExport, move || {
+        self.start_background_job(JobKind::VerifyExport, move |control| {
             let source = (!source.is_empty()).then(|| PathBuf::from(source));
-            match verify_bound_export(
+            match verify_bound_export_with_progress(
                 &candidate,
                 &escrow,
                 source.as_deref(),
                 CandidateVerificationLimits::default(),
+                |progress| control.observe(progress),
             ) {
                 Ok(evidence) => JobOutcome::Verification(evidence),
+                Err(CandidateExportError::Cancelled { phase }) => JobOutcome::Cancelled {
+                    kind: JobKind::VerifyExport,
+                    phase,
+                },
                 Err(error) => JobOutcome::Failed {
                     kind: JobKind::VerifyExport,
                     message: error.to_string(),
@@ -1090,16 +1237,33 @@ fn build_exact_preview(
     })
 }
 
+#[derive(Debug)]
+enum ControlledJobError {
+    Cancelled(CandidateWorkPhase),
+    Failed(String),
+}
+
 fn build_candidate_export(
     source_path: &str,
     output_path: &Path,
     mode: GuaranteeMode,
-) -> Result<ExportJobSuccess, String> {
-    let image = ImageFile::open(source_path).map_err(|error| error.to_string())?;
-    let inspection = inspect_open_image(&image).map_err(|error| error.to_string())?;
+    control: &JobControl,
+) -> Result<ExportJobSuccess, ControlledJobError> {
+    control
+        .checkpoint(CandidateWorkPhase::InspectSource)
+        .map_err(ControlledJobError::Cancelled)?;
+    let image = ImageFile::open(source_path)
+        .map_err(|error| ControlledJobError::Failed(error.to_string()))?;
+    let inspection = inspect_open_image(&image)
+        .map_err(|error| ControlledJobError::Failed(error.to_string()))?;
+    control
+        .checkpoint(CandidateWorkPhase::BuildExpectedManifest)
+        .map_err(ControlledJobError::Cancelled)?;
     let target = opposite_filesystem(inspection.profile.filesystem);
     if target == FileSystem::Unknown {
-        return Err("recognized image has unknown filesystem".into());
+        return Err(ControlledJobError::Failed(
+            "recognized image has unknown filesystem".into(),
+        ));
     }
     let evidence = match (
         inspection.normalized_exfat.as_deref(),
@@ -1113,16 +1277,21 @@ fn build_candidate_export(
                 ExfatToNtfsOptions::default(),
                 ExfatToNtfsLimits::default(),
             )
-            .map_err(|error| format!("cross-format plan refused: {error}"))?;
+            .map_err(|error| {
+                ControlledJobError::Failed(format!("cross-format plan refused: {error}"))
+            })?;
             let preview =
                 preview_ntfs_phase_writes(&image, &plan.destination, PreimageLimits::default())
-                    .map_err(|error| format!("phase preview failed: {error}"))?;
+                    .map_err(|error| {
+                        ControlledJobError::Failed(format!("phase preview failed: {error}"))
+                    })?;
             export_gui_candidate(
                 &image,
                 output_path,
                 &preview,
                 &plan.target_graph,
                 &plan.preservation,
+                control,
             )?
         }
         (None, Some(normalized), FileSystem::ExFat) => {
@@ -1132,26 +1301,37 @@ fn build_candidate_export(
                 NtfsToExfatOptions::default(),
                 NtfsToExfatLimits::default(),
             )
-            .map_err(|error| format!("cross-format plan refused: {error}"))?;
+            .map_err(|error| {
+                ControlledJobError::Failed(format!("cross-format plan refused: {error}"))
+            })?;
             let preview =
                 preview_exfat_phase_writes(&image, &plan.destination, PreimageLimits::default())
-                    .map_err(|error| format!("phase preview failed: {error}"))?;
+                    .map_err(|error| {
+                        ControlledJobError::Failed(format!("phase preview failed: {error}"))
+                    })?;
             export_gui_candidate(
                 &image,
                 output_path,
                 &preview,
                 &plan.target_graph,
                 &plan.preservation,
+                control,
             )?
         }
         (Some(_), None, _) | (None, Some(_), _) => {
-            return Err("conversion direction does not match the inspected source".into());
+            return Err(ControlledJobError::Failed(
+                "conversion direction does not match the inspected source".into(),
+            ));
         }
         (None, None, _) => {
-            return Err("complete normalized inventory is required for conversion".into());
+            return Err(ControlledJobError::Failed(
+                "complete normalized inventory is required for conversion".into(),
+            ));
         }
         (Some(_), Some(_), _) => {
-            return Err("inspection contains evidence for two filesystems".into());
+            return Err(ControlledJobError::Failed(
+                "inspection contains evidence for two filesystems".into(),
+            ));
         }
     };
     Ok(ExportJobSuccess {
@@ -1166,6 +1346,27 @@ impl eframe::App for StarConverterApp {
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let session_before = self.session_fingerprint();
         self.poll_background_jobs();
+        let close_requested = root.ctx().input(|input| input.viewport().close_requested());
+        if close_requested && self.jobs.is_busy() {
+            root.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            if self.close_intent == CloseIntent::RemainOpen {
+                self.close_intent = CloseIntent::CloseAfterJob;
+                if self
+                    .jobs
+                    .progress()
+                    .is_none_or(|progress| progress.cancellable)
+                {
+                    self.cancel_background_job();
+                }
+                self.activity.push(
+                    "00:00:00  [CLOSING] waiting for worker cleanup or artifact publication".into(),
+                );
+            }
+        }
+        if self.close_intent == CloseIntent::CloseAfterJob && !self.jobs.is_busy() {
+            root.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         if self.jobs.is_busy() {
             root.ctx().request_repaint_after(Duration::from_millis(75));
         }
@@ -1228,6 +1429,9 @@ impl StarConverterApp {
             });
     }
 
+    // The footer intentionally keeps the complete job-state action cluster together so its
+    // enabled/disabled labels cannot drift across helper boundaries.
+    #[allow(clippy::too_many_lines)]
     fn show_footer(&mut self, root: &mut egui::Ui) {
         egui::Panel::bottom("footer")
             .frame(
@@ -1251,6 +1455,11 @@ impl StarConverterApp {
                         .color(MUTED),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let progress = self.jobs.progress();
+                        let cancel_requested = self.jobs.active().is_some_and(|job| {
+                            job.cancel_requested.load(Ordering::Acquire)
+                        });
+                        let cancellable = progress.is_none_or(|value| value.cancellable);
                         ui.add_enabled(false, Button::new("Convert"))
                             .on_disabled_hover_text(
                                 "In-place and physical conversion remain locked behind activation gates.",
@@ -1289,21 +1498,43 @@ impl StarConverterApp {
                         }
                         if ui
                             .add_enabled(
-                                !idle,
-                                Button::new("Detach background job").fill(DANGER),
+                                !idle && !cancel_requested && cancellable,
+                                Button::new(if cancel_requested {
+                                    "Cancellation requested"
+                                } else if cancellable {
+                                    "Request cancellation"
+                                } else {
+                                    "Publishing artifacts"
+                                })
+                                .fill(DANGER),
                             )
                             .on_hover_text(
-                                "Ignore this result. An export already in progress may continue to safe completion.",
+                                if cancellable {
+                                    "Request cooperative cancellation. The worker remains active until cleanup reaches a safe checkpoint."
+                                } else {
+                                    "Verified publication has begun and cannot be interrupted without hiding a partial-success state."
+                                },
                             )
                             .clicked()
                         {
                             self.cancel_background_job();
                         }
                         if let Some(job) = self.jobs.active() {
+                            let (token, color) = if !cancellable {
+                                ("COMMITTING", WARNING)
+                            } else if cancel_requested {
+                                ("CANCELLING", WARNING)
+                            } else {
+                                ("WORKING", WORKING)
+                            };
+                            let detail = progress.map_or_else(
+                                || job.kind.label().to_owned(),
+                                format_candidate_progress,
+                            );
                             ui.label(
-                                RichText::new(format!("[WORKING] {}", job.kind.label()))
+                                RichText::new(format!("[{token}] {detail}"))
                                     .monospace()
-                                    .color(WORKING),
+                                    .color(color),
                             );
                         }
                     });
@@ -2291,13 +2522,14 @@ fn export_gui_candidate(
     preview: &PhaseWritePreview,
     target_graph: &ObjectGraph,
     preservation: &PreservationReport,
-) -> Result<CandidateExportEvidence, String> {
+    control: &JobControl,
+) -> Result<CandidateExportEvidence, ControlledJobError> {
     let escrow_path = preservation.escrow.as_ref().map(|_| {
         let mut name = output.as_os_str().to_os_string();
         name.push(".starconverter-escrow");
         PathBuf::from(name)
     });
-    export_candidate_image(
+    export_candidate_image_with_progress(
         source,
         output,
         escrow_path.as_deref(),
@@ -2305,8 +2537,12 @@ fn export_gui_candidate(
         target_graph,
         preservation,
         CandidateExportLimits::default(),
+        |progress| control.observe(progress),
     )
-    .map_err(|error| format!("candidate export failed: {error}"))
+    .map_err(|error| match error {
+        CandidateExportError::Cancelled { phase } => ControlledJobError::Cancelled(phase),
+        error => ControlledJobError::Failed(format!("candidate export failed: {error}")),
+    })
 }
 
 fn export_evidence_report(evidence: &CandidateExportEvidence) -> String {
@@ -2442,6 +2678,22 @@ fn format_byte_count(bytes: usize) -> String {
     let whole = bytes / divisor;
     let hundredths = ((bytes % divisor) * 100 + divisor / 2) / divisor;
     format!("{whole}.{hundredths:02} {suffix}")
+}
+
+fn format_candidate_progress(progress: CandidateWorkProgress) -> String {
+    match progress.total_bytes {
+        Some(total) if total != 0 => {
+            let completed = progress.completed_bytes.min(total);
+            let percent = u64::try_from((u128::from(completed) * 100_u128) / u128::from(total))
+                .unwrap_or(100);
+            format!(
+                "{} :: {completed}/{total} bytes ({percent}%)",
+                progress.phase.label()
+            )
+        }
+        Some(_) => format!("{} :: 0/0 bytes", progress.phase.label()),
+        None => format!("{} :: bounded stage", progress.phase.label()),
+    }
 }
 
 fn plan_report(plan: &ConversionPlan) -> String {
@@ -2602,7 +2854,8 @@ mod tests {
         jobs.active = Some(ActiveJob {
             id: 2,
             kind: JobKind::Preview,
-            cancelled: Arc::new(AtomicBool::new(false)),
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            progress: Arc::new(Mutex::new(None)),
         });
         jobs.sender
             .send(JobMessage {
@@ -2632,16 +2885,18 @@ mod tests {
     }
 
     #[test]
-    fn detached_job_result_is_deterministically_ignored() {
+    fn cancellation_request_keeps_job_active_and_terminal_result_is_applied() {
         let mut jobs = BackgroundJobs::new();
         let cancelled = Arc::new(AtomicBool::new(false));
         jobs.active = Some(ActiveJob {
             id: 7,
             kind: JobKind::Export,
-            cancelled: Arc::clone(&cancelled),
+            cancel_requested: Arc::clone(&cancelled),
+            progress: Arc::new(Mutex::new(None)),
         });
-        assert_eq!(jobs.cancel(), Some(JobKind::Export));
+        assert_eq!(jobs.request_cancel(), Some(JobKind::Export));
         assert!(cancelled.load(Ordering::Acquire));
+        assert!(jobs.is_busy());
         jobs.sender
             .send(JobMessage {
                 id: 7,
@@ -2652,10 +2907,66 @@ mod tests {
             })
             .unwrap();
 
-        assert!(jobs.take_ready().is_none());
+        assert!(matches!(
+            jobs.take_ready(),
+            Some(JobOutcome::Failed {
+                kind: JobKind::Export,
+                ..
+            })
+        ));
+        assert!(!jobs.is_busy());
         assert_eq!(
             job_result_disposition(None, 7),
             JobResultDisposition::IgnoreStale
+        );
+    }
+
+    #[test]
+    fn coalesced_progress_keeps_only_latest_snapshot_and_late_cancel_does_not_hide_success() {
+        let cancel_requested = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new(Mutex::new(None));
+        let control = JobControl {
+            cancel_requested: Arc::clone(&cancel_requested),
+            progress: Arc::clone(&progress),
+        };
+        assert_eq!(
+            control.observe(CandidateWorkProgress {
+                phase: CandidateWorkPhase::CopySource,
+                completed_bytes: 4,
+                total_bytes: Some(8),
+                cancellable: true,
+            }),
+            CandidateWorkControl::Continue
+        );
+        cancel_requested.store(true, Ordering::Release);
+        assert_eq!(
+            control.observe(CandidateWorkProgress {
+                phase: CandidateWorkPhase::PublishArtifacts,
+                completed_bytes: 0,
+                total_bytes: None,
+                cancellable: false,
+            }),
+            CandidateWorkControl::Continue
+        );
+        assert_eq!(
+            *progress.lock().unwrap(),
+            Some(CandidateWorkProgress {
+                phase: CandidateWorkPhase::PublishArtifacts,
+                completed_bytes: 0,
+                total_bytes: None,
+                cancellable: false,
+            })
+        );
+
+        let active = ActiveJob {
+            id: 11,
+            kind: JobKind::Export,
+            cancel_requested,
+            progress,
+        };
+        assert_eq!(
+            job_result_disposition(Some(&active), 11),
+            JobResultDisposition::Apply
         );
     }
 

@@ -72,6 +72,69 @@ pub struct CandidateExportEvidence {
     pub escrow_directory_durability: Option<DirectoryDurability>,
 }
 
+/// Stable stage identifiers for copy-only export and read-only bound verification progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateWorkPhase {
+    InspectSource,
+    BuildExpectedManifest,
+    HashSourceBefore,
+    CopySource,
+    ApplyCandidateWrites,
+    SyncCandidate,
+    InspectCandidate,
+    BuildCandidateManifest,
+    HashCandidate,
+    HashSourceAfter,
+    WriteEscrow,
+    ReadyToPublish,
+    PublishArtifacts,
+    VerifyBoundCandidate,
+    HashVerificationCandidate,
+    HashVerificationSource,
+}
+
+impl CandidateWorkPhase {
+    /// Stable user-facing label for progress displays and logs.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::InspectSource => "inspect source",
+            Self::BuildExpectedManifest => "build expected manifest",
+            Self::HashSourceBefore => "hash source before export",
+            Self::CopySource => "copy source into private candidate",
+            Self::ApplyCandidateWrites => "apply candidate writes",
+            Self::SyncCandidate => "flush private candidate",
+            Self::InspectCandidate => "inspect private candidate",
+            Self::BuildCandidateManifest => "build candidate manifest",
+            Self::HashCandidate => "hash private candidate",
+            Self::HashSourceAfter => "prove source unchanged",
+            Self::WriteEscrow => "write private bound escrow",
+            Self::ReadyToPublish => "ready to publish",
+            Self::PublishArtifacts => "publish verified artifacts",
+            Self::VerifyBoundCandidate => "inspect bound export",
+            Self::HashVerificationCandidate => "hash bound candidate",
+            Self::HashVerificationSource => "hash original source",
+        }
+    }
+}
+
+/// One coalescible progress snapshot. `total_bytes == None` means the phase is intentionally
+/// indeterminate; callers must not synthesize a percentage for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CandidateWorkProgress {
+    pub phase: CandidateWorkPhase,
+    pub completed_bytes: u64,
+    pub total_bytes: Option<u64>,
+    pub cancellable: bool,
+}
+
+/// Cooperative response from a progress observer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateWorkControl {
+    Continue,
+    Cancel,
+}
+
 /// Strength of the namespace-durability barrier completed after publishing one artifact.
 ///
 /// File contents are always flushed before publication. Safe Rust exposes directory `sync_all` on
@@ -215,6 +278,9 @@ pub enum CandidateExportError {
     Verification(VerificationError),
     ManifestMismatch,
     SourceChangedAfterExport,
+    Cancelled {
+        phase: CandidateWorkPhase,
+    },
     CandidateHashMismatch,
     CandidateManifestMismatch,
     CandidateFilesystemMismatch {
@@ -352,6 +418,11 @@ impl fmt::Display for CandidateExportError {
             Self::SourceChangedAfterExport => {
                 formatter.write_str("source content hash changed during candidate export")
             }
+            Self::Cancelled { phase } => write!(
+                formatter,
+                "operation cancelled at safe checkpoint during {}",
+                phase.label()
+            ),
             Self::CandidateHashMismatch => formatter
                 .write_str("candidate SHA-256 does not match the bound escrow envelope"),
             Self::CandidateManifestMismatch => formatter.write_str(
@@ -566,7 +637,39 @@ pub fn verify_bound_export(
     source_path: Option<&Path>,
     limits: CandidateVerificationLimits,
 ) -> Result<CandidateVerificationEvidence, CandidateExportError> {
+    verify_bound_export_with_progress(candidate_path, escrow_path, source_path, limits, |_| {
+        CandidateWorkControl::Continue
+    })
+}
+
+/// Verifies a bound export read-only while reporting coalescible progress and honoring cooperative
+/// cancellation at safe checkpoints.
+///
+/// The observer is invoked after successful byte chunks and at indeterminate phase boundaries.
+/// Returning [`CandidateWorkControl::Cancel`] never opens an artifact for write.
+///
+/// # Errors
+///
+/// Returns the same errors as [`verify_bound_export`], plus
+/// [`CandidateExportError::Cancelled`] when the observer requests cancellation.
+#[allow(clippy::too_many_lines)]
+pub fn verify_bound_export_with_progress<F>(
+    candidate_path: impl AsRef<Path>,
+    escrow_path: impl AsRef<Path>,
+    source_path: Option<&Path>,
+    limits: CandidateVerificationLimits,
+    mut observer: F,
+) -> Result<CandidateVerificationEvidence, CandidateExportError>
+where
+    F: FnMut(CandidateWorkProgress) -> CandidateWorkControl,
+{
     validate_verification_limits(limits)?;
+    observe_cancellable(
+        &mut observer,
+        CandidateWorkPhase::VerifyBoundCandidate,
+        0,
+        None,
+    )?;
 
     let max_envelope_bytes = BOUND_ESCROW_FIXED_BYTES
         .checked_add(limits.max_escrow_bytes)
@@ -623,7 +726,12 @@ pub fn verify_bound_export(
     if manifest.metadata_sha256 != envelope.manifest_sha256 {
         return Err(CandidateExportError::CandidateManifestMismatch);
     }
-    let candidate_sha256 = hash_image(&candidate, limits.hash_chunk_bytes)?;
+    let candidate_sha256 = hash_image_with_progress(
+        &candidate,
+        limits.hash_chunk_bytes,
+        CandidateWorkPhase::HashVerificationCandidate,
+        &mut observer,
+    )?;
     if candidate_sha256 != envelope.candidate_sha256 {
         return Err(CandidateExportError::CandidateHashMismatch);
     }
@@ -643,7 +751,13 @@ pub fn verify_bound_export(
                 actual: source_inspection.profile.filesystem,
             });
         }
-        if hash_image(&source, limits.hash_chunk_bytes)? != envelope.source_sha256 {
+        if hash_image_with_progress(
+            &source,
+            limits.hash_chunk_bytes,
+            CandidateWorkPhase::HashVerificationSource,
+            &mut observer,
+        )? != envelope.source_sha256
+        {
             return Err(CandidateExportError::SourceHashMismatch);
         }
         (
@@ -773,8 +887,47 @@ pub fn export_candidate_image(
     preservation: &PreservationReport,
     limits: CandidateExportLimits,
 ) -> Result<CandidateExportEvidence, CandidateExportError> {
+    export_candidate_image_with_progress(
+        source,
+        output_path,
+        escrow_path,
+        preview,
+        target_graph,
+        preservation,
+        limits,
+        |_| CandidateWorkControl::Continue,
+    )
+}
+
+/// Creates and verifies a new candidate while reporting safe-checkpoint progress.
+///
+/// Cancellation is cooperative. It is honored before publication begins, when all newly created
+/// paths are still private partials governed by RAII cleanup. Once the observer receives
+/// [`CandidateWorkPhase::PublishArtifacts`] with `cancellable == false`, its return value is
+/// intentionally ignored and the function reports the real publication result. This prevents a
+/// late request from hiding an already published escrow or candidate.
+///
+/// # Errors
+///
+/// Returns the same errors as [`export_candidate_image`], plus
+/// [`CandidateExportError::Cancelled`] when cancellation is accepted at a safe checkpoint.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub fn export_candidate_image_with_progress<F>(
+    source: &ImageFile,
+    output_path: impl AsRef<Path>,
+    escrow_path: Option<&Path>,
+    preview: &PhaseWritePreview,
+    target_graph: &ObjectGraph,
+    preservation: &PreservationReport,
+    limits: CandidateExportLimits,
+    mut observer: F,
+) -> Result<CandidateExportEvidence, CandidateExportError>
+where
+    F: FnMut(CandidateWorkProgress) -> CandidateWorkControl,
+{
     validate_limits(limits)?;
     validate_policy(preview, preservation, escrow_path, limits.max_escrow_bytes)?;
+    observe_cancellable(&mut observer, CandidateWorkPhase::InspectSource, 0, None)?;
     let source_inspection = inspect_open_image(source)?;
     if source_inspection.profile.filesystem != preservation.source
         || !source_inspection.profile.inventory_complete
@@ -803,26 +956,55 @@ pub fn export_candidate_image(
     }
 
     let (write_count, replacement_bytes) = validate_preview(source, preview.writes(), limits)?;
+    observe_cancellable(
+        &mut observer,
+        CandidateWorkPhase::BuildExpectedManifest,
+        0,
+        None,
+    )?;
     let expected_manifest = build_manifest(source, target_graph, limits.verification)?;
-    let source_sha256 = hash_image(source, limits.copy_chunk_bytes)?;
+    let source_sha256 = hash_image_with_progress(
+        source,
+        limits.copy_chunk_bytes,
+        CandidateWorkPhase::HashSourceBefore,
+        &mut observer,
+    )?;
 
     let mut output_guard = NewFileGuard::create_partial(&output)?;
-    copy_source(source, output_guard.file_mut(), limits.copy_chunk_bytes)?;
-    apply_forward_writes(output_guard.file_mut(), preview.writes())?;
+    copy_source_with_progress(
+        source,
+        output_guard.file_mut(),
+        limits.copy_chunk_bytes,
+        &mut observer,
+    )?;
+    apply_forward_writes_with_progress(
+        output_guard.file_mut(),
+        preview.writes(),
+        limits.copy_chunk_bytes,
+        replacement_bytes,
+        &mut observer,
+    )?;
+    observe_cancellable(&mut observer, CandidateWorkPhase::SyncCandidate, 0, None)?;
     output_guard
         .file()
         .sync_all()
         .map_err(|source| CandidateExportError::io("flush candidate image", source))?;
 
-    let (manifest_sha256, candidate_sha256, candidate_identity) = verify_candidate(
+    let (manifest_sha256, candidate_sha256, candidate_identity) = verify_candidate_with_progress(
         &output_guard,
         preview.target_filesystem(),
         &expected_manifest,
         limits,
+        &mut observer,
     )?;
     output_guard.bind_verified_identity(candidate_identity);
 
-    let after_sha256 = hash_image(source, limits.copy_chunk_bytes)?;
+    let after_sha256 = hash_image_with_progress(
+        source,
+        limits.copy_chunk_bytes,
+        CandidateWorkPhase::HashSourceAfter,
+        &mut observer,
+    )?;
     if after_sha256 != source_sha256 {
         return Err(CandidateExportError::SourceChangedAfterExport);
     }
@@ -838,10 +1020,12 @@ pub fn export_candidate_image(
                 bytes,
             )?;
             let mut guard = NewFileGuard::create_partial(path)?;
-            guard
-                .file_mut()
-                .write_all(&envelope)
-                .map_err(|source| CandidateExportError::io("write bound escrow", source))?;
+            write_escrow_with_progress(
+                guard.file_mut(),
+                &envelope,
+                limits.copy_chunk_bytes,
+                &mut observer,
+            )?;
             guard
                 .file()
                 .sync_all()
@@ -851,6 +1035,9 @@ pub fn export_candidate_image(
         } else {
             None
         };
+
+    observe_cancellable(&mut observer, CandidateWorkPhase::ReadyToPublish, 0, None)?;
+    report_non_cancellable(&mut observer, CandidateWorkPhase::PublishArtifacts, 0, None);
 
     let escrow_directory_durability =
         if let (Some(guard), Some(path)) = (escrow_guard, escrow.as_deref()) {
@@ -877,12 +1064,17 @@ pub fn export_candidate_image(
     })
 }
 
-fn verify_candidate(
+fn verify_candidate_with_progress<F>(
     guard: &NewFileGuard,
     target_filesystem: FileSystem,
     expected_manifest: &VerificationManifest,
     limits: CandidateExportLimits,
-) -> Result<([u8; 32], [u8; 32], ImageIdentity), CandidateExportError> {
+    observer: &mut F,
+) -> Result<([u8; 32], [u8; 32], ImageIdentity), CandidateExportError>
+where
+    F: FnMut(CandidateWorkProgress) -> CandidateWorkControl,
+{
+    observe_cancellable(observer, CandidateWorkPhase::InspectCandidate, 0, None)?;
     let candidate = ImageFile::from_open_regular_file(
         guard.file(),
         guard.path.clone(),
@@ -905,11 +1097,22 @@ fn verify_candidate(
         FileSystem::Unknown => None,
     }
     .ok_or(CandidateExportError::TargetInspectionMismatch)?;
+    observe_cancellable(
+        observer,
+        CandidateWorkPhase::BuildCandidateManifest,
+        0,
+        None,
+    )?;
     let actual_manifest = build_manifest(&candidate, actual_graph, limits.verification)?;
     if !expected_manifest.equivalent_to(&actual_manifest) {
         return Err(CandidateExportError::ManifestMismatch);
     }
-    let candidate_sha256 = hash_image(&candidate, limits.copy_chunk_bytes)?;
+    let candidate_sha256 = hash_image_with_progress(
+        &candidate,
+        limits.copy_chunk_bytes,
+        CandidateWorkPhase::HashCandidate,
+        observer,
+    )?;
     let identity = candidate.identity().clone();
     if !identity.matches_container_metadata(
         &guard
@@ -1083,9 +1286,64 @@ fn resolve_new_path(path: &Path) -> Result<PathBuf, CandidateExportError> {
     Ok(resolved)
 }
 
+fn observe_cancellable<F>(
+    observer: &mut F,
+    phase: CandidateWorkPhase,
+    completed_bytes: u64,
+    total_bytes: Option<u64>,
+) -> Result<(), CandidateExportError>
+where
+    F: FnMut(CandidateWorkProgress) -> CandidateWorkControl,
+{
+    match observer(CandidateWorkProgress {
+        phase,
+        completed_bytes,
+        total_bytes,
+        cancellable: true,
+    }) {
+        CandidateWorkControl::Continue => Ok(()),
+        CandidateWorkControl::Cancel => Err(CandidateExportError::Cancelled { phase }),
+    }
+}
+
+fn report_non_cancellable<F>(
+    observer: &mut F,
+    phase: CandidateWorkPhase,
+    completed_bytes: u64,
+    total_bytes: Option<u64>,
+) where
+    F: FnMut(CandidateWorkProgress) -> CandidateWorkControl,
+{
+    let _ = observer(CandidateWorkProgress {
+        phase,
+        completed_bytes,
+        total_bytes,
+        cancellable: false,
+    });
+}
+
+#[cfg(test)]
 fn hash_image(image: &ImageFile, chunk_bytes: usize) -> Result<[u8; 32], CandidateExportError> {
+    hash_image_with_progress(
+        image,
+        chunk_bytes,
+        CandidateWorkPhase::HashCandidate,
+        &mut |_| CandidateWorkControl::Continue,
+    )
+}
+
+fn hash_image_with_progress<F>(
+    image: &ImageFile,
+    chunk_bytes: usize,
+    phase: CandidateWorkPhase,
+    observer: &mut F,
+) -> Result<[u8; 32], CandidateExportError>
+where
+    F: FnMut(CandidateWorkProgress) -> CandidateWorkControl,
+{
     let mut hasher = Sha256::new();
     let mut offset = 0_u64;
+    observe_cancellable(observer, phase, 0, Some(image.len()))?;
     while offset < image.len() {
         let remaining = image.len() - offset;
         let length = usize::try_from(remaining.min(chunk_bytes as u64))
@@ -1097,16 +1355,38 @@ fn hash_image(image: &ImageFile, chunk_bytes: usize) -> Result<[u8; 32], Candida
                     CandidateExportError::ArithmeticOverflow("hash offset conversion")
                 })?)
                 .ok_or(CandidateExportError::ArithmeticOverflow("hash offset"))?;
+        observe_cancellable(observer, phase, offset, Some(image.len()))?;
     }
     Ok(hasher.finalize().into())
 }
 
+#[cfg(test)]
 fn copy_source(
     source: &ImageFile,
     output: &mut File,
     chunk_bytes: usize,
 ) -> Result<(), CandidateExportError> {
+    copy_source_with_progress(source, output, chunk_bytes, &mut |_| {
+        CandidateWorkControl::Continue
+    })
+}
+
+fn copy_source_with_progress<F>(
+    source: &ImageFile,
+    output: &mut File,
+    chunk_bytes: usize,
+    observer: &mut F,
+) -> Result<(), CandidateExportError>
+where
+    F: FnMut(CandidateWorkProgress) -> CandidateWorkControl,
+{
     let mut offset = 0_u64;
+    observe_cancellable(
+        observer,
+        CandidateWorkPhase::CopySource,
+        0,
+        Some(source.len()),
+    )?;
     while offset < source.len() {
         let remaining = source.len() - offset;
         let length = usize::try_from(remaining.min(chunk_bytes as u64))
@@ -1121,14 +1401,54 @@ fn copy_source(
                     CandidateExportError::ArithmeticOverflow("copy offset conversion")
                 })?)
                 .ok_or(CandidateExportError::ArithmeticOverflow("copy offset"))?;
+        observe_cancellable(
+            observer,
+            CandidateWorkPhase::CopySource,
+            offset,
+            Some(source.len()),
+        )?;
     }
     Ok(())
 }
 
+#[cfg(test)]
 fn apply_forward_writes(
     output: &mut File,
     writes: &OpaqueWriteSets,
 ) -> Result<(), CandidateExportError> {
+    let replacement_bytes = writes
+        .target_staging
+        .iter()
+        .chain(&writes.backup_boot)
+        .chain(&writes.activation)
+        .try_fold(0_u64, |total, write| {
+            total.checked_add(write.write.bytes.len() as u64)
+        })
+        .ok_or(CandidateExportError::ArithmeticOverflow(
+            "replacement byte total",
+        ))?;
+    apply_forward_writes_with_progress(output, writes, usize::MAX, replacement_bytes, &mut |_| {
+        CandidateWorkControl::Continue
+    })
+}
+
+fn apply_forward_writes_with_progress<F>(
+    output: &mut File,
+    writes: &OpaqueWriteSets,
+    chunk_bytes: usize,
+    replacement_bytes: u64,
+    observer: &mut F,
+) -> Result<(), CandidateExportError>
+where
+    F: FnMut(CandidateWorkProgress) -> CandidateWorkControl,
+{
+    let mut completed = 0_u64;
+    observe_cancellable(
+        observer,
+        CandidateWorkPhase::ApplyCandidateWrites,
+        0,
+        Some(replacement_bytes),
+    )?;
     for write in writes
         .target_staging
         .iter()
@@ -1138,9 +1458,49 @@ fn apply_forward_writes(
         output
             .seek(SeekFrom::Start(write.write.offset))
             .map_err(|source| CandidateExportError::io("seek candidate image", source))?;
+        for chunk in write.write.bytes.chunks(chunk_bytes) {
+            output
+                .write_all(chunk)
+                .map_err(|source| CandidateExportError::io("write candidate image", source))?;
+            completed = completed.checked_add(chunk.len() as u64).ok_or(
+                CandidateExportError::ArithmeticOverflow("candidate write progress"),
+            )?;
+            observe_cancellable(
+                observer,
+                CandidateWorkPhase::ApplyCandidateWrites,
+                completed,
+                Some(replacement_bytes),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn write_escrow_with_progress<F>(
+    output: &mut File,
+    envelope: &[u8],
+    chunk_bytes: usize,
+    observer: &mut F,
+) -> Result<(), CandidateExportError>
+where
+    F: FnMut(CandidateWorkProgress) -> CandidateWorkControl,
+{
+    let total = envelope.len() as u64;
+    let mut completed = 0_u64;
+    observe_cancellable(observer, CandidateWorkPhase::WriteEscrow, 0, Some(total))?;
+    for chunk in envelope.chunks(chunk_bytes) {
         output
-            .write_all(&write.write.bytes)
-            .map_err(|source| CandidateExportError::io("write candidate image", source))?;
+            .write_all(chunk)
+            .map_err(|source| CandidateExportError::io("write bound escrow", source))?;
+        completed = completed.checked_add(chunk.len() as u64).ok_or(
+            CandidateExportError::ArithmeticOverflow("bound escrow write progress"),
+        )?;
+        observe_cancellable(
+            observer,
+            CandidateWorkPhase::WriteEscrow,
+            completed,
+            Some(total),
+        )?;
     }
     Ok(())
 }
@@ -1455,6 +1815,7 @@ mod tests {
 
     use super::*;
     use crate::conversion::OpaqueWriteSets;
+    use crate::cross_format::{ExfatToNtfsLimits, ExfatToNtfsOptions, plan_lossless_exfat_to_ntfs};
     use crate::extent::ExtentGraph;
     use crate::fs::ntfs_inventory::NtfsObjectReference;
     use crate::fs::ntfs_normalize::{
@@ -1462,6 +1823,8 @@ mod tests {
     };
     use crate::geometry::ReservationKind;
     use crate::object::{ObjectGraphLimits, ObjectId, ObjectKind, ObjectRecord, ObjectSemantics};
+    use crate::phase::preview_ntfs_phase_writes;
+    use crate::preimage::PreimageLimits;
     use crate::preservation::evaluate_ntfs;
 
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
@@ -1738,6 +2101,194 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_during_copy_cleans_private_partial_and_preserves_source() {
+        let bytes = vec![b'x'; 1536];
+        let source_file = TempFile::create(&bytes);
+        let source = ImageFile::open_with_limit(&source_file.path, 512).unwrap();
+        let destination = temp_path("cancelled-candidate.img");
+        let partial;
+        {
+            let mut guard = NewFileGuard::create_partial(&destination).unwrap();
+            partial = guard.path.clone();
+            let error =
+                copy_source_with_progress(&source, guard.file_mut(), 512, &mut |progress| {
+                    if progress.completed_bytes >= 512 {
+                        CandidateWorkControl::Cancel
+                    } else {
+                        CandidateWorkControl::Continue
+                    }
+                })
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                CandidateExportError::Cancelled {
+                    phase: CandidateWorkPhase::CopySource
+                }
+            ));
+        }
+        assert!(!destination.exists());
+        assert!(!partial.exists());
+        assert_eq!(fs::read(&source_file.path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn byte_progress_is_monotonic_bounded_and_finishes_at_total() {
+        let bytes = vec![b'z'; 1537];
+        let source_file = TempFile::create(&bytes);
+        let source = ImageFile::open_with_limit(&source_file.path, 512).unwrap();
+        let mut snapshots = Vec::new();
+        let digest = hash_image_with_progress(
+            &source,
+            512,
+            CandidateWorkPhase::HashSourceBefore,
+            &mut |progress| {
+                snapshots.push(progress);
+                CandidateWorkControl::Continue
+            },
+        )
+        .unwrap();
+        assert_eq!(digest, Sha256::digest(&bytes)[..]);
+        assert!(snapshots.windows(2).all(|pair| {
+            pair[0].phase == pair[1].phase && pair[0].completed_bytes <= pair[1].completed_bytes
+        }));
+        assert!(snapshots.iter().all(|progress| {
+            progress.total_bytes == Some(bytes.len() as u64)
+                && progress.completed_bytes <= bytes.len() as u64
+                && progress.cancellable
+        }));
+        assert_eq!(
+            snapshots.last().unwrap().completed_bytes,
+            bytes.len() as u64
+        );
+    }
+
+    #[test]
+    fn non_cancellable_publication_ignores_late_cancel_action() {
+        let mut observed = None;
+        report_non_cancellable(
+            &mut |progress| {
+                observed = Some(progress);
+                CandidateWorkControl::Cancel
+            },
+            CandidateWorkPhase::PublishArtifacts,
+            0,
+            None,
+        );
+        assert_eq!(
+            observed,
+            Some(CandidateWorkProgress {
+                phase: CandidateWorkPhase::PublishArtifacts,
+                completed_bytes: 0,
+                total_bytes: None,
+                cancellable: false,
+            })
+        );
+    }
+
+    #[test]
+    fn end_to_end_cancel_before_publication_never_exposes_destination() {
+        let source_file = TempFile::create(&minimal_exfat_image());
+        let source_before = fs::read(&source_file.path).unwrap();
+        let source = ImageFile::open(&source_file.path).unwrap();
+        let inspection = inspect_open_image(&source).unwrap();
+        let normalized = inspection.normalized_exfat.as_deref().unwrap();
+        let plan = plan_lossless_exfat_to_ntfs(
+            normalized,
+            GuaranteeMode::Escrow,
+            ExfatToNtfsOptions::default(),
+            ExfatToNtfsLimits::default(),
+        )
+        .unwrap();
+        let preview =
+            preview_ntfs_phase_writes(&source, &plan.destination, PreimageLimits::default())
+                .unwrap();
+        let destination = temp_path("cancelled-before-publication.img");
+        let escrow = temp_path("cancelled-before-publication.escrow");
+
+        let error = export_candidate_image_with_progress(
+            &source,
+            &destination,
+            Some(&escrow),
+            &preview,
+            &plan.target_graph,
+            &plan.preservation,
+            CandidateExportLimits::default(),
+            |progress| {
+                if progress.phase == CandidateWorkPhase::ReadyToPublish {
+                    CandidateWorkControl::Cancel
+                } else {
+                    CandidateWorkControl::Continue
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            CandidateExportError::Cancelled {
+                phase: CandidateWorkPhase::ReadyToPublish
+            }
+        ));
+        assert!(!destination.exists());
+        assert!(!escrow.exists());
+        assert_eq!(fs::read(&source_file.path).unwrap(), source_before);
+    }
+
+    #[test]
+    fn end_to_end_late_cancel_during_publication_reports_real_success() {
+        let source_file = TempFile::create(&minimal_exfat_image());
+        let source_before = fs::read(&source_file.path).unwrap();
+        let source = ImageFile::open(&source_file.path).unwrap();
+        let inspection = inspect_open_image(&source).unwrap();
+        let normalized = inspection.normalized_exfat.as_deref().unwrap();
+        let plan = plan_lossless_exfat_to_ntfs(
+            normalized,
+            GuaranteeMode::Escrow,
+            ExfatToNtfsOptions::default(),
+            ExfatToNtfsLimits::default(),
+        )
+        .unwrap();
+        let preview =
+            preview_ntfs_phase_writes(&source, &plan.destination, PreimageLimits::default())
+                .unwrap();
+        let destination = temp_path("late-cancel-published.img");
+        let escrow = temp_path("late-cancel-published.escrow");
+        let mut saw_non_cancellable = false;
+
+        let evidence = export_candidate_image_with_progress(
+            &source,
+            &destination,
+            Some(&escrow),
+            &preview,
+            &plan.target_graph,
+            &plan.preservation,
+            CandidateExportLimits::default(),
+            |progress| {
+                if progress.phase == CandidateWorkPhase::PublishArtifacts {
+                    saw_non_cancellable = !progress.cancellable;
+                    CandidateWorkControl::Cancel
+                } else {
+                    CandidateWorkControl::Continue
+                }
+            },
+        )
+        .unwrap();
+        assert!(saw_non_cancellable);
+        assert_eq!(
+            evidence.output_path,
+            fs::canonicalize(&destination).unwrap()
+        );
+        assert!(destination.exists());
+        assert_eq!(
+            evidence.escrow_path,
+            Some(fs::canonicalize(&escrow).unwrap())
+        );
+        assert!(escrow.exists());
+        assert_eq!(fs::read(&source_file.path).unwrap(), source_before);
+        fs::remove_file(destination).unwrap();
+        fs::remove_file(escrow).unwrap();
+    }
+
+    #[test]
     fn directory_durability_has_stable_user_facing_labels() {
         assert_eq!(
             DirectoryDurability::Synchronized.to_string(),
@@ -1865,6 +2416,51 @@ mod tests {
         assert_eq!(evidence.candidate_sha256, candidate_sha256);
         assert_eq!(evidence.manifest_sha256, manifest.metadata_sha256);
         assert_eq!(evidence.escrow_schema_version, 4);
+        assert_eq!(fs::read(&candidate_file.path).unwrap(), candidate_before);
+        assert_eq!(fs::read(&escrow_file.path).unwrap(), escrow_before);
+    }
+
+    #[test]
+    fn cancelling_bound_verification_never_changes_artifacts() {
+        let candidate_file = TempFile::create(&minimal_exfat_image());
+        let candidate = ImageFile::open(&candidate_file.path).unwrap();
+        let inspection = inspect_open_image(&candidate).unwrap();
+        let graph = normalized_graph(&inspection, FileSystem::ExFat).unwrap();
+        let manifest = build_manifest(&candidate, graph, VerificationLimits::default()).unwrap();
+        let candidate_sha256 = hash_image(&candidate, 64 * 1024).unwrap();
+        let envelope = encode_bound_escrow(
+            FileSystem::Ntfs,
+            FileSystem::ExFat,
+            [0x5a; 32],
+            candidate_sha256,
+            manifest.metadata_sha256,
+            &test_ntfs_escrow_payload(),
+        )
+        .unwrap();
+        let escrow_file = TempFile::create(&envelope);
+        let candidate_before = fs::read(&candidate_file.path).unwrap();
+        let escrow_before = fs::read(&escrow_file.path).unwrap();
+
+        let error = verify_bound_export_with_progress(
+            &candidate_file.path,
+            &escrow_file.path,
+            None,
+            CandidateVerificationLimits::default(),
+            |progress| {
+                if progress.phase == CandidateWorkPhase::HashVerificationCandidate {
+                    CandidateWorkControl::Cancel
+                } else {
+                    CandidateWorkControl::Continue
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            CandidateExportError::Cancelled {
+                phase: CandidateWorkPhase::HashVerificationCandidate
+            }
+        ));
         assert_eq!(fs::read(&candidate_file.path).unwrap(), candidate_before);
         assert_eq!(fs::read(&escrow_file.path).unwrap(), escrow_before);
     }

@@ -205,6 +205,8 @@ installed. CI always tests both language stacks.
 - [x] Phase-separated exFAT and NTFS structural destination serializers
 - [x] Exact regular-image preimage capture for every source-visible write phase
 - [x] Versioned capsule recovery bundle retaining exact phase before-images
+- [x] Bounded append-only capsule store with exclusive create/resume, one-generation growth,
+      read-back verification, flush evidence, and torn/changed-file refusal
 - [x] Bounded parser fuzz targets and CI smoke workflow
 - [x] Modeled crash campaign across every durable transaction barrier
 - [x] Every-byte capsule-tail and in-flight write-group recovery matrix
@@ -223,6 +225,8 @@ installed. CI always tests both language stacks.
 - [x] Populated formatter-origin feature corpus with nested Unicode, allocation boundaries, fragmentation, and exact driver-read payload hashes
 - [x] Native desktop exact-candidate preview with in-memory rollback capture and no executor authority
 - [x] Nonblocking desktop inspect/preview/export/verify jobs with stale-result and panic containment
+- [x] Byte-level candidate progress and cooperative cancellation through the last safe
+      pre-publication checkpoint, with truthful non-cancellable publication reporting
 - [x] Bounded desktop session recovery with stale/corrupt/raw-device refusal and keyboard/contrast regressions
 - [x] Create-new exFAT→NTFS and NTFS→exFAT export with reinspection, manifest equality, source re-hash, and escrow sidecar
 - [x] Independently mount both exported rich cross-format candidates read-only and verify exact payload hashes
@@ -231,6 +235,8 @@ installed. CI always tests both language stacks.
 - [x] Deterministic converted fixed-VHD fixtures and fail-closed Windows validation harness
 - [x] Four-target deterministic portable packaging with exact bundle inventories, SBOM identity checks, and verified provenance attestations
 - [x] Deterministic unsigned macOS application bundles with closed-schema validation and native dependency/signature gates
+- [x] Source-bound Windows PE identity: console CLI, windowed GUI, `asInvoker`, long-path manifest,
+      exact pre-release version metadata, no icon artwork, and unsigned-channel enforcement
 - [x] Scheduled RustSec/Go vulnerability scans and weekly Cargo, Go, and GitHub Actions update proposals
 - [ ] Close serializer activation gaps and qualify the cross-filesystem metadata profiles
 - [ ] In-place image conversion with durable recovery/finalize workflow

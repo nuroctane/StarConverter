@@ -1,6 +1,7 @@
 [package]
 name = "starconverter-cli"
 description = "Image inspection, preview, and copy-based conversion frontend for StarConverter"
+build = "build.rs"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,6 +15,9 @@ path = "src/main.rs"
 
 [dependencies]
 starconverter-core = { path = "../starconverter-core" }
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = { version = "=0.1.31", default-features = false }
 
 [lints]
 workspace = true

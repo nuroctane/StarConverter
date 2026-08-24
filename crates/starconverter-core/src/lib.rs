@@ -6,6 +6,7 @@
 
 pub mod candidate_export;
 pub mod capsule;
+pub mod capsule_store;
 pub mod conversion;
 pub mod cross_format;
 pub mod executor;

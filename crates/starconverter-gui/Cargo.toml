@@ -1,6 +1,7 @@
 [package]
 name = "starconverter-gui"
 description = "Native cross-platform desktop shell for StarConverter"
+build = "build.rs"
 version.workspace = true
 edition.workspace = true
 rust-version = "1.95"
@@ -16,6 +17,9 @@ path = "src/main.rs"
 eframe = "0.36.1"
 rfd = "0.17.2"
 starconverter-core = { path = "../starconverter-core" }
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = { version = "=0.1.31", default-features = false }
 
 [lints]
 workspace = true

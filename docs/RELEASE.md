@@ -22,6 +22,13 @@ A tag such as `v0.1.0` produces these deterministic names:
 Each portable archive contains the `starconverter` CLI, the `starconverter-gui` desktop executable,
 `README.md`, `LICENSE`, and this release guide.
 
+The Windows executables carry source-bound PE metadata rather than artwork: the CLI uses the
+console subsystem, the desktop executable uses the windowed subsystem, and both embed exact
+pre-release `VERSIONINFO` plus an `asInvoker`, long-path-aware application manifest. The unsigned
+engineering channel rejects icon/group-icon resources and any Authenticode certificate table. CI
+reopens the ZIP, verifies those resources independently and with Windows SDK/native tools, and
+runs the packaged CLI read-only smoke command before upload.
+
 The two `-macos-app.tar.gz` engineering archives instead contain an exact four-file
 `StarConverter.app`: its canonical `Contents/Info.plist`, the GUI under `Contents/MacOS`, and the
 license and release guide under `Contents/Resources`. The standalone CLI remains in the portable
@@ -173,6 +180,7 @@ The workflow reduces accidental variance by:
 - using Rust 1.95.0 and `cargo build --locked`;
 - selecting explicit runner operating systems and target triples;
 - disabling incremental compilation and remapping the workspace source path;
+- asking the Windows linker for reproducible PE/CodeView fields with `/Brepro`;
 - deriving archive and SBOM timestamps from the source commit;
 - replacing the SBOM generator's intentionally omitted random serial with a deterministic UUIDv5
   bound to repository, source commit, and component, then refusing foreign identities;
