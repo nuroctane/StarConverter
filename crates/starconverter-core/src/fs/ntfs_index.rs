@@ -75,7 +75,9 @@ pub struct NtfsIndexRoot<'a> {
     pub indexed_attribute_type: u32,
     pub collation_rule: u32,
     pub index_block_size: u32,
-    pub clusters_per_index_block: i8,
+    /// Number of clusters per index block, or 512-byte sectors when the block is sub-cluster.
+    /// This field is an unsigned byte on disk.
+    pub clusters_per_index_block: u8,
     pub header: NtfsIndexHeader,
     entries: ValidatedEntries<'a>,
 }
@@ -343,7 +345,7 @@ pub enum NtfsIndexError {
         value: u32,
     },
     InvalidClustersPerIndexBlock {
-        value: i8,
+        value: u8,
     },
     InvalidMagic {
         found: [u8; 4],
@@ -693,7 +695,7 @@ pub fn parse_index_root(
             value: index_block_size,
         });
     }
-    let clusters_per_index_block = i8::from_ne_bytes([bytes[12]]);
+    let clusters_per_index_block = bytes[12];
     if clusters_per_index_block == 0 {
         return Err(NtfsIndexError::InvalidClustersPerIndexBlock {
             value: clusters_per_index_block,
@@ -1256,6 +1258,16 @@ mod tests {
             vec![0x61, 0xd83d, 0xde80]
         );
         assert!(parsed.entries().last().unwrap().is_end);
+    }
+
+    #[test]
+    fn parses_unsigned_128_index_block_units() {
+        let mut bytes = root(false);
+        put_u32(&mut bytes, 8, 65_536);
+        bytes[12] = 128;
+        let parsed = parse_index_root(&bytes, NtfsIndexLimits::default()).unwrap();
+        assert_eq!(parsed.index_block_size, 65_536);
+        assert_eq!(parsed.clusters_per_index_block, 128);
     }
 
     #[test]

@@ -17,9 +17,9 @@ const VIRTUAL_BYTES: u64 = 34_603_008;
 const PARTITION_OFFSET_BYTES: u64 = 1024 * 1024;
 
 const NTFS_CASE_NAME: &str = "exFAT-to-NTFS rich conversion";
-const NTFS_CASE_HASH: &str = "4D1CDDB7676FE60A541A432B38E32880621B88B5CA6404097FAAC357A8291E2F";
+const NTFS_CASE_HASH: &str = "F58C1F68BF819331EA9B42EDE8646A3EC7F4D7A34A77034249ACBE04802B2DC3";
 const EXFAT_CASE_NAME: &str = "NTFS-to-exFAT rich conversion";
-const EXFAT_CASE_HASH: &str = "EE905BAEE3EEFD654F15EF5514110C2DCF9E6E58DB28751B8833D79FAF8F5B7A";
+const EXFAT_CASE_HASH: &str = "8FC03DE6F777B3473FCF08322C6B8159AD73E372CCEF3BB459853CF423C3EC47";
 
 const EXPECTED_PAYLOADS: [(&str, u64, &str); 3] = [
     (
@@ -996,7 +996,7 @@ mod tests {
                 .iter()
                 .all(|case| case.driver_evidence().is_none())
         );
-        assert_eq!(evidence.cases()[0].sha256()[0], 0x4d);
+        assert_eq!(evidence.cases()[0].sha256()[0], 0xf5);
     }
 
     #[test]

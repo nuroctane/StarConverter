@@ -14,7 +14,8 @@
 //! The supported object subset is intentionally narrow: one namespace link per non-root object,
 //! no security/reparse semantics, no named/sparse/compressed/encrypted streams, resident unnamed
 //! data that fits its FILE record, or cluster-aligned physical unnamed data extents. Directories
-//! must fit a resident `$I30` index root.  Refusal is preferable to silently weakening semantics.
+//! must fit a resident or single-level spilled `$I30` tree. Refusal is preferable to silently
+//! weakening semantics.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -85,6 +86,7 @@ const ACTIVATION_GAPS: &[&str] = &[
     "$Extend uses a pinned NTFS-3G bootstrap profile whose exact bytes are not specified by Microsoft",
     "$Extend case-sensitivity semantics remain a FIXME in the pinned formatter profile",
     "$UsnJrnl is omitted and modern $RmMetadata variants are not modeled",
+    "directory indexes requiring internal INDX levels are not modeled",
     "external Windows chkdsk/mount interoperability has not been proven",
 ];
 
@@ -95,6 +97,7 @@ const STRUCTURAL_ACTIVATION_GAPS: &[&str] = &[
     "$Extend uses a pinned NTFS-3G bootstrap profile whose exact bytes are not specified by Microsoft",
     "$Extend case-sensitivity semantics remain a FIXME in the pinned formatter profile",
     "$UsnJrnl is omitted and modern $RmMetadata variants are not modeled",
+    "directory indexes requiring internal INDX levels are not modeled",
     "external Windows chkdsk/mount interoperability has not been proven",
 ];
 
@@ -298,6 +301,7 @@ pub enum NtfsSerializeError {
     InvalidVolumeLabel {
         reason: &'static str,
     },
+    /// Retained for API compatibility with older planners that stopped at 4 KiB clusters.
     UnsupportedDirectoryIndexGeometry {
         cluster_bytes: u32,
     },
@@ -458,7 +462,7 @@ impl fmt::Display for NtfsSerializeError {
             }
             Self::UnsupportedDirectoryIndexGeometry { cluster_bytes } => write!(
                 f,
-                "{cluster_bytes}-byte clusters require sub-cluster directory-index VCN support; the current safe subset stops at 4096 bytes"
+                "{cluster_bytes}-byte clusters have unsupported directory-index geometry"
             ),
             Self::VolumeTooSmall { required, actual } => write!(
                 f,
@@ -842,11 +846,6 @@ fn plan_ntfs_destination_impl(
     let cluster_count = declared_sectors / (cluster / SECTOR_BYTES);
     if cluster_count <= MFT_LCN + 1 {
         return Err(NtfsSerializeError::InvalidImageGeometry);
-    }
-    if inputs.cluster_bytes > u32::try_from(INDEX_BLOCK_BYTES).unwrap() {
-        return Err(NtfsSerializeError::UnsupportedDirectoryIndexGeometry {
-            cluster_bytes: inputs.cluster_bytes,
-        });
     }
     let upcase = generate_ntfs3g_windows61_upcase(NtfsUpcaseLimits::default())
         .map_err(|source| NtfsSerializeError::Upcase { source })?;
@@ -4981,16 +4980,41 @@ mod tests {
     }
 
     #[test]
-    fn directory_index_geometry_limits_and_pinned_collisions_fail_closed() {
+    fn sub_cluster_directory_indexes_round_trip_at_large_cluster_sizes() {
         let graph = two_spilled_directories_graph(36);
-        let mut geometry = inputs();
-        geometry.cluster_bytes = 8192;
-        assert!(matches!(
-            plan_ntfs_destination(&graph, geometry, NtfsSerializeLimits::default()),
-            Err(NtfsSerializeError::UnsupportedDirectoryIndexGeometry {
-                cluster_bytes: 8192
-            })
-        ));
+        for cluster_bytes in [8192, 65_536] {
+            let mut geometry = inputs();
+            geometry.cluster_bytes = cluster_bytes;
+            let plan =
+                plan_ntfs_destination(&graph, geometry, NtfsSerializeLimits::default()).unwrap();
+            assert_eq!(plan.cluster_bytes, cluster_bytes);
+            assert_eq!(i8::from_ne_bytes([plan.primary_boot_write.bytes[68]]), -12);
+
+            let temp = TempImage::create(&activated_image(&plan));
+            let inspection = crate::inspect::inspect_image(&temp.0).unwrap();
+            let inventory = inspection.ntfs_inventory.as_ref().unwrap();
+            for directory in [ObjectId(2), ObjectId(3)] {
+                let record_number = plan
+                    .object_placements
+                    .iter()
+                    .find(|placement| placement.object == directory)
+                    .unwrap()
+                    .record_number;
+                let inventoried = inventory
+                    .objects
+                    .iter()
+                    .find(|object| object.reference.record_number == record_number)
+                    .unwrap();
+                assert!(inventoried.is_directory);
+                assert_eq!(inventoried.directory_entries.len(), 36);
+            }
+            assert!(inspection.profile.inventory_complete);
+        }
+    }
+
+    #[test]
+    fn directory_index_limits_and_pinned_collisions_fail_closed() {
+        let graph = two_spilled_directories_graph(36);
 
         let allocation_limited = NtfsSerializeLimits {
             max_index_allocation_bytes: 4095,

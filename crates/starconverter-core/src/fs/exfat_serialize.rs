@@ -14,6 +14,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use super::exfat_inventory::{ExfatPreservationEvidence, ExfatTimestamps};
+use super::exfat_region::{
+    ExfatBootRegionComparison, ExfatBootRegionError, ExfatBootRegionKind, validate_boot_regions,
+};
 use super::exfat_upcase::{MAX_FILE_NAME_CODE_UNITS, UpcaseLimits, UpcaseTable, table_checksum};
 use crate::extent::{ExtentKind, Placement, StreamId};
 use crate::geometry::{ByteRange, DestinationReservation, ReservationKind, SourceAllocation};
@@ -26,6 +29,8 @@ const END_OF_CHAIN: u32 = u32::MAX;
 const FAT_MEDIA_ENTRY: u32 = 0xffff_fff8;
 const DIRECTORY_ATTRIBUTE: u16 = 0x0010;
 const VALID_FILE_ATTRIBUTES: u16 = 0x0037;
+const BOOT_CODE_START: usize = 120;
+const BOOT_CODE_END: usize = 510;
 const ACTIVATION_GAPS: &[&str] = &[
     "per-candidate exFAT driver mount and payload evidence is not yet bound into activation authorization",
     "external Windows chkdsk/mount interoperability has not been proven",
@@ -202,6 +207,12 @@ pub enum ExfatSerializeError {
     MetadataSpaceExhausted {
         clusters: u64,
     },
+    GeneratedBootRegion(ExfatBootRegionError),
+    GeneratedBootCode {
+        region: ExfatBootRegionKind,
+        offset: usize,
+        found: u8,
+    },
     Overlay(OverlayError),
 }
 
@@ -290,6 +301,17 @@ impl fmt::Display for ExfatSerializeError {
                 formatter,
                 "cannot reserve {clusters} contiguous clusters for destination metadata"
             ),
+            Self::GeneratedBootRegion(error) => {
+                write!(formatter, "generated exFAT boot regions failed validation: {error}")
+            }
+            Self::GeneratedBootCode {
+                region,
+                offset,
+                found,
+            } => write!(
+                formatter,
+                "generated exFAT {region} formatter boot code byte {offset} is {found:#04x}, expected 0xf4"
+            ),
             Self::Overlay(error) => write!(formatter, "invalid exFAT overlay: {error}"),
         }
     }
@@ -298,6 +320,7 @@ impl fmt::Display for ExfatSerializeError {
 impl std::error::Error for ExfatSerializeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::GeneratedBootRegion(error) => Some(error),
             Self::Overlay(error) => Some(error),
             _ => None,
         }
@@ -1449,6 +1472,10 @@ fn build_boot_regions(
     main[110] = 1;
     main[111] = options.drive_select;
     main[112] = percent_in_use;
+    // StarConverter supplies no bootstrap implementation. Section 3.1.19 of Microsoft's exFAT
+    // specification requires formatters in that case to fill the entire BootCode field with the
+    // x86 HLT instruction rather than leave executable zero bytes behind.
+    main[BOOT_CODE_START..BOOT_CODE_END].fill(0xf4);
     put_u16(&mut main, 510, 0xaa55);
     for index in 1..=8 {
         put_u32(&mut main, index * sector + sector - 4, 0xaa55_0000);
@@ -1466,7 +1493,57 @@ fn build_boot_regions(
     }
     let mut both = main.clone();
     both.extend_from_slice(&main);
+    validate_generated_boot_regions(&both, sector)?;
     Ok(both)
+}
+
+fn validate_generated_boot_regions(
+    regions: &[u8],
+    bytes_per_sector: usize,
+) -> Result<(), ExfatSerializeError> {
+    let validated = validate_boot_regions(regions, bytes_per_sector)
+        .map_err(ExfatSerializeError::GeneratedBootRegion)?;
+    if validated.comparison != ExfatBootRegionComparison::Exact {
+        return Err(ExfatSerializeError::InvalidGeometry(
+            "generated main and backup boot regions differ",
+        ));
+    }
+    validate_formatter_boot_code(regions, bytes_per_sector)
+}
+
+fn validate_formatter_boot_code(
+    regions: &[u8],
+    bytes_per_sector: usize,
+) -> Result<(), ExfatSerializeError> {
+    let region_bytes =
+        bytes_per_sector
+            .checked_mul(12)
+            .ok_or(ExfatSerializeError::ArithmeticOverflow(
+                "boot region byte length",
+            ))?;
+    for (region, base) in [
+        (ExfatBootRegionKind::Main, 0),
+        (ExfatBootRegionKind::Backup, region_bytes),
+    ] {
+        let boot_code = regions
+            .get(base + BOOT_CODE_START..base + BOOT_CODE_END)
+            .ok_or(ExfatSerializeError::InvalidGeometry(
+                "generated boot code range is truncated",
+            ))?;
+        if let Some((offset, found)) = boot_code
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, byte)| *byte != 0xf4)
+        {
+            return Err(ExfatSerializeError::GeneratedBootCode {
+                region,
+                offset,
+                found,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn reservations_for(
@@ -1838,6 +1915,77 @@ mod tests {
         assert_eq!(summary.files, 0);
         assert_eq!(summary.allocation_bitmaps, 1);
         assert_eq!(summary.upcase_tables, 1);
+    }
+
+    #[test]
+    fn formatter_boot_code_and_generated_regions_roundtrip_every_sector_size() {
+        let graph = graph(vec![root()], Vec::new(), Vec::new());
+        let upcase = non_interoperable_ascii_test_upcase_table();
+        for bytes_per_sector in [512_u32, 1024, 2048, 4096] {
+            let plan = serialize_exfat_destination(
+                &graph,
+                &[],
+                profile(&upcase),
+                ExfatSerializeOptions {
+                    bytes_per_sector,
+                    ..ExfatSerializeOptions::default()
+                },
+                ExfatSerializeLimits::default(),
+            )
+            .unwrap();
+            let sector = usize::try_from(bytes_per_sector).unwrap();
+            let mut regions = plan.primary_boot_write().bytes.clone();
+            regions.extend_from_slice(&plan.backup_boot_write().bytes);
+            let validated = validate_boot_regions(&regions, sector).unwrap();
+            assert_eq!(validated.comparison, ExfatBootRegionComparison::Exact);
+            for base in [0, 12 * sector] {
+                assert!(
+                    regions[base + BOOT_CODE_START..base + BOOT_CODE_END]
+                        .iter()
+                        .all(|byte| *byte == 0xf4)
+                );
+                for extended_sector in 1..=8 {
+                    let start = base + extended_sector * sector;
+                    assert!(
+                        regions[start..start + sector - 4]
+                            .iter()
+                            .all(|byte| *byte == 0)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn formatter_boot_code_tamper_is_rejected_by_policy_and_boot_checksum_parser() {
+        let graph = graph(vec![root()], Vec::new(), Vec::new());
+        let plan = serialize_exfat_destination(
+            &graph,
+            &[],
+            profile(&non_interoperable_ascii_test_upcase_table()),
+            ExfatSerializeOptions::default(),
+            ExfatSerializeLimits::default(),
+        )
+        .unwrap();
+        let mut regions = plan.primary_boot_write().bytes.clone();
+        regions.extend_from_slice(&plan.backup_boot_write().bytes);
+        regions[BOOT_CODE_START + 17] = 0;
+
+        assert!(matches!(
+            validate_formatter_boot_code(&regions, 512),
+            Err(ExfatSerializeError::GeneratedBootCode {
+                region: ExfatBootRegionKind::Main,
+                offset: 17,
+                found: 0,
+            })
+        ));
+        assert!(matches!(
+            validate_boot_regions(&regions, 512),
+            Err(ExfatBootRegionError::InvalidBootChecksumWord {
+                region: ExfatBootRegionKind::Main,
+                ..
+            })
+        ));
     }
 
     #[test]

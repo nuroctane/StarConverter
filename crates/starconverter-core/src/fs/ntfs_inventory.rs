@@ -375,6 +375,12 @@ pub enum NtfsInventoryError {
         record_number: u64,
         child_vcn: u64,
     },
+    InvalidIndexRootGeometry {
+        record_number: u64,
+        cluster_bytes: u64,
+        index_block_bytes: u32,
+        encoded_units: u8,
+    },
     IndexParentMismatch {
         directory: u64,
         found_parent: u64,
@@ -560,6 +566,15 @@ impl fmt::Display for NtfsInventoryError {
             } => write!(
                 formatter,
                 "directory record {record_number} has misaligned child VCN {child_vcn}"
+            ),
+            Self::InvalidIndexRootGeometry {
+                record_number,
+                cluster_bytes,
+                index_block_bytes,
+                encoded_units,
+            } => write!(
+                formatter,
+                "directory record {record_number} has index geometry block={index_block_bytes}, cluster={cluster_bytes}, units={encoded_units}"
             ),
             Self::IndexParentMismatch {
                 directory,
@@ -1822,32 +1837,50 @@ fn index_child_offset(
     root: &NtfsIndexRoot<'_>,
     cluster_bytes: u64,
 ) -> Result<(u64, u64), NtfsInventoryError> {
-    if root.clusters_per_index_block > 0 {
-        let clusters = u64::try_from(root.clusters_per_index_block).unwrap_or(0);
-        if child_vcn % clusters != 0 {
-            return Err(NtfsInventoryError::IndexChildVcnMisaligned {
+    let index_block_bytes = u64::from(root.index_block_size);
+    let (expected_units, unit_bytes) = if index_block_bytes >= cluster_bytes {
+        if index_block_bytes % cluster_bytes != 0 {
+            return Err(NtfsInventoryError::InvalidIndexRootGeometry {
                 record_number,
-                child_vcn,
+                cluster_bytes,
+                index_block_bytes: root.index_block_size,
+                encoded_units: root.clusters_per_index_block,
             });
         }
-        Ok((
-            child_vcn
-                .checked_mul(cluster_bytes)
-                .ok_or(NtfsInventoryError::GeometryOverflow {
-                    calculation: "index child offset",
-                })?,
-            child_vcn / clusters,
-        ))
+        (index_block_bytes / cluster_bytes, cluster_bytes)
     } else {
-        Ok((
-            child_vcn
-                .checked_mul(u64::from(root.index_block_size))
-                .ok_or(NtfsInventoryError::GeometryOverflow {
-                    calculation: "index child offset",
-                })?,
-            child_vcn,
-        ))
+        if cluster_bytes % index_block_bytes != 0 || index_block_bytes % 512 != 0 {
+            return Err(NtfsInventoryError::InvalidIndexRootGeometry {
+                record_number,
+                cluster_bytes,
+                index_block_bytes: root.index_block_size,
+                encoded_units: root.clusters_per_index_block,
+            });
+        }
+        (index_block_bytes / 512, 512)
+    };
+    if u64::from(root.clusters_per_index_block) != expected_units {
+        return Err(NtfsInventoryError::InvalidIndexRootGeometry {
+            record_number,
+            cluster_bytes,
+            index_block_bytes: root.index_block_size,
+            encoded_units: root.clusters_per_index_block,
+        });
     }
+    if child_vcn % expected_units != 0 {
+        return Err(NtfsInventoryError::IndexChildVcnMisaligned {
+            record_number,
+            child_vcn,
+        });
+    }
+    Ok((
+        child_vcn
+            .checked_mul(unit_bytes)
+            .ok_or(NtfsInventoryError::GeometryOverflow {
+                calculation: "index child offset",
+            })?,
+        child_vcn / expected_units,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2419,6 +2452,26 @@ mod tests {
         assert!(matches!(
             parse_standard_information(1, &[0; 47]),
             Err(NtfsInventoryError::InvalidStandardInformation { .. })
+        ));
+    }
+
+    #[test]
+    fn index_child_offsets_accept_unsigned_128_units_and_reject_wrong_geometry() {
+        let mut value = empty_index_root();
+        value[8..12].copy_from_slice(&65_536_u32.to_le_bytes());
+        value[12] = 128;
+        let root = parse_index_root(&value, NtfsIndexLimits::default()).unwrap();
+        assert_eq!(index_child_offset(5, 128, &root, 512).unwrap(), (65_536, 1));
+
+        value[12] = 127;
+        let root = parse_index_root(&value, NtfsIndexLimits::default()).unwrap();
+        assert!(matches!(
+            index_child_offset(5, 128, &root, 512),
+            Err(NtfsInventoryError::InvalidIndexRootGeometry {
+                record_number: 5,
+                encoded_units: 127,
+                ..
+            })
         ));
     }
 

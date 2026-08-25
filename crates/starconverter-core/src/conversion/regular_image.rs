@@ -583,7 +583,13 @@ impl<'plan> RegularImageCoordinator<'plan> {
             return Err(RegularImageCoordinatorError::LeaseStateChanged);
         }
         let mut updated = self.store.bytes().to_vec();
-        let observed = self.observe_current()?;
+        let observed = match self.observe_current() {
+            Ok(observed) => observed,
+            Err(error) => {
+                self.poison();
+                return Err(error);
+            }
+        };
         if let Err(error) =
             self.prepared
                 .record_execution(&mut updated, observed, executed, staging_verification)
@@ -607,7 +613,13 @@ impl<'plan> RegularImageCoordinator<'plan> {
         let mut updated = self.store.bytes().to_vec();
         // The executor has already restored every conservative before-image. Hash the raw current
         // image as the source, without phase masks, before accepting `RolledBack`.
-        let observed = self.observe_phase(TransactionPhase::Discovered)?;
+        let observed = match self.observe_phase(TransactionPhase::Discovered) {
+            Ok(observed) => observed,
+            Err(error) => {
+                self.poison();
+                return Err(error);
+            }
+        };
         if let Err(error) = self
             .prepared
             .record_executed_rollback(&mut updated, observed, executed)

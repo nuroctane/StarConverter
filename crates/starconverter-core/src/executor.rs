@@ -1370,58 +1370,55 @@ mod tests {
     }
 
     #[test]
-    fn every_write_cut_point_withholds_completion_and_retry_converges() {
+    fn every_phase_write_cut_point_withholds_completion_and_retry_converges() {
         let original = vec![0x11; 64];
         let desired = OverlayWrite {
             offset: 16,
             bytes: vec![0x77; 13],
         };
-        let discovery = {
-            let temp = TempImage::new(&original);
-            let executor = open_executor(&temp, 5);
-            let mut recorder = RecordFaults {
-                fail_at: None,
-                seen: Vec::new(),
+        for kind in [
+            ExecutionKind::TargetStaging,
+            ExecutionKind::BackupBoot,
+            ExecutionKind::Activation,
+            ExecutionKind::Rollback,
+        ] {
+            let discovery = {
+                let temp = TempImage::new(&original);
+                let executor = open_executor(&temp, 5);
+                let mut recorder = RecordFaults {
+                    fail_at: None,
+                    seen: Vec::new(),
+                };
+                executor
+                    .apply_overlay_writes(kind, std::slice::from_ref(&desired), &mut recorder)
+                    .unwrap();
+                recorder.seen
             };
-            executor
-                .apply_overlay_writes(
-                    ExecutionKind::Rollback,
-                    std::slice::from_ref(&desired),
-                    &mut recorder,
-                )
-                .unwrap();
-            recorder.seen
-        };
-        assert!(!discovery.is_empty());
-        for cut in 0..discovery.len() {
-            let temp = TempImage::new(&original);
-            let executor = open_executor(&temp, 5);
-            let mut fault = RecordFaults {
-                fail_at: Some(cut),
-                seen: Vec::new(),
-            };
-            let error = executor
-                .apply_overlay_writes(
-                    ExecutionKind::Rollback,
-                    std::slice::from_ref(&desired),
-                    &mut fault,
-                )
-                .unwrap_err();
-            assert!(matches!(error, ExecutorError::InjectedFault { .. }));
-            let mut retry = RecordFaults {
-                fail_at: None,
-                seen: Vec::new(),
-            };
-            let evidence = executor
-                .apply_overlay_writes(
-                    ExecutionKind::Rollback,
-                    std::slice::from_ref(&desired),
-                    &mut retry,
-                )
-                .unwrap();
-            assert!(evidence.sync_all_completed);
-            drop(executor);
-            assert_eq!(&fs::read(&temp.0).unwrap()[16..29], desired.bytes);
+            assert!(!discovery.is_empty());
+            assert!(discovery.iter().all(|point| point.kind == kind));
+            for cut in 0..discovery.len() {
+                let temp = TempImage::new(&original);
+                let executor = open_executor(&temp, 5);
+                let mut fault = RecordFaults {
+                    fail_at: Some(cut),
+                    seen: Vec::new(),
+                };
+                let error = executor
+                    .apply_overlay_writes(kind, std::slice::from_ref(&desired), &mut fault)
+                    .unwrap_err();
+                assert!(matches!(error, ExecutorError::InjectedFault { .. }));
+                let mut retry = RecordFaults {
+                    fail_at: None,
+                    seen: Vec::new(),
+                };
+                let evidence = executor
+                    .apply_overlay_writes(kind, std::slice::from_ref(&desired), &mut retry)
+                    .unwrap();
+                assert_eq!(evidence.kind(), kind);
+                assert!(evidence.sync_all_completed);
+                drop(executor);
+                assert_eq!(&fs::read(&temp.0).unwrap()[16..29], desired.bytes);
+            }
         }
     }
 

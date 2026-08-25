@@ -262,7 +262,9 @@ impl std::error::Error for NtfsDirectoryIndexError {}
 #[derive(Debug, Clone, Copy)]
 struct CheckedGeometry {
     block_bytes: usize,
-    clusters_per_block: u8,
+    /// Units stored in `INDEX_ROOT.clusters_per_index_block` and used by child/block VCNs.
+    /// NTFS uses clusters when a record is at least one cluster, otherwise 512-byte sectors.
+    vcn_units_per_block: u8,
     entries_offset: usize,
     leaf_entry_bytes: usize,
     root_budget: usize,
@@ -342,7 +344,7 @@ pub fn serialize_ntfs_directory_index(
         });
     }
 
-    let block_vcns = block_vcns(leaf_ranges.len(), checked.clusters_per_block)?;
+    let block_vcns = block_vcns(leaf_ranges.len(), checked.vcn_units_per_block)?;
     let mut index_allocation = Vec::new();
     index_allocation
         .try_reserve_exact(allocation_bytes)
@@ -393,7 +395,7 @@ pub fn validate_serialized_ntfs_directory_index(
     let root = parse_index_root(&serialized.index_root, parser_limits)
         .map_err(|error| malformed_error("INDEX_ROOT", error.to_string()))?;
     if root.index_block_size != geometry.index_block_bytes
-        || root.clusters_per_index_block != i8::try_from(checked.clusters_per_block).unwrap_or(-1)
+        || root.clusters_per_index_block != checked.vcn_units_per_block
         || root.header.allocated_size != root.header.index_length
     {
         return malformed("INDEX_ROOT", "noncanonical geometry or allocation length");
@@ -462,7 +464,7 @@ fn validate_spilled(
             maximum: limits.max_allocation_bytes,
         });
     }
-    let expected_vcns = block_vcns(block_count, checked.clusters_per_block)?;
+    let expected_vcns = block_vcns(block_count, checked.vcn_units_per_block)?;
     if serialized.block_vcns != expected_vcns {
         return malformed("INDEX_ALLOCATION", "noncanonical block VCN list");
     }
@@ -576,6 +578,7 @@ fn check_inputs(
     Ok(checked)
 }
 
+#[allow(clippy::too_many_lines)]
 fn check_geometry(
     upcase: &[u16],
     geometry: NtfsDirectoryIndexGeometry,
@@ -610,13 +613,9 @@ fn check_geometry(
             reason: "cluster size must be a power of two of at least 512 bytes",
         });
     }
-    if block_bytes < cluster_bytes
-        || !block_bytes.is_power_of_two()
-        || block_bytes % cluster_bytes != 0
-        || block_bytes % UPDATE_SEQUENCE_STRIDE != 0
-    {
+    if !block_bytes.is_power_of_two() || block_bytes % UPDATE_SEQUENCE_STRIDE != 0 {
         return Err(NtfsDirectoryIndexError::UnsupportedGeometry {
-            reason: "index blocks must be power-of-two, cluster-aligned, and at least one cluster",
+            reason: "index blocks must be power-of-two multiples of 512 bytes",
         });
     }
     if block_bytes > limits.max_block_bytes {
@@ -624,15 +623,29 @@ fn check_geometry(
             reason: "index block exceeds the configured block-size cap",
         });
     }
-    let clusters_per_block = block_bytes / cluster_bytes;
-    let clusters_per_block = u8::try_from(clusters_per_block).map_err(|_| {
+    let vcn_units_per_block = if block_bytes >= cluster_bytes {
+        if block_bytes % cluster_bytes != 0 {
+            return Err(NtfsDirectoryIndexError::UnsupportedGeometry {
+                reason: "index blocks at least one cluster must contain a whole cluster count",
+            });
+        }
+        block_bytes / cluster_bytes
+    } else {
+        if cluster_bytes % block_bytes != 0 {
+            return Err(NtfsDirectoryIndexError::UnsupportedGeometry {
+                reason: "sub-cluster index blocks must divide one cluster exactly",
+            });
+        }
+        block_bytes / UPDATE_SEQUENCE_STRIDE
+    };
+    let vcn_units_per_block = u8::try_from(vcn_units_per_block).map_err(|_| {
         NtfsDirectoryIndexError::UnsupportedGeometry {
-            reason: "clusters per index block do not fit the supported positive root field",
+            reason: "index-block VCN units do not fit the supported positive root field",
         }
     })?;
-    if clusters_per_block == 0 || clusters_per_block > u8::try_from(i8::MAX).unwrap_or(u8::MAX) {
+    if vcn_units_per_block == 0 {
         return Err(NtfsDirectoryIndexError::UnsupportedGeometry {
-            reason: "clusters per index block must fit a positive signed byte",
+            reason: "index-block VCN units must be nonzero",
         });
     }
     let sector_count = block_bytes / UPDATE_SEQUENCE_STRIDE;
@@ -667,7 +680,7 @@ fn check_geometry(
     }
     Ok(CheckedGeometry {
         block_bytes,
-        clusters_per_block,
+        vcn_units_per_block,
         entries_offset,
         leaf_entry_bytes,
         root_budget,
@@ -776,15 +789,15 @@ fn build_root(
         u32::try_from(checked.block_bytes)
             .map_err(|_| NtfsDirectoryIndexError::ArithmeticOverflow)?,
     )?;
-    bytes[12] = checked.clusters_per_block;
+    bytes[12] = checked.vcn_units_per_block;
     for (child_number, (_, entry)) in selected.iter().enumerate() {
         let child_vcn = children
-            .then(|| child_vcn(child_number, checked.clusters_per_block))
+            .then(|| child_vcn(child_number, checked.vcn_units_per_block))
             .transpose()?;
         append_entry(&mut bytes, entry, child_vcn, false)?;
     }
     let terminal_vcn = children
-        .then(|| child_vcn(selected.len(), checked.clusters_per_block))
+        .then(|| child_vcn(selected.len(), checked.vcn_units_per_block))
         .transpose()?;
     append_terminal(&mut bytes, terminal_vcn)?;
     let used = bytes
@@ -1052,20 +1065,20 @@ fn validate_name_order(names: &[Vec<u16>], upcase: &[u16]) -> Result<(), NtfsDir
     Ok(())
 }
 
-fn block_vcns(count: usize, clusters_per_block: u8) -> Result<Vec<u64>, NtfsDirectoryIndexError> {
+fn block_vcns(count: usize, vcn_units_per_block: u8) -> Result<Vec<u64>, NtfsDirectoryIndexError> {
     let mut vcns = Vec::new();
     vcns.try_reserve_exact(count)
         .map_err(|_| NtfsDirectoryIndexError::AllocationFailed)?;
     for block in 0..count {
-        vcns.push(child_vcn(block, clusters_per_block)?);
+        vcns.push(child_vcn(block, vcn_units_per_block)?);
     }
     Ok(vcns)
 }
 
-fn child_vcn(block_number: usize, clusters_per_block: u8) -> Result<u64, NtfsDirectoryIndexError> {
+fn child_vcn(block_number: usize, vcn_units_per_block: u8) -> Result<u64, NtfsDirectoryIndexError> {
     u64::try_from(block_number)
         .ok()
-        .and_then(|block| block.checked_mul(u64::from(clusters_per_block)))
+        .and_then(|block| block.checked_mul(u64::from(vcn_units_per_block)))
         .ok_or(NtfsDirectoryIndexError::ArithmeticOverflow)
 }
 
@@ -1297,7 +1310,7 @@ mod tests {
     }
 
     #[test]
-    fn child_vcns_advance_by_clusters_per_block() {
+    fn child_vcns_use_cluster_units_when_blocks_are_at_least_one_cluster() {
         let table = upcase();
         let input = entries(100);
         let two_cluster_blocks = NtfsDirectoryIndexGeometry {
@@ -1321,6 +1334,95 @@ mod tests {
             NtfsDirectoryIndexLimits::default(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn child_vcns_use_sector_units_when_blocks_are_smaller_than_a_cluster() {
+        let table = upcase();
+        let input = entries(100);
+        for cluster_bytes in [8192, 65_536] {
+            let sub_cluster_blocks = NtfsDirectoryIndexGeometry {
+                cluster_bytes,
+                index_block_bytes: 4096,
+                resident_root_bytes: 4096,
+            };
+            let serialized = serialize_ntfs_directory_index(
+                &input,
+                &table,
+                sub_cluster_blocks,
+                NtfsDirectoryIndexLimits::default(),
+            )
+            .unwrap();
+            assert!(serialized.block_vcns.len() > 2);
+            assert_eq!(&serialized.block_vcns[..3], &[0, 8, 16]);
+
+            let root =
+                parse_index_root(&serialized.index_root, NtfsIndexLimits::default()).unwrap();
+            assert_eq!(root.clusters_per_index_block, 8);
+            for (block, expected_vcn) in serialized
+                .index_allocation
+                .chunks_exact(4096)
+                .zip(serialized.block_vcns.iter().copied())
+            {
+                parse_index_block(block, Some(expected_vcn), NtfsIndexLimits::default()).unwrap();
+            }
+            validate_serialized_ntfs_directory_index(
+                &serialized,
+                &table,
+                sub_cluster_blocks,
+                NtfsDirectoryIndexLimits::default(),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn unsigned_128_unit_geometry_round_trips() {
+        let table = upcase();
+        let input = entries(1_000);
+        let geometry = NtfsDirectoryIndexGeometry {
+            cluster_bytes: 512,
+            index_block_bytes: 65_536,
+            resident_root_bytes: 4096,
+        };
+        let serialized = serialize_ntfs_directory_index(
+            &input,
+            &table,
+            geometry,
+            NtfsDirectoryIndexLimits::default(),
+        )
+        .unwrap();
+        assert!(serialized.block_vcns.len() > 1);
+        assert_eq!(&serialized.block_vcns[..2], &[0, 128]);
+        let root = parse_index_root(&serialized.index_root, NtfsIndexLimits::default()).unwrap();
+        assert_eq!(root.clusters_per_index_block, 128);
+        validate_serialized_ntfs_directory_index(
+            &serialized,
+            &table,
+            geometry,
+            NtfsDirectoryIndexLimits::default(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn rejects_geometry_requiring_more_than_255_vcn_units() {
+        let geometry = NtfsDirectoryIndexGeometry {
+            cluster_bytes: 512,
+            index_block_bytes: 262_144,
+            resident_root_bytes: 4096,
+        };
+        assert!(matches!(
+            serialize_ntfs_directory_index(
+                &entries(100),
+                &upcase(),
+                geometry,
+                NtfsDirectoryIndexLimits::default(),
+            ),
+            Err(NtfsDirectoryIndexError::UnsupportedGeometry {
+                reason: "index-block VCN units do not fit the supported positive root field"
+            })
+        ));
     }
 
     #[test]
@@ -1496,7 +1598,7 @@ mod tests {
         ));
         let bad_geometry = NtfsDirectoryIndexGeometry {
             cluster_bytes: 4096,
-            index_block_bytes: 1024,
+            index_block_bytes: 1536,
             resident_root_bytes: 4096,
         };
         assert!(matches!(

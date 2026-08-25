@@ -4,6 +4,34 @@ StarConverter's own parsers are not sufficient evidence of interoperability. Thi
 independent, read-only checks against regular-file candidates. It does **not** authorize activation,
 image conversion, writable mounting, repair, or physical-device access.
 
+## 2026-08-25 generated boot-code revision requalification
+
+The exFAT serializer now emits the specification-mandated `F4` formatter BootCode bytes when no
+bootstrap implementation is supplied, and independently reparses every generated main/backup boot
+region before returning a plan. Parser round trips cover all four legal sector sizes and reject a
+tampered boot-code checksum.
+
+The complete regular-file corpus was regenerated after that byte change. exfatprogs 1.2.2,
+NTFS-3G 2022.10.3, the verified read-only exFAT loop/FUSE path, the read-only NTFS-3G path, and both
+payload-manifest helpers all passed. Every artifact's SHA-256 was identical before and after the
+checks. Current exFAT-bearing hashes are:
+
+```text
+structural exFAT             F515742D1778EF03964A26F6713738D1F0764DCA06BEBA2C9E1B47FF0C3B8989
+structural exFAT VHD         7D72358FCB56518D022CA6F0EFBAD63F74215DB0AABEF7C24B7DBEBDE19DFCB8
+rich exFAT                   C6714034E8BBD49D10DB1D89AD8D3F8874E8AC2B404A65F388593B9F443FCC72
+converted rich exFAT         F2C2D0082693DD341AD65B2143F521A567B155803F30CDAED4C2EB2E3996B88E
+converted Windows NTFS VHD   F58C1F68BF819331EA9B42EDE8646A3EC7F4D7A34A77034249ACBE04802B2DC3
+converted Windows exFAT VHD  8FC03DE6F777B3473FCF08322C6B8159AD73E372CCEF3BB459853CF423C3EC47
+edge exFAT                   DFAF63806D6B65347B4F13F3D33581C6511F557C47D1486ADBAA089B94989E58
+converted edge exFAT         39E0CE5B51102F1E333871C4F4CE76CC84D2063ADAFD11FD007B6C1973F6401D
+```
+
+This refresh qualifies the current bytes only against the listed Linux tools and read-only
+filesystem-driver paths. The non-elevated Windows detached-VHD preflight also passed against the
+two refreshed pinned hashes above. Windows attachment, `chkdsk`, payload access, detach, and hash
+qualification remain pending separately.
+
 ## Reproducing the fixtures
 
 The ignored integration test emits six raw source images, two fixed VHD wrappers, four actual
