@@ -71,7 +71,10 @@ struct OfflineRegularImageAuthority {
 struct OfflineAuthoritySeal;
 
 impl OfflineRegularImageAuthority {
-    #[allow(clippy::unnecessary_wraps)] // The advisory-lock host branch returns an error.
+    #[allow(
+        clippy::missing_const_for_fn, // Non-Windows cfg erases the identity read required on Windows.
+        clippy::unnecessary_wraps // The advisory-lock host branch returns an error.
+    )]
     fn mint(executor: &ImageExecutor) -> Result<Self, RegularImageCoordinatorError> {
         match executor.lock_strength() {
             #[cfg(windows)]
