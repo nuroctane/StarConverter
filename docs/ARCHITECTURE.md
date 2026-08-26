@@ -58,7 +58,11 @@ operating-system or GUI dependency. Implemented foundations include:
   unleased mutators are private. A lifetime-bound read view is cloned from the already-open locked
   handle for coordinator inspection; it exposes no raw-device or arbitrary-range write API.
 - `conversion/regular_image`: internal image-then-capsule lock ownership and durable sequencing
-  through `Activated`. Resume observations hash the complete locked source view, virtually
+  through `Activated`. A one-use Windows preparation session first acquires mandatory deny-share
+  exclusion, mints the transaction identity, and performs inspection, whole-source hashing,
+  manifest construction, planning, and exact preimage capture through that same handle. It refuses
+  advisory-only offline claims and consumes a fully parent-synchronized initial capsule before a
+  coordinator exists. Resume observations hash the complete locked source view, virtually
   restoring only conservative phase rollback ranges. Before backup-boot or activation retry, a
   bounded zero-copy classifier proves the relevant real bytes are exact before-images, exact
   after-images, a before/after-only mixture, or an unsafe third state. The coordinator rechecks
@@ -80,9 +84,11 @@ regular-image coordinator proves image-before-capsule durability and rollback th
 constructs fresh resume observations from its locked handle, and can reconcile and audit every
 regular-image recognition boundary through activation after reconstructing its plan from capsule
 generation zero. Finalization is a separate, capability-gated operation that repeats the complete
-target audit immediately before crossing the rollback boundary. This remains unreachable from
-production because trusted initial preflight/capsule creation and serializer qualification are
-unfinished. Neither serializer qualifies for activation. There is intentionally no executable
+target audit immediately before crossing the rollback boundary. The trusted initial-preflight and
+initial-capsule boundary is now implemented for mandatory-lock Windows regular files and
+deliberately fails closed on advisory-only hosts. This remains unreachable from frontends because
+neither serializer qualifies for activation and explicit user acceptance policy is unfinished.
+There is intentionally no executable
 in-place conversion command and no physical-device backend. The
 separate copy-based exporter can
 produce a complete target only in a brand-new regular file, so it does not consume or weaken that

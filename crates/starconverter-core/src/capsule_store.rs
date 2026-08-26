@@ -10,6 +10,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::capsule::{CapsuleError, CapsuleLimits, recover_capsule, scan_capsule};
+use crate::capsule_fault::{CapsuleFaultBoundary, CapsuleFaultInjector, NoCapsuleFault};
 use crate::image::{ImageError, reject_device_like_path};
 
 /// Strength of the exclusion held for the store lifetime.
@@ -24,14 +25,18 @@ pub enum CapsuleLockStrength {
 }
 
 /// Namespace durability achieved by a completed store operation.
+///
+/// `FileSynchronizedOnly` is deliberately not sufficient evidence for exclusive capsule
+/// creation: a power loss may preserve the capsule contents while losing its directory entry.
+/// [`CapsuleStore::create_new`] therefore returns success only after it upgrades creation evidence
+/// to [`Self::ParentDirectorySynchronized`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NamespaceDurability {
     /// The parent directory was flushed after exclusive creation.
-    #[cfg(unix)]
     ParentDirectorySynchronized,
-    /// File data and metadata were flushed, but portable Rust cannot open a Windows directory for
-    /// an additional namespace flush without a platform-specific layer.
-    #[cfg(windows)]
+    /// File data and metadata were flushed, but the containing directory entry was not proven
+    /// durable. This is an explicit insufficient evidence class and is never returned by a
+    /// successful exclusive creation.
     FileSynchronizedOnly,
     /// Appending does not create or rename a directory entry.
     NotRequired,
@@ -81,7 +86,10 @@ impl CapsuleStore {
     ///
     /// The capsule path is required to differ from the canonical regular image path. The encoded
     /// bytes are validated before `create_new` is attempted, and an existing path is never opened,
-    /// replaced, or truncated.
+    /// replaced, or truncated. If the file is synchronized but the platform rejects the required
+    /// parent-directory flush, the fully written capsule remains at the requested path and this
+    /// function returns [`CapsuleStoreError::NamespaceDurabilityUnproven`]. That error is not
+    /// authorization to mutate an image.
     ///
     /// # Errors
     ///
@@ -92,6 +100,22 @@ impl CapsuleStore {
         image_path: impl AsRef<Path>,
         encoded_capsule: &[u8],
         limits: CapsuleLimits,
+    ) -> Result<(Self, CapsuleSyncEvidence), CapsuleStoreError> {
+        Self::create_new_with_faults(
+            capsule_path,
+            image_path,
+            encoded_capsule,
+            limits,
+            &mut NoCapsuleFault,
+        )
+    }
+
+    fn create_new_with_faults<F: CapsuleFaultInjector>(
+        capsule_path: impl AsRef<Path>,
+        image_path: impl AsRef<Path>,
+        encoded_capsule: &[u8],
+        limits: CapsuleLimits,
+        faults: &mut F,
     ) -> Result<(Self, CapsuleSyncEvidence), CapsuleStoreError> {
         let view = scan_capsule(encoded_capsule, limits).map_err(CapsuleStoreError::Capsule)?;
         if view.generations().is_empty() {
@@ -129,10 +153,11 @@ impl CapsuleStore {
             lock_strength: platform_lock_strength(),
             poisoned: false,
         };
-        let mut evidence = store.persist_suffix(
+        let mut evidence = store.persist_suffix_with_faults(
             encoded_capsule,
             generation_count,
             NamespaceDurability::NotRequired,
+            faults,
         )?;
         evidence.namespace_durability = creation_durability(&store)?;
         Ok((store, evidence))
@@ -276,6 +301,14 @@ impl CapsuleStore {
         &mut self,
         updated_capsule: &[u8],
     ) -> Result<CapsuleSyncEvidence, CapsuleStoreError> {
+        self.append_with_faults(updated_capsule, &mut NoCapsuleFault)
+    }
+
+    fn append_with_faults<F: CapsuleFaultInjector>(
+        &mut self,
+        updated_capsule: &[u8],
+        faults: &mut F,
+    ) -> Result<CapsuleSyncEvidence, CapsuleStoreError> {
         if self.poisoned {
             return Err(CapsuleStoreError::Poisoned);
         }
@@ -298,7 +331,7 @@ impl CapsuleStore {
         }
         self.ensure_unchanged()?;
         let suffix = &updated_capsule[self.bytes.len()..];
-        self.persist_suffix(suffix, expected, NamespaceDurability::NotRequired)
+        self.persist_suffix_with_faults(suffix, expected, NamespaceDurability::NotRequired, faults)
     }
 
     /// Canonical capsule path pinned for the store lifetime.
@@ -431,11 +464,12 @@ impl CapsuleStore {
         }
     }
 
-    fn persist_suffix(
+    fn persist_suffix_with_faults<F: CapsuleFaultInjector>(
         &mut self,
         suffix: &[u8],
         generation_count: usize,
         namespace_durability: NamespaceDurability,
+        faults: &mut F,
     ) -> Result<CapsuleSyncEvidence, CapsuleStoreError> {
         self.ensure_unchanged()?;
         let previous = self.bytes.len();
@@ -466,24 +500,30 @@ impl CapsuleStore {
         let offset = previous_bytes;
         self.poisoned = true;
         let persisted = (|| {
+            inject_capsule_fault(faults, CapsuleFaultBoundary::BeforeWrite)?;
             write_all_at(&self.file, offset, suffix)
                 .map_err(|source| CapsuleStoreError::io("append capsule bytes", source))?;
+            inject_capsule_fault(faults, CapsuleFaultBoundary::AfterWrite)?;
             self.file
                 .sync_data()
                 .map_err(|source| CapsuleStoreError::io("flush capsule data", source))?;
+            inject_capsule_fault(faults, CapsuleFaultBoundary::AfterSyncData)?;
 
             read_exact_at(&self.file, offset, &mut actual)
                 .map_err(|source| CapsuleStoreError::io("verify appended capsule bytes", source))?;
             if actual != suffix {
                 return Err(CapsuleStoreError::VerificationMismatch);
             }
+            inject_capsule_fault(faults, CapsuleFaultBoundary::AfterReadback)?;
             self.file.sync_all().map_err(|source| {
                 CapsuleStoreError::io("flush capsule data and metadata", source)
             })?;
+            inject_capsule_fault(faults, CapsuleFaultBoundary::AfterSyncAll)?;
             Ok(())
         })();
         persisted?;
 
+        inject_capsule_fault(faults, CapsuleFaultBoundary::BeforeAdopt)?;
         self.bytes.extend_from_slice(suffix);
         self.generation_count = generation_count;
         self.ensure_unchanged()?;
@@ -538,6 +578,15 @@ impl CapsuleStore {
             .map_err(|source| CapsuleStoreError::io("reinspect capsule path", source))?;
         validate_same_file_minimum(self.identity, &path, minimum)
     }
+}
+
+fn inject_capsule_fault<F: CapsuleFaultInjector>(
+    faults: &mut F,
+    boundary: CapsuleFaultBoundary,
+) -> Result<(), CapsuleStoreError> {
+    faults
+        .hit(boundary)
+        .map_err(|source| CapsuleStoreError::io("injected capsule persistence fault", source))
 }
 
 fn repair_torn_suffix(
@@ -614,6 +663,12 @@ pub enum CapsuleStoreError {
     AllocationFailed,
     ArithmeticOverflow,
     VerificationMismatch,
+    /// The capsule file itself was synchronized, but its newly created directory entry could not
+    /// be proven durable. The fully written capsule is intentionally left at its exclusive path;
+    /// callers must not authorize image mutation from this failed creation attempt.
+    NamespaceDurabilityUnproven {
+        source: io::Error,
+    },
     Io {
         operation: &'static str,
         source: io::Error,
@@ -668,6 +723,10 @@ impl fmt::Display for CapsuleStoreError {
             Self::VerificationMismatch => {
                 formatter.write_str("appended capsule bytes failed read-back verification")
             }
+            Self::NamespaceDurabilityUnproven { source } => write!(
+                formatter,
+                "capsule file was synchronized, but parent-directory namespace durability is unproven: {source}"
+            ),
             Self::Io { operation, source } => write!(formatter, "{operation}: {source}"),
         }
     }
@@ -678,7 +737,7 @@ impl std::error::Error for CapsuleStoreError {
         match self {
             Self::Capsule(error) => Some(error),
             Self::ImagePath(error) => Some(error),
-            Self::Io { source, .. } => Some(source),
+            Self::NamespaceDurabilityUnproven { source } | Self::Io { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -853,20 +912,39 @@ fn creation_durability(store: &CapsuleStore) -> Result<NamespaceDurability, Caps
         .parent()
         .ok_or(CapsuleStoreError::IdentityChanged)?;
     let directory = File::open(parent)
-        .map_err(|source| CapsuleStoreError::io("open capsule parent directory", source))?;
-    directory
-        .sync_all()
-        .map_err(|source| CapsuleStoreError::io("flush capsule parent directory", source))?;
-    Ok(NamespaceDurability::ParentDirectorySynchronized)
+        .map_err(|source| CapsuleStoreError::NamespaceDurabilityUnproven { source })?;
+    parent_namespace_durability(directory.sync_all())
 }
 
 #[cfg(windows)]
 fn creation_durability(store: &CapsuleStore) -> Result<NamespaceDurability, CapsuleStoreError> {
-    store
-        .file
-        .sync_all()
-        .map_err(|source| CapsuleStoreError::io("reflush capsule after creation", source))?;
-    Ok(NamespaceDurability::FileSynchronizedOnly)
+    use std::os::windows::fs::OpenOptionsExt;
+
+    // CreateFileW requires FILE_FLAG_BACKUP_SEMANTICS to open a directory. Rust's File::sync_all
+    // then calls FlushFileBuffers on that handle. Microsoft documents cached filesystem metadata
+    // as requiring FlushFileBuffers or write-through semantics; a successful directory-handle
+    // flush is therefore the evidence boundary. Some filesystems or access policies may reject
+    // the directory handle or flush. Those cases must fail closed even though persist_suffix has
+    // already synchronized and verified the capsule file itself.
+    //
+    // Primary contracts:
+    // - https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew
+    // - https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-flushfilebuffers
+    // - https://learn.microsoft.com/en-us/windows/win32/fileio/file-caching
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let parent = store
+        .canonical_path
+        .parent()
+        .ok_or(CapsuleStoreError::IdentityChanged)?;
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    let directory = options
+        .open(parent)
+        .map_err(|source| CapsuleStoreError::NamespaceDurabilityUnproven { source })?;
+    parent_namespace_durability(directory.sync_all())
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -875,7 +953,20 @@ fn creation_durability(store: &CapsuleStore) -> Result<NamespaceDurability, Caps
         .file
         .sync_all()
         .map_err(|source| CapsuleStoreError::io("reflush capsule after creation", source))?;
-    Ok(NamespaceDurability::NotRequired)
+    Err(CapsuleStoreError::NamespaceDurabilityUnproven {
+        source: io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this platform has no proven parent-directory synchronization primitive",
+        ),
+    })
+}
+
+fn parent_namespace_durability(
+    synchronized: io::Result<()>,
+) -> Result<NamespaceDurability, CapsuleStoreError> {
+    synchronized
+        .map(|()| NamespaceDurability::ParentDirectorySynchronized)
+        .map_err(|source| CapsuleStoreError::NamespaceDurabilityUnproven { source })
 }
 
 #[cfg(unix)]
@@ -968,6 +1059,7 @@ fn positional_write_loop(
 mod tests {
     use super::*;
     use crate::capsule::{CapsuleIdentity, HEADER_BYTES, TransactionPhase, append_generation};
+    use crate::capsule_fault::{CapsuleFaultBoundary, CapsuleFaultInjector};
     use crc32fast::Hasher as Crc32;
     #[cfg(unix)]
     use std::io::Write as _;
@@ -1060,6 +1152,122 @@ mod tests {
         bytes
     }
 
+    const CAPSULE_FAULT_BOUNDARIES: [CapsuleFaultBoundary; 6] = [
+        CapsuleFaultBoundary::BeforeWrite,
+        CapsuleFaultBoundary::AfterWrite,
+        CapsuleFaultBoundary::AfterSyncData,
+        CapsuleFaultBoundary::AfterReadback,
+        CapsuleFaultBoundary::AfterSyncAll,
+        CapsuleFaultBoundary::BeforeAdopt,
+    ];
+
+    #[derive(Debug)]
+    struct FailAtCapsuleBoundary {
+        target: CapsuleFaultBoundary,
+        seen: Vec<CapsuleFaultBoundary>,
+    }
+
+    impl FailAtCapsuleBoundary {
+        const fn new(target: CapsuleFaultBoundary) -> Self {
+            Self {
+                target,
+                seen: Vec::new(),
+            }
+        }
+    }
+
+    impl CapsuleFaultInjector for FailAtCapsuleBoundary {
+        fn hit(&mut self, boundary: CapsuleFaultBoundary) -> io::Result<()> {
+            self.seen.push(boundary);
+            if boundary == self.target {
+                Err(io::Error::other(format!(
+                    "injected capsule fault at {boundary:?}"
+                )))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn capsule_through(phase: TransactionPhase) -> Vec<u8> {
+        let mut bytes = initial_capsule();
+        if phase == TransactionPhase::Discovered {
+            return bytes;
+        }
+        if phase == TransactionPhase::RolledBack {
+            bytes = capsule_through(TransactionPhase::Activated);
+            append_generation(
+                &mut bytes,
+                CapsuleIdentity {
+                    transaction_id: [0x12; 16],
+                    source_digest: [0x34; 32],
+                },
+                TransactionPhase::RolledBack,
+                b"durable rollback evidence",
+                limits(),
+            )
+            .unwrap();
+            return bytes;
+        }
+        for next in [
+            TransactionPhase::Reserved,
+            TransactionPhase::Relocating,
+            TransactionPhase::TargetStaged,
+            TransactionPhase::BackupBootWritten,
+            TransactionPhase::Activated,
+            TransactionPhase::Verified,
+            TransactionPhase::Finalized,
+        ] {
+            append_generation(
+                &mut bytes,
+                CapsuleIdentity {
+                    transaction_id: [0x12; 16],
+                    source_digest: [0x34; 32],
+                },
+                next,
+                b"durable evidence",
+                limits(),
+            )
+            .unwrap();
+            if next == phase {
+                return bytes;
+            }
+        }
+        panic!("unsupported phase {phase:?}");
+    }
+
+    const fn previous_phase(phase: TransactionPhase) -> TransactionPhase {
+        match phase {
+            TransactionPhase::BackupBootWritten => TransactionPhase::TargetStaged,
+            TransactionPhase::Activated => TransactionPhase::BackupBootWritten,
+            TransactionPhase::RolledBack => TransactionPhase::Activated,
+            _ => panic!("phase is not part of the coupled append matrix"),
+        }
+    }
+
+    fn apply_coupled_image_write(image: &mut [u8], phase: TransactionPhase) {
+        match phase {
+            TransactionPhase::BackupBootWritten => image[512..1024].fill(0xb4),
+            TransactionPhase::Activated => image[1024..1536].fill(0xa5),
+            TransactionPhase::RolledBack => image.fill(0x11),
+            _ => panic!("phase is not part of the coupled append matrix"),
+        }
+    }
+
+    fn conservatively_restore_image(image: &mut [u8], phase: TransactionPhase) {
+        match phase {
+            TransactionPhase::TargetStaged => image[512..1024].fill(0x11),
+            TransactionPhase::BackupBootWritten
+            | TransactionPhase::Activated
+            | TransactionPhase::Verified => {
+                image[512..1024].fill(0x11);
+                image[1024..1536].fill(0x11);
+            }
+            TransactionPhase::RolledBack => {}
+            _ => panic!("phase is not part of the coupled recovery matrix"),
+        }
+    }
+
     #[test]
     fn create_append_and_resume_preserve_exact_bytes() {
         let dir = TempDir::new();
@@ -1074,6 +1282,10 @@ mod tests {
             u64::try_from(initial.len()).unwrap()
         );
         assert!(created.sync_data_completed && created.sync_all_completed);
+        assert_eq!(
+            created.namespace_durability,
+            NamespaceDurability::ParentDirectorySynchronized
+        );
 
         let updated = appended_capsule(2);
         let appended = store.append(&updated).unwrap();
@@ -1091,6 +1303,126 @@ mod tests {
         assert_eq!(resumed.generation_count(), 2);
         drop(resumed);
         assert_eq!(fs::read(capsule).unwrap(), updated);
+    }
+
+    #[test]
+    fn rejected_parent_flush_never_becomes_creation_durability_evidence() {
+        let error = parent_namespace_durability(Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "injected unsupported parent-directory flush",
+        )))
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            CapsuleStoreError::NamespaceDurabilityUnproven { source }
+                if source.kind() == io::ErrorKind::Unsupported
+        ));
+    }
+
+    #[test]
+    fn create_fault_matrix_leaves_only_empty_or_strictly_recoverable_regular_files() {
+        let initial = initial_capsule();
+        for boundary in CAPSULE_FAULT_BOUNDARIES {
+            let dir = TempDir::new();
+            let image = image(&dir);
+            let capsule_name = format!("create-{boundary:?}.starcap");
+            let capsule = dir.join(&capsule_name);
+            let mut faults = FailAtCapsuleBoundary::new(boundary);
+
+            let error = CapsuleStore::create_new_with_faults(
+                &capsule,
+                &image,
+                &initial,
+                limits(),
+                &mut faults,
+            )
+            .unwrap_err();
+            assert!(matches!(error, CapsuleStoreError::Io { .. }));
+            assert_eq!(faults.seen.last(), Some(&boundary));
+
+            let on_disk = fs::read(&capsule).unwrap();
+            if boundary == CapsuleFaultBoundary::BeforeWrite {
+                assert!(on_disk.is_empty());
+                assert!(CapsuleStore::resume_recovering(&capsule, &image, limits()).is_err());
+            } else {
+                assert_eq!(on_disk, initial);
+                let (recovered, evidence) =
+                    CapsuleStore::resume_recovering(&capsule, &image, limits()).unwrap();
+                assert_eq!(recovered.bytes(), initial);
+                assert_eq!(evidence.discarded_torn_bytes, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn coupled_image_write_and_capsule_append_converge_at_every_io_boundary() {
+        let source_image = vec![0x11; 2048];
+        for phase in [
+            TransactionPhase::BackupBootWritten,
+            TransactionPhase::Activated,
+            TransactionPhase::RolledBack,
+        ] {
+            let previous_phase = previous_phase(phase);
+            let previous = capsule_through(previous_phase);
+            let updated = capsule_through(phase);
+            for boundary in CAPSULE_FAULT_BOUNDARIES {
+                let dir = TempDir::new();
+                let image_path = image(&dir);
+                fs::write(&image_path, &source_image).unwrap();
+                let capsule_name = format!("{phase:?}-{boundary:?}.starcap");
+                let capsule = dir.join(&capsule_name);
+                let (mut store, _) =
+                    CapsuleStore::create_new(&capsule, &image_path, &previous, limits()).unwrap();
+
+                let mut changed_image = source_image.clone();
+                apply_coupled_image_write(&mut changed_image, phase);
+                let changed_handle = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&image_path)
+                    .unwrap();
+                write_all_at(&changed_handle, 0, &changed_image).unwrap();
+                changed_handle.sync_all().unwrap();
+
+                let mut faults = FailAtCapsuleBoundary::new(boundary);
+                let error = store.append_with_faults(&updated, &mut faults).unwrap_err();
+                assert!(matches!(error, CapsuleStoreError::Io { .. }));
+                assert!(store.is_poisoned());
+                assert_eq!(faults.seen.last(), Some(&boundary));
+
+                store.restore_verified_prefix().unwrap();
+                assert!(!store.is_poisoned());
+                let durable_phase = scan_capsule(store.bytes(), limits())
+                    .unwrap()
+                    .newest()
+                    .unwrap()
+                    .phase;
+                let expected_phase = if boundary == CapsuleFaultBoundary::BeforeWrite {
+                    previous_phase
+                } else {
+                    phase
+                };
+                assert_eq!(durable_phase, expected_phase, "{phase:?} at {boundary:?}");
+                assert_eq!(read_store_file(&store), store.bytes());
+
+                let mut durable_image = fs::read(&image_path).unwrap();
+                conservatively_restore_image(&mut durable_image, durable_phase);
+                let recovery_handle = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&image_path)
+                    .unwrap();
+                write_all_at(&recovery_handle, 0, &durable_image).unwrap();
+                recovery_handle.sync_data().unwrap();
+                recovery_handle.sync_all().unwrap();
+                drop(recovery_handle);
+                assert_eq!(
+                    fs::read(&image_path).unwrap(),
+                    source_image,
+                    "image rollback at {phase:?} / {boundary:?} / {durable_phase:?}"
+                );
+            }
+        }
     }
 
     #[test]

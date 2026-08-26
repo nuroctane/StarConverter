@@ -113,6 +113,16 @@ original source view by masking only conservative before-image ranges, so change
 digest-visible. Ambiguous executor/capsule operations poison the coupled coordinator; exact
 before-image rollback is idempotent under the retained locks.
 
+Initial preparation is also lock-coupled. On Windows, a non-cloneable session accepts only the
+executor's mandatory deny-share plus whole-file lock, internally mints the transaction identity,
+and runs inspection, source hashing, logical manifest construction, planning, and exact preimage
+capture through a view borrowed from that same handle. It rejects planner-selected transaction
+identity, substituted preflight or graph evidence, and any rollback bytes that differ from the
+locked source. Advisory Unix locks cannot establish production `Offline` evidence and fail before
+capsule creation. The session creates generation zero only while retaining the image lock and
+requires data flush, metadata flush, readback, and `ParentDirectorySynchronized` evidence before it
+can be consumed into a coordinator.
+
 New capsules embed the complete bounded, canonical forward plan and nested recovery bundle in their
 first generation. The coordinator can therefore discard all process memory, reacquire image then
 capsule locks, reconstruct the plan, recompute its commitments, and re-audit `TargetStaged`. Older
@@ -126,6 +136,15 @@ only when bounded recovery proves that the exact last verified checkpoint is fol
 newest generation, then flushes, rereads, and strict-scans the retained prefix. Identity changes,
 complete corruption, ambiguous multi-generation growth, and an incomplete first generation are
 refused without mutation.
+
+Successful exclusive capsule creation additionally synchronizes the canonical parent directory.
+Unix uses a directory `sync_all`; Windows opens the directory with
+`FILE_FLAG_BACKUP_SEMANTICS` and requires `FlushFileBuffers` success. A rejected or unsupported
+parent barrier returns `NamespaceDurabilityUnproven`: the fully written capsule remains available
+for explicit recovery, but no image mutation authority is returned. Test-only persistence cuts at
+`BeforeWrite`, `AfterWrite`, `AfterSyncData`, `AfterReadback`, `AfterSyncAll`, and `BeforeAdopt`
+exercise create plus BackupBootWritten, Activated, and RolledBack recovery against synced regular
+temp files.
 
 This is not physical-volume authorization. Serializer activation remains opaque and unavailable,
 and frontends expose no in-place conversion command. The create-new path below is a separate safety

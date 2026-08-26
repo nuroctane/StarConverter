@@ -11,33 +11,433 @@
 use std::borrow::Cow;
 use std::fmt;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use sha2::{Digest, Sha256};
 
 use crate::FileSystem;
 use crate::capsule::TransactionPhase;
-use crate::capsule_store::{CapsuleRecoveryEvidence, CapsuleStore, CapsuleStoreError};
+use crate::capsule_store::{
+    CapsuleRecoveryEvidence, CapsuleStore, CapsuleStoreError, CapsuleSyncEvidence,
+    NamespaceDurability,
+};
 use crate::executor::{
     ExecutionLease, ExecutorError, ExecutorLimits, ImageExecutor, LeasedIntent, LeasedRollback,
+    LockStrength,
 };
-use crate::image::{BoundedImageReader, ImageIdentity};
-use crate::inspect::{InspectionError, inspect_overlay};
-use crate::overlay::{OverlayError, OverlayWrite};
+use crate::image::{BoundedImageReader, ImageFile, ImageIdentity};
+use crate::inspect::{
+    ImageInspection, InspectionError, NtfsAllocationReconciliationStatus,
+    NtfsMftRecordReconciliationStatus, inspect_overlay,
+};
+use crate::object::ObjectGraph;
+use crate::overlay::{OverlayError, OverlayLimits, OverlayPlan, OverlayWrite};
+use crate::preimage::{PreimageError, PreimageLimits, capture_before_images_with_reader};
 use crate::source_view::{
     SourceDigestLimits, SourceViewError, VirtualOriginalLimits, VirtualOriginalReader,
     digest_source_view,
 };
 use crate::verify::{
-    VerificationError, VerificationLimits, VerificationManifest, build_manifest_with_reader,
+    ManifestCommitment, VerificationError, VerificationLimits, VerificationManifest,
+    build_manifest_with_reader,
 };
+use crate::{AccessState, HealthState};
 
 use super::activation_bytes::{
     ActivationByteError, ActivationByteLimits, ActivationByteState, classify_reserved_write_group,
 };
 use super::{
-    ConversionError, ObservedImage, PreparedConversion, ReservedWrite, StagingVerificationEvidence,
-    TransactionIntent, VerificationEvidence,
+    ConversionError, ObservedImage, PreflightEvidence, PreparedConversion, ReservedWrite,
+    StagingVerificationEvidence, TransactionIntent, VerificationEvidence,
 };
 
 const CANDIDATE_AUDIT_MAX_READ_BYTES: usize = 16 * 1024 * 1024;
+static NEXT_TRANSACTION_NONCE: AtomicU64 = AtomicU64::new(0);
+
+/// Non-cloneable proof that the preparation session owns production-strength exclusion for one
+/// exact regular-file container.
+///
+/// Windows deny-share access is currently the only supported production authority. Advisory Unix
+/// locks exclude cooperating processes but cannot prove that an unrelated writer is absent, so
+/// they fail closed instead of being relabeled as `Offline` evidence.
+#[derive(Debug)]
+struct OfflineRegularImageAuthority {
+    image_instance: [u8; 32],
+    _one_use: OfflineAuthoritySeal,
+}
+
+#[derive(Debug)]
+struct OfflineAuthoritySeal;
+
+impl OfflineRegularImageAuthority {
+    #[allow(clippy::unnecessary_wraps)] // The advisory-lock host branch returns an error.
+    fn mint(executor: &ImageExecutor) -> Result<Self, RegularImageCoordinatorError> {
+        match executor.lock_strength() {
+            #[cfg(windows)]
+            LockStrength::MandatoryDenyShareAndFileLock => Ok(Self {
+                image_instance: executor.identity().stable_container_token(),
+                _one_use: OfflineAuthoritySeal,
+            }),
+            #[cfg(not(windows))]
+            LockStrength::AdvisoryFileLock => {
+                Err(RegularImageCoordinatorError::OfflineAuthorityUnavailable {
+                    lock_strength: executor.lock_strength(),
+                })
+            }
+        }
+    }
+
+    fn consume(self, executor: &ImageExecutor) -> Result<(), RegularImageCoordinatorError> {
+        if self.image_instance != executor.identity().stable_container_token() {
+            return Err(RegularImageCoordinatorError::OfflineAuthorityChanged);
+        }
+        Ok(())
+    }
+}
+
+/// Trusted facts and bounded read helpers exposed only while the exclusive image lock is held.
+///
+/// The value borrows the session's locked handle, so neither the inspection nor exact preimage
+/// capture can be retained as an independently reusable mutation authority.
+#[derive(Debug)]
+pub struct LockedRegularImagePlanningEvidence<'view> {
+    inspection: &'view ImageInspection,
+    graph: &'view ObjectGraph,
+    preflight: PreflightEvidence,
+    transaction_id: [u8; 16],
+    reader: &'view dyn BoundedImageReader,
+}
+
+impl LockedRegularImagePlanningEvidence<'_> {
+    pub(crate) const fn inspection(&self) -> &ImageInspection {
+        self.inspection
+    }
+
+    pub(crate) const fn graph(&self) -> &ObjectGraph {
+        self.graph
+    }
+
+    pub(crate) const fn preflight(&self) -> PreflightEvidence {
+        self.preflight
+    }
+
+    pub(crate) const fn transaction_id(&self) -> [u8; 16] {
+        self.transaction_id
+    }
+
+    /// Captures exact source bytes through the same locked view used for inspection and hashing.
+    pub(crate) fn capture_before_images(
+        &self,
+        replacements: &[OverlayWrite],
+        limits: PreimageLimits,
+    ) -> Result<Vec<OverlayWrite>, PreimageError> {
+        capture_before_images_with_reader(self.reader, replacements, limits)
+    }
+}
+
+/// One-use production preparation session for a caller-named regular image.
+///
+/// Opening pins the container and acquires production-strength exclusion. `prepare_with` consumes
+/// the session, runs inspection, whole-source hashing, logical manifest construction, planning,
+/// and before-image validation without releasing that lock, then returns a session which still
+/// owns the same executor.
+#[derive(Debug)]
+pub struct RegularImagePreparationSession {
+    executor: ImageExecutor,
+    authority: OfflineRegularImageAuthority,
+}
+
+impl RegularImagePreparationSession {
+    pub(crate) fn open(
+        image_path: impl AsRef<Path>,
+        executor_limits: ExecutorLimits,
+    ) -> Result<Self, RegularImageCoordinatorError> {
+        // `ImageExecutor::open` requires a pinned read identity. The read-only handle is closed
+        // before the Windows deny-share writer is opened; any namespace replacement between the
+        // two opens is rejected by the executor's exact identity comparison.
+        let image = ImageFile::open(image_path.as_ref())
+            .map_err(|error| RegularImageCoordinatorError::Executor(ExecutorError::Image(error)))?;
+        let identity = image.identity().clone();
+        drop(image);
+        let executor = ImageExecutor::open(image_path.as_ref(), &identity, executor_limits)
+            .map_err(RegularImageCoordinatorError::Executor)?;
+        let authority = OfflineRegularImageAuthority::mint(&executor)?;
+        Ok(Self {
+            executor,
+            authority,
+        })
+    }
+
+    pub(crate) fn prepare_with<F>(
+        self,
+        verification_limits: VerificationLimits,
+        planner: F,
+    ) -> Result<PreparedRegularImageSession, RegularImageCoordinatorError>
+    where
+        F: FnOnce(
+            &LockedRegularImagePlanningEvidence<'_>,
+        ) -> Result<PreparedConversion, ConversionError>,
+    {
+        let view = self
+            .executor
+            .locked_view(CANDIDATE_AUDIT_MAX_READ_BYTES)
+            .map_err(RegularImageCoordinatorError::Executor)?;
+        let empty_overlay =
+            OverlayPlan::build(view.len(), 512, Vec::new(), OverlayLimits::default())
+                .map_err(RegularImageCoordinatorError::Overlay)?;
+        let inspection = inspect_overlay(
+            &view,
+            self.executor.identity(),
+            &empty_overlay,
+            super::digest_overlay_writes(empty_overlay.writes()),
+        )
+        .map_err(RegularImageCoordinatorError::Inspection)?;
+        let graph = inspection_graph(&inspection)?;
+        let source_evidence_digest = digest_source_view(
+            &view,
+            SourceDigestLimits {
+                max_image_bytes: view.len(),
+                chunk_bytes: CANDIDATE_AUDIT_MAX_READ_BYTES,
+            },
+        )
+        .map_err(RegularImageCoordinatorError::SourceView)?;
+        let manifest = build_manifest_with_reader(&view, graph, verification_limits)
+            .map_err(RegularImageCoordinatorError::Verification)?;
+        let source_manifest_commitment = ManifestCommitment::from_manifest(&manifest)
+            .map_err(RegularImageCoordinatorError::Verification)?;
+        let preflight = trusted_preflight(
+            self.executor.identity(),
+            &inspection,
+            source_evidence_digest,
+            source_manifest_commitment,
+        )?;
+        let transaction_id = mint_transaction_id(self.executor.identity(), source_evidence_digest);
+        let evidence = LockedRegularImagePlanningEvidence {
+            inspection: &inspection,
+            graph,
+            preflight,
+            transaction_id,
+            reader: &view,
+        };
+        let prepared = planner(&evidence).map_err(RegularImageCoordinatorError::Conversion)?;
+        validate_locked_preparation(&view, graph, preflight, transaction_id, &prepared)?;
+        view.post_operation_revalidate()
+            .map_err(RegularImageCoordinatorError::Executor)?;
+        drop(view);
+        Ok(PreparedRegularImageSession {
+            executor: self.executor,
+            authority: self.authority,
+            prepared,
+        })
+    }
+}
+
+/// A plan sealed to the still-held preparation lock and one-use offline authority.
+#[derive(Debug)]
+pub struct PreparedRegularImageSession {
+    executor: ImageExecutor,
+    authority: OfflineRegularImageAuthority,
+    prepared: PreparedConversion,
+}
+
+impl PreparedRegularImageSession {
+    /// Creates the initial capsule while the image remains locked, requires full file and parent
+    /// namespace durability, then consumes the one-use authority into the coordinator.
+    pub(crate) fn create_coordinator(
+        self,
+        capsule_path: impl AsRef<Path>,
+    ) -> Result<(RegularImageCoordinator<'static>, CapsuleSyncEvidence), RegularImageCoordinatorError>
+    {
+        let observed = observe_locked_source(&self.executor, &self.prepared)?;
+        let mut capsule = Vec::new();
+        self.prepared
+            .begin_capsule(&mut capsule, observed)
+            .map_err(RegularImageCoordinatorError::Conversion)?;
+        let (store, sync) = CapsuleStore::create_new(
+            capsule_path,
+            self.executor.identity().canonical_path(),
+            &capsule,
+            self.prepared.capsule_limits,
+        )
+        .map_err(RegularImageCoordinatorError::CapsuleStore)?;
+        if !sync.sync_data_completed
+            || !sync.sync_all_completed
+            || sync.namespace_durability != NamespaceDurability::ParentDirectorySynchronized
+        {
+            return Err(
+                RegularImageCoordinatorError::InitialCapsuleDurabilityMissing { evidence: sync },
+            );
+        }
+        self.authority.consume(&self.executor)?;
+        let coordinator = RegularImageCoordinator {
+            store,
+            executor: self.executor,
+            prepared: Cow::Owned(self.prepared),
+            poisoned: false,
+        };
+        coordinator.checkpoint()?;
+        Ok((coordinator, sync))
+    }
+}
+
+fn inspection_graph(
+    inspection: &ImageInspection,
+) -> Result<&ObjectGraph, RegularImageCoordinatorError> {
+    match inspection.profile.filesystem {
+        FileSystem::ExFat => inspection
+            .normalized_exfat
+            .as_deref()
+            .map(|normalized| &normalized.graph),
+        FileSystem::Ntfs => inspection
+            .normalized_ntfs
+            .as_deref()
+            .map(|normalized| &normalized.graph),
+        FileSystem::Unknown => None,
+    }
+    .ok_or(RegularImageCoordinatorError::SourceInventoryIncomplete)
+}
+
+fn trusted_preflight(
+    identity: &ImageIdentity,
+    inspection: &ImageInspection,
+    source_evidence_digest: [u8; 32],
+    source_manifest_commitment: ManifestCommitment,
+) -> Result<PreflightEvidence, RegularImageCoordinatorError> {
+    if inspection.profile.state.health != HealthState::Clean {
+        return Err(RegularImageCoordinatorError::SourceHealthNotClean {
+            actual: inspection.profile.state.health,
+        });
+    }
+    let allocation_map_complete = match inspection.profile.filesystem {
+        FileSystem::ExFat => inspection.normalized_exfat.is_some(),
+        FileSystem::Ntfs => {
+            matches!(
+                inspection.ntfs_allocation_reconciliation,
+                Some(NtfsAllocationReconciliationStatus::Complete(_))
+            ) && matches!(
+                inspection.ntfs_mft_record_reconciliation,
+                Some(NtfsMftRecordReconciliationStatus::Complete(_))
+            )
+        }
+        FileSystem::Unknown => false,
+    };
+    if !inspection.profile.inventory_complete || !allocation_map_complete {
+        return Err(RegularImageCoordinatorError::SourceInventoryIncomplete);
+    }
+    if inspection.profile.logical_sector_bytes == 0
+        || inspection.profile.cluster_bytes == 0
+        || inspection.profile.cluster_bytes < inspection.profile.logical_sector_bytes
+    {
+        return Err(RegularImageCoordinatorError::InvalidSourceGeometry);
+    }
+    Ok(PreflightEvidence {
+        image: super::ImageIdentity::from_regular_image(identity),
+        source_filesystem: inspection.profile.filesystem,
+        source_evidence_digest,
+        source_manifest_commitment,
+        sector_bytes: inspection.profile.logical_sector_bytes,
+        allocation_alignment: u64::from(inspection.profile.cluster_bytes),
+        inventory_complete: true,
+        allocation_map_complete: true,
+        health: inspection.profile.state.health,
+        access: AccessState::Offline,
+    })
+}
+
+fn validate_locked_preparation(
+    reader: &dyn BoundedImageReader,
+    graph: &ObjectGraph,
+    preflight: PreflightEvidence,
+    transaction_id: [u8; 16],
+    prepared: &PreparedConversion,
+) -> Result<(), RegularImageCoordinatorError> {
+    if prepared.identity().transaction_id != transaction_id {
+        return Err(RegularImageCoordinatorError::PreparedTransactionMismatch);
+    }
+    if prepared.preflight != preflight {
+        return Err(RegularImageCoordinatorError::PreparedPreflightMismatch);
+    }
+    if prepared.graph_digest() != super::digest_graph(graph) {
+        return Err(RegularImageCoordinatorError::PreparedGraphMismatch);
+    }
+    verify_locked_before_images(reader, prepared.staging_rollback_overlay().writes())?;
+    verify_locked_before_images(reader, prepared.backup_boot_before_images())?;
+    verify_locked_before_images(reader, prepared.activation_before_images())?;
+    Ok(())
+}
+
+fn mint_transaction_id(identity: &ImageIdentity, source_digest: [u8; 32]) -> [u8; 16] {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let nonce = NEXT_TRANSACTION_NONCE.fetch_add(1, Ordering::Relaxed);
+    let mut hasher = Sha256::new();
+    hasher.update(b"starconverter/regular-image-transaction-id/v1\0");
+    hasher.update(identity.stable_container_token());
+    hasher.update(source_digest);
+    hasher.update(std::process::id().to_le_bytes());
+    hasher.update(elapsed.as_secs().to_le_bytes());
+    hasher.update(elapsed.subsec_nanos().to_le_bytes());
+    hasher.update(nonce.to_le_bytes());
+    let digest = hasher.finalize();
+    let mut transaction_id = [0_u8; 16];
+    transaction_id.copy_from_slice(&digest[..16]);
+    transaction_id
+}
+
+fn verify_locked_before_images(
+    reader: &dyn BoundedImageReader,
+    before_images: &[OverlayWrite],
+) -> Result<(), RegularImageCoordinatorError> {
+    for before in before_images {
+        let mut relative = 0_usize;
+        while relative < before.bytes.len() {
+            let count = (before.bytes.len() - relative).min(reader.max_read_bytes());
+            if count == 0 {
+                return Err(RegularImageCoordinatorError::CandidateReadLimitInvalid);
+            }
+            let offset = before
+                .offset
+                .checked_add(
+                    u64::try_from(relative)
+                        .map_err(|_| RegularImageCoordinatorError::CandidateRangeOverflow)?,
+                )
+                .ok_or(RegularImageCoordinatorError::CandidateRangeOverflow)?;
+            let actual = reader.read_exact_at(offset, count).map_err(|error| {
+                RegularImageCoordinatorError::Executor(ExecutorError::Image(error))
+            })?;
+            if actual != before.bytes[relative..relative + count] {
+                return Err(RegularImageCoordinatorError::PreparedBeforeImageMismatch { offset });
+            }
+            relative += count;
+        }
+    }
+    Ok(())
+}
+
+fn observe_locked_source(
+    executor: &ImageExecutor,
+    prepared: &PreparedConversion,
+) -> Result<ObservedImage, RegularImageCoordinatorError> {
+    let view = executor
+        .locked_view(CANDIDATE_AUDIT_MAX_READ_BYTES)
+        .map_err(RegularImageCoordinatorError::Executor)?;
+    let source_evidence_digest = digest_source_view(
+        &view,
+        SourceDigestLimits {
+            max_image_bytes: prepared.preflight.image.image_bytes,
+            chunk_bytes: CANDIDATE_AUDIT_MAX_READ_BYTES,
+        },
+    )
+    .map_err(RegularImageCoordinatorError::SourceView)?;
+    view.post_operation_revalidate()
+        .map_err(RegularImageCoordinatorError::Executor)?;
+    Ok(ObservedImage {
+        image: super::ImageIdentity::from_regular_image(executor.identity()),
+        source_evidence_digest: Some(source_evidence_digest),
+    })
+}
 
 /// Last checkpoint known to have been durably appended by this coordinator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,12 +474,20 @@ pub struct RegularImageCoordinator<'plan> {
     poisoned: bool,
 }
 
+// Naming the lifetime keeps the test-only borrowed-plan constructor and every instance method in
+// one impl while making the returned coordinator's borrow explicit.
+#[allow(
+    unknown_lints,
+    clippy::elidable_lifetime_names,
+    clippy::needless_lifetimes
+)]
 impl<'plan> RegularImageCoordinator<'plan> {
     /// Opens the image executor before opening/recovering the capsule store, then binds both to the
     /// exact sealed plan and current capsule generation.
     ///
     /// The sealed observation is constructed internally from the locked image; callers cannot
     /// supply or replay source evidence.
+    #[cfg(test)]
     pub fn resume_existing(
         prepared: &'plan PreparedConversion,
         image_path: impl AsRef<Path>,
@@ -799,6 +1207,11 @@ impl RegularImageCoordinator<'static> {
     ) -> Result<(Self, CapsuleRecoveryEvidence), RegularImageCoordinatorError> {
         let executor = ImageExecutor::open(image_path.as_ref(), expected_image, executor_limits)
             .map_err(RegularImageCoordinatorError::Executor)?;
+        // Normal recovery still needs fresh production-strength offline authority. Unit tests use
+        // regular temporary images on Unix and exercise coordinator logic under advisory locks;
+        // non-test builds never accept that weaker exclusion.
+        #[cfg(not(test))]
+        let authority = OfflineRegularImageAuthority::mint(&executor)?;
         let (store, recovery) =
             CapsuleStore::resume_recovering(capsule_path, image_path, capsule_policy)
                 .map_err(RegularImageCoordinatorError::CapsuleStore)?;
@@ -807,6 +1220,8 @@ impl RegularImageCoordinator<'static> {
         if !prepared.matches_regular_image(executor.identity()) {
             return Err(RegularImageCoordinatorError::PlanImageMismatch);
         }
+        #[cfg(not(test))]
+        authority.consume(&executor)?;
         let coordinator = Self {
             store,
             executor,
@@ -861,6 +1276,24 @@ pub enum RegularImageCoordinatorError {
     Verification(VerificationError),
     SourceView(SourceViewError),
     ActivationBytes(ActivationByteError),
+    OfflineAuthorityUnavailable {
+        lock_strength: LockStrength,
+    },
+    OfflineAuthorityChanged,
+    SourceInventoryIncomplete,
+    SourceHealthNotClean {
+        actual: HealthState,
+    },
+    InvalidSourceGeometry,
+    PreparedTransactionMismatch,
+    PreparedPreflightMismatch,
+    PreparedGraphMismatch,
+    PreparedBeforeImageMismatch {
+        offset: u64,
+    },
+    InitialCapsuleDurabilityMissing {
+        evidence: CapsuleSyncEvidence,
+    },
     PlanImageMismatch,
     RelocationNotSupported,
     LeaseStateChanged,
@@ -903,6 +1336,7 @@ pub enum RegularImageCoordinatorError {
 }
 
 impl fmt::Display for RegularImageCoordinatorError {
+    #[allow(clippy::too_many_lines)]
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Executor(error) => write!(formatter, "image executor failed: {error}"),
@@ -917,6 +1351,40 @@ impl fmt::Display for RegularImageCoordinatorError {
             Self::ActivationBytes(error) => {
                 write!(formatter, "activation-byte classification failed: {error}")
             }
+            Self::OfflineAuthorityUnavailable { lock_strength } => write!(
+                formatter,
+                "regular-image lock strength {lock_strength:?} cannot prove production offline access"
+            ),
+            Self::OfflineAuthorityChanged => formatter.write_str(
+                "one-use offline regular-image authority no longer matches the locked container",
+            ),
+            Self::SourceInventoryIncomplete => formatter.write_str(
+                "locked source inspection did not prove a complete object and allocation inventory",
+            ),
+            Self::SourceHealthNotClean { actual } => write!(
+                formatter,
+                "locked source filesystem health is {actual:?}, not clean",
+            ),
+            Self::InvalidSourceGeometry => formatter.write_str(
+                "locked source inspection reported invalid sector or allocation geometry",
+            ),
+            Self::PreparedTransactionMismatch => formatter.write_str(
+                "prepared conversion did not use the transaction identity minted by the locked session",
+            ),
+            Self::PreparedPreflightMismatch => formatter.write_str(
+                "prepared conversion is not bound to the locked inspection, digest, and manifest evidence",
+            ),
+            Self::PreparedGraphMismatch => formatter.write_str(
+                "prepared conversion graph differs from the graph parsed through the locked image view",
+            ),
+            Self::PreparedBeforeImageMismatch { offset } => write!(
+                formatter,
+                "prepared rollback bytes differ from the locked source at image offset {offset}",
+            ),
+            Self::InitialCapsuleDurabilityMissing { evidence } => write!(
+                formatter,
+                "initial capsule lacks full file and parent-namespace durability: {evidence:?}",
+            ),
             Self::PlanImageMismatch => {
                 formatter.write_str("prepared conversion does not match the locked image")
             }
@@ -1031,7 +1499,7 @@ mod tests {
 
     use super::super::{
         ConversionDraft, ConversionLimits, ImageIdentity as ConversionImageIdentity,
-        PreflightEvidence, TargetCapabilities,
+        OpaqueWriteSets, PreflightEvidence, TargetCapabilities,
     };
 
     use super::*;
@@ -1125,6 +1593,272 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    fn inspectable_empty_exfat_source() -> (TempDir, PathBuf) {
+        const IMAGE_BYTES: u64 = 4 * 1024 * 1024;
+
+        let dir = TempDir::new();
+        let image_path = dir.join("locked-source.exfat.img");
+        let graph = empty_graph(IMAGE_BYTES);
+        let upcase = non_interoperable_ascii_test_upcase_table();
+        let serializer = serialize_exfat_destination(
+            &graph,
+            &[],
+            ExfatVolumeProfile {
+                volume_label: None,
+                encoded_upcase_table: &upcase,
+                upcase_checksum: table_checksum(&upcase),
+                source_preservation: ExfatPreservationEvidence::default(),
+                allocated_bad_clusters: 0,
+            },
+            ExfatSerializeOptions::default(),
+            ExfatSerializeLimits::default(),
+        )
+        .unwrap();
+        let mut image = vec![0_u8; usize::try_from(IMAGE_BYTES).unwrap()];
+        for write in serializer.staging_writes().chain([
+            serializer.backup_boot_write(),
+            serializer.primary_boot_write(),
+        ]) {
+            let start = usize::try_from(write.offset).unwrap();
+            image[start..start + write.bytes.len()].copy_from_slice(&write.bytes);
+        }
+        fs::write(&image_path, image).unwrap();
+        (dir, image_path)
+    }
+
+    fn prepared_from_locked_evidence(
+        evidence: &LockedRegularImagePlanningEvidence<'_>,
+        corrupt_before_image: bool,
+    ) -> Result<PreparedConversion, ConversionError> {
+        prepared_from_locked_evidence_with_bindings(
+            evidence,
+            corrupt_before_image,
+            evidence.transaction_id(),
+            evidence.preflight(),
+        )
+    }
+
+    fn prepared_from_locked_evidence_with_bindings(
+        evidence: &LockedRegularImagePlanningEvidence<'_>,
+        corrupt_before_image: bool,
+        transaction_id: [u8; 16],
+        preflight: PreflightEvidence,
+    ) -> Result<PreparedConversion, ConversionError> {
+        let boot = DestinationReservation {
+            range: ByteRange {
+                offset: 1024 * 1024,
+                length: 4096,
+            },
+            kind: ReservationKind::BootRegion,
+        };
+        let allocation = DestinationReservation {
+            range: ByteRange {
+                offset: 2 * 1024 * 1024,
+                length: 4096,
+            },
+            kind: ReservationKind::AllocationMetadata,
+        };
+        let namespace = DestinationReservation {
+            range: ByteRange {
+                offset: 2 * 1024 * 1024 + 4096,
+                length: 4096,
+            },
+            kind: ReservationKind::NamespaceMetadata,
+        };
+        let capsule = DestinationReservation {
+            range: ByteRange {
+                offset: 3 * 1024 * 1024,
+                length: 4096,
+            },
+            kind: ReservationKind::Capsule,
+        };
+        let staging = vec![
+            OverlayWrite {
+                offset: allocation.range.offset,
+                bytes: vec![0xa1; 512],
+            },
+            OverlayWrite {
+                offset: namespace.range.offset,
+                bytes: vec![0xb2; 512],
+            },
+        ];
+        let backup = OverlayWrite {
+            offset: boot.range.offset,
+            bytes: vec![0xc3; 512],
+        };
+        let activation = OverlayWrite {
+            offset: boot.range.offset + 512,
+            bytes: vec![0xd4; 512],
+        };
+        let mut staging_rollback = evidence
+            .capture_before_images(&staging, PreimageLimits::default())
+            .unwrap();
+        let backup_boot_rollback = evidence
+            .capture_before_images(std::slice::from_ref(&backup), PreimageLimits::default())
+            .unwrap();
+        let activation_rollback = evidence
+            .capture_before_images(std::slice::from_ref(&activation), PreimageLimits::default())
+            .unwrap();
+        if corrupt_before_image {
+            staging_rollback[0].bytes[0] ^= 0xff;
+        }
+        let writes = OpaqueWriteSets {
+            target_staging: vec![
+                ReservedWrite {
+                    reservation_kind: allocation.kind,
+                    write: staging[0].clone(),
+                },
+                ReservedWrite {
+                    reservation_kind: namespace.kind,
+                    write: staging[1].clone(),
+                },
+            ],
+            backup_boot: vec![ReservedWrite {
+                reservation_kind: boot.kind,
+                write: backup,
+            }],
+            activation: vec![ReservedWrite {
+                reservation_kind: boot.kind,
+                write: activation,
+            }],
+            target_staging_rollback: staging_rollback,
+            backup_boot_rollback,
+            activation_rollback,
+        };
+        PreparedConversion::build(
+            evidence.graph(),
+            ConversionDraft {
+                transaction_id,
+                preflight,
+                target: TargetCapabilities {
+                    filesystem: FileSystem::Ntfs,
+                    features: Vec::new(),
+                },
+                source_allocations: Vec::new(),
+                reservations: vec![boot, allocation, namespace, capsule],
+                writes: ActivationAuthorizedWrites::test_only(FileSystem::Ntfs, writes),
+            },
+            ConversionLimits::default(),
+        )
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn one_use_locked_session_binds_preflight_preimages_and_initial_capsule() {
+        let (dir, image_path) = inspectable_empty_exfat_source();
+        let capsule_path = dir.join("locked-transaction.starcap");
+        let session =
+            RegularImagePreparationSession::open(&image_path, ExecutorLimits::default()).unwrap();
+        let prepared = session
+            .prepare_with(VerificationLimits::default(), |evidence| {
+                assert_eq!(evidence.inspection().profile.filesystem, FileSystem::ExFat);
+                assert_eq!(evidence.preflight().access, AccessState::Offline);
+                assert_ne!(evidence.transaction_id(), [0_u8; 16]);
+                assert!(ImageFile::open(&image_path).is_err());
+                prepared_from_locked_evidence(evidence, false)
+            })
+            .unwrap();
+        assert!(ImageFile::open(&image_path).is_err());
+        let (coordinator, sync) = prepared.create_coordinator(&capsule_path).unwrap();
+        assert!(ImageFile::open(&image_path).is_err());
+        assert!(sync.sync_data_completed);
+        assert!(sync.sync_all_completed);
+        assert_eq!(
+            sync.namespace_durability,
+            NamespaceDurability::ParentDirectorySynchronized
+        );
+        assert_eq!(
+            coordinator.checkpoint().unwrap().phase,
+            TransactionPhase::Discovered
+        );
+        drop(coordinator);
+        assert!(ImageFile::open(&image_path).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn locked_session_rejects_planner_supplied_wrong_before_image() {
+        let (_dir, image_path) = inspectable_empty_exfat_source();
+        let session =
+            RegularImagePreparationSession::open(&image_path, ExecutorLimits::default()).unwrap();
+        assert!(matches!(
+            session.prepare_with(VerificationLimits::default(), |evidence| {
+                prepared_from_locked_evidence(evidence, true)
+            }),
+            Err(RegularImageCoordinatorError::PreparedBeforeImageMismatch { .. })
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn locked_session_rejects_planner_selected_transaction_identity() {
+        let (_dir, image_path) = inspectable_empty_exfat_source();
+        let session =
+            RegularImagePreparationSession::open(&image_path, ExecutorLimits::default()).unwrap();
+        assert!(matches!(
+            session.prepare_with(VerificationLimits::default(), |evidence| {
+                prepared_from_locked_evidence_with_bindings(
+                    evidence,
+                    false,
+                    [0x77; 16],
+                    evidence.preflight(),
+                )
+            }),
+            Err(RegularImageCoordinatorError::PreparedTransactionMismatch)
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn locked_session_rejects_planner_substituted_preflight() {
+        let (_dir, image_path) = inspectable_empty_exfat_source();
+        let session =
+            RegularImagePreparationSession::open(&image_path, ExecutorLimits::default()).unwrap();
+        assert!(matches!(
+            session.prepare_with(VerificationLimits::default(), |evidence| {
+                let mut substituted = evidence.preflight();
+                substituted.source_evidence_digest[0] ^= 0xff;
+                prepared_from_locked_evidence_with_bindings(
+                    evidence,
+                    false,
+                    evidence.transaction_id(),
+                    substituted,
+                )
+            }),
+            Err(RegularImageCoordinatorError::PreparedPreflightMismatch)
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn preparation_error_releases_mandatory_image_lock() {
+        let (_dir, image_path) = inspectable_empty_exfat_source();
+        let session =
+            RegularImagePreparationSession::open(&image_path, ExecutorLimits::default()).unwrap();
+        let result = session.prepare_with(VerificationLimits::default(), |_evidence| {
+            Err(ConversionError::UnknownFilesystem)
+        });
+        assert!(matches!(
+            result,
+            Err(RegularImageCoordinatorError::Conversion(
+                ConversionError::UnknownFilesystem
+            ))
+        ));
+        assert!(ImageFile::open(&image_path).is_ok());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn advisory_regular_file_lock_cannot_mint_offline_authority() {
+        let (_dir, image_path) = inspectable_empty_exfat_source();
+        assert!(matches!(
+            RegularImagePreparationSession::open(&image_path, ExecutorLimits::default()),
+            Err(RegularImageCoordinatorError::OfflineAuthorityUnavailable {
+                lock_strength: LockStrength::AdvisoryFileLock,
+            })
+        ));
     }
 
     fn valid_exfat_fixture() -> (TempDir, PathBuf, PathBuf, PreparedConversion) {

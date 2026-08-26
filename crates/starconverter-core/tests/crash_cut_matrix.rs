@@ -6,7 +6,8 @@
 //! its activation authorization is deliberately unforgeable and neither serializer is currently
 //! activation-ready.
 
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -14,6 +15,7 @@ use starconverter_core::capsule::{
     CapsuleIdentity, CapsuleLimits, HEADER_BYTES, TransactionPhase, append_generation,
     recover_capsule, scan_capsule,
 };
+use starconverter_core::capsule_store::CapsuleStore;
 use starconverter_core::overlay::OverlayWrite;
 use starconverter_core::recovery::{
     RecoveryBundle, RecoveryLimits, decode_recovery_bundle, encode_recovery_bundle,
@@ -45,6 +47,15 @@ impl TempImage {
 
     fn path(&self) -> &Path {
         &self.0
+    }
+
+    fn vacant(label: &str) -> Self {
+        let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "starconverter-{label}-{}-{sequence}.starcap",
+            std::process::id()
+        ));
+        Self(path)
     }
 }
 
@@ -173,6 +184,43 @@ fn apply_group(image: &mut [u8], writes: &[OverlayWrite]) {
     for item in writes {
         apply(image, item);
     }
+}
+
+fn persist_exact_regular_file(path: &Path, bytes: &[u8]) {
+    let mut file = OpenOptions::new().write(true).open(path).unwrap();
+    file.seek(SeekFrom::Start(0)).unwrap();
+    file.write_all(bytes).unwrap();
+    file.set_len(u64::try_from(bytes.len()).unwrap()).unwrap();
+    file.sync_data().unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    assert_eq!(fs::read(path).unwrap(), bytes);
+}
+
+fn append_and_sync_regular_file(path: &Path, suffix: &[u8]) {
+    let mut file = OpenOptions::new().append(true).open(path).unwrap();
+    file.write_all(suffix).unwrap();
+    file.sync_data().unwrap();
+    file.sync_all().unwrap();
+}
+
+fn semantic_suffix_cuts(length: usize) -> Vec<usize> {
+    let mut cuts = vec![
+        0,
+        1,
+        HEADER_BYTES.saturating_sub(1),
+        HEADER_BYTES,
+        HEADER_BYTES.saturating_add(1),
+        length / 2,
+        length.saturating_sub(HEADER_BYTES).saturating_sub(1),
+        length.saturating_sub(HEADER_BYTES),
+        length.saturating_sub(1),
+        length,
+    ];
+    cuts.retain(|cut| *cut <= length);
+    cuts.sort_unstable();
+    cuts.dedup();
+    cuts
 }
 
 fn rollback_writes(bundle: &RecoveryBundle, phase: TransactionPhase) -> Vec<&OverlayWrite> {
@@ -346,6 +394,85 @@ fn each_durable_phase_restores_the_exact_regular_file_before_image() {
         }
         fs::write(temp.path(), &bytes).unwrap();
         assert_eq!(fs::read(temp.path()).unwrap(), source, "phase {phase:?}");
+    }
+}
+
+#[test]
+fn coupled_regular_image_and_semantic_capsule_cuts_recover_exact_disk_bytes() {
+    let limits = CapsuleLimits::default();
+    let groups = forward_groups();
+    let bundle = decode_recovery_bundle(&recovery_payload(), recovery_limits()).unwrap();
+    let source = source_image();
+    for (previous_phase, next_phase, applied_groups) in [
+        (
+            TransactionPhase::TargetStaged,
+            TransactionPhase::BackupBootWritten,
+            2,
+        ),
+        (
+            TransactionPhase::BackupBootWritten,
+            TransactionPhase::Activated,
+            3,
+        ),
+        (TransactionPhase::Activated, TransactionPhase::RolledBack, 0),
+    ] {
+        let previous = capsule_at(previous_phase);
+        let mut updated = previous.clone();
+        append_generation(&mut updated, IDENTITY, next_phase, CHECKPOINT, limits).unwrap();
+        let suffix = &updated[previous.len()..];
+
+        // Byte-exhaustive newest-generation recovery lives in capsule_store's focused tests. This
+        // coupled disk matrix samples every framing transition while keeping routine Windows gates
+        // fast despite multiple real FlushFileBuffers calls per cut.
+        for cut in semantic_suffix_cuts(suffix.len()) {
+            let image = TempImage::create(&source);
+            let capsule = TempImage::vacant("coupled-cut");
+            let (store, _) =
+                CapsuleStore::create_new(capsule.path(), image.path(), &previous, limits).unwrap();
+            drop(store);
+
+            let mut changed = source.clone();
+            if next_phase == TransactionPhase::RolledBack {
+                for group in &groups {
+                    apply_group(&mut changed, group);
+                }
+                for before_image in rollback_writes(&bundle, previous_phase) {
+                    apply(&mut changed, before_image);
+                }
+            } else {
+                for group in groups.iter().take(applied_groups) {
+                    apply_group(&mut changed, group);
+                }
+            }
+            persist_exact_regular_file(image.path(), &changed);
+            append_and_sync_regular_file(capsule.path(), &suffix[..cut]);
+
+            let (recovered, _) =
+                CapsuleStore::resume_recovering(capsule.path(), image.path(), limits).unwrap();
+            let durable_phase = scan_capsule(recovered.bytes(), limits)
+                .unwrap()
+                .newest()
+                .unwrap()
+                .phase;
+            let expected_phase = if cut == suffix.len() {
+                next_phase
+            } else {
+                previous_phase
+            };
+            assert_eq!(durable_phase, expected_phase, "{next_phase:?} cut {cut}");
+            drop(recovered);
+
+            let mut actual = fs::read(image.path()).unwrap();
+            for before_image in rollback_writes(&bundle, durable_phase) {
+                apply(&mut actual, before_image);
+            }
+            persist_exact_regular_file(image.path(), &actual);
+            assert_eq!(
+                fs::read(image.path()).unwrap(),
+                source,
+                "disk rollback at {next_phase:?} cut {cut} durable {durable_phase:?}"
+            );
+        }
     }
 }
 

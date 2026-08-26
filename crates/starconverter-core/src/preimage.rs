@@ -6,7 +6,7 @@
 
 use std::fmt;
 
-use crate::image::{ImageError, ImageFile};
+use crate::image::{BoundedImageReader, ImageError, ImageFile};
 use crate::overlay::OverlayWrite;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +111,15 @@ impl From<ImageError> for PreimageError {
 /// failure, out-of-image reads, and any image identity change detected during capture.
 pub fn capture_before_images(
     image: &ImageFile,
+    replacements: &[OverlayWrite],
+    limits: PreimageLimits,
+) -> Result<Vec<OverlayWrite>, PreimageError> {
+    capture_before_images_with_reader(image, replacements, limits)
+}
+
+/// Shared bounded capture used by trusted readers that already pin the regular image handle.
+pub(crate) fn capture_before_images_with_reader(
+    image: &dyn BoundedImageReader,
     replacements: &[OverlayWrite],
     limits: PreimageLimits,
 ) -> Result<Vec<OverlayWrite>, PreimageError> {

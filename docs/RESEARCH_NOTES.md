@@ -17,6 +17,9 @@ filesystem tooling.
 - Microsoft [`FSCTL_LOCK_VOLUME`](https://learn.microsoft.com/en-us/windows/win32/api/winioctl/ni-winioctl-fsctl_lock_volume)
 - Microsoft [`FSCTL_DISMOUNT_VOLUME`](https://learn.microsoft.com/en-us/windows/win32/api/winioctl/ni-winioctl-fsctl_dismount_volume)
 - Microsoft [file buffering](https://learn.microsoft.com/en-us/windows/win32/fileio/file-buffering)
+- Microsoft [`CreateFileW`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew)
+- Microsoft [`FlushFileBuffers`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-flushfilebuffers)
+- Microsoft [file caching and metadata durability](https://learn.microsoft.com/en-us/windows/win32/fileio/file-caching)
 - Linux kernel [NTFS3 documentation](https://docs.kernel.org/filesystems/ntfs3.html)
 - Microsoft [`chkdsk`](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/chkdsk)
 - Microsoft [`Mount-DiskImage`](https://learn.microsoft.com/en-us/powershell/module/storage/mount-diskimage)
@@ -72,6 +75,14 @@ filesystem tooling.
 16. Activation and acceptance are different authority boundaries. Verification must remain
     rollbackable, and finalization must repeat the complete real-byte and semantic audit while
     requiring an explicit approval capability that production cannot mint accidentally.
+17. A successful file `sync_all` does not by itself prove a newly created capsule's directory entry
+    will survive power loss. Initial mutation authority must also require a parent-namespace
+    barrier; an unsupported or rejected barrier leaves the file recoverable but returns no authority.
+18. Windows deny-share opening can establish mandatory exclusion for a regular file. Advisory Unix
+    locks cannot honestly be relabeled as production `Offline` evidence, so the current in-place
+    preparation boundary must fail closed there until a stronger platform authority exists.
+19. Capsule persistence faults must be cut after the image write but before every append write,
+    flush, readback, and in-memory adoption boundary; a file-write error is not evidence of absence.
 
 ## Independent interoperability gate
 

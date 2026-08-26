@@ -4473,7 +4473,7 @@ mod tests {
     fn exact_volume_label_roundtrips_and_invalid_labels_fail_before_planning() {
         let graph = two_file_graph();
         let metadata = exact_metadata();
-        let label: Vec<u16> = "STAR★".encode_utf16().collect();
+        let label: Vec<u16> = "Données".encode_utf16().collect();
         let plan = plan_ntfs_destination_with_metadata_and_volume(
             &graph,
             inputs(),

@@ -223,11 +223,16 @@ installed. CI always tests both language stacks.
 - [x] Every-byte capsule-tail and in-flight write-group recovery matrix
 - [x] Type-level serializer activation authorization (no public bypass)
 - [x] Module-sealed preflight/verification/completion evidence (no caller-forged clean state)
+- [x] One-use mandatory-lock Windows preparation session binding inspection, hashing, manifest,
+      internally minted transaction identity, planning, exact preimages, and strong initial capsule
+      namespace durability to one retained regular-file handle
 - [x] Exact-intent regular-image executor with locking, read-back, flush, rollback, and fault cuts
 - [x] Opaque plan/container-bound executor completion evidence for mutation and rollback checkpoints
 - [x] Crate-private generation/phase leases and an internal regular-image coordinator through
       `Activated`, with bounded exact-byte restart classification, rollback through `Verified`, and
       capability-gated finalization
+- [x] Capsule create/append fault cuts across write, data flush, readback, metadata flush, and
+      adoption, with real-file recovery matrices through backup boot, activation, and rollback
 - [x] Deterministic parser mutation suite
 - [x] Real-image `inspect` command with evidence-aware blocking
 - [x] Real-image read-only `preview` with exact candidate phases and rollback bytes
