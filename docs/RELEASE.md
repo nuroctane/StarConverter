@@ -33,8 +33,8 @@ The two `-macos-app.tar.gz` engineering archives instead contain an exact four-f
 `StarConverter.app`: its canonical `Contents/Info.plist`, the GUI under `Contents/MacOS`, and the
 license and release guide under `Contents/Resources`. The standalone CLI remains in the portable
 archive. The app bundle intentionally has no custom graphic icon and no `_CodeSignature`; it uses
-the system's generic app presentation until an approved icon and a real distribution signature
-exist.
+the system's generic app presentation by design; the product identity remains the ASCII-only
+`[ STAR :: CONVERTER ]` wordmark. A real distribution signature remains required for public release.
 
 The release also contains:
 
@@ -157,7 +157,7 @@ blockers for any claim beyond the unsigned engineering pre-alpha channel.
 | --- | --- | --- |
 | Windows | Validated unpackaged x64 ZIP | MSIX/MSI/installer until the distribution channel, durable package identity and publisher, signing provider, update/uninstall behavior, and clean-VM certification tests are selected |
 | macOS | Canonical unsigned Intel and Apple Silicon `.app` layouts | Developer ID distribution ZIP/DMG/PKG until hardened-runtime signing, secure timestamping, notarization, stapling, Gatekeeper assessment, and native launch tests are available |
-| Linux | Validated glibc x64 tar archive | AppDir/AppImage until there is an approved icon, a measured dependency-closure policy, and clean-host desktop integration tests; DEB/RPM additionally need an installation and upgrade policy |
+| Linux | Validated glibc x64 tar archive | AppDir/AppImage while their required graphic-icon contract conflicts with the ASCII-only identity, and until there is a measured dependency-closure policy plus clean-host desktop integration tests; DEB/RPM additionally need an installation and upgrade policy |
 
 These refusals follow the platform contracts rather than a missing archive command. Microsoft
 distinguishes unpackaged deployment from MSIX package identity and warns that unsigned executable

@@ -669,12 +669,19 @@ enum CloseIntent {
     CloseAfterJob,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlanCurrency {
+    Current,
+    Stale,
+}
+
 #[derive(Debug)]
 struct StarConverterApp {
     source: VolumeProfile,
     target: FileSystem,
     mode: GuaranteeMode,
     plan: ConversionPlan,
+    plan_currency: PlanCurrency,
     image_path: String,
     real_source: bool,
     inspection_status: String,
@@ -746,6 +753,7 @@ impl StarConverterApp {
             target,
             mode,
             plan,
+            plan_currency: PlanCurrency::Current,
             image_path,
             real_source: false,
             inspection_status: if recovered_image_path {
@@ -846,6 +854,52 @@ impl StarConverterApp {
 
     fn replan(&mut self) {
         self.plan = Planner.plan(&self.source, self.target, self.mode);
+        self.plan_currency = PlanCurrency::Current;
+    }
+
+    fn invalidate_conversion_evidence(&mut self, status: &str) {
+        self.plan_currency = PlanCurrency::Stale;
+        self.real_source = false;
+        self.exact_preview = None;
+        self.inspection_status = status.into();
+        self.clear_verification_result(
+            "Conversion inputs changed; prior verification acceptance was cleared.",
+        );
+    }
+
+    fn replace_image_path(&mut self, image_path: String) {
+        if self.image_path == image_path {
+            return;
+        }
+        self.image_path = image_path;
+        self.invalidate_conversion_evidence(
+            "Image path changed; analyze this source again before preview or export.",
+        );
+    }
+
+    fn select_guarantee_mode(&mut self, mode: GuaranteeMode) {
+        if self.mode == mode {
+            return;
+        }
+        self.mode = mode;
+        self.plan = Planner.plan(&self.source, self.target, self.mode);
+        self.invalidate_conversion_evidence(
+            "Guarantee mode changed; analyze and preview the source again before export.",
+        );
+    }
+
+    fn export_block_reason(&self) -> Option<&'static str> {
+        if self.mode == GuaranteeMode::ContentOnly {
+            Some("Content-only is preview-only; choose strict or escrow to export.")
+        } else if self.plan_currency == PlanCurrency::Stale || !self.real_source {
+            Some("Analyze the current regular image before export.")
+        } else if self.exact_preview.is_none() {
+            Some("Build an exact preview for the current inputs before export.")
+        } else if !self.plan.is_ready() {
+            Some("Resolve every preflight blocker before export.")
+        } else {
+            None
+        }
     }
 
     fn start_background_job<F>(&mut self, kind: JobKind, work: F)
@@ -1012,9 +1066,12 @@ impl StarConverterApp {
             }
             JobKind::Inspect => {
                 self.real_source = false;
+                self.plan_currency = PlanCurrency::Stale;
                 self.inspection_status = message;
             }
             JobKind::Preview => {
+                self.real_source = false;
+                self.plan_currency = PlanCurrency::Stale;
                 self.exact_preview = None;
                 self.inspection_status = message;
             }
@@ -1023,15 +1080,19 @@ impl StarConverterApp {
     }
 
     fn select_exfat_demo(&mut self) {
+        self.invalidate_conversion_evidence(
+            "Synthetic exFAT profile selected; regular-image evidence was cleared.",
+        );
         self.source = VolumeProfile::demo_exfat();
         self.target = FileSystem::Ntfs;
-        self.real_source = false;
-        self.exact_preview = None;
         self.inspection_status = "Synthetic exFAT capability profile selected.".into();
         self.replan();
     }
 
     fn select_ntfs_demo(&mut self) {
+        self.invalidate_conversion_evidence(
+            "Synthetic NTFS profile selected; regular-image evidence was cleared.",
+        );
         let mut source = VolumeProfile::demo_exfat();
         source.display_name = "DEMO_WORKSPACE".into();
         source.stable_id = "image://demo-workspace.ntfs".into();
@@ -1043,14 +1104,11 @@ impl StarConverterApp {
         ];
         self.source = source;
         self.target = FileSystem::ExFat;
-        self.real_source = false;
-        self.exact_preview = None;
         self.inspection_status = "Synthetic NTFS capability profile selected.".into();
         self.replan();
     }
 
     fn analyze_image(&mut self) {
-        self.exact_preview = None;
         let path = self.image_path.trim().to_owned();
         if path.is_empty() {
             self.inspection_status = "Image path is required.".into();
@@ -1058,6 +1116,9 @@ impl StarConverterApp {
                 .push("00:00:00  [BLOCKED] image path is empty".into());
             return;
         }
+        self.invalidate_conversion_evidence(
+            "Read-only image inspection is running; prior evidence is no longer accepted.",
+        );
         self.inspection_status = "Read-only image inspection is running in the background.".into();
         self.start_background_job(JobKind::Inspect, move |control| {
             run_coarse_cancellable_job(
@@ -1084,15 +1145,20 @@ impl StarConverterApp {
         else {
             return;
         };
-        self.image_path = path.display().to_string();
-        self.real_source = false;
-        self.exact_preview = None;
+        self.replace_image_path(path.display().to_string());
         self.inspection_status = "Image selected; analysis has not started.".into();
         self.activity
             .push("00:00:00  [READY] regular image path selected".into());
     }
 
     fn save_plan(&mut self) {
+        if self.plan_currency == PlanCurrency::Stale {
+            self.inspection_status =
+                "Plan is stale; analyze the current source before saving a report.".into();
+            self.activity
+                .push("00:00:00  [BLOCKED] stale plan cannot be saved".into());
+            return;
+        }
         let Some(path) = rfd::FileDialog::new()
             .set_title("Save StarConverter analysis plan")
             .set_file_name("starconverter-plan.txt")
@@ -1126,7 +1192,9 @@ impl StarConverterApp {
             return;
         }
         let mode = self.mode;
-        self.exact_preview = None;
+        self.invalidate_conversion_evidence(
+            "Exact preview is running; prior evidence is no longer accepted.",
+        );
         self.inspection_status = "Exact preview is being built in the background.".into();
         self.start_background_job(JobKind::Preview, move |control| {
             run_coarse_cancellable_job(
@@ -1145,6 +1213,12 @@ impl StarConverterApp {
     }
 
     fn export_new_image(&mut self) {
+        if let Some(reason) = self.export_block_reason() {
+            self.inspection_status = reason.into();
+            self.activity
+                .push(format!("00:00:00  [BLOCKED] candidate export :: {reason}"));
+            return;
+        }
         let source_path = self.image_path.trim().to_owned();
         if source_path.is_empty() {
             self.inspection_status = "Image path is required.".into();
@@ -1592,11 +1666,14 @@ impl StarConverterApp {
                         {
                             self.preview_image();
                         }
-                        let export_enabled = idle && self.mode != GuaranteeMode::ContentOnly;
+                        let export_block_reason = self.export_block_reason();
+                        let export_enabled = idle && export_block_reason.is_none();
                         if ui
                             .add_enabled(export_enabled, Button::new("Export new image"))
                             .on_disabled_hover_text(
-                                "Content-only is preview-only; choose strict or escrow to export.",
+                                export_block_reason.unwrap_or(
+                                    "Wait for the active job to reach a safe terminal state.",
+                                ),
                             )
                             .clicked()
                         {
@@ -1746,14 +1823,21 @@ impl StarConverterApp {
         ui.horizontal(|ui| {
             let browse_width = 78.0;
             let path_width = (ui.available_width() - browse_width - 8.0).max(80.0);
-            ui.add_sized(
+            let path_response = ui.add_sized(
                 [path_width, 44.0],
                 egui::TextEdit::singleline(&mut self.image_path)
                     .id_source("source_image_path")
                     .hint_text("C:\\path\\volume.img"),
-            )
-            .labelled_by(label.id)
-            .on_hover_text("Regular image file only. Raw-device namespaces are rejected.");
+            );
+            let path_changed = path_response.changed();
+            path_response
+                .labelled_by(label.id)
+                .on_hover_text("Regular image file only. Raw-device namespaces are rejected.");
+            if path_changed {
+                self.invalidate_conversion_evidence(
+                    "Image path changed; analyze this source again before preview or export.",
+                );
+            }
             if ui
                 .add_sized([browse_width, 44.0], Button::new("Browse"))
                 .clicked()
@@ -1948,11 +2032,12 @@ impl StarConverterApp {
                         .color(INK),
                 );
             });
-            let (text, color) = if self.plan.is_ready() {
-                ("PREFLIGHT READY", READY)
-            } else {
-                ("PREFLIGHT BLOCKED", DANGER)
-            };
+            let (text, color) =
+                if self.plan_currency == PlanCurrency::Current && self.plan.is_ready() {
+                    ("PREFLIGHT READY", READY)
+                } else {
+                    ("PREFLIGHT BLOCKED", DANGER)
+                };
             status_label(ui, text, color);
         });
     }
@@ -1961,11 +2046,12 @@ impl StarConverterApp {
         ui.add_space(24.0);
         section_label(ui, "GUARANTEE MODE");
         ui.add_space(8.0);
+        let mut selected_mode = self.mode;
         ui.add_enabled_ui(!self.jobs.is_busy(), |ui| {
             if ui.available_width() < 560.0 {
                 mode_card(
                     ui,
-                    &mut self.mode,
+                    &mut selected_mode,
                     GuaranteeMode::Strict,
                     "STRICT",
                     "Refuse anything that cannot round-trip natively.",
@@ -1973,7 +2059,7 @@ impl StarConverterApp {
                 ui.add_space(6.0);
                 mode_card(
                     ui,
-                    &mut self.mode,
+                    &mut selected_mode,
                     GuaranteeMode::Escrow,
                     "ESCROW",
                     "Keep source-only semantics in a durable capsule.",
@@ -1981,7 +2067,7 @@ impl StarConverterApp {
                 ui.add_space(6.0);
                 mode_card(
                     ui,
-                    &mut self.mode,
+                    &mut selected_mode,
                     GuaranteeMode::ContentOnly,
                     "CONTENT ONLY",
                     "Preserve bytes; report metadata downgrades.",
@@ -1990,21 +2076,21 @@ impl StarConverterApp {
                 ui.columns(3, |columns| {
                     mode_card(
                         &mut columns[0],
-                        &mut self.mode,
+                        &mut selected_mode,
                         GuaranteeMode::Strict,
                         "STRICT",
                         "Refuse anything that cannot round-trip natively.",
                     );
                     mode_card(
                         &mut columns[1],
-                        &mut self.mode,
+                        &mut selected_mode,
                         GuaranteeMode::Escrow,
                         "ESCROW",
                         "Keep source-only semantics in a durable capsule.",
                     );
                     mode_card(
                         &mut columns[2],
-                        &mut self.mode,
+                        &mut selected_mode,
                         GuaranteeMode::ContentOnly,
                         "CONTENT ONLY",
                         "Preserve bytes; report metadata downgrades.",
@@ -2012,9 +2098,7 @@ impl StarConverterApp {
                 });
             }
         });
-        if self.mode != self.plan.mode {
-            self.replan();
-        }
+        self.select_guarantee_mode(selected_mode);
     }
 
     fn show_preflight(&self, ui: &mut egui::Ui) {
@@ -2026,6 +2110,15 @@ impl StarConverterApp {
             .stroke(Stroke::new(1.0, LINE))
             .inner_margin(Margin::same(14))
             .show(ui, |ui| {
+                if self.plan_currency == PlanCurrency::Stale {
+                    preflight_row(
+                        ui,
+                        "EVIDENCE",
+                        "conversion inputs changed; analyze and preview again",
+                        "STALE",
+                        DANGER,
+                    );
+                }
                 preflight_row(ui, "IDENTITY", &self.source.stable_id, "PINNED", READY);
                 preflight_row(
                     ui,
@@ -3020,6 +3113,45 @@ mod tests {
         ))
     }
 
+    fn app_with_current_conversion_evidence() -> StarConverterApp {
+        let source = VolumeProfile::demo_exfat();
+        let target = FileSystem::Ntfs;
+        let mode = GuaranteeMode::Strict;
+        StarConverterApp {
+            plan: Planner.plan(&source, target, mode),
+            plan_currency: PlanCurrency::Current,
+            source,
+            target,
+            mode,
+            image_path: "C:\\images\\accepted.img".into(),
+            real_source: true,
+            inspection_status: "accepted".into(),
+            exact_preview: Some("accepted exact preview".into()),
+            verification_candidate_path: "C:\\images\\candidate.img".into(),
+            verification_escrow_path: "C:\\images\\candidate.img.starconverter-escrow".into(),
+            verification_source_path: "C:\\images\\accepted.img".into(),
+            verification_status: "accepted".into(),
+            verification_report: Some("accepted verification".into()),
+            verification_ok: true,
+            jobs: BackgroundJobs::new(),
+            activity: Vec::new(),
+            session_store: None,
+            session_recovery: SessionRecoveryState::Unavailable,
+            session_dirty: false,
+            session_last_save_attempt: Instant::now(),
+            close_intent: CloseIntent::RemainOpen,
+        }
+    }
+
+    fn assert_old_conversion_evidence_is_unusable(app: &StarConverterApp) {
+        assert!(!app.real_source);
+        assert_eq!(app.plan_currency, PlanCurrency::Stale);
+        assert!(app.exact_preview.is_none());
+        assert!(!app.verification_ok);
+        assert!(app.verification_report.is_none());
+        assert!(app.export_block_reason().is_some());
+    }
+
     fn relative_luminance(color: Color32) -> f32 {
         let linear = |component: u8| {
             let value = f32::from(component) / 255.0;
@@ -3052,6 +3184,48 @@ mod tests {
         assert_eq!(first, plan_report(&plan));
         assert!(first.contains("NOT AN EXECUTABLE WRITE AUTHORIZATION"));
         assert!(first.contains("direction=exFAT -> NTFS"));
+    }
+
+    #[test]
+    fn editing_source_path_immediately_invalidates_old_export_evidence() {
+        let mut app = app_with_current_conversion_evidence();
+        assert_eq!(app.export_block_reason(), None);
+
+        app.replace_image_path("C:\\images\\different.img".into());
+
+        assert_eq!(app.image_path, "C:\\images\\different.img");
+        assert_old_conversion_evidence_is_unusable(&app);
+    }
+
+    #[test]
+    fn changing_filesystem_direction_cannot_retain_old_export_evidence() {
+        let mut app = app_with_current_conversion_evidence();
+        assert_eq!(app.export_block_reason(), None);
+
+        app.select_ntfs_demo();
+
+        assert_eq!(app.source.filesystem, FileSystem::Ntfs);
+        assert_eq!(app.target, FileSystem::ExFat);
+        assert!(!app.real_source);
+        assert!(app.exact_preview.is_none());
+        assert!(!app.verification_ok);
+        assert!(app.verification_report.is_none());
+        assert!(app.export_block_reason().is_some());
+        assert_eq!(app.plan_currency, PlanCurrency::Current);
+        assert_eq!(app.plan.source.filesystem, FileSystem::Ntfs);
+        assert_eq!(app.plan.target, FileSystem::ExFat);
+    }
+
+    #[test]
+    fn changing_guarantee_cannot_retain_or_export_old_evidence() {
+        let mut app = app_with_current_conversion_evidence();
+        assert_eq!(app.export_block_reason(), None);
+
+        app.select_guarantee_mode(GuaranteeMode::Escrow);
+
+        assert_eq!(app.mode, GuaranteeMode::Escrow);
+        assert_eq!(app.plan.mode, GuaranteeMode::Escrow);
+        assert_old_conversion_evidence_is_unusable(&app);
     }
 
     #[test]

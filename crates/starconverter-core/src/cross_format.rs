@@ -20,7 +20,7 @@ use std::fmt;
 
 use crate::FileSystem;
 use crate::GuaranteeMode;
-use crate::extent::{Placement, StreamId};
+use crate::extent::{ExtentKind, Placement, StreamId};
 use crate::fs::exfat_inventory::{ExfatPreservationEvidence, ExfatTimestamps};
 use crate::fs::exfat_normalize::NormalizedExfat;
 use crate::fs::exfat_serialize::{
@@ -140,15 +140,27 @@ pub struct NtfsToExfatPlan {
 #[derive(Debug)]
 pub enum ExfatToNtfsError {
     ContentOnlyIsNotLossless,
+    /// The current NTFS serializer does not yet project exFAT bad-cluster allocation into both
+    /// `$BadClus:$Bad` and `$Bitmap`. Escrow alone is insufficient because the converted
+    /// filesystem could otherwise allocate known-bad media.
+    AllocatedBadClustersNotRepresented {
+        allocated_clusters: u64,
+        bad_cluster_extents: usize,
+    },
     Preservation(PreservationError),
-    PreservationRefused { blockers: Vec<PreservationField> },
+    PreservationRefused {
+        blockers: Vec<PreservationField>,
+    },
     MissingObjectEvidence(ObjectId),
     DuplicateObjectEvidence(ObjectId),
     UnknownObjectEvidence(ObjectId),
     MissingTimestamp(ObjectId),
     InvalidTimestamp(ObjectId),
     AllocationFailed,
-    SourceMetadataLimitExceeded { actual: usize, maximum: usize },
+    SourceMetadataLimitExceeded {
+        actual: usize,
+        maximum: usize,
+    },
     GraphProjection(ObjectGraphError),
     Serialization(NtfsSerializeError),
 }
@@ -158,6 +170,13 @@ impl fmt::Display for ExfatToNtfsError {
         match self {
             Self::ContentOnlyIsNotLossless => formatter.write_str(
                 "content-only mode cannot produce a lossless exFAT-to-NTFS conversion plan",
+            ),
+            Self::AllocatedBadClustersNotRepresented {
+                allocated_clusters,
+                bad_cluster_extents,
+            } => write!(
+                formatter,
+                "exFAT reports {allocated_clusters} allocated bad clusters with {bad_cluster_extents} bad-cluster extents, but the NTFS serializer does not yet represent them in both `$BadClus:$Bad` and `$Bitmap`"
             ),
             Self::Preservation(error) => write!(formatter, "preservation policy failed: {error}"),
             Self::PreservationRefused { blockers } => write!(
@@ -339,8 +358,9 @@ impl From<ExfatSerializeError> for NtfsToExfatError {
 ///
 /// # Errors
 ///
-/// Refuses content-only mode, any preservation blocker, incomplete/inconsistent sidecar evidence,
-/// invalid timestamps, cap exhaustion, and every refusal exposed by the NTFS serializer.
+/// Refuses content-only mode, allocated bad clusters until the NTFS serializer represents them in
+/// `$BadClus:$Bad` and `$Bitmap`, any preservation blocker, incomplete/inconsistent sidecar
+/// evidence, invalid timestamps, cap exhaustion, and every refusal exposed by the NTFS serializer.
 pub fn plan_lossless_exfat_to_ntfs(
     normalized: &NormalizedExfat,
     mode: GuaranteeMode,
@@ -349,6 +369,18 @@ pub fn plan_lossless_exfat_to_ntfs(
 ) -> Result<ExfatToNtfsPlan, ExfatToNtfsError> {
     if mode == GuaranteeMode::ContentOnly {
         return Err(ExfatToNtfsError::ContentOnlyIsNotLossless);
+    }
+    let bad_cluster_extents = normalized
+        .preservation
+        .filesystem_extents
+        .iter()
+        .filter(|extent| extent.kind == ExtentKind::BadCluster)
+        .count();
+    if normalized.preservation.allocated_bad_clusters != 0 || bad_cluster_extents != 0 {
+        return Err(ExfatToNtfsError::AllocatedBadClustersNotRepresented {
+            allocated_clusters: normalized.preservation.allocated_bad_clusters,
+            bad_cluster_extents,
+        });
     }
     let preservation = evaluate_exfat(normalized, FileSystem::Ntfs, mode, limits.preservation)?;
     if !preservation.permitted {
@@ -1354,6 +1386,81 @@ mod tests {
                         && !allocation.movable
                 })
         );
+    }
+
+    #[test]
+    fn exfat_bad_clusters_refuse_until_ntfs_badclus_and_bitmap_are_serialized() {
+        let mut normalized = normalized_exfat();
+        normalized
+            .preservation
+            .filesystem_extents
+            .push(crate::extent::Extent {
+                stream: StreamId(998),
+                logical_offset: 0,
+                length: 4096,
+                placement: Placement::Physical {
+                    byte_offset: 30 * 1024 * 1024,
+                },
+                kind: ExtentKind::BadCluster,
+            });
+        normalized.preservation.allocated_bad_clusters = 1;
+        assert!(
+            evaluate_exfat(
+                &normalized,
+                FileSystem::Ntfs,
+                GuaranteeMode::Escrow,
+                PreservationLimits::default(),
+            )
+            .expect("consistent exact bad-cluster evidence")
+            .permitted,
+            "escrow policy alone permits exact source evidence, so the target-native guard is required"
+        );
+
+        let error = plan_lossless_exfat_to_ntfs(
+            &normalized,
+            GuaranteeMode::Escrow,
+            ExfatToNtfsOptions::default(),
+            ExfatToNtfsLimits::default(),
+        )
+        .expect_err("escrow cannot replace target-native bad-cluster allocation state");
+
+        assert!(matches!(
+            error,
+            ExfatToNtfsError::AllocatedBadClustersNotRepresented {
+                allocated_clusters: 1,
+                bad_cluster_extents: 1,
+            }
+        ));
+    }
+
+    #[test]
+    fn exfat_bad_cluster_extent_cannot_bypass_guard_with_zero_reported_count() {
+        let mut normalized = normalized_exfat();
+        normalized
+            .preservation
+            .filesystem_extents
+            .push(crate::extent::Extent {
+                stream: StreamId(998),
+                logical_offset: 0,
+                length: 4096,
+                placement: Placement::Physical {
+                    byte_offset: 30 * 1024 * 1024,
+                },
+                kind: ExtentKind::BadCluster,
+            });
+
+        assert!(matches!(
+            plan_lossless_exfat_to_ntfs(
+                &normalized,
+                GuaranteeMode::Escrow,
+                ExfatToNtfsOptions::default(),
+                ExfatToNtfsLimits::default(),
+            ),
+            Err(ExfatToNtfsError::AllocatedBadClustersNotRepresented {
+                allocated_clusters: 0,
+                bad_cluster_extents: 1,
+            })
+        ));
     }
 
     #[test]

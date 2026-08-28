@@ -208,13 +208,13 @@ installed. CI always tests both language stacks.
 - [x] Lifetime-bound staged-candidate audit through the executor's already-locked image handle
 - [x] Byte-for-byte staged-range verification before overlay parsing can fill later phases
 - [x] Domain-separated full source-view digest with conservative virtual-original rollback masks
-- [x] Canonical bounded `SCPREP01` restart envelope embedded in capsule generation zero
+- [x] Canonical bounded `SCPREP02` restart envelope with distinct source/relocated-target graph commitments embedded in capsule generation zero
 - [x] Plan reconstruction and exact phase re-audit from capsule plus locked image after process loss
 - [x] Legacy recovery-only capsules explicitly restricted from forward execution
 - [x] Pure resumable transaction coordinator with pre-activation overlay proof
 - [x] Phase-separated exFAT and NTFS structural destination serializers
 - [x] Exact regular-image preimage capture for every source-visible write phase
-- [x] Versioned capsule recovery bundle retaining exact phase before-images
+- [x] Versioned `SCRECOV2` capsule recovery bundle retaining relocation-destination and exact phase before-images
 - [x] Bounded append-only capsule store with exclusive create/resume, one-generation growth,
       read-back verification, flush evidence, complete ambiguous-append adoption, and provable
       torn-suffix repair

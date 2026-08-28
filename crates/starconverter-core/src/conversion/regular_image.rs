@@ -419,6 +419,70 @@ fn verify_locked_before_images(
     Ok(())
 }
 
+fn verify_relocation_copies(
+    executor: &ImageExecutor,
+    prepared: &PreparedConversion,
+) -> Result<(), RegularImageCoordinatorError> {
+    if prepared.layout().relocations.is_empty() {
+        return Ok(());
+    }
+    let view = executor
+        .locked_view(CANDIDATE_AUDIT_MAX_READ_BYTES)
+        .map_err(RegularImageCoordinatorError::Executor)?;
+    for relocation in &prepared.layout().relocations {
+        let mut relative = 0_u64;
+        while relative < relocation.source.length {
+            let remaining = relocation
+                .source
+                .length
+                .checked_sub(relative)
+                .ok_or(RegularImageCoordinatorError::RelocationRangeOverflow)?;
+            let count = usize::try_from(
+                remaining.min(
+                    u64::try_from(view.max_read_bytes())
+                        .map_err(|_| RegularImageCoordinatorError::RelocationRangeOverflow)?,
+                ),
+            )
+            .map_err(|_| RegularImageCoordinatorError::RelocationRangeOverflow)?;
+            if count == 0 {
+                return Err(RegularImageCoordinatorError::CandidateReadLimitInvalid);
+            }
+            let source_offset = relocation
+                .source
+                .offset
+                .checked_add(relative)
+                .ok_or(RegularImageCoordinatorError::RelocationRangeOverflow)?;
+            let destination_offset = relocation
+                .destination
+                .offset
+                .checked_add(relative)
+                .ok_or(RegularImageCoordinatorError::RelocationRangeOverflow)?;
+            let source = view.read_exact_at(source_offset, count).map_err(|error| {
+                RegularImageCoordinatorError::Executor(ExecutorError::Image(error))
+            })?;
+            let destination = view
+                .read_exact_at(destination_offset, count)
+                .map_err(|error| {
+                    RegularImageCoordinatorError::Executor(ExecutorError::Image(error))
+                })?;
+            if source != destination {
+                return Err(RegularImageCoordinatorError::RelocationCopyMismatch {
+                    source_offset,
+                    destination_offset,
+                });
+            }
+            relative = relative
+                .checked_add(
+                    u64::try_from(count)
+                        .map_err(|_| RegularImageCoordinatorError::RelocationRangeOverflow)?,
+                )
+                .ok_or(RegularImageCoordinatorError::RelocationRangeOverflow)?;
+        }
+    }
+    view.post_operation_revalidate()
+        .map_err(RegularImageCoordinatorError::Executor)
+}
+
 fn observe_locked_source(
     executor: &ImageExecutor,
     prepared: &PreparedConversion,
@@ -517,18 +581,16 @@ impl<'plan> RegularImageCoordinator<'plan> {
         Ok((coordinator, recovery))
     }
 
-    /// Advances a no-relocation plan through its durable `TargetStaged` checkpoint.
+    /// Advances a prepared plan through its durable `TargetStaged` checkpoint.
     ///
-    /// Any nonempty relocation list is refused before the executor receives an intent. Every image
-    /// mutation completes read-back verification plus both flush barriers before the corresponding
-    /// capsule generation is built and appended.
+    /// Every image mutation completes read-back verification plus both flush barriers before the
+    /// corresponding capsule generation is built and appended. Before target staging, every
+    /// relocated destination is independently compared with its still-intact source through the
+    /// locked handle, including after a restarted transaction.
     pub fn advance_to_target_staged(
         &mut self,
     ) -> Result<DurableCheckpoint, RegularImageCoordinatorError> {
         self.ensure_forward_ready()?;
-        if !self.prepared.layout().relocations.is_empty() {
-            return Err(RegularImageCoordinatorError::RelocationNotSupported);
-        }
 
         loop {
             let checkpoint = self.checkpoint()?;
@@ -545,7 +607,7 @@ impl<'plan> RegularImageCoordinator<'plan> {
         }
     }
 
-    /// Advances a fully prepared no-relocation regular image through activation only.
+    /// Advances a fully prepared regular image through activation only.
     ///
     /// Every durable boundary is independently re-audited from the locked handle. Backup boot and
     /// activation writes consume one-use leases. This helper deliberately stops at `Activated`,
@@ -555,9 +617,6 @@ impl<'plan> RegularImageCoordinator<'plan> {
         verification_limits: VerificationLimits,
     ) -> Result<DurableCheckpoint, RegularImageCoordinatorError> {
         self.ensure_forward_ready()?;
-        if !self.prepared.layout().relocations.is_empty() {
-            return Err(RegularImageCoordinatorError::RelocationNotSupported);
-        }
 
         loop {
             let checkpoint = self.checkpoint()?;
@@ -951,6 +1010,12 @@ impl<'plan> RegularImageCoordinator<'plan> {
         &mut self,
         checkpoint: DurableCheckpoint,
     ) -> Result<(), RegularImageCoordinatorError> {
+        if checkpoint.phase == TransactionPhase::Relocating {
+            if let Err(error) = verify_relocation_copies(&self.executor, self.prepared.as_ref()) {
+                self.poison();
+                return Err(error);
+            }
+        }
         let observed = self.observe_current()?;
         let resumed = self
             .prepared
@@ -1298,7 +1363,11 @@ pub enum RegularImageCoordinatorError {
         evidence: CapsuleSyncEvidence,
     },
     PlanImageMismatch,
-    RelocationNotSupported,
+    RelocationCopyMismatch {
+        source_offset: u64,
+        destination_offset: u64,
+    },
+    RelocationRangeOverflow,
     LeaseStateChanged,
     CapsuleDurabilityMissing,
     Poisoned,
@@ -1391,9 +1460,16 @@ impl fmt::Display for RegularImageCoordinatorError {
             Self::PlanImageMismatch => {
                 formatter.write_str("prepared conversion does not match the locked image")
             }
-            Self::RelocationNotSupported => formatter.write_str(
-                "pre-activation coordinator refuses nonempty relocation plans before writing",
+            Self::RelocationCopyMismatch {
+                source_offset,
+                destination_offset,
+            } => write!(
+                formatter,
+                "relocated bytes at image offset {destination_offset} differ from source offset {source_offset}",
             ),
+            Self::RelocationRangeOverflow => {
+                formatter.write_str("relocation verification range overflowed")
+            }
             Self::LeaseStateChanged => {
                 formatter.write_str("capsule generation or phase changed across a one-use lease")
             }
@@ -1484,17 +1560,21 @@ mod tests {
 
     use crate::capsule::recover_capsule;
     use crate::capsule_store::CapsuleStore;
-    use crate::extent::{ExtentGraph, StreamId};
+    use crate::extent::{Extent, ExtentGraph, ExtentKind, Placement, StreamId};
     use crate::fs::exfat_inventory::ExfatPreservationEvidence;
     use crate::fs::exfat_serialize::{
         ExfatSerializeLimits, ExfatSerializeOptions, ExfatVolumeProfile,
         non_interoperable_ascii_test_upcase_table, serialize_exfat_destination,
     };
     use crate::fs::exfat_upcase::table_checksum;
-    use crate::geometry::{ByteRange, DestinationReservation, Relocation, ReservationKind};
+    use crate::geometry::{
+        ByteRange, DestinationReservation, ReservationKind, SourceAllocation,
+        relocate_object_graph, solve_layout_with_staging_exclusions,
+    };
     use crate::image::{BoundedImageReader, ImageFile};
     use crate::object::{
-        ObjectGraph, ObjectGraphLimits, ObjectId, ObjectKind, ObjectRecord, ObjectSemantics,
+        NamespaceEntry, ObjectGraph, ObjectGraphLimits, ObjectId, ObjectKind, ObjectRecord,
+        ObjectSemantics, ObjectStream, StreamFlags, StreamStorage,
     };
     use crate::phase::{ActivationAuthorizedWrites, preview_exfat_phase_writes};
     use crate::preimage::PreimageLimits;
@@ -1574,6 +1654,251 @@ mod tests {
         .unwrap();
         drop(store);
         (dir, image_path, capsule_path, prepared)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn relocation_fixture() -> (TempDir, PathBuf, PathBuf, PreparedConversion, Vec<u8>) {
+        const IMAGE_BYTES: u64 = 16 * 1024;
+        const SOURCE_OFFSET: u64 = 4096;
+        const EXTENT_BYTES: usize = 512;
+
+        let dir = TempDir::new();
+        let image_path = dir.join("relocation-source.img");
+        let capsule_path = dir.join("relocation.starcap");
+        let mut source_bytes = vec![0x5a; usize::try_from(IMAGE_BYTES).unwrap()];
+        let payload: Vec<u8> = (0..EXTENT_BYTES)
+            .map(|index| u8::try_from(index % 251).unwrap())
+            .collect();
+        source_bytes[usize::try_from(SOURCE_OFFSET).unwrap()
+            ..usize::try_from(SOURCE_OFFSET).unwrap() + EXTENT_BYTES]
+            .copy_from_slice(&payload);
+        for (offset, byte) in [(1024, 0x10), (1536, 0x11), (2048, 0x12), (2560, 0x13)] {
+            source_bytes[offset..offset + EXTENT_BYTES].fill(byte);
+        }
+
+        let graph = ObjectGraph::build(
+            ObjectId(0),
+            vec![
+                ObjectRecord {
+                    id: ObjectId(0),
+                    kind: ObjectKind::Directory,
+                    link_count: 0,
+                    semantics: ObjectSemantics::default(),
+                    streams: Vec::new(),
+                },
+                ObjectRecord {
+                    id: ObjectId(1),
+                    kind: ObjectKind::File,
+                    link_count: 1,
+                    semantics: ObjectSemantics::default(),
+                    streams: vec![ObjectStream {
+                        id: StreamId(1),
+                        name: None,
+                        logical_bytes: EXTENT_BYTES as u64,
+                        initialized_bytes: EXTENT_BYTES as u64,
+                        mapped_bytes: EXTENT_BYTES as u64,
+                        allocated_bytes: EXTENT_BYTES as u64,
+                        flags: StreamFlags::default(),
+                        storage: StreamStorage::Extents,
+                    }],
+                },
+            ],
+            vec![NamespaceEntry {
+                parent: ObjectId(0),
+                target: ObjectId(1),
+                name: "payload.bin".encode_utf16().collect(),
+            }],
+            ExtentGraph::build(
+                vec![Extent {
+                    stream: StreamId(1),
+                    logical_offset: 0,
+                    length: EXTENT_BYTES as u64,
+                    placement: Placement::Physical {
+                        byte_offset: SOURCE_OFFSET,
+                    },
+                    kind: ExtentKind::FileData,
+                }],
+                IMAGE_BYTES,
+                1,
+            )
+            .unwrap(),
+            ObjectGraphLimits {
+                max_objects: 2,
+                max_entries: 1,
+                max_streams: 1,
+                max_name_code_units: 11,
+            },
+        )
+        .unwrap();
+        let boot = DestinationReservation {
+            range: ByteRange {
+                offset: 1024,
+                length: 1024,
+            },
+            kind: ReservationKind::BootRegion,
+        };
+        let allocation = DestinationReservation {
+            range: ByteRange {
+                offset: 2048,
+                length: 512,
+            },
+            kind: ReservationKind::AllocationMetadata,
+        };
+        let namespace = DestinationReservation {
+            range: ByteRange {
+                offset: 2560,
+                length: 512,
+            },
+            kind: ReservationKind::NamespaceMetadata,
+        };
+        let capsule = DestinationReservation {
+            range: ByteRange {
+                offset: 3584,
+                length: 1024,
+            },
+            kind: ReservationKind::Capsule,
+        };
+        let reservations = vec![boot, allocation, namespace, capsule];
+        let movable = SourceAllocation {
+            stream: StreamId(1),
+            logical_offset: 0,
+            range: ByteRange {
+                offset: SOURCE_OFFSET,
+                length: EXTENT_BYTES as u64,
+            },
+            movable: true,
+        };
+        let retired_metadata = SourceAllocation {
+            stream: StreamId(99),
+            logical_offset: 0,
+            range: ByteRange {
+                offset: 0,
+                length: EXTENT_BYTES as u64,
+            },
+            movable: false,
+        };
+        let limits = ConversionLimits::default();
+        let layout = solve_layout_with_staging_exclusions(
+            IMAGE_BYTES,
+            512,
+            vec![movable],
+            reservations.clone(),
+            vec![retired_metadata.range],
+            limits.layout,
+        )
+        .unwrap();
+        assert_eq!(layout.relocations.len(), 1);
+        let target_graph = relocate_object_graph(&graph, &layout).unwrap();
+        let destination = layout.relocations[0].destination;
+        let destination_start = usize::try_from(destination.offset).unwrap();
+        let destination_end = destination_start + usize::try_from(destination.length).unwrap();
+        let relocation_before_images = vec![OverlayWrite {
+            offset: destination.offset,
+            bytes: source_bytes[destination_start..destination_end].to_vec(),
+        }];
+        let rollback = |offset: usize| OverlayWrite {
+            offset: u64::try_from(offset).unwrap(),
+            bytes: source_bytes[offset..offset + EXTENT_BYTES].to_vec(),
+        };
+        let writes = OpaqueWriteSets {
+            target_staging: vec![
+                ReservedWrite {
+                    reservation_kind: allocation.kind,
+                    write: OverlayWrite {
+                        offset: allocation.range.offset,
+                        bytes: vec![0xa1; EXTENT_BYTES],
+                    },
+                },
+                ReservedWrite {
+                    reservation_kind: namespace.kind,
+                    write: OverlayWrite {
+                        offset: namespace.range.offset,
+                        bytes: vec![0xb2; EXTENT_BYTES],
+                    },
+                },
+            ],
+            backup_boot: vec![ReservedWrite {
+                reservation_kind: boot.kind,
+                write: OverlayWrite {
+                    offset: boot.range.offset,
+                    bytes: vec![0xc3; EXTENT_BYTES],
+                },
+            }],
+            activation: vec![ReservedWrite {
+                reservation_kind: boot.kind,
+                write: OverlayWrite {
+                    offset: boot.range.offset + EXTENT_BYTES as u64,
+                    bytes: vec![0xd4; EXTENT_BYTES],
+                },
+            }],
+            target_staging_rollback: vec![rollback(2048), rollback(2560)],
+            backup_boot_rollback: vec![rollback(1024)],
+            activation_rollback: vec![rollback(1536)],
+        };
+        let mut prepared = PreparedConversion::build_with_target_graph(
+            &graph,
+            &target_graph,
+            ConversionDraft {
+                transaction_id: [0x31; 16],
+                preflight: PreflightEvidence {
+                    image: ConversionImageIdentity {
+                        instance: [0x41; 32],
+                        image_bytes: IMAGE_BYTES,
+                    },
+                    source_filesystem: FileSystem::ExFat,
+                    source_evidence_digest: [0x51; 32],
+                    source_manifest_commitment: ManifestCommitment::from_validated_parts(
+                        [0x61; 32], 1, 1,
+                    ),
+                    sector_bytes: 512,
+                    allocation_alignment: 512,
+                    inventory_complete: true,
+                    allocation_map_complete: true,
+                    health: HealthState::Clean,
+                    access: AccessState::Offline,
+                },
+                target: TargetCapabilities {
+                    filesystem: FileSystem::Ntfs,
+                    features: Vec::new(),
+                },
+                source_allocations: vec![retired_metadata, movable],
+                reservations,
+                writes: ActivationAuthorizedWrites::test_only(FileSystem::Ntfs, writes),
+            },
+            relocation_before_images,
+            limits,
+        )
+        .unwrap();
+        fs::write(&image_path, &source_bytes).unwrap();
+        let image = ImageFile::open(&image_path).unwrap();
+        let identity = image.identity().clone();
+        let source_evidence_digest = digest_source_view(
+            &image,
+            SourceDigestLimits {
+                max_image_bytes: image.len(),
+                chunk_bytes: CANDIDATE_AUDIT_MAX_READ_BYTES,
+            },
+        )
+        .unwrap();
+        prepared.test_bind_regular_image(&identity, source_evidence_digest);
+        let observed = ObservedImage {
+            image: prepared.preflight.image,
+            source_evidence_digest: Some(source_evidence_digest),
+        };
+        let mut capsule_bytes = Vec::new();
+        prepared
+            .begin_capsule(&mut capsule_bytes, observed)
+            .unwrap();
+        drop(image);
+        let (store, _) = CapsuleStore::create_new(
+            &capsule_path,
+            &image_path,
+            &capsule_bytes,
+            prepared.capsule_limits,
+        )
+        .unwrap();
+        drop(store);
+        (dir, image_path, capsule_path, prepared, source_bytes)
     }
 
     fn empty_graph(image_bytes: u64) -> ObjectGraph {
@@ -2649,25 +2974,10 @@ mod tests {
     }
 
     #[test]
-    fn nonempty_relocation_is_refused_before_image_or_capsule_changes() {
-        let (_dir, image_path, capsule_path, mut prepared) = fixture();
-        prepared.layout.relocations.push(Relocation {
-            stream: StreamId(7),
-            logical_offset: 0,
-            source: ByteRange {
-                offset: 4096,
-                length: 512,
-            },
-            destination: ByteRange {
-                offset: 4608,
-                length: 512,
-            },
-        });
-        let image_before = fs::read(&image_path).unwrap();
-        let capsule_before = fs::read(&capsule_path).unwrap();
-        let image = ImageFile::open(&image_path).unwrap();
-        let identity = image.identity().clone();
-        drop(image);
+    fn relocation_journey_restarts_at_target_staged_and_rolls_back_exactly() {
+        let (_dir, image_path, capsule_path, prepared, source_before) = relocation_fixture();
+        let relocation = prepared.layout().relocations[0];
+        let identity = ImageFile::open(&image_path).unwrap().identity().clone();
         let (mut coordinator, _) = RegularImageCoordinator::resume_existing(
             &prepared,
             &image_path,
@@ -2676,12 +2986,136 @@ mod tests {
             ExecutorLimits::default(),
         )
         .unwrap();
-        assert!(matches!(
-            coordinator.advance_to_target_staged(),
-            Err(RegularImageCoordinatorError::RelocationNotSupported)
-        ));
+        assert_eq!(
+            coordinator.advance_to_target_staged().unwrap().phase,
+            TransactionPhase::TargetStaged
+        );
         drop(coordinator);
-        assert_eq!(fs::read(image_path).unwrap(), image_before);
-        assert_eq!(fs::read(capsule_path).unwrap(), capsule_before);
+
+        let staged = fs::read(&image_path).unwrap();
+        let source_start = usize::try_from(relocation.source.offset).unwrap();
+        let destination_start = usize::try_from(relocation.destination.offset).unwrap();
+        let length = usize::try_from(relocation.source.length).unwrap();
+        assert_eq!(
+            &staged[destination_start..destination_start + length],
+            &source_before[source_start..source_start + length]
+        );
+
+        let identity = ImageFile::open(&image_path).unwrap().identity().clone();
+        let (mut resumed, _) = RegularImageCoordinator::resume_existing(
+            &prepared,
+            &image_path,
+            &identity,
+            &capsule_path,
+            ExecutorLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            resumed.checkpoint().unwrap().phase,
+            TransactionPhase::TargetStaged
+        );
+        assert_eq!(
+            resumed.rollback().unwrap().phase,
+            TransactionPhase::RolledBack
+        );
+        drop(resumed);
+        assert_eq!(fs::read(image_path).unwrap(), source_before);
+    }
+
+    #[test]
+    fn every_reserved_partial_relocation_cut_retries_and_rolls_back_exactly() {
+        for copied_bytes in [0_usize, 1, 127, 511, 512] {
+            let (_dir, image_path, capsule_path, prepared, source_before) = relocation_fixture();
+            let relocation = prepared.layout().relocations[0];
+            let identity = ImageFile::open(&image_path).unwrap().identity().clone();
+            let (mut coordinator, _) = RegularImageCoordinator::resume_existing(
+                &prepared,
+                &image_path,
+                &identity,
+                &capsule_path,
+                ExecutorLimits::default(),
+            )
+            .unwrap();
+            coordinator.append_reservation().unwrap();
+            assert_eq!(
+                coordinator.checkpoint().unwrap().phase,
+                TransactionPhase::Reserved
+            );
+            drop(coordinator);
+
+            let mut cut_image = source_before.clone();
+            let source_start = usize::try_from(relocation.source.offset).unwrap();
+            let destination_start = usize::try_from(relocation.destination.offset).unwrap();
+            cut_image[destination_start..destination_start + copied_bytes]
+                .copy_from_slice(&source_before[source_start..source_start + copied_bytes]);
+            fs::write(&image_path, cut_image).unwrap();
+
+            let identity = ImageFile::open(&image_path).unwrap().identity().clone();
+            let (mut resumed, _) = RegularImageCoordinator::resume_existing(
+                &prepared,
+                &image_path,
+                &identity,
+                &capsule_path,
+                ExecutorLimits::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                resumed.advance_to_target_staged().unwrap().phase,
+                TransactionPhase::TargetStaged
+            );
+            assert_eq!(
+                resumed.rollback().unwrap().phase,
+                TransactionPhase::RolledBack
+            );
+            drop(resumed);
+            assert_eq!(fs::read(image_path).unwrap(), source_before);
+        }
+    }
+
+    #[test]
+    fn corrupted_durable_relocation_is_blocked_before_staging_and_can_rollback() {
+        let (_dir, image_path, capsule_path, prepared, source_before) = relocation_fixture();
+        let relocation = prepared.layout().relocations[0];
+        let identity = ImageFile::open(&image_path).unwrap().identity().clone();
+        let (mut coordinator, _) = RegularImageCoordinator::resume_existing(
+            &prepared,
+            &image_path,
+            &identity,
+            &capsule_path,
+            ExecutorLimits::default(),
+        )
+        .unwrap();
+        coordinator.append_reservation().unwrap();
+        let reserved = coordinator.checkpoint().unwrap();
+        coordinator.execute_next_mutation(reserved).unwrap();
+        assert_eq!(
+            coordinator.checkpoint().unwrap().phase,
+            TransactionPhase::Relocating
+        );
+        drop(coordinator);
+
+        let mut corrupted = fs::read(&image_path).unwrap();
+        let destination_start = usize::try_from(relocation.destination.offset).unwrap();
+        corrupted[destination_start] ^= 0xff;
+        fs::write(&image_path, corrupted).unwrap();
+        let identity = ImageFile::open(&image_path).unwrap().identity().clone();
+        let (mut resumed, _) = RegularImageCoordinator::resume_existing(
+            &prepared,
+            &image_path,
+            &identity,
+            &capsule_path,
+            ExecutorLimits::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            resumed.advance_to_target_staged(),
+            Err(RegularImageCoordinatorError::RelocationCopyMismatch { .. })
+        ));
+        assert_eq!(
+            resumed.rollback().unwrap().phase,
+            TransactionPhase::RolledBack
+        );
+        drop(resumed);
+        assert_eq!(fs::read(image_path).unwrap(), source_before);
     }
 }

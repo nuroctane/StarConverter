@@ -94,7 +94,8 @@ including the authorized before-image digest whenever source-visible bytes were 
 
 Raw executor mutation methods are private. The crate-private regular-image coordinator opens the
 image executor before the capsule store and owns both locks. It mints one-use leases bound to the
-current durable capsule generation and phase, refuses nonempty relocation before any image intent,
+current durable capsule generation and phase, accepts only sealed relocations with exact destination
+before-images and a separately committed relocated target graph,
 and requires executor read-back plus both flush barriers before appending the corresponding capsule
 generation. It has no CLI/GUI entry point. At restart boundaries, a bounded classifier borrows the
 sealed before/after ranges without cloning their payloads and labels the actual write group exact
@@ -105,7 +106,7 @@ only from exact before or exact after, while mixed or third-state activation is 
 The lifetime-bound read view is cloned from the already-open locked handle without reopening its
 path. Before evidence is accepted, every real write group required by the current phase is proven
 byte-for-byte exact; both filesystem parsers and the logical stream hasher then read the complete
-prepared target. The normalized graph and logical manifest must match generation-zero `SCPREP01`
+prepared target. The normalized graph and logical manifest must match generation-zero `SCPREP02`
 authority, and the handle is revalidated afterward. Verification is explicitly separate from
 activation and still permits rollback. Finalization repeats the full audit and requires a private
 approval capability; production has no constructor for that capability. Resume reconstructs the
@@ -126,8 +127,9 @@ can be consumed into a coordinator.
 New capsules embed the complete bounded, canonical forward plan and nested recovery bundle in their
 first generation. The coordinator can therefore discard all process memory, reacquire image then
 capsule locks, reconstruct the plan, recompute its commitments, and re-audit `TargetStaged`. Older
-`SCRECOV1`-only capsules require the exact external plan and are rollback-only; they cannot recreate
-forward authority.
+envelope-free recovery capsules require the exact external plan and are rollback-only; they cannot
+recreate forward authority. Version-1 executable envelopes and recovery bundles are refused rather
+than interpreted with version-2 relocation semantics.
 
 The durable capsule store has an explicit recovering-resume operation and a stricter poisoned-write
 reconciliation path. Under its exclusive lock, it adopts and flushes exactly one complete valid

@@ -15,8 +15,9 @@ use sha2::{Digest, Sha256};
 use super::{
     FeatureCompatibility, ImageIdentity, OpaqueWriteSets, PreflightEvidence, PreparedConversion,
     PreservationMethod, ReservedWrite, digest_overlay_writes, digest_plan, digest_source_identity,
-    final_writes, full_rollback_writes, preactivation_rollback_writes,
-    validate_initial_capsule_generation, validate_required_reservations, validate_rollback_pairing,
+    final_writes, full_rollback_writes, preactivation_rollback_writes, staging_rollback_writes,
+    validate_initial_capsule_generation, validate_relocation_before_image_ranges,
+    validate_required_reservations, validate_rollback_pairing,
     validate_writes_against_reservations,
 };
 use crate::capsule::{CapsuleError, CapsuleIdentity, CapsuleLimits};
@@ -27,12 +28,12 @@ use crate::recovery::{RecoveryError, RecoveryLimits, decode_recovery_bundle};
 use crate::verify::ManifestCommitment;
 use crate::{AccessState, FileSystem, HealthState, SemanticFeature};
 
-const MAGIC: &[u8; 8] = b"SCPREP01";
-const VERSION: u16 = 1;
-const HEADER_BYTES: usize = 512;
+const MAGIC: &[u8; 8] = b"SCPREP02";
+const VERSION: u16 = 2;
+const HEADER_BYTES: usize = 576;
 const HEADER_CRC_OFFSET: usize = 64;
 const SECTION_HEADER_BYTES: usize = 48;
-const SECTION_COUNT: usize = 11;
+const SECTION_COUNT: usize = 12;
 const RESERVED_WRITE_HEADER_BYTES: usize = 24;
 const ROLLBACK_WRITE_HEADER_BYTES: usize = 16;
 
@@ -47,6 +48,7 @@ const BACKUP_BOOT_ROLLBACK: u16 = 8;
 const ACTIVATION_ROLLBACK: u16 = 9;
 const RECOVERY_PAYLOAD: u16 = 10;
 const TARGET_FEATURES: u16 = 11;
+const RELOCATION_DESTINATION_ROLLBACK: u16 = 12;
 
 /// Caller-controlled decode and reconstruction limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,15 +295,18 @@ struct EnvelopeState {
     preflight: PreflightEvidence,
     target_filesystem: FileSystem,
     target_features: Vec<FeatureCompatibility>,
-    graph_digest: [u8; 32],
+    source_graph_digest: [u8; 32],
+    target_graph_digest: [u8; 32],
     plan_digest: [u8; 32],
     candidate_overlay_digest: [u8; 32],
+    relocation_rollback_digest: [u8; 32],
     staging_rollback_digest: [u8; 32],
     preactivation_rollback_digest: [u8; 32],
     full_rollback_digest: [u8; 32],
     reservations: Vec<DestinationReservation>,
     layout: LayoutPlan,
     writes: OpaqueWriteSets,
+    relocation_destination_before_images: Vec<OverlayWrite>,
     recovery_payload: Vec<u8>,
     capsule_limits: CapsuleLimits,
 }
@@ -313,15 +318,21 @@ impl EnvelopeState {
             preflight: prepared.preflight,
             target_filesystem: prepared.target_filesystem,
             target_features: prepared.target_features.clone(),
-            graph_digest: prepared.graph_digest,
+            source_graph_digest: prepared.source_graph_digest,
+            target_graph_digest: prepared.target_graph_digest,
             plan_digest: prepared.plan_digest,
             candidate_overlay_digest: prepared.candidate_overlay_digest,
+            relocation_rollback_digest: prepared.relocation_rollback_digest,
             staging_rollback_digest: prepared.staging_rollback_digest,
             preactivation_rollback_digest: prepared.preactivation_rollback_digest,
             full_rollback_digest: prepared.full_rollback_digest,
             reservations: prepared.reservations.clone(),
             layout: prepared.layout.clone(),
             writes: prepared.writes.clone(),
+            relocation_destination_before_images: prepared
+                .relocation_rollback_overlay
+                .writes()
+                .to_vec(),
             recovery_payload: prepared.recovery_payload.clone(),
             capsule_limits: prepared.capsule_limits,
         }
@@ -348,19 +359,25 @@ impl EnvelopeState {
         let staging_rollback_overlay = OverlayPlan::build(
             image_bytes,
             sector_bytes,
-            self.writes.target_staging_rollback.clone(),
+            staging_rollback_writes(&self.relocation_destination_before_images, &self.writes),
             overlay_limits,
         )?;
         let preactivation_rollback_overlay = OverlayPlan::build(
             image_bytes,
             sector_bytes,
-            preactivation_rollback_writes(&self.writes),
+            preactivation_rollback_writes(&self.relocation_destination_before_images, &self.writes),
             overlay_limits,
         )?;
         let full_rollback_overlay = OverlayPlan::build(
             image_bytes,
             sector_bytes,
-            full_rollback_writes(&self.writes),
+            full_rollback_writes(&self.relocation_destination_before_images, &self.writes),
+            overlay_limits,
+        )?;
+        let relocation_rollback_overlay = OverlayPlan::build(
+            image_bytes,
+            sector_bytes,
+            self.relocation_destination_before_images,
             overlay_limits,
         )?;
         let expected_manifest = self.preflight.source_manifest_commitment;
@@ -370,9 +387,11 @@ impl EnvelopeState {
                 preflight: self.preflight,
                 target_filesystem: self.target_filesystem,
                 target_features: self.target_features,
-                graph_digest: self.graph_digest,
+                source_graph_digest: self.source_graph_digest,
+                target_graph_digest: self.target_graph_digest,
                 plan_digest: self.plan_digest,
                 candidate_overlay_digest: self.candidate_overlay_digest,
+                relocation_rollback_digest: self.relocation_rollback_digest,
                 staging_rollback_digest: self.staging_rollback_digest,
                 preactivation_rollback_digest: self.preactivation_rollback_digest,
                 full_rollback_digest: self.full_rollback_digest,
@@ -380,6 +399,7 @@ impl EnvelopeState {
                 layout: self.layout,
                 writes: self.writes,
                 candidate_overlay,
+                relocation_rollback_overlay,
                 staging_rollback_overlay,
                 preactivation_rollback_overlay,
                 full_rollback_overlay,
@@ -523,6 +543,8 @@ fn decode_state(
     let activation_rollback =
         decode_rollback_writes(section_bytes(bytes, sections[8]), sections[8], limits)?;
     let recovery_payload = copy_bounded(section_bytes(bytes, sections[9]))?;
+    let relocation_destination_before_images =
+        decode_rollback_writes(section_bytes(bytes, sections[11]), sections[11], limits)?;
     let state = EnvelopeState {
         identity: header.identity,
         preflight: header.preflight,
@@ -531,9 +553,11 @@ fn decode_state(
             section_bytes(bytes, sections[10]),
             sections[10].count,
         )?,
-        graph_digest: header.graph_digest,
+        source_graph_digest: header.source_graph_digest,
+        target_graph_digest: header.target_graph_digest,
         plan_digest: header.plan_digest,
         candidate_overlay_digest: header.candidate_overlay_digest,
+        relocation_rollback_digest: header.relocation_rollback_digest,
         staging_rollback_digest: header.staging_rollback_digest,
         preactivation_rollback_digest: header.preactivation_rollback_digest,
         full_rollback_digest: header.full_rollback_digest,
@@ -552,6 +576,7 @@ fn decode_state(
             backup_boot_rollback,
             activation_rollback,
         },
+        relocation_destination_before_images,
         recovery_payload,
         capsule_limits: header.capsule_limits,
     };
@@ -564,9 +589,11 @@ struct HeaderState {
     identity: CapsuleIdentity,
     preflight: PreflightEvidence,
     target_filesystem: FileSystem,
-    graph_digest: [u8; 32],
+    source_graph_digest: [u8; 32],
+    target_graph_digest: [u8; 32],
     plan_digest: [u8; 32],
     candidate_overlay_digest: [u8; 32],
+    relocation_rollback_digest: [u8; 32],
     staging_rollback_digest: [u8; 32],
     preactivation_rollback_digest: [u8; 32],
     full_rollback_digest: [u8; 32],
@@ -605,7 +632,7 @@ fn encode_header(
     header[120..152].copy_from_slice(&state.preflight.image.instance);
     put_u64(header, 152, state.preflight.image.image_bytes);
     header[160..192].copy_from_slice(&state.preflight.source_evidence_digest);
-    header[192..224].copy_from_slice(&state.graph_digest);
+    header[192..224].copy_from_slice(&state.source_graph_digest);
     header[224..256].copy_from_slice(&state.plan_digest);
     header[256..288].copy_from_slice(&state.candidate_overlay_digest);
     header[288..320].copy_from_slice(&state.staging_rollback_digest);
@@ -645,6 +672,8 @@ fn encode_header(
         u32::try_from(SECTION_COUNT).map_err(|_| PreparedEnvelopeError::ArithmeticOverflow)?,
     );
     put_u64(header, 492, manifest.object_count());
+    header[500..532].copy_from_slice(&state.target_graph_digest);
+    header[532..564].copy_from_slice(&state.relocation_rollback_digest);
     let crc = header_crc(header);
     put_u32(header, HEADER_CRC_OFFSET, crc);
     Ok(())
@@ -666,7 +695,7 @@ fn validate_header(bytes: &[u8]) -> Result<(), PreparedEnvelopeError> {
         .iter()
         .chain(&bytes[68..72])
         .chain(&bytes[441..448])
-        .chain(&bytes[500..HEADER_BYTES])
+        .chain(&bytes[564..HEADER_BYTES])
         .any(|byte| *byte != 0)
     {
         return Err(PreparedEnvelopeError::NonZeroReserved);
@@ -712,9 +741,11 @@ fn decode_header(bytes: &[u8]) -> Result<HeaderState, PreparedEnvelopeError> {
             access: decode_access(bytes[431])?,
         },
         target_filesystem: decode_filesystem(bytes[429], "target filesystem")?,
-        graph_digest: array_32(bytes, 192)?,
+        source_graph_digest: array_32(bytes, 192)?,
+        target_graph_digest: array_32(bytes, 500)?,
         plan_digest: array_32(bytes, 224)?,
         candidate_overlay_digest: array_32(bytes, 256)?,
+        relocation_rollback_digest: array_32(bytes, 532)?,
         staging_rollback_digest: array_32(bytes, 288)?,
         preactivation_rollback_digest: array_32(bytes, 320)?,
         full_rollback_digest: array_32(bytes, 352)?,
@@ -749,6 +780,10 @@ fn encode_sections(
             TARGET_FEATURES,
             &state.target_features,
             encode_target_feature,
+        )?,
+        rollback_write_section(
+            RELOCATION_DESTINATION_ROLLBACK,
+            &state.relocation_destination_before_images,
         )?,
     ])
 }
@@ -887,6 +922,7 @@ fn scan_sections(
                 | TARGET_STAGING_ROLLBACK
                 | BACKUP_BOOT_ROLLBACK
                 | ACTIVATION_ROLLBACK
+                | RELOCATION_DESTINATION_ROLLBACK
         ) {
             let header_bytes = if matches!(tag, TARGET_STAGING | BACKUP_BOOT | ACTIVATION) {
                 RESERVED_WRITE_HEADER_BYTES as u64
@@ -1146,6 +1182,7 @@ fn bounded_write_end(
     Ok(end)
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_state(
     state: &EnvelopeState,
     limits: PreparedEnvelopeLimits,
@@ -1181,6 +1218,11 @@ fn validate_state(
         .map_err(|_| PreparedEnvelopeError::InvalidPreparedInvariant)?;
     validate_rollback_pairing(&state.writes)
         .map_err(|_| PreparedEnvelopeError::InvalidPreparedInvariant)?;
+    validate_relocation_before_image_ranges(
+        &state.layout,
+        &state.relocation_destination_before_images,
+    )
+    .map_err(|_| PreparedEnvelopeError::InvalidPreparedInvariant)?;
     let manifest = state.preflight.source_manifest_commitment;
     if manifest.object_count() > usize_u64(limits.max_entries)?
         || manifest.logical_bytes_hashed() > limits.max_logical_bytes
@@ -1194,11 +1236,21 @@ fn validate_state(
             max_bytes: limits.max_recovery_bytes,
         },
     )?;
-    if recovery.plan_digest != state.plan_digest
-        || recovery.target_staging != state.writes.target_staging_rollback
-        || recovery.backup_boot != state.writes.backup_boot_rollback
-        || recovery.activation != state.writes.activation_rollback
-    {
+    let recovery_groups = (
+        recovery.plan_digest,
+        &recovery.relocation_destinations,
+        &recovery.target_staging,
+        &recovery.backup_boot,
+        &recovery.activation,
+    );
+    let prepared_groups = (
+        state.plan_digest,
+        &state.relocation_destination_before_images,
+        &state.writes.target_staging_rollback,
+        &state.writes.backup_boot_rollback,
+        &state.writes.activation_rollback,
+    );
+    if recovery_groups != prepared_groups {
         return Err(PreparedEnvelopeError::RecoveryMismatch);
     }
     for (field, actual, expected) in [
@@ -1208,18 +1260,32 @@ fn validate_state(
             state.candidate_overlay_digest,
         ),
         (
+            "relocation rollback",
+            digest_overlay_writes(&state.relocation_destination_before_images),
+            state.relocation_rollback_digest,
+        ),
+        (
             "staging rollback",
-            digest_overlay_writes(&state.writes.target_staging_rollback),
+            digest_overlay_writes(&staging_rollback_writes(
+                &state.relocation_destination_before_images,
+                &state.writes,
+            )),
             state.staging_rollback_digest,
         ),
         (
             "preactivation rollback",
-            digest_overlay_writes(&preactivation_rollback_writes(&state.writes)),
+            digest_overlay_writes(&preactivation_rollback_writes(
+                &state.relocation_destination_before_images,
+                &state.writes,
+            )),
             state.preactivation_rollback_digest,
         ),
         (
             "full rollback",
-            digest_overlay_writes(&full_rollback_writes(&state.writes)),
+            digest_overlay_writes(&full_rollback_writes(
+                &state.relocation_destination_before_images,
+                &state.writes,
+            )),
             state.full_rollback_digest,
         ),
     ] {
@@ -1234,12 +1300,16 @@ fn validate_state(
         &state.reservations,
         &state.layout,
         &state.writes,
-        state.graph_digest,
+        state.source_graph_digest,
+        state.target_graph_digest,
+        &state.relocation_destination_before_images,
     ) != state.plan_digest
     {
         return Err(PreparedEnvelopeError::CommitmentMismatch { field: "plan" });
     }
-    if digest_source_identity(state.preflight, state.graph_digest) != state.identity.source_digest {
+    if digest_source_identity(state.preflight, state.source_graph_digest)
+        != state.identity.source_digest
+    {
         return Err(PreparedEnvelopeError::CommitmentMismatch {
             field: "source identity",
         });
@@ -1261,6 +1331,7 @@ fn validate_counts_and_bytes(
         state.writes.target_staging_rollback.len(),
         state.writes.backup_boot_rollback.len(),
         state.writes.activation_rollback.len(),
+        state.relocation_destination_before_images.len(),
         state.target_features.len(),
     ];
     let total = counts
@@ -1298,6 +1369,12 @@ fn validate_counts_and_bytes(
             state
                 .writes
                 .activation_rollback
+                .iter()
+                .map(|v| v.bytes.len()),
+        )
+        .chain(
+            state
+                .relocation_destination_before_images
                 .iter()
                 .map(|v| v.bytes.len()),
         )
@@ -1394,6 +1471,10 @@ fn validate_ranges(state: &EnvelopeState) -> Result<(), PreparedEnvelopeError> {
         ),
         (BACKUP_BOOT_ROLLBACK, &state.writes.backup_boot_rollback),
         (ACTIVATION_ROLLBACK, &state.writes.activation_rollback),
+        (
+            RELOCATION_DESTINATION_ROLLBACK,
+            &state.relocation_destination_before_images,
+        ),
     ] {
         ensure_order(writes, tag, |v| v.offset)?;
         for value in writes {
@@ -1786,6 +1867,7 @@ mod tests {
 
     #[allow(clippy::too_many_lines)]
     fn state() -> EnvelopeState {
+        let relocation_before = vec![write(12288, 10)];
         let rollback = OpaqueWriteSets {
             target_staging: vec![ReservedWrite {
                 reservation_kind: ReservationKind::NamespaceMetadata,
@@ -1830,14 +1912,23 @@ mod tests {
                 feature: SemanticFeature::AccessControl,
                 method: PreservationMethod::Native,
             }],
-            graph_digest: [5; 32],
+            source_graph_digest: [5; 32],
+            target_graph_digest: [6; 32],
             plan_digest: [0; 32],
             candidate_overlay_digest: digest_overlay_writes(&final_writes(&rollback)),
-            staging_rollback_digest: digest_overlay_writes(&rollback.target_staging_rollback),
-            preactivation_rollback_digest: digest_overlay_writes(&preactivation_rollback_writes(
+            relocation_rollback_digest: digest_overlay_writes(&relocation_before),
+            staging_rollback_digest: digest_overlay_writes(&staging_rollback_writes(
+                &relocation_before,
                 &rollback,
             )),
-            full_rollback_digest: digest_overlay_writes(&full_rollback_writes(&rollback)),
+            preactivation_rollback_digest: digest_overlay_writes(&preactivation_rollback_writes(
+                &relocation_before,
+                &rollback,
+            )),
+            full_rollback_digest: digest_overlay_writes(&full_rollback_writes(
+                &relocation_before,
+                &rollback,
+            )),
             reservations: vec![
                 DestinationReservation {
                     range: ByteRange {
@@ -1889,6 +1980,7 @@ mod tests {
                 largest_free_range: 1024,
             },
             writes: rollback,
+            relocation_destination_before_images: relocation_before,
             recovery_payload: Vec::new(),
             capsule_limits: CapsuleLimits {
                 max_capsule_bytes: 32768,
@@ -1903,12 +1995,16 @@ mod tests {
             &state.reservations,
             &state.layout,
             &state.writes,
-            state.graph_digest,
+            state.source_graph_digest,
+            state.target_graph_digest,
+            &state.relocation_destination_before_images,
         );
-        state.identity.source_digest = digest_source_identity(state.preflight, state.graph_digest);
+        state.identity.source_digest =
+            digest_source_identity(state.preflight, state.source_graph_digest);
         state.recovery_payload = encode_recovery_bundle(
             &RecoveryBundle {
                 plan_digest: state.plan_digest,
+                relocation_destinations: state.relocation_destination_before_images.clone(),
                 target_staging: state.writes.target_staging_rollback.clone(),
                 backup_boot: state.writes.backup_boot_rollback.clone(),
                 activation: state.writes.activation_rollback.clone(),
@@ -1963,6 +2059,49 @@ mod tests {
         assert!(matches!(
             decode_state(&payload, limits()),
             Err(PreparedEnvelopeError::PayloadDigestMismatch)
+        ));
+    }
+
+    #[test]
+    fn tampered_target_digest_and_relocation_geometry_fail_commitment_validation() {
+        let encoded = encode_state(&state(), limits()).unwrap();
+
+        let mut target_digest = encoded.clone();
+        target_digest[500] ^= 1;
+        let crc = header_crc(&target_digest[..HEADER_BYTES]);
+        put_u32(&mut target_digest, HEADER_CRC_OFFSET, crc);
+        assert!(matches!(
+            decode_state(&target_digest, limits()),
+            Err(PreparedEnvelopeError::CommitmentMismatch { field: "plan" })
+        ));
+
+        let mut geometry = encoded;
+        let reservation_bytes = state().reservations.len() * 24;
+        let relocation_header = HEADER_BYTES + SECTION_HEADER_BYTES + reservation_bytes;
+        let relocation_data = relocation_header + SECTION_HEADER_BYTES;
+        let destination_offset = relocation_data + 32;
+        put_u64(&mut geometry, destination_offset, 12_800);
+        let relocation_end = relocation_data + 48;
+        let section_digest = sha256(&geometry[relocation_data..relocation_end]);
+        geometry[relocation_header + 16..relocation_header + 48].copy_from_slice(&section_digest);
+        let payload_digest = sha256(&geometry[HEADER_BYTES..]);
+        geometry[32..64].copy_from_slice(&payload_digest);
+        let crc = header_crc(&geometry[..HEADER_BYTES]);
+        put_u32(&mut geometry, HEADER_CRC_OFFSET, crc);
+        assert!(decode_state(&geometry, limits()).is_err());
+    }
+
+    #[test]
+    fn v1_executable_envelope_is_rejected() {
+        let mut encoded = encode_state(&state(), limits()).unwrap();
+        encoded[..8].copy_from_slice(b"SCPREP01");
+        put_u16(&mut encoded, 8, 1);
+        let crc = header_crc(&encoded[..HEADER_BYTES]);
+        put_u32(&mut encoded, HEADER_CRC_OFFSET, crc);
+        assert!(matches!(
+            decode_state(&encoded, limits()),
+            Err(PreparedEnvelopeError::InvalidMagic
+                | PreparedEnvelopeError::UnsupportedVersion { actual: 1 })
         ));
     }
 
@@ -2029,6 +2168,7 @@ mod tests {
         value.recovery_payload = encode_recovery_bundle(
             &RecoveryBundle {
                 plan_digest: value.plan_digest,
+                relocation_destinations: value.relocation_destination_before_images.clone(),
                 target_staging: vec![write(4096, 99)],
                 backup_boot: value.writes.backup_boot_rollback.clone(),
                 activation: value.writes.activation_rollback.clone(),
@@ -2043,6 +2183,30 @@ mod tests {
             encode_state(&value, limits()),
             Err(PreparedEnvelopeError::RecoveryMismatch)
         ));
+    }
+
+    #[test]
+    fn executable_envelope_requires_exact_relocation_destination_group() {
+        for case in 0..4 {
+            let mut value = state();
+            match case {
+                0 => value.relocation_destination_before_images.clear(),
+                1 => value
+                    .relocation_destination_before_images
+                    .push(write(15_360, 9)),
+                2 => value
+                    .relocation_destination_before_images
+                    .push(value.relocation_destination_before_images[0].clone()),
+                _ => {
+                    value.relocation_destination_before_images[0].bytes.pop();
+                }
+            }
+            assert!(matches!(
+                encode_state(&value, limits()),
+                Err(PreparedEnvelopeError::InvalidPreparedInvariant
+                    | PreparedEnvelopeError::NonCanonicalOrder { .. })
+            ));
+        }
     }
 
     #[test]

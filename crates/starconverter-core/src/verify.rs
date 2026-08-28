@@ -170,6 +170,14 @@ pub enum VerificationError {
     },
     MissingObjectPath(ObjectId),
     MissingStreamExtents(StreamId),
+    /// Raw physical bytes are not the logical byte sequence for an encoded nonresident stream.
+    /// A format-aware decompressor/decryptor must be introduced before such a stream can be
+    /// included in a logical-content manifest.
+    ExtentStreamRequiresDecoding {
+        stream: StreamId,
+        compressed: bool,
+        encrypted: bool,
+    },
     ExtentCoverageGap {
         stream: StreamId,
         expected: u64,
@@ -210,6 +218,15 @@ impl fmt::Display for VerificationError {
             Self::MissingStreamExtents(stream) => {
                 write!(formatter, "stream {} has no extent evidence", stream.0)
             }
+            Self::ExtentStreamRequiresDecoding {
+                stream,
+                compressed,
+                encrypted,
+            } => write!(
+                formatter,
+                "extent-backed stream {} requires logical decoding (compressed: {compressed}, encrypted: {encrypted}); raw physical storage is not logical content",
+                stream.0
+            ),
             Self::ExtentCoverageGap {
                 stream,
                 expected,
@@ -246,8 +263,9 @@ impl From<ImageError> for VerificationError {
 ///
 /// # Errors
 ///
-/// Returns [`VerificationError`] if a limit is invalid or exhausted, namespace traversal cannot
-/// assign a path, extent coverage is inconsistent, arithmetic overflows, or an image read fails.
+/// Returns [`VerificationError`] if a limit is invalid or exhausted, an extent-backed stream
+/// requires format-aware decompression or decryption, namespace traversal cannot assign a path,
+/// extent coverage is inconsistent, arithmetic overflows, or an image read fails.
 pub fn build_manifest(
     image: &ImageFile,
     graph: &ObjectGraph,
@@ -273,6 +291,7 @@ pub(crate) fn build_manifest_with_reader(
             maximum: limits.max_objects,
         });
     }
+    validate_extent_stream_encodings(graph)?;
 
     let paths = enumerate_paths(graph, limits.max_paths)?;
     let mut extents: BTreeMap<StreamId, Vec<Extent>> = BTreeMap::new();
@@ -364,6 +383,23 @@ pub(crate) fn build_manifest_with_reader(
         metadata_sha256,
         logical_bytes_hashed,
     })
+}
+
+fn validate_extent_stream_encodings(graph: &ObjectGraph) -> Result<(), VerificationError> {
+    for object in graph.objects() {
+        for stream in &object.streams {
+            if matches!(stream.storage, StreamStorage::Extents)
+                && (stream.flags.compressed || stream.flags.encrypted)
+            {
+                return Err(VerificationError::ExtentStreamRequiresDecoding {
+                    stream: stream.id,
+                    compressed: stream.flags.compressed,
+                    encrypted: stream.flags.encrypted,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_limits(limits: VerificationLimits) -> Result<(), VerificationError> {
@@ -593,6 +629,23 @@ mod tests {
 
     struct TempImage(PathBuf);
 
+    #[derive(Debug)]
+    struct PanicOnRead;
+
+    impl BoundedImageReader for PanicOnRead {
+        fn len(&self) -> u64 {
+            16
+        }
+
+        fn max_read_bytes(&self) -> usize {
+            16
+        }
+
+        fn read_exact_at(&self, _offset: u64, _length: usize) -> Result<Vec<u8>, ImageError> {
+            panic!("encoded extent stream reached raw physical image reads")
+        }
+    }
+
     impl TempImage {
         fn write(bytes: &[u8]) -> Self {
             let id = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
@@ -698,6 +751,35 @@ mod tests {
         .expect("valid object graph")
     }
 
+    fn graph_with_extent_stream_flags(flags: StreamFlags) -> ObjectGraph {
+        let base = graph();
+        let mut objects = base.objects().to_vec();
+        let stream = objects
+            .iter_mut()
+            .find(|object| object.id == ObjectId(1))
+            .and_then(|object| {
+                object
+                    .streams
+                    .iter_mut()
+                    .find(|stream| stream.id == StreamId(1))
+            })
+            .expect("fixture stream");
+        stream.flags = flags;
+        ObjectGraph::build(
+            base.root(),
+            objects,
+            base.entries().to_vec(),
+            base.extents().clone(),
+            ObjectGraphLimits {
+                max_objects: 2,
+                max_entries: 2,
+                max_streams: 2,
+                max_name_code_units: 255,
+            },
+        )
+        .expect("valid encoded-stream fixture")
+    }
+
     #[test]
     fn hashes_physical_sparse_uninitialized_and_resident_bytes() {
         let temp = TempImage::write(b"xxxxDATAxxxxxxxx");
@@ -720,6 +802,49 @@ mod tests {
             .expect("unnamed stream");
         let expected: [u8; 32] = Sha256::digest(b"DATA\0\0\0").into();
         assert_eq!(unnamed.sha256, expected);
+        let resident = file
+            .streams
+            .iter()
+            .find(|stream| stream.name.is_some())
+            .expect("resident named stream");
+        let resident_expected: [u8; 32] = Sha256::digest(b"ads").into();
+        assert_eq!(resident.sha256, resident_expected);
+    }
+
+    #[test]
+    fn refuses_compressed_extent_stream_before_hashing_raw_storage() {
+        let encoded = graph_with_extent_stream_flags(StreamFlags {
+            sparse: true,
+            compressed: true,
+            encrypted: false,
+        });
+
+        assert!(matches!(
+            build_manifest_with_reader(&PanicOnRead, &encoded, VerificationLimits::default()),
+            Err(VerificationError::ExtentStreamRequiresDecoding {
+                stream: StreamId(1),
+                compressed: true,
+                encrypted: false,
+            })
+        ));
+    }
+
+    #[test]
+    fn refuses_encrypted_extent_stream_before_hashing_raw_storage() {
+        let encoded = graph_with_extent_stream_flags(StreamFlags {
+            sparse: true,
+            compressed: false,
+            encrypted: true,
+        });
+
+        assert!(matches!(
+            build_manifest_with_reader(&PanicOnRead, &encoded, VerificationLimits::default()),
+            Err(VerificationError::ExtentStreamRequiresDecoding {
+                stream: StreamId(1),
+                compressed: false,
+                encrypted: true,
+            })
+        ));
     }
 
     #[test]

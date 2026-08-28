@@ -4,8 +4,8 @@ use std::fmt;
 
 use crate::overlay::OverlayWrite;
 
-const MAGIC: &[u8; 8] = b"SCRECOV1";
-const VERSION: u16 = 1;
+const MAGIC: &[u8; 8] = b"SCRECOV2";
+const VERSION: u16 = 2;
 const HEADER_BYTES: usize = 64;
 const ENTRY_BYTES: usize = 16;
 
@@ -18,6 +18,8 @@ pub struct RecoveryLimits {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveryBundle {
     pub plan_digest: [u8; 32],
+    /// Exact bytes originally occupying every relocation destination.
+    pub relocation_destinations: Vec<OverlayWrite>,
     pub target_staging: Vec<OverlayWrite>,
     pub backup_boot: Vec<OverlayWrite>,
     pub activation: Vec<OverlayWrite>,
@@ -139,6 +141,7 @@ pub fn encode_recovery_bundle(
     output.extend_from_slice(&[0_u8; 6]);
     output.extend_from_slice(&bundle.plan_digest);
     for count in [
+        bundle.relocation_destinations.len(),
         bundle.target_staging.len(),
         bundle.backup_boot.len(),
         bundle.activation.len(),
@@ -149,10 +152,11 @@ pub fn encode_recovery_bundle(
                 .to_le_bytes(),
         );
     }
-    output.extend_from_slice(&[0_u8; 4]);
+    // The v2 header uses all bytes; there is no uncommitted count slot.
     for write in bundle
-        .target_staging
+        .relocation_destinations
         .iter()
+        .chain(&bundle.target_staging)
         .chain(&bundle.backup_boot)
         .chain(&bundle.activation)
     {
@@ -189,11 +193,7 @@ pub fn decode_recovery_bundle(
     if version != VERSION {
         return Err(RecoveryError::UnsupportedVersion { actual: version });
     }
-    if bytes[10..16]
-        .iter()
-        .chain(&bytes[60..64])
-        .any(|byte| *byte != 0)
-    {
+    if bytes[10..16].iter().any(|byte| *byte != 0) {
         return Err(RecoveryError::NonZeroReserved);
     }
     let mut plan_digest = [0_u8; 32];
@@ -202,6 +202,7 @@ pub fn decode_recovery_bundle(
         read_u32(bytes, 48)?,
         read_u32(bytes, 52)?,
         read_u32(bytes, 56)?,
+        read_u32(bytes, 60)?,
     ];
     let counts = counts.map(|count| usize::try_from(count).unwrap_or(usize::MAX));
     let total_count = counts
@@ -215,7 +216,7 @@ pub fn decode_recovery_bundle(
         });
     }
     let mut cursor = HEADER_BYTES;
-    let mut groups = [Vec::new(), Vec::new(), Vec::new()];
+    let mut groups = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
     let mut total_bytes = 0_u64;
     for (group, count) in groups.iter_mut().zip(counts) {
         group
@@ -276,9 +277,15 @@ pub fn decode_recovery_bundle(
             actual: bytes.len() - cursor,
         });
     }
-    let [target_staging, backup_boot, activation] = groups;
+    let [
+        relocation_destinations,
+        target_staging,
+        backup_boot,
+        activation,
+    ] = groups;
     let bundle = RecoveryBundle {
         plan_digest,
+        relocation_destinations,
         target_staging,
         backup_boot,
         activation,
@@ -319,8 +326,9 @@ fn validate_bundle(bundle: &RecoveryBundle, limits: RecoveryLimits) -> Result<()
         .try_reserve_exact(count)
         .map_err(|_| RecoveryError::AllocationFailed)?;
     for write in bundle
-        .target_staging
+        .relocation_destinations
         .iter()
+        .chain(&bundle.target_staging)
         .chain(&bundle.backup_boot)
         .chain(&bundle.activation)
     {
@@ -354,17 +362,19 @@ fn validate_bundle(bundle: &RecoveryBundle, limits: RecoveryLimits) -> Result<()
 
 fn total_write_count(bundle: &RecoveryBundle) -> Result<usize, RecoveryError> {
     bundle
-        .target_staging
+        .relocation_destinations
         .len()
-        .checked_add(bundle.backup_boot.len())
+        .checked_add(bundle.target_staging.len())
+        .and_then(|value| value.checked_add(bundle.backup_boot.len()))
         .and_then(|value| value.checked_add(bundle.activation.len()))
         .ok_or(RecoveryError::ArithmeticOverflow)
 }
 
 fn total_payload_bytes(bundle: &RecoveryBundle) -> Result<usize, RecoveryError> {
     bundle
-        .target_staging
+        .relocation_destinations
         .iter()
+        .chain(&bundle.target_staging)
         .chain(&bundle.backup_boot)
         .chain(&bundle.activation)
         .try_fold(0_usize, |sum, write| sum.checked_add(write.bytes.len()))
@@ -403,6 +413,10 @@ mod tests {
     fn bundle() -> RecoveryBundle {
         RecoveryBundle {
             plan_digest: [7; 32],
+            relocation_destinations: vec![OverlayWrite {
+                offset: 2048,
+                bytes: vec![4; 512],
+            }],
             target_staging: vec![OverlayWrite {
                 offset: 1024,
                 bytes: vec![1; 512],
@@ -464,6 +478,17 @@ mod tests {
                 }
             ),
             Err(RecoveryError::WriteLimitExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn v1_recovery_payload_is_not_forward_compatible() {
+        let mut encoded = encode_recovery_bundle(&bundle(), LIMITS).unwrap();
+        encoded[..8].copy_from_slice(b"SCRECOV1");
+        encoded[8..10].copy_from_slice(&1_u16.to_le_bytes());
+        assert!(matches!(
+            decode_recovery_bundle(&encoded, LIMITS),
+            Err(RecoveryError::InvalidMagic | RecoveryError::UnsupportedVersion { actual: 1 })
         ));
     }
 }

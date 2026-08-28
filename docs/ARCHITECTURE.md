@@ -43,9 +43,9 @@ operating-system or GUI dependency. Implemented foundations include:
 - `object` and `extent`: normalized namespace/stream model plus physical ownership validation;
 - `geometry`: deterministic destination reservations and conflict relocation;
 - `capsule`: duplicated append-only generation headers, CRCs, SHA-256 payload identity, phase
-  monotonicity, and a canonical first-generation `SCPREP01` plan envelope. The envelope commits the
+  monotonicity, and a canonical first-generation `SCPREP02` plan envelope. The envelope commits the
   complete forward plan, source logical manifest, target feature rules, operational limits, and a
-  nested versioned recovery bundle containing exact before-images;
+  nested `SCRECOV2` recovery bundle containing exact relocation-destination and phase before-images;
 - `overlay`: immutable sector-aligned candidate writes over a crate-private bounded reader, with no
   path, handle, identity, seek, or mutation capability;
 - `phase` and `preimage`: activation-gated serializer composition plus bounded capture of exact
@@ -68,7 +68,7 @@ operating-system or GUI dependency. Implemented foundations include:
   after-images, a before/after-only mixture, or an unsafe third state. The coordinator rechecks
   real staged/backup/activation bytes, reparses, and logically hashes the target against the sealed
   graph and source-manifest commitment at every applicable boundary. It reconstructs an owned plan
-  from capsule plus image after process loss, refuses relocation and all frontend access, separates
+  from capsule plus image after process loss, executes only sealed relocation authority, refuses all frontend access, separates
   verification from activation, and requires a private approval capability to finalize;
 - `candidate_export`: create-new-only full image copy, exact preview application, independent target
   reinspection, logical manifest equality, validated escrow persistence, and source SHA-256

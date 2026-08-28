@@ -18,8 +18,9 @@ use crate::capsule::{
 use crate::executor::{ExecutedIntent, ExecutedRollback};
 use crate::extent::{ExtentKind, Placement};
 use crate::geometry::{
-    ByteRange, DestinationReservation, LayoutError, LayoutLimits, LayoutPlan, Relocation,
-    ReservationKind, SourceAllocation, solve_layout_with_staging_exclusions,
+    ByteRange, DestinationReservation, LayoutError, LayoutLimits, LayoutPlan, RelocatedGraphError,
+    Relocation, ReservationKind, SourceAllocation, relocate_object_graph,
+    solve_layout_with_staging_exclusions,
 };
 use crate::object::{ObjectGraph, ObjectKind, StreamStorage};
 use crate::overlay::{OverlayError, OverlayLimits, OverlayPlan, OverlayWrite};
@@ -268,9 +269,11 @@ pub struct PreparedConversion {
     preflight: PreflightEvidence,
     target_filesystem: FileSystem,
     target_features: Vec<FeatureCompatibility>,
-    graph_digest: [u8; 32],
+    source_graph_digest: [u8; 32],
+    target_graph_digest: [u8; 32],
     plan_digest: [u8; 32],
     candidate_overlay_digest: [u8; 32],
+    relocation_rollback_digest: [u8; 32],
     staging_rollback_digest: [u8; 32],
     preactivation_rollback_digest: [u8; 32],
     full_rollback_digest: [u8; 32],
@@ -278,6 +281,7 @@ pub struct PreparedConversion {
     layout: LayoutPlan,
     writes: OpaqueWriteSets,
     candidate_overlay: OverlayPlan,
+    relocation_rollback_overlay: OverlayPlan,
     staging_rollback_overlay: OverlayPlan,
     preactivation_rollback_overlay: OverlayPlan,
     full_rollback_overlay: OverlayPlan,
@@ -297,8 +301,33 @@ impl PreparedConversion {
     /// unsafe relocation geometry, resource cap exhaustion, and arithmetic overflow.
     #[allow(clippy::too_many_lines)]
     pub fn build(
-        graph: &ObjectGraph,
+        source_graph: &ObjectGraph,
+        draft: ConversionDraft,
+        limits: ConversionLimits,
+    ) -> Result<Self, ConversionError> {
+        Self::build_with_target_graph(source_graph, source_graph, draft, Vec::new(), limits)
+    }
+
+    /// Builds a conversion whose expected target graph includes every solved payload relocation.
+    ///
+    /// `relocation_destination_before_images` must contain exactly one source before-image for
+    /// every solved relocation destination: no missing, extra, duplicate, shortened, or extended
+    /// range is accepted. The group is sorted and bound only after layout solving. An independently
+    /// supplied `target_graph` must be byte-for-byte equivalent to
+    /// [`relocate_object_graph(source_graph, solved_layout)`]. This makes the source identity and
+    /// expected activated target distinct commitments. Call [`Self::build`] for the ergonomic
+    /// no-relocation case; it deliberately fails closed if relocation becomes necessary.
+    ///
+    /// # Errors
+    ///
+    /// In addition to [`Self::build`] errors, refuses target-graph disagreement and any incomplete
+    /// or inexact relocation destination before-image group.
+    #[allow(clippy::too_many_lines)]
+    pub fn build_with_target_graph(
+        source_graph: &ObjectGraph,
+        target_graph: &ObjectGraph,
         mut draft: ConversionDraft,
+        mut relocation_destination_before_images: Vec<OverlayWrite>,
         limits: ConversionLimits,
     ) -> Result<Self, ConversionError> {
         validate_limits(limits)?;
@@ -310,9 +339,9 @@ impl PreparedConversion {
                 target: draft.target.filesystem,
             });
         }
-        validate_preflight(graph, draft.preflight, draft.target.filesystem)?;
-        validate_features(graph, &mut draft.target, limits.max_feature_rules)?;
-        validate_source_allocations(graph, &draft.source_allocations)?;
+        validate_preflight(source_graph, draft.preflight, draft.target.filesystem)?;
+        validate_features(source_graph, &mut draft.target, limits.max_feature_rules)?;
+        validate_source_allocations(source_graph, &draft.source_allocations)?;
         validate_required_reservations(&draft.reservations)?;
         validate_write_caps(&writes, limits)?;
 
@@ -342,7 +371,7 @@ impl PreparedConversion {
         validate_rollback_pairing(&writes)?;
 
         let (live_allocations, staging_exclusions) =
-            partition_source_allocations(graph, &draft.source_allocations);
+            partition_source_allocations(source_graph, &draft.source_allocations);
         let layout = solve_layout_with_staging_exclusions(
             draft.preflight.image.image_bytes,
             draft.preflight.allocation_alignment,
@@ -351,32 +380,49 @@ impl PreparedConversion {
             staging_exclusions,
             limits.layout,
         )?;
+        let relocated_target = relocate_object_graph(source_graph, &layout)?;
+        if &relocated_target != target_graph {
+            return Err(ConversionError::TargetGraphMismatch);
+        }
+        validate_relocation_before_images(
+            &layout,
+            &mut relocation_destination_before_images,
+            &writes,
+            limits,
+        )?;
         let candidate_overlay = OverlayPlan::build(
             draft.preflight.image.image_bytes,
             draft.preflight.sector_bytes,
             final_writes(&writes),
             limits.overlay,
         )?;
+        let relocation_rollback_overlay = OverlayPlan::build(
+            draft.preflight.image.image_bytes,
+            draft.preflight.sector_bytes,
+            relocation_destination_before_images.clone(),
+            limits.overlay,
+        )?;
         let staging_rollback_overlay = OverlayPlan::build(
             draft.preflight.image.image_bytes,
             draft.preflight.sector_bytes,
-            writes.target_staging_rollback.clone(),
+            staging_rollback_writes(&relocation_destination_before_images, &writes),
             limits.overlay,
         )?;
         let preactivation_rollback_overlay = OverlayPlan::build(
             draft.preflight.image.image_bytes,
             draft.preflight.sector_bytes,
-            preactivation_rollback_writes(&writes),
+            preactivation_rollback_writes(&relocation_destination_before_images, &writes),
             limits.overlay,
         )?;
         let full_rollback_overlay = OverlayPlan::build(
             draft.preflight.image.image_bytes,
             draft.preflight.sector_bytes,
-            full_rollback_writes(&writes),
+            full_rollback_writes(&relocation_destination_before_images, &writes),
             limits.overlay,
         )?;
 
-        let graph_digest = digest_graph(graph);
+        let source_graph_digest = digest_graph(source_graph);
+        let target_graph_digest = digest_graph(target_graph);
         let plan_digest = digest_plan(
             draft.preflight,
             draft.target.filesystem,
@@ -384,15 +430,20 @@ impl PreparedConversion {
             &draft.reservations,
             &layout,
             &writes,
-            graph_digest,
+            source_graph_digest,
+            target_graph_digest,
+            &relocation_destination_before_images,
         );
         let staging_rollback_digest = digest_overlay_writes(staging_rollback_overlay.writes());
+        let relocation_rollback_digest =
+            digest_overlay_writes(relocation_rollback_overlay.writes());
         let preactivation_rollback_digest =
             digest_overlay_writes(preactivation_rollback_overlay.writes());
         let full_rollback_digest = digest_overlay_writes(full_rollback_overlay.writes());
         let recovery_payload = encode_recovery_bundle(
             &RecoveryBundle {
                 plan_digest,
+                relocation_destinations: relocation_destination_before_images.clone(),
                 target_staging: writes.target_staging_rollback.clone(),
                 backup_boot: writes.backup_boot_rollback.clone(),
                 activation: writes.activation_rollback.clone(),
@@ -405,7 +456,7 @@ impl PreparedConversion {
         let candidate_overlay_digest = digest_overlay_writes(candidate_overlay.writes());
         let identity = CapsuleIdentity {
             transaction_id: draft.transaction_id,
-            source_digest: digest_source_identity(draft.preflight, graph_digest),
+            source_digest: digest_source_identity(draft.preflight, source_graph_digest),
         };
 
         let mut prepared = Self {
@@ -413,9 +464,11 @@ impl PreparedConversion {
             preflight: draft.preflight,
             target_filesystem: draft.target.filesystem,
             target_features: draft.target.features,
-            graph_digest,
+            source_graph_digest,
+            target_graph_digest,
             plan_digest,
             candidate_overlay_digest,
+            relocation_rollback_digest,
             staging_rollback_digest,
             preactivation_rollback_digest,
             full_rollback_digest,
@@ -423,6 +476,7 @@ impl PreparedConversion {
             layout,
             writes,
             candidate_overlay,
+            relocation_rollback_overlay,
             staging_rollback_overlay,
             preactivation_rollback_overlay,
             full_rollback_overlay,
@@ -441,7 +495,13 @@ impl PreparedConversion {
 
     #[must_use]
     pub const fn graph_digest(&self) -> [u8; 32] {
-        self.graph_digest
+        self.source_graph_digest
+    }
+
+    /// Digest of the graph expected after applying the sealed relocation layout.
+    #[must_use]
+    pub const fn target_graph_digest(&self) -> [u8; 32] {
+        self.target_graph_digest
     }
 
     #[must_use]
@@ -473,19 +533,24 @@ impl PreparedConversion {
             &self.reservations,
             &self.layout,
             &self.writes,
-            self.graph_digest,
+            self.source_graph_digest,
+            self.target_graph_digest,
+            self.relocation_rollback_overlay.writes(),
         );
-        self.identity.source_digest = digest_source_identity(self.preflight, self.graph_digest);
+        self.identity.source_digest =
+            digest_source_identity(self.preflight, self.source_graph_digest);
         let recovery_write_count = self
-            .writes
-            .target_staging_rollback
+            .relocation_rollback_overlay
+            .writes()
             .len()
+            .saturating_add(self.writes.target_staging_rollback.len())
             .saturating_add(self.writes.backup_boot_rollback.len())
             .saturating_add(self.writes.activation_rollback.len());
         let recovery_bytes = self
-            .writes
-            .target_staging_rollback
+            .relocation_rollback_overlay
+            .writes()
             .iter()
+            .chain(&self.writes.target_staging_rollback)
             .chain(&self.writes.backup_boot_rollback)
             .chain(&self.writes.activation_rollback)
             .fold(0_usize, |total, write| {
@@ -494,6 +559,7 @@ impl PreparedConversion {
         self.recovery_payload = encode_recovery_bundle(
             &RecoveryBundle {
                 plan_digest: self.plan_digest,
+                relocation_destinations: self.relocation_rollback_overlay.writes().to_vec(),
                 target_staging: self.writes.target_staging_rollback.clone(),
                 backup_boot: self.writes.backup_boot_rollback.clone(),
                 activation: self.writes.activation_rollback.clone(),
@@ -521,6 +587,12 @@ impl PreparedConversion {
     #[must_use]
     pub const fn candidate_overlay(&self) -> &OverlayPlan {
         &self.candidate_overlay
+    }
+
+    /// Exact source bytes for every relocation destination, sealed after layout solving.
+    #[must_use]
+    pub const fn relocation_rollback_overlay(&self) -> &OverlayPlan {
+        &self.relocation_rollback_overlay
     }
 
     #[must_use]
@@ -574,9 +646,10 @@ impl PreparedConversion {
     ) -> Option<&[OverlayWrite]> {
         match phase {
             TransactionPhase::Discovered
-            | TransactionPhase::Reserved
             | TransactionPhase::Finalized
             | TransactionPhase::RolledBack => None,
+            TransactionPhase::Reserved if self.layout.relocations.is_empty() => None,
+            TransactionPhase::Reserved => Some(self.relocation_rollback_overlay.writes()),
             TransactionPhase::Relocating => Some(self.staging_rollback_overlay.writes()),
             TransactionPhase::TargetStaged => Some(self.preactivation_rollback_overlay.writes()),
             TransactionPhase::BackupBootWritten
@@ -633,7 +706,7 @@ impl PreparedConversion {
     pub const fn expected_verification(&self) -> ExpectedVerification {
         ExpectedVerification {
             target_filesystem: self.target_filesystem,
-            object_graph_digest: self.graph_digest,
+            object_graph_digest: self.target_graph_digest,
             plan_digest: self.plan_digest,
         }
     }
@@ -642,7 +715,7 @@ impl PreparedConversion {
     pub const fn expected_staging_verification(&self) -> ExpectedStagingVerification {
         ExpectedStagingVerification {
             target_filesystem: self.target_filesystem,
-            object_graph_digest: self.graph_digest,
+            object_graph_digest: self.target_graph_digest,
             plan_digest: self.plan_digest,
             candidate_overlay_digest: self.candidate_overlay_digest,
         }
@@ -935,9 +1008,14 @@ impl PreparedConversion {
         phase: TransactionPhase,
     ) -> Result<RollbackIntent<'_>, ConversionError> {
         match phase {
-            TransactionPhase::Discovered | TransactionPhase::Reserved => {
+            TransactionPhase::Discovered => Ok(RollbackIntent::DiscardStaging),
+            TransactionPhase::Reserved if self.layout.relocations.is_empty() => {
                 Ok(RollbackIntent::DiscardStaging)
             }
+            TransactionPhase::Reserved => Ok(RollbackIntent::RestoreSource {
+                writes: self.relocation_rollback_overlay.writes(),
+                digest: self.relocation_rollback_digest,
+            }),
             TransactionPhase::Relocating => Ok(RollbackIntent::RestoreSource {
                 writes: self.staging_rollback_overlay.writes(),
                 digest: self.staging_rollback_digest,
@@ -1222,6 +1300,8 @@ pub enum ConversionError {
         kind: ReservationKind,
     },
     RollbackRangeMismatch,
+    RelocationBeforeImageRangeMismatch,
+    TargetGraphMismatch,
     CapsuleAlreadyStarted,
     CapsuleNotStarted,
     LegacyCapsuleRollbackOnly,
@@ -1255,6 +1335,7 @@ pub enum ConversionError {
     InvalidRollbackEvidence,
     ArithmeticOverflow,
     Layout(LayoutError),
+    RelocatedGraph(RelocatedGraphError),
     Overlay(OverlayError),
     Capsule(CapsuleError),
     Recovery(RecoveryError),
@@ -1367,6 +1448,12 @@ impl fmt::Display for ConversionError {
             Self::RollbackRangeMismatch => formatter.write_str(
                 "rollback ranges do not exactly pair with their source-visible write phase",
             ),
+            Self::RelocationBeforeImageRangeMismatch => formatter.write_str(
+                "relocation destination before-images do not exactly match solved destinations",
+            ),
+            Self::TargetGraphMismatch => formatter.write_str(
+                "expected target graph does not equal the source graph after solved relocations",
+            ),
             Self::CapsuleAlreadyStarted => {
                 formatter.write_str("transaction capsule is already started")
             }
@@ -1432,6 +1519,12 @@ impl fmt::Display for ConversionError {
                 .write_str("rollback completion evidence does not match the required intent"),
             Self::ArithmeticOverflow => formatter.write_str("conversion accounting overflow"),
             Self::Layout(error) => write!(formatter, "layout planning failed: {error}"),
+            Self::RelocatedGraph(error) => {
+                write!(
+                    formatter,
+                    "relocated object graph validation failed: {error}"
+                )
+            }
             Self::Overlay(error) => write!(formatter, "overlay validation failed: {error}"),
             Self::Capsule(error) => write!(formatter, "capsule validation failed: {error}"),
             Self::Recovery(error) => {
@@ -1448,6 +1541,7 @@ impl std::error::Error for ConversionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Layout(error) => Some(error),
+            Self::RelocatedGraph(error) => Some(error),
             Self::Overlay(error) => Some(error),
             Self::Capsule(error) => Some(error),
             Self::Recovery(error) => Some(error),
@@ -1459,6 +1553,11 @@ impl std::error::Error for ConversionError {
 impl From<LayoutError> for ConversionError {
     fn from(value: LayoutError) -> Self {
         Self::Layout(value)
+    }
+}
+impl From<RelocatedGraphError> for ConversionError {
+    fn from(value: RelocatedGraphError) -> Self {
+        Self::RelocatedGraph(value)
     }
 }
 impl From<OverlayError> for ConversionError {
@@ -1899,17 +1998,131 @@ fn validate_rollback_pairing(writes: &OpaqueWriteSets) -> Result<(), ConversionE
     Ok(())
 }
 
-fn preactivation_rollback_writes(writes: &OpaqueWriteSets) -> Vec<OverlayWrite> {
-    writes
-        .target_staging_rollback
+fn validate_relocation_before_images(
+    layout: &LayoutPlan,
+    before_images: &mut [OverlayWrite],
+    writes: &OpaqueWriteSets,
+    limits: ConversionLimits,
+) -> Result<(), ConversionError> {
+    before_images.sort_unstable_by_key(|write| write.offset);
+    validate_relocation_before_image_ranges(layout, before_images)?;
+
+    let existing_count = writes
+        .target_staging
+        .len()
+        .checked_add(writes.backup_boot.len())
+        .and_then(|value| value.checked_add(writes.activation.len()))
+        .and_then(|value| value.checked_add(writes.target_staging_rollback.len()))
+        .and_then(|value| value.checked_add(writes.backup_boot_rollback.len()))
+        .and_then(|value| value.checked_add(writes.activation_rollback.len()))
+        .ok_or(ConversionError::ArithmeticOverflow)?;
+    let count = existing_count
+        .checked_add(before_images.len())
+        .ok_or(ConversionError::ArithmeticOverflow)?;
+    if count > limits.max_total_writes {
+        return Err(ConversionError::WriteLimitExceeded {
+            actual: count,
+            maximum: limits.max_total_writes,
+        });
+    }
+    let existing_bytes = writes
+        .target_staging
         .iter()
-        .chain(&writes.backup_boot_rollback)
+        .map(|value| value.write.bytes.len())
+        .chain(
+            writes
+                .backup_boot
+                .iter()
+                .map(|value| value.write.bytes.len()),
+        )
+        .chain(
+            writes
+                .activation
+                .iter()
+                .map(|value| value.write.bytes.len()),
+        )
+        .chain(
+            writes
+                .target_staging_rollback
+                .iter()
+                .map(|value| value.bytes.len()),
+        )
+        .chain(
+            writes
+                .backup_boot_rollback
+                .iter()
+                .map(|value| value.bytes.len()),
+        )
+        .chain(
+            writes
+                .activation_rollback
+                .iter()
+                .map(|value| value.bytes.len()),
+        )
+        .chain(before_images.iter().map(|value| value.bytes.len()))
+        .try_fold(0_usize, usize::checked_add)
+        .ok_or(ConversionError::ArithmeticOverflow)?;
+    if existing_bytes > limits.max_total_write_bytes {
+        return Err(ConversionError::WriteByteLimitExceeded {
+            actual: u64::try_from(existing_bytes).unwrap_or(u64::MAX),
+            maximum: limits.max_total_write_bytes,
+        });
+    }
+    Ok(())
+}
+
+fn validate_relocation_before_image_ranges(
+    layout: &LayoutPlan,
+    before_images: &[OverlayWrite],
+) -> Result<(), ConversionError> {
+    let mut expected: Vec<_> = layout
+        .relocations
+        .iter()
+        .map(|relocation| (relocation.destination.offset, relocation.destination.length))
+        .collect();
+    expected.sort_unstable();
+    let actual: Vec<_> = before_images
+        .iter()
+        .map(|write| {
+            Ok((
+                write.offset,
+                u64::try_from(write.bytes.len())
+                    .map_err(|_| ConversionError::ArithmeticOverflow)?,
+            ))
+        })
+        .collect::<Result<_, ConversionError>>()?;
+    if actual != expected {
+        return Err(ConversionError::RelocationBeforeImageRangeMismatch);
+    }
+    Ok(())
+}
+
+fn staging_rollback_writes(
+    relocation: &[OverlayWrite],
+    writes: &OpaqueWriteSets,
+) -> Vec<OverlayWrite> {
+    relocation
+        .iter()
+        .chain(&writes.target_staging_rollback)
         .cloned()
         .collect()
 }
 
-fn full_rollback_writes(writes: &OpaqueWriteSets) -> Vec<OverlayWrite> {
-    preactivation_rollback_writes(writes)
+fn preactivation_rollback_writes(
+    relocation: &[OverlayWrite],
+    writes: &OpaqueWriteSets,
+) -> Vec<OverlayWrite> {
+    staging_rollback_writes(relocation, writes)
+        .into_iter()
+        .chain(writes.backup_boot_rollback.iter().cloned())
+        .collect()
+}
+
+fn full_rollback_writes(
+    relocation: &[OverlayWrite],
+    writes: &OpaqueWriteSets,
+) -> Vec<OverlayWrite> {
+    preactivation_rollback_writes(relocation, writes)
         .into_iter()
         .chain(writes.activation_rollback.iter().cloned())
         .collect()
@@ -2121,11 +2334,14 @@ fn digest_plan(
     reservations: &[DestinationReservation],
     layout: &LayoutPlan,
     writes: &OpaqueWriteSets,
-    graph_digest: [u8; 32],
+    source_graph_digest: [u8; 32],
+    target_graph_digest: [u8; 32],
+    relocation_destination_before_images: &[OverlayWrite],
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(b"starconverter-plan-v1");
-    hasher.update(graph_digest);
+    hasher.update(b"starconverter-plan-v2");
+    hasher.update(source_graph_digest);
+    hasher.update(target_graph_digest);
     hasher.update([
         filesystem_key(evidence.source_filesystem),
         filesystem_key(target),
@@ -2183,6 +2399,7 @@ fn digest_plan(
     hasher.update(digest_overlay_writes(&writes.target_staging_rollback));
     hasher.update(digest_overlay_writes(&writes.backup_boot_rollback));
     hasher.update(digest_overlay_writes(&writes.activation_rollback));
+    hasher.update(digest_overlay_writes(relocation_destination_before_images));
     finish(hasher)
 }
 
@@ -2393,6 +2610,42 @@ pub(crate) mod tests {
         PreparedConversion::build(&graph(false), draft(), ConversionLimits::default()).unwrap()
     }
 
+    fn relocation_fixture() -> (ObjectGraph, ConversionDraft, ObjectGraph, Vec<OverlayWrite>) {
+        let source = graph(false);
+        let mut value = draft();
+        value.reservations[2].range = ByteRange {
+            offset: 4096,
+            length: 512,
+        };
+        value.writes.test_writes_mut().target_staging[1]
+            .write
+            .offset = 4096;
+        value.writes.test_writes_mut().target_staging_rollback[1].offset = 4096;
+
+        let mut reservations = value.reservations.clone();
+        reservations.sort_unstable_by_key(reservation_sort_key);
+        let (live, exclusions) = partition_source_allocations(&source, &value.source_allocations);
+        let layout = solve_layout_with_staging_exclusions(
+            value.preflight.image.image_bytes,
+            value.preflight.allocation_alignment,
+            live,
+            reservations,
+            exclusions,
+            ConversionLimits::default().layout,
+        )
+        .unwrap();
+        let target = relocate_object_graph(&source, &layout).unwrap();
+        let before_images = layout
+            .relocations
+            .iter()
+            .map(|relocation| OverlayWrite {
+                offset: relocation.destination.offset,
+                bytes: vec![0x77; usize::try_from(relocation.destination.length).unwrap()],
+            })
+            .collect();
+        (source, value, target, before_images)
+    }
+
     #[test]
     fn only_bound_executor_evidence_advances_mutation_and_rollback_phases() {
         let sequence = NEXT_EXECUTION_TEMP.fetch_add(1, Ordering::Relaxed);
@@ -2539,6 +2792,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(decoded.plan_digest, plan.plan_digest());
+        assert!(decoded.relocation_destinations.is_empty());
         assert_eq!(decoded.target_staging, plan.writes.target_staging_rollback);
         assert_eq!(decoded.backup_boot, plan.writes.backup_boot_rollback);
         assert_eq!(decoded.activation, plan.writes.activation_rollback);
@@ -2547,7 +2801,7 @@ pub(crate) mod tests {
         plan.begin_capsule(&mut capsule, observed()).unwrap();
         let view = scan_capsule(&capsule, CapsuleLimits::default()).unwrap();
         assert_eq!(view.newest().unwrap().payload, plan.prepared_envelope);
-        assert_eq!(&view.newest().unwrap().payload[..8], b"SCPREP01");
+        assert_eq!(&view.newest().unwrap().payload[..8], b"SCPREP02");
         let restored =
             PreparedConversion::from_restart_capsule(&capsule, CapsuleLimits::default()).unwrap();
         assert_eq!(restored, plan);
@@ -2582,20 +2836,108 @@ pub(crate) mod tests {
 
     #[test]
     fn derives_relocation_and_keeps_writes_in_reserved_ranges() {
-        let mut value = draft();
-        value.reservations[2].range = ByteRange {
-            offset: 4096,
-            length: 512,
-        };
-        value.writes.test_writes_mut().target_staging[1]
-            .write
-            .offset = 4096;
-        value.writes.test_writes_mut().target_staging_rollback[1].offset = 4096;
-        let plan =
-            PreparedConversion::build(&graph(false), value, ConversionLimits::default()).unwrap();
+        let (source, value, target, before_images) = relocation_fixture();
+        assert!(matches!(
+            PreparedConversion::build(&source, value.clone(), ConversionLimits::default()),
+            Err(ConversionError::TargetGraphMismatch)
+        ));
+        let plan = PreparedConversion::build_with_target_graph(
+            &source,
+            &target,
+            value,
+            before_images,
+            ConversionLimits::default(),
+        )
+        .unwrap();
         assert_eq!(plan.layout().relocations.len(), 1);
         assert_eq!(plan.layout().relocations[0].source.offset, 4096);
         assert_ne!(plan.layout().relocations[0].destination.offset, 4096);
+        assert_ne!(plan.graph_digest(), plan.target_graph_digest());
+    }
+
+    #[test]
+    fn relocation_requires_exact_destination_before_images_and_target_graph() {
+        for case in 0..4 {
+            let (source, value, target, mut before_images) = relocation_fixture();
+            match case {
+                0 => before_images.clear(),
+                1 => before_images.push(OverlayWrite {
+                    offset: 15 * 1024,
+                    bytes: vec![0; 512],
+                }),
+                2 => before_images.push(before_images[0].clone()),
+                _ => before_images[0].bytes.pop().map_or((), drop),
+            }
+            assert!(matches!(
+                PreparedConversion::build_with_target_graph(
+                    &source,
+                    &target,
+                    value,
+                    before_images,
+                    ConversionLimits::default(),
+                ),
+                Err(ConversionError::RelocationBeforeImageRangeMismatch)
+            ));
+        }
+
+        let (source, value, _target, before_images) = relocation_fixture();
+        assert!(matches!(
+            PreparedConversion::build_with_target_graph(
+                &source,
+                &source,
+                value,
+                before_images,
+                ConversionLimits::default(),
+            ),
+            Err(ConversionError::TargetGraphMismatch)
+        ));
+    }
+
+    #[test]
+    fn relocation_rollback_masks_are_exact_and_survive_restart() {
+        let (source, value, target, before_images) = relocation_fixture();
+        let plan = PreparedConversion::build_with_target_graph(
+            &source,
+            &target,
+            value,
+            before_images,
+            ConversionLimits::default(),
+        )
+        .unwrap();
+        let expected_lengths = [
+            (TransactionPhase::Reserved, 1),
+            (TransactionPhase::Relocating, 3),
+            (TransactionPhase::TargetStaged, 4),
+            (TransactionPhase::BackupBootWritten, 5),
+            (TransactionPhase::Activated, 5),
+            (TransactionPhase::Verified, 5),
+        ];
+        for (phase, expected_len) in expected_lengths {
+            let rollback = match plan.rollback_intent(phase).unwrap() {
+                RollbackIntent::RestoreSource { writes, .. } => writes,
+                RollbackIntent::DiscardStaging => panic!("relocation phase lost restoration"),
+            };
+            assert_eq!(rollback.len(), expected_len, "phase {phase:?}");
+            assert_eq!(
+                plan.observation_rollback_writes(phase).unwrap(),
+                rollback,
+                "phase {phase:?}",
+            );
+            assert!(rollback.iter().any(|write| {
+                write.offset == plan.layout().relocations[0].destination.offset
+                    && write.bytes.len() == 512
+            }));
+        }
+
+        let mut capsule = Vec::new();
+        plan.begin_capsule(&mut capsule, observed()).unwrap();
+        let recovered =
+            PreparedConversion::from_restart_capsule(&capsule, CapsuleLimits::default()).unwrap();
+        assert_eq!(recovered, plan);
+        assert_eq!(
+            recovered.relocation_rollback_overlay().writes(),
+            plan.relocation_rollback_overlay().writes()
+        );
     }
 
     #[test]

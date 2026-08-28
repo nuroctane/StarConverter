@@ -7,7 +7,8 @@
 
 use std::fmt;
 
-use crate::extent::StreamId;
+use crate::extent::{ExtentGraph, ExtentGraphError, ExtentKind, Placement, StreamId};
+use crate::object::{ObjectGraph, ObjectGraphError, ObjectGraphLimits};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ByteRange {
@@ -256,6 +257,251 @@ impl fmt::Display for LayoutError {
 }
 
 impl std::error::Error for LayoutError {}
+
+/// Failure to derive the exact target object graph described by a relocation layout.
+#[derive(Debug)]
+pub enum RelocatedGraphError {
+    AllocationFailed,
+    InvalidRelocation {
+        stream: StreamId,
+        logical_offset: u64,
+    },
+    RelocationSourceMissing {
+        stream: StreamId,
+        logical_offset: u64,
+    },
+    DuplicateRelocationSource {
+        stream: StreamId,
+        logical_offset: u64,
+    },
+    NonPayloadRelocation {
+        stream: StreamId,
+        logical_offset: u64,
+        kind: ExtentKind,
+    },
+    RelocatedByteCountMismatch {
+        declared: u64,
+        actual: u64,
+    },
+    Extents(ExtentGraphError),
+    Objects(ObjectGraphError),
+}
+
+impl fmt::Display for RelocatedGraphError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AllocationFailed => {
+                formatter.write_str("could not allocate bounded relocated-graph state")
+            }
+            Self::InvalidRelocation {
+                stream,
+                logical_offset,
+            } => write!(
+                formatter,
+                "stream {} relocation at logical byte {logical_offset} has invalid geometry",
+                stream.0
+            ),
+            Self::RelocationSourceMissing {
+                stream,
+                logical_offset,
+            } => write!(
+                formatter,
+                "stream {} relocation source at logical byte {logical_offset} is absent from the source graph",
+                stream.0
+            ),
+            Self::DuplicateRelocationSource {
+                stream,
+                logical_offset,
+            } => write!(
+                formatter,
+                "stream {} extent at logical byte {logical_offset} has multiple relocation records",
+                stream.0
+            ),
+            Self::NonPayloadRelocation {
+                stream,
+                logical_offset,
+                kind,
+            } => write!(
+                formatter,
+                "stream {} relocation at logical byte {logical_offset} targets non-payload extent {kind:?}",
+                stream.0
+            ),
+            Self::RelocatedByteCountMismatch { declared, actual } => write!(
+                formatter,
+                "layout declares {declared} relocated bytes but exact relocation records contain {actual}"
+            ),
+            Self::Extents(error) => write!(formatter, "relocated extent graph is invalid: {error}"),
+            Self::Objects(error) => write!(formatter, "relocated object graph is invalid: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for RelocatedGraphError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Extents(error) => Some(error),
+            Self::Objects(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+/// Rebuilds an object graph with each exact file-payload extent moved to its planned destination.
+///
+/// The source graph is not modified. Every relocation must name one complete physical
+/// [`ExtentKind::FileData`] extent by stream, logical offset, source offset, and length. The rebuilt
+/// extent graph independently rejects destination overlap and out-of-volume placement. Object,
+/// namespace, stream, and semantic-feature evidence is retained byte-for-byte.
+///
+/// # Errors
+///
+/// Refuses partial, duplicate, missing, non-payload, overlapping, out-of-volume, or incorrectly
+/// accounted relocations, and any graph which is no longer internally consistent after remapping.
+pub fn relocate_object_graph(
+    source: &ObjectGraph,
+    layout: &LayoutPlan,
+) -> Result<ObjectGraph, RelocatedGraphError> {
+    let mut relocated = source.extents().extents().to_vec();
+    let sources = physical_extent_index(&relocated)?;
+    let mut relocation_keys = Vec::new();
+    relocation_keys
+        .try_reserve_exact(layout.relocations.len())
+        .map_err(|_| RelocatedGraphError::AllocationFailed)?;
+    for relocation in &layout.relocations {
+        relocation_keys.push(relocation_key(relocation));
+    }
+    relocation_keys.sort_unstable();
+    if let Some(duplicate) = relocation_keys.windows(2).find(|pair| pair[0] == pair[1]) {
+        return Err(RelocatedGraphError::DuplicateRelocationSource {
+            stream: duplicate[0].0,
+            logical_offset: duplicate[0].1,
+        });
+    }
+    let mut actual_bytes = 0_u64;
+
+    for relocation in &layout.relocations {
+        if relocation.source.length == 0
+            || relocation.source.length != relocation.destination.length
+            || overlaps(relocation.source, relocation.destination).map_err(|_| {
+                RelocatedGraphError::InvalidRelocation {
+                    stream: relocation.stream,
+                    logical_offset: relocation.logical_offset,
+                }
+            })?
+        {
+            return Err(RelocatedGraphError::InvalidRelocation {
+                stream: relocation.stream,
+                logical_offset: relocation.logical_offset,
+            });
+        }
+        actual_bytes = actual_bytes.checked_add(relocation.source.length).ok_or(
+            RelocatedGraphError::RelocatedByteCountMismatch {
+                declared: layout.relocated_bytes,
+                actual: u64::MAX,
+            },
+        )?;
+
+        let key = relocation_key(relocation);
+        let source_index = sources
+            .binary_search_by_key(&key, |(candidate, _)| *candidate)
+            .ok()
+            .map(|position| sources[position].1)
+            .ok_or(RelocatedGraphError::RelocationSourceMissing {
+                stream: relocation.stream,
+                logical_offset: relocation.logical_offset,
+            })?;
+        if relocated[source_index].kind != ExtentKind::FileData {
+            return Err(RelocatedGraphError::NonPayloadRelocation {
+                stream: relocation.stream,
+                logical_offset: relocation.logical_offset,
+                kind: relocated[source_index].kind,
+            });
+        }
+        relocated[source_index].placement = Placement::Physical {
+            byte_offset: relocation.destination.offset,
+        };
+    }
+
+    if actual_bytes != layout.relocated_bytes {
+        return Err(RelocatedGraphError::RelocatedByteCountMismatch {
+            declared: layout.relocated_bytes,
+            actual: actual_bytes,
+        });
+    }
+    rebuild_relocated_graph(source, relocated)
+}
+
+type PhysicalExtentKey = (StreamId, u64, u64, u64);
+
+const fn relocation_key(relocation: &Relocation) -> PhysicalExtentKey {
+    (
+        relocation.stream,
+        relocation.logical_offset,
+        relocation.source.offset,
+        relocation.source.length,
+    )
+}
+
+fn physical_extent_index(
+    extents: &[crate::extent::Extent],
+) -> Result<Vec<(PhysicalExtentKey, usize)>, RelocatedGraphError> {
+    let mut sources = Vec::new();
+    sources
+        .try_reserve_exact(extents.len())
+        .map_err(|_| RelocatedGraphError::AllocationFailed)?;
+    for (index, extent) in extents.iter().enumerate() {
+        if let Placement::Physical { byte_offset } = extent.placement {
+            sources.push((
+                (
+                    extent.stream,
+                    extent.logical_offset,
+                    byte_offset,
+                    extent.length,
+                ),
+                index,
+            ));
+        }
+    }
+    sources.sort_unstable_by_key(|(key, _)| *key);
+    Ok(sources)
+}
+
+fn rebuild_relocated_graph(
+    source: &ObjectGraph,
+    relocated: Vec<crate::extent::Extent>,
+) -> Result<ObjectGraph, RelocatedGraphError> {
+    let extents = ExtentGraph::build(
+        relocated,
+        source.extents().volume_bytes(),
+        source.extents().extents().len(),
+    )
+    .map_err(RelocatedGraphError::Extents)?;
+    let limits = ObjectGraphLimits {
+        max_objects: source.objects().len().max(1),
+        max_entries: source.entries().len().max(1),
+        max_streams: source
+            .objects()
+            .iter()
+            .map(|object| object.streams.len())
+            .sum::<usize>()
+            .max(1),
+        max_name_code_units: source
+            .entries()
+            .iter()
+            .map(|entry| entry.name.len())
+            .max()
+            .unwrap_or(1)
+            .max(1),
+    };
+    ObjectGraph::build(
+        source.root(),
+        source.objects().to_vec(),
+        source.entries().to_vec(),
+        extents,
+        limits,
+    )
+    .map_err(RelocatedGraphError::Objects)
+}
 
 /// Solves exact relocation placement for destination reservations.
 ///
@@ -621,6 +867,11 @@ fn allocate_first_fit(free: &mut Vec<ByteRange>, length: u64) -> Option<ByteRang
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extent::Extent;
+    use crate::object::{
+        NamespaceEntry, ObjectId, ObjectKind, ObjectRecord, ObjectSemantics, ObjectStream,
+        StreamFlags, StreamStorage,
+    };
 
     const LIMITS: LayoutLimits = LayoutLimits {
         max_source_extents: 16,
@@ -640,6 +891,85 @@ mod tests {
         DestinationReservation {
             range: ByteRange { offset, length },
             kind: ReservationKind::AllocationMetadata,
+        }
+    }
+
+    fn payload_graph(kind: ExtentKind, offset: u64) -> ObjectGraph {
+        let stream = ObjectStream {
+            id: StreamId(7),
+            name: None,
+            logical_bytes: 512,
+            initialized_bytes: 512,
+            mapped_bytes: 512,
+            allocated_bytes: 512,
+            flags: StreamFlags::default(),
+            storage: StreamStorage::Extents,
+        };
+        let extents = ExtentGraph::build(
+            vec![Extent {
+                stream: StreamId(7),
+                logical_offset: 0,
+                length: 512,
+                placement: Placement::Physical {
+                    byte_offset: offset,
+                },
+                kind,
+            }],
+            8192,
+            1,
+        )
+        .unwrap();
+        ObjectGraph::build(
+            ObjectId(0),
+            vec![
+                ObjectRecord {
+                    id: ObjectId(0),
+                    kind: ObjectKind::Directory,
+                    link_count: 0,
+                    semantics: ObjectSemantics::default(),
+                    streams: Vec::new(),
+                },
+                ObjectRecord {
+                    id: ObjectId(1),
+                    kind: ObjectKind::File,
+                    link_count: 1,
+                    semantics: ObjectSemantics::default(),
+                    streams: vec![stream],
+                },
+            ],
+            vec![NamespaceEntry {
+                parent: ObjectId(0),
+                target: ObjectId(1),
+                name: "payload.bin".encode_utf16().collect(),
+            }],
+            extents,
+            ObjectGraphLimits {
+                max_objects: 2,
+                max_entries: 1,
+                max_streams: 1,
+                max_name_code_units: 11,
+            },
+        )
+        .unwrap()
+    }
+
+    fn relocation_layout(source: u64, destination: u64) -> LayoutPlan {
+        LayoutPlan {
+            relocations: vec![Relocation {
+                stream: StreamId(7),
+                logical_offset: 0,
+                source: ByteRange {
+                    offset: source,
+                    length: 512,
+                },
+                destination: ByteRange {
+                    offset: destination,
+                    length: 512,
+                },
+            }],
+            free_after_staging: Vec::new(),
+            relocated_bytes: 512,
+            largest_free_range: 0,
         }
     }
 
@@ -794,6 +1124,101 @@ mod tests {
                 LIMITS,
             ),
             Err(LayoutError::StagingExclusionOverlapsSource { .. })
+        ));
+    }
+
+    #[test]
+    fn relocates_exact_file_payload_extent_without_changing_semantics() {
+        let source = payload_graph(ExtentKind::FileData, 4096);
+        let target = relocate_object_graph(&source, &relocation_layout(4096, 6144)).unwrap();
+
+        assert_eq!(target.root(), source.root());
+        assert_eq!(target.objects(), source.objects());
+        assert_eq!(target.entries(), source.entries());
+        assert_eq!(target.features(), source.features());
+        assert_eq!(
+            target.extents().extents()[0].placement,
+            Placement::Physical { byte_offset: 6144 }
+        );
+        assert_eq!(
+            source.extents().extents()[0].placement,
+            Placement::Physical { byte_offset: 4096 }
+        );
+    }
+
+    #[test]
+    fn relocated_graph_refuses_missing_duplicate_nonpayload_and_overlap() {
+        let source = payload_graph(ExtentKind::FileData, 4096);
+        assert!(matches!(
+            relocate_object_graph(&source, &relocation_layout(3584, 6144)),
+            Err(RelocatedGraphError::RelocationSourceMissing { .. })
+        ));
+
+        let mut duplicate = relocation_layout(4096, 6144);
+        duplicate.relocations.push(Relocation {
+            destination: ByteRange {
+                offset: 6656,
+                length: 512,
+            },
+            ..duplicate.relocations[0]
+        });
+        duplicate.relocated_bytes = 1024;
+        assert!(matches!(
+            relocate_object_graph(&source, &duplicate),
+            Err(RelocatedGraphError::DuplicateRelocationSource { .. })
+        ));
+
+        let metadata = payload_graph(ExtentKind::DirectoryData, 4096);
+        assert!(matches!(
+            relocate_object_graph(&metadata, &relocation_layout(4096, 6144)),
+            Err(RelocatedGraphError::NonPayloadRelocation { .. })
+        ));
+
+        let extents = ExtentGraph::build(
+            vec![
+                source.extents().extents()[0],
+                Extent {
+                    stream: StreamId(8),
+                    logical_offset: 0,
+                    length: 512,
+                    placement: Placement::Physical { byte_offset: 6144 },
+                    kind: ExtentKind::FileData,
+                },
+            ],
+            8192,
+            2,
+        )
+        .unwrap();
+        let second_stream = ObjectStream {
+            id: StreamId(8),
+            name: Some("second".encode_utf16().collect()),
+            logical_bytes: 512,
+            initialized_bytes: 512,
+            mapped_bytes: 512,
+            allocated_bytes: 512,
+            flags: StreamFlags::default(),
+            storage: StreamStorage::Extents,
+        };
+        let mut objects = source.objects().to_vec();
+        objects[1].streams.push(second_stream);
+        let overlap = ObjectGraph::build(
+            source.root(),
+            objects,
+            source.entries().to_vec(),
+            extents,
+            ObjectGraphLimits {
+                max_objects: 2,
+                max_entries: 1,
+                max_streams: 2,
+                max_name_code_units: 11,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            relocate_object_graph(&overlap, &relocation_layout(4096, 6144)),
+            Err(RelocatedGraphError::Extents(
+                ExtentGraphError::PhysicalOverlap { .. }
+            ))
         ));
     }
 }

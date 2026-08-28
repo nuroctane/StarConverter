@@ -83,6 +83,7 @@ fn forward_groups() -> [Vec<OverlayWrite>; 3] {
 fn recovery_bundle() -> RecoveryBundle {
     RecoveryBundle {
         plan_digest: PLAN_DIGEST,
+        relocation_destinations: Vec::new(),
         target_staging: vec![write(2048, 0x12), write(2560, 0x13)],
         backup_boot: vec![write(1024, 0x10)],
         activation: vec![write(1536, 0x11)],

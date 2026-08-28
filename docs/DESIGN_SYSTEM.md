@@ -23,7 +23,7 @@ level below the primary workflow and remain available for audit.
 | `line-strong` | `#59616B` | Focus and active boundaries |
 | `ink` | `#F2F4F5` | Primary text |
 | `ink-muted` | `#9AA1AA` | Secondary labels |
-| `ink-faint` | `#626971` | Disabled and tertiary text |
+| `ink-faint` | `#848C96` | Disabled and tertiary text |
 | `ready` | `#7BFFB2` | Verified success only |
 | `warning` | `#FFC857` | Needs attention; reversible |
 | `danger` | `#FF6077` | Blocker, destructive, or failed |
