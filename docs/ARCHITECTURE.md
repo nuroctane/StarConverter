@@ -37,9 +37,9 @@ operating-system or GUI dependency. Implemented foundations include:
 
 - `fs/exfat_*`: boot regions, dual FAT/bitmap pairing, directory entry sets, allocation ownership,
   recursive inventory, exact timestamp preservation, Up-case semantics, and neutral normalization;
-- `fs/ntfs_*`: boot sector, MFT records, attributes and continuation lists, runlists, `$Bitmap`,
-  `$MFT::$BITMAP`/FILE-state reconciliation, `$Volume`, `$I30` indexes, system-file discovery, and
-  bounded object inventory;
+- `fs/ntfs_*`: boot sector, MFT records, byte-exact `$MFTMirr` comparison for protected records
+  0 through 3, attributes and continuation lists, runlists, `$Bitmap`, `$MFT::$BITMAP`/FILE-state
+  reconciliation, `$Volume`, `$I30` indexes, system-file discovery, and bounded object inventory;
 - `object` and `extent`: normalized namespace/stream model plus physical ownership validation;
 - `geometry`: deterministic destination reservations and conflict relocation;
 - `capsule`: duplicated append-only generation headers, CRCs, SHA-256 payload identity, phase

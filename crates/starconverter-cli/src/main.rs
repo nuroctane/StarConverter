@@ -830,6 +830,18 @@ fn print_inspection(inspection: &ImageInspection) {
             "| NTFS system : {found}/{} records validated",
             discovery.system_records.len()
         );
+        let mirror = match discovery.mft_mirror {
+            starconverter_core::fs::ntfs_discovery::MftMirrorEvidence::Exact { .. } => {
+                "exact (records 0-3)"
+            }
+            starconverter_core::fs::ntfs_discovery::MftMirrorEvidence::Mismatch { .. } => {
+                "MISMATCH; no clean proof"
+            }
+            starconverter_core::fs::ntfs_discovery::MftMirrorEvidence::Incomplete { .. } => {
+                "incomplete; no clean proof"
+            }
+        };
+        println!("| MFT mirror  : {mirror}");
     }
     if let Some(volume) = &inspection.ntfs_volume {
         if let starconverter_core::fs::ntfs_volume::NtfsVolumeEvidence::Complete(info) =

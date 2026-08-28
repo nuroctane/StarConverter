@@ -20,6 +20,7 @@ use crate::fs::ntfs_runlist::{
 use crate::image::{BoundedImageReader, ImageError, ImageFile};
 
 const DATA_ATTRIBUTE_TYPE: u32 = 0x80;
+const MFT_MIRROR_RECORD_COUNT: u64 = 4;
 const SYSTEM_RECORDS: [SystemRecordKind; 3] = [
     SystemRecordKind::MftMirror,
     SystemRecordKind::Volume,
@@ -128,10 +129,28 @@ pub enum SystemRecordEvidence {
     },
 }
 
+/// Byte-exact comparison of the boot-sector `$MFTMirr` copy with `$MFT` records 0 through 3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MftMirrorEvidence {
+    /// All four protected records are present in the decoded `$MFT` mapping and match exactly.
+    Exact {
+        records_compared: u64,
+        bytes_compared: u64,
+    },
+    /// The mirror differs from its authoritative `$MFT` record bytes.
+    Mismatch {
+        record_number: u64,
+        byte_offset_within_record: u64,
+    },
+    /// The bounded discovery pass could not compare all four protected records.
+    Incomplete { reason: IncompleteReason },
+}
+
 /// Bounded NTFS bootstrap result and the first well-known system-record identities.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NtfsSystemDiscovery {
     pub mft: MftBootstrap,
+    pub mft_mirror: MftMirrorEvidence,
     pub system_records: Vec<SystemRecordEvidence>,
     /// Total image bytes read during discovery.
     pub bytes_read: u64,
@@ -369,8 +388,11 @@ pub(crate) fn discover_system_records_with_reader(
         records_read += 1;
     }
 
+    let mft_mirror = validate_mft_mirror(image, boot, &mft, limits, record_size, &mut budget)?;
+
     Ok(NtfsSystemDiscovery {
         mft,
+        mft_mirror,
         system_records,
         bytes_read: budget.used,
     })
@@ -636,6 +658,17 @@ fn read_mft_record_inner(
     record_number: u64,
     record_size: usize,
 ) -> Result<NtfsFileRecord, NtfsDiscoveryError> {
+    let output = read_mft_record_bytes_inner(image, boot, mft, record_number, record_size)?;
+    Ok(parse_file_record(&output)?)
+}
+
+fn read_mft_record_bytes_inner(
+    image: &dyn BoundedImageReader,
+    boot: &NtfsBootSector,
+    mft: &MftBootstrap,
+    record_number: u64,
+    record_size: usize,
+) -> Result<Vec<u8>, NtfsDiscoveryError> {
     if !record_is_mapped(mft, boot, record_number)? {
         return Err(NtfsDiscoveryError::MftRecordOutsideMapping { record_number });
     }
@@ -694,7 +727,95 @@ fn read_mft_record_inner(
     if logical != end || output_offset != record_size {
         return Err(NtfsDiscoveryError::MftRecordOutsideMapping { record_number });
     }
-    Ok(parse_file_record(&output)?)
+    Ok(output)
+}
+
+fn validate_mft_mirror(
+    image: &dyn BoundedImageReader,
+    boot: &NtfsBootSector,
+    mft: &MftBootstrap,
+    limits: NtfsDiscoveryLimits,
+    record_size: usize,
+    budget: &mut ReadBudget,
+) -> Result<MftMirrorEvidence, NtfsDiscoveryError> {
+    let required_records = usize::try_from(MFT_MIRROR_RECORD_COUNT).map_err(|_| {
+        NtfsDiscoveryError::GeometryOverflow {
+            calculation: "$MFTMirr protected record count",
+        }
+    })?;
+    if limits.max_records < required_records {
+        return Ok(MftMirrorEvidence::Incomplete {
+            reason: IncompleteReason::RecordLimit,
+        });
+    }
+    for record_number in 0..MFT_MIRROR_RECORD_COUNT {
+        if !record_is_mapped(mft, boot, record_number)? {
+            return Ok(MftMirrorEvidence::Incomplete {
+                reason: IncompleteReason::MappingContinuationRequired,
+            });
+        }
+    }
+
+    let mirror_start = boot
+        .mft_mirror_lcn
+        .checked_mul(boot.cluster_size_bytes)
+        .ok_or(NtfsDiscoveryError::GeometryOverflow {
+            calculation: "$MFTMirr byte offset",
+        })?;
+    let mirror_bytes = MFT_MIRROR_RECORD_COUNT
+        .checked_mul(boot.mft_record_size.bytes)
+        .ok_or(NtfsDiscoveryError::GeometryOverflow {
+            calculation: "$MFTMirr protected byte length",
+        })?;
+    let mirror_end =
+        mirror_start
+            .checked_add(mirror_bytes)
+            .ok_or(NtfsDiscoveryError::GeometryOverflow {
+                calculation: "$MFTMirr protected byte end",
+            })?;
+    if mirror_end > boot.filesystem_bytes {
+        return Err(NtfsDiscoveryError::UnsupportedDataStorage {
+            reason: "$MFTMirr protected records extend beyond the declared filesystem",
+        });
+    }
+
+    for record_number in 0..MFT_MIRROR_RECORD_COUNT {
+        budget.charge(boot.mft_record_size.bytes)?;
+        let source = read_mft_record_bytes_inner(image, boot, mft, record_number, record_size)?;
+        budget.charge(boot.mft_record_size.bytes)?;
+        let mirror_offset = mirror_start
+            .checked_add(
+                record_number
+                    .checked_mul(boot.mft_record_size.bytes)
+                    .ok_or(NtfsDiscoveryError::GeometryOverflow {
+                        calculation: "$MFTMirr record offset",
+                    })?,
+            )
+            .ok_or(NtfsDiscoveryError::GeometryOverflow {
+                calculation: "$MFTMirr record offset",
+            })?;
+        let mut mirror = vec![0_u8; record_size];
+        read_chunked(image, mirror_offset, &mut mirror)?;
+        if let Some(byte_offset) = source
+            .iter()
+            .zip(&mirror)
+            .position(|(source_byte, mirror_byte)| source_byte != mirror_byte)
+        {
+            return Ok(MftMirrorEvidence::Mismatch {
+                record_number,
+                byte_offset_within_record: u64::try_from(byte_offset).map_err(|_| {
+                    NtfsDiscoveryError::GeometryOverflow {
+                        calculation: "$MFTMirr mismatch byte offset",
+                    }
+                })?,
+            });
+        }
+    }
+
+    Ok(MftMirrorEvidence::Exact {
+        records_compared: MFT_MIRROR_RECORD_COUNT,
+        bytes_compared: mirror_bytes,
+    })
 }
 
 fn read_chunked(
@@ -819,6 +940,11 @@ mod tests {
             let offset = mft_offset + logical;
             image[offset..offset + RECORD_SIZE].copy_from_slice(&file_record(record_number, None));
         }
+        let record_two_offset = mft_offset + 2 * RECORD_SIZE;
+        image[record_two_offset..record_two_offset + RECORD_SIZE]
+            .copy_from_slice(&file_record(2, None));
+        let mirror_offset = 32 * CLUSTER_SIZE;
+        image.copy_within(mft_offset..mft_offset + 4 * RECORD_SIZE, mirror_offset);
         image
     }
 
@@ -892,11 +1018,38 @@ mod tests {
 
         assert!(discovery.mft.mapping_complete);
         assert_eq!(discovery.mft.runlist.extents.len(), 1);
-        assert_eq!(discovery.bytes_read, 4 * RECORD_SIZE as u64);
+        assert_eq!(discovery.bytes_read, 12 * RECORD_SIZE as u64);
         assert_eq!(discovery.system_records.len(), 3);
         assert!(discovery.system_records.iter().all(
             |item| matches!(item, SystemRecordEvidence::Found(identifier) if identifier.in_use)
         ));
+        assert_eq!(
+            discovery.mft_mirror,
+            MftMirrorEvidence::Exact {
+                records_compared: 4,
+                bytes_compared: 4 * RECORD_SIZE as u64,
+            }
+        );
+    }
+
+    #[test]
+    fn retains_exact_mft_mirror_mismatch_location() {
+        let mut bytes = synthetic_image(MFT_LCN, 2, 2);
+        let mirror_offset = 32 * CLUSTER_SIZE;
+        bytes[mirror_offset + RECORD_SIZE + 73] ^= 0x40;
+        let temp = TempImage::create(&bytes);
+        let image = ImageFile::open(&temp.0).unwrap();
+
+        let discovery =
+            discover_system_records(&image, &boot(), NtfsDiscoveryLimits::default()).unwrap();
+
+        assert_eq!(
+            discovery.mft_mirror,
+            MftMirrorEvidence::Mismatch {
+                record_number: 1,
+                byte_offset_within_record: 73,
+            }
+        );
     }
 
     #[test]
@@ -931,6 +1084,12 @@ mod tests {
         .unwrap();
 
         assert_eq!(discovery.bytes_read, RECORD_SIZE as u64);
+        assert_eq!(
+            discovery.mft_mirror,
+            MftMirrorEvidence::Incomplete {
+                reason: IncompleteReason::RecordLimit,
+            }
+        );
         assert!(discovery.system_records.iter().all(|item| matches!(
             item,
             SystemRecordEvidence::Incomplete {

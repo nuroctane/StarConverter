@@ -606,7 +606,7 @@ fn inspect_ntfs(
             calculation: "NTFS cluster size conversion",
         })?,
         boot.minimum_image_bytes,
-        ntfs_health(&volume.volume),
+        ntfs_health(&volume.volume, discovery.mft_mirror),
         InspectionEvidence {
             boot_sector: BootSector::Ntfs(boot),
             boot_redundancy: BootRedundancy::Ntfs(Box::new(boot_redundancy)),
@@ -985,13 +985,25 @@ const fn exfat_health(volume_flags: u16, comparison: ExfatBootRegionComparison) 
     }
 }
 
-const fn ntfs_health(volume: &NtfsVolumeEvidence) -> HealthState {
+const fn ntfs_health(
+    volume: &NtfsVolumeEvidence,
+    mft_mirror: crate::fs::ntfs_discovery::MftMirrorEvidence,
+) -> HealthState {
     match volume {
-        NtfsVolumeEvidence::Complete(information) if information.flags.raw == 0 => {
+        NtfsVolumeEvidence::Complete(information) if information.flags.raw != 0 => {
+            HealthState::Dirty
+        }
+        NtfsVolumeEvidence::Complete(_)
+            if matches!(
+                mft_mirror,
+                crate::fs::ntfs_discovery::MftMirrorEvidence::Exact { .. }
+            ) =>
+        {
             HealthState::Clean
         }
-        NtfsVolumeEvidence::Complete(_) => HealthState::Dirty,
-        NtfsVolumeEvidence::Incomplete { .. } => HealthState::Unknown,
+        NtfsVolumeEvidence::Complete(_) | NtfsVolumeEvidence::Incomplete { .. } => {
+            HealthState::Unknown
+        }
     }
 }
 
@@ -1140,6 +1152,8 @@ mod tests {
             let offset = mft_offset + usize::try_from(record_number).unwrap() * 1024;
             image[offset..offset + 1024].copy_from_slice(&ntfs_file_record(record_number, false));
         }
+        let mirror_offset = 128 * 4096;
+        image.copy_within(mft_offset..mft_offset + 4 * 1024, mirror_offset);
         let backup_offset = image.len() - 512;
         let (primary, backup) = image.split_at_mut(backup_offset);
         backup[..512].copy_from_slice(&primary[..512]);
@@ -1385,6 +1399,35 @@ mod tests {
             ))
         );
         assert!(inspection.normalized_ntfs.is_some());
+    }
+
+    #[test]
+    fn every_protected_mft_mirror_record_region_is_health_authoritative() {
+        let mirror_offset = 128 * 4096;
+        for record_number in 0_u64..4 {
+            for byte_offset in [0_u64, 100, 510, 1023] {
+                let mut bytes = ntfs_image();
+                let mutation =
+                    mirror_offset + usize::try_from(record_number * 1024 + byte_offset).unwrap();
+                bytes[mutation] ^= 1;
+                let temp = TempImage::write(&bytes);
+
+                let inspection = inspect_image(&temp.0).expect("retain mismatched mirror evidence");
+
+                assert_eq!(inspection.profile.state.health, HealthState::Unknown);
+                assert_eq!(
+                    inspection
+                        .ntfs_discovery
+                        .as_ref()
+                        .expect("NTFS discovery")
+                        .mft_mirror,
+                    crate::fs::ntfs_discovery::MftMirrorEvidence::Mismatch {
+                        record_number,
+                        byte_offset_within_record: byte_offset,
+                    }
+                );
+            }
+        }
     }
 
     #[test]

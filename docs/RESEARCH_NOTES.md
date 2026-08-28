@@ -83,6 +83,9 @@ filesystem tooling.
     preparation boundary must fail closed there until a stronger platform authority exists.
 19. Capsule persistence faults must be cut after the image write but before every append write,
     flush, readback, and in-memory adoption boundary; a file-write error is not evidence of absence.
+20. A zero `$Volume` dirty flag is necessary but insufficient clean-source evidence. The four
+    protected `$MFT` records must byte-match the boot-sector `$MFTMirr` copy; mismatch or bounded
+    incomplete evidence prevents clean source health and therefore grants no conversion authority.
 
 ## Independent interoperability gate
 
