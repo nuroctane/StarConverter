@@ -510,11 +510,19 @@ fn exfat_image(
 }
 
 fn ntfs_image(graph: &ObjectGraph, partition_offset_sectors: u64) -> Vec<u8> {
+    ntfs_image_with_cluster(graph, partition_offset_sectors, 4096)
+}
+
+fn ntfs_image_with_cluster(
+    graph: &ObjectGraph,
+    partition_offset_sectors: u64,
+    cluster_bytes: u32,
+) -> Vec<u8> {
     let ntfs = plan_ntfs_destination(
         graph,
         NtfsDestinationInputs {
             image_bytes: IMAGE_BYTES,
-            cluster_bytes: 4096,
+            cluster_bytes,
             partition_offset_sectors,
             volume_serial_number: 0x1122_3344_5566_7788,
             // 2026-08-20 12:34:56 UTC as a deterministic NTFS FILETIME. Keeping the fixture inside
@@ -716,6 +724,32 @@ fn export_edge_corpus(
     )
 }
 
+fn export_large_cluster_ntfs(directory: &Path, graph: &ObjectGraph) -> PathBuf {
+    let path = directory.join("ntfs-structural-64k-cluster.img");
+    fs::write(&path, ntfs_image_with_cluster(graph, 0, 65_536)).unwrap();
+    path
+}
+
+fn print_structural_paths(paths: [&Path; 5]) {
+    for (label, path) in [
+        "exFAT",
+        "NTFS",
+        "NTFS 64 KiB-cluster",
+        "exFAT VHD",
+        "NTFS VHD",
+    ]
+    .into_iter()
+    .zip(paths)
+    {
+        println!("{label} fixture: {}", path.display());
+    }
+}
+
+fn print_windows_vhd_paths(ntfs: &Path, exfat: &Path) {
+    println!("Windows NTFS VHD candidate: {}", ntfs.display());
+    println!("Windows exFAT VHD candidate: {}", exfat.display());
+}
+
 #[test]
 #[ignore = "writes regular image fixtures under target for independent tools"]
 fn export_structural_candidate_images() {
@@ -733,6 +767,8 @@ fn export_structural_candidate_images() {
     let ntfs_raw = ntfs_image(&graph, 0);
     let ntfs_path = directory.join("ntfs-structural-activation-blocked.img");
     fs::write(&ntfs_path, ntfs_raw).unwrap();
+
+    let ntfs_large_cluster_path = export_large_cluster_ntfs(&directory, &graph);
 
     let exfat_partition = exfat_image(
         &graph,
@@ -803,22 +839,18 @@ fn export_structural_candidate_images() {
         edge_manifest_path,
     ) = export_edge_corpus(&directory, upcase.encoded_bytes());
 
-    println!("exFAT fixture: {}", exfat_path.display());
-    println!("NTFS fixture: {}", ntfs_path.display());
-    println!("exFAT VHD: {}", exfat_vhd_path.display());
-    println!("NTFS VHD: {}", ntfs_vhd_path.display());
+    print_structural_paths([
+        &exfat_path,
+        &ntfs_path,
+        &ntfs_large_cluster_path,
+        &exfat_vhd_path,
+        &ntfs_vhd_path,
+    ]);
     println!("rich exFAT fixture: {}", rich_exfat_path.display());
     println!("rich NTFS fixture: {}", rich_ntfs_path.display());
     println!("converted NTFS candidate: {exported_ntfs:?}");
     println!("converted exFAT candidate: {exported_exfat:?}");
-    println!(
-        "Windows NTFS VHD candidate: {}",
-        windows_ntfs_vhd_path.display()
-    );
-    println!(
-        "Windows exFAT VHD candidate: {}",
-        windows_exfat_vhd_path.display()
-    );
+    print_windows_vhd_paths(&windows_ntfs_vhd_path, &windows_exfat_vhd_path);
     println!("rich manifest: {}", manifest_path.display());
     println!("edge exFAT fixture: {}", edge_exfat_path.display());
     println!("edge NTFS fixture: {}", edge_ntfs_path.display());

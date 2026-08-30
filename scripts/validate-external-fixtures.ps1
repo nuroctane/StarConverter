@@ -10,6 +10,7 @@ $repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
 $fixtureRoot = Join-Path $repoRoot "target\external-validator-fixtures"
 $exfatImage = Join-Path $fixtureRoot "exfat-structural-recommended-upcase.img"
 $ntfsImage = Join-Path $fixtureRoot "ntfs-structural-activation-blocked.img"
+$ntfsLargeClusterImage = Join-Path $fixtureRoot "ntfs-structural-64k-cluster.img"
 $exfatVhd = Join-Path $fixtureRoot "exfat-structural-validation.vhd"
 $ntfsVhd = Join-Path $fixtureRoot "ntfs-structural-validation.vhd"
 $richExfatImage = Join-Path $fixtureRoot "exfat-rich-namespace-payload.img"
@@ -35,6 +36,7 @@ $edgeManifest = Join-Path $fixtureRoot "edge-corpus-manifest.tsv"
 $allFixtures = @(
     $exfatImage,
     $ntfsImage,
+    $ntfsLargeClusterImage,
     $exfatVhd,
     $ntfsVhd,
     $richExfatImage,
@@ -110,6 +112,7 @@ try {
 
     $exfatWsl = Convert-ToWslPath $exfatImage
     $ntfsWsl = Convert-ToWslPath $ntfsImage
+    $ntfsLargeClusterWsl = Convert-ToWslPath $ntfsLargeClusterImage
     $richExfatWsl = Convert-ToWslPath $richExfatImage
     $richNtfsWsl = Convert-ToWslPath $richNtfsImage
     $convertedNtfsWsl = Convert-ToWslPath $convertedNtfsImage
@@ -125,6 +128,9 @@ try {
     Invoke-WslValidator "bin/ntfsinfo" @("-m", $ntfsWsl)
     Invoke-WslValidator "bin/ntfsls" @("-s", "-l", $ntfsWsl)
     Invoke-WslValidator "bin/ntfsfix" @("-n", $ntfsWsl)
+    Invoke-WslValidator "bin/ntfsinfo" @("-m", $ntfsLargeClusterWsl)
+    Invoke-WslValidator "bin/ntfsls" @("-s", "-l", $ntfsLargeClusterWsl)
+    Invoke-WslValidator "bin/ntfsfix" @("-n", $ntfsLargeClusterWsl)
     Invoke-WslValidator "usr/sbin/fsck.exfat" @("-n", $richExfatWsl)
     & wsl.exe -u root -- sh $exfatMountValidatorWsl $ValidatorRoot $richExfatWsl
     if ($LASTEXITCODE -ne 0) {

@@ -1201,6 +1201,20 @@ mod tests {
             record[bitmap + 24] = 0b0110_1011;
             put_u32(&mut record, bitmap + 32, u32::MAX);
             168
+        } else if record_number == 1 {
+            let attribute = 56;
+            put_u32(&mut record, attribute, 0x80);
+            put_u32(&mut record, attribute + 4, 72);
+            record[attribute + 8] = 1;
+            put_i64(&mut record, attribute + 16, 0);
+            put_i64(&mut record, attribute + 24, 0);
+            put_u16(&mut record, attribute + 32, 64);
+            put_i64(&mut record, attribute + 40, 4096);
+            put_i64(&mut record, attribute + 48, 4096);
+            put_i64(&mut record, attribute + 56, 4096);
+            record[attribute + 64..attribute + 69].copy_from_slice(&[0x21, 1, 0x80, 0, 0]);
+            put_u32(&mut record, attribute + 72, u32::MAX);
+            136
         } else if record_number == 3 {
             let attribute = 56;
             put_u32(&mut record, attribute, 0x70);
@@ -1262,6 +1276,7 @@ mod tests {
             put_u32(&mut record, attribute + 16, 32);
             put_u16(&mut record, attribute + 20, 24);
             record[attribute + 24] = 0b0011_0000;
+            record[attribute + 40] = 0b0000_0001;
             record[attribute + 55] = 0x80;
             put_u32(&mut record, attribute + 56, u32::MAX);
             120
@@ -1381,7 +1396,7 @@ mod tests {
         assert_eq!(inspection.profile.filesystem, FileSystem::Ntfs);
         assert_eq!(inspection.profile.cluster_bytes, 4096);
         assert_eq!(inspection.profile.state.health, HealthState::Clean);
-        assert_eq!(inspection.profile.free_bytes, Some(253 * 4096));
+        assert_eq!(inspection.profile.free_bytes, Some(252 * 4096));
         assert!(inspection.profile.inventory_complete);
         assert!(inspection.ntfs_discovery.is_some());
         assert!(inspection.ntfs_volume.is_some());
@@ -1402,31 +1417,71 @@ mod tests {
     }
 
     #[test]
-    fn every_protected_mft_mirror_record_region_is_health_authoritative() {
+    fn every_used_mft_mirror_record_region_is_health_authoritative() {
         let mirror_offset = 128 * 4096;
-        for record_number in 0_u64..4 {
-            for byte_offset in [0_u64, 100, 510, 1023] {
-                let mut bytes = ntfs_image();
-                let mutation =
-                    mirror_offset + usize::try_from(record_number * 1024 + byte_offset).unwrap();
-                bytes[mutation] ^= 1;
-                let temp = TempImage::write(&bytes);
+        for (record_number, bytes_in_use) in [168_u64, 136, 64, 104].into_iter().enumerate() {
+            let byte_offset = bytes_in_use - 1;
+            let mut bytes = ntfs_image();
+            let mutation =
+                mirror_offset + record_number * 1024 + usize::try_from(byte_offset).unwrap();
+            bytes[mutation] ^= 1;
+            let temp = TempImage::write(&bytes);
 
-                let inspection = inspect_image(&temp.0).expect("retain mismatched mirror evidence");
+            let inspection = inspect_image(&temp.0).expect("retain mismatched mirror evidence");
 
-                assert_eq!(inspection.profile.state.health, HealthState::Unknown);
-                assert_eq!(
-                    inspection
-                        .ntfs_discovery
-                        .as_ref()
-                        .expect("NTFS discovery")
-                        .mft_mirror,
-                    crate::fs::ntfs_discovery::MftMirrorEvidence::Mismatch {
-                        record_number,
-                        byte_offset_within_record: byte_offset,
-                    }
-                );
-            }
+            assert_eq!(inspection.profile.state.health, HealthState::Unknown);
+            assert_eq!(
+                inspection
+                    .ntfs_discovery
+                    .as_ref()
+                    .expect("NTFS discovery")
+                    .mft_mirror,
+                crate::fs::ntfs_discovery::MftMirrorEvidence::Mismatch {
+                    record_number: u64::try_from(record_number).unwrap(),
+                    byte_offset_within_record: byte_offset,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_mft_mirror_records_fail_closed() {
+        let mirror_offset = 128 * 4096;
+        for byte_offset in [0, 510] {
+            let mut bytes = ntfs_image();
+            bytes[mirror_offset + byte_offset] ^= 1;
+            let temp = TempImage::write(&bytes);
+
+            assert!(matches!(
+                inspect_image(&temp.0),
+                Err(InspectionError::InvalidNtfsDiscovery(
+                    NtfsDiscoveryError::FileRecord(_)
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn stale_unused_mft_mirror_tails_do_not_claim_corruption() {
+        let mirror_offset = 128 * 4096;
+        for record_number in 0..4 {
+            let mut bytes = ntfs_image();
+            bytes[mirror_offset + record_number * 1024 + 700] ^= 1;
+            let temp = TempImage::write(&bytes);
+
+            let inspection = inspect_image(&temp.0).expect("ignore unused mirror tail bytes");
+            assert_eq!(inspection.profile.state.health, HealthState::Clean);
+            assert!(matches!(
+                inspection
+                    .ntfs_discovery
+                    .as_ref()
+                    .expect("NTFS discovery")
+                    .mft_mirror,
+                crate::fs::ntfs_discovery::MftMirrorEvidence::Exact {
+                    records_compared: 4,
+                    ..
+                }
+            ));
         }
     }
 

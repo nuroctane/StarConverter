@@ -36,6 +36,15 @@ filesystem tooling.
 - [`exfatprogs`](https://github.com/exfatprogs/exfatprogs): authoritative Linux exFAT utilities,
   allocation movement, validation, and malformed-image fixtures.
 - [`ntfs-3g`](https://github.com/tuxera/ntfs-3g): NTFS parsing and formatting implementation.
+- NTFS-3G [`bootsect.c`](https://github.com/tuxera/ntfs-3g/blob/d327833ec1d5eb1358b6f2c37139f10a3460944d/libntfs-3g/bootsect.c):
+  derives the mirror record count from cluster/FILE-record geometry.
+- NTFS-3G [`volume.c`](https://github.com/tuxera/ntfs-3g/blob/d327833ec1d5eb1358b6f2c37139f10a3460944d/libntfs-3g/volume.c): opens
+  record 1's unnamed `$DATA`, maps its runlist, checks its first LCN against the boot sector, and
+  accepts a positive short complete-record mirror read, and compares repaired record content only
+  through each source FILE record's used size because current Windows may leave later mirror slots
+  and unused tails stale.
+- NTFS-3G [`layout.h`](https://github.com/tuxera/ntfs-3g/blob/d327833ec1d5eb1358b6f2c37139f10a3460944d/include/ntfs-3g/layout.h): defines
+  records 12 through 15 as reserved and `FILE_first_user` as 16, which is the comparison boundary.
 - [`fsck.exfat`](https://github.com/exfatprogs/exfatprogs/blob/master/manpages/fsck.exfat.8):
   independent read-only exFAT consistency checking with `-n`.
 - [`ntfsfix` and the NTFS-3G image-file driver](https://github.com/tuxera/ntfs-3g): independent
@@ -83,9 +92,16 @@ filesystem tooling.
     preparation boundary must fail closed there until a stronger platform authority exists.
 19. Capsule persistence faults must be cut after the image write but before every append write,
     flush, readback, and in-memory adoption boundary; a file-write error is not evidence of absence.
-20. A zero `$Volume` dirty flag is necessary but insufficient clean-source evidence. The four
-    protected `$MFT` records must byte-match the boot-sector `$MFTMirr` copy; mismatch or bounded
-    incomplete evidence prevents clean source health and therefore grants no conversion authority.
+20. A zero `$Volume` dirty flag is necessary but insufficient clean-source evidence. Record 1's
+    unnamed nonresident `$DATA` must own the boot-declared `$MFTMirr` start and completely map its
+    declared allocation. A source mirror may be shorter than the geometry profile when it contains
+    at least four complete records, matching NTFS-3G's positive-short-read behavior; generated
+    destinations remain canonical and geometry-sized. The geometry-sized `$MFT` range must be
+    mapped and initialized, and repaired used content through reserved record 15 (or the shorter
+    mirror end) must match. Malformed, mismatched, or bounded-incomplete evidence prevents clean
+    health. Later mirror records and unused record tails are excluded because current Windows may
+    not refresh them. Complete source mirror-allocation ownership is StarConverter's stronger
+    conversion-authority gate, not a general NTFS validity rule.
 
 ## Independent interoperability gate
 

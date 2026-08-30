@@ -53,6 +53,7 @@ use crate::overlay::OverlayWrite;
 
 const SECTOR_BYTES: u64 = 512;
 const RECORD_BYTES: usize = 1024;
+const MIN_MFT_MIRROR_BYTES: u64 = 4 * RECORD_BYTES as u64;
 const INDEX_BLOCK_BYTES: u64 = 4096;
 const FIRST_USER_RECORD: u64 = 27;
 const SYSTEM_RECORDS: usize = 12;
@@ -582,7 +583,10 @@ impl std::error::Error for NtfsSerializeError {}
 struct MetadataLayout {
     cluster: u64,
     cluster_count: u64,
+    /// Number of formatted FILE slots physically/logically present in `$MFT`.
     record_count: usize,
+    /// Exclusive upper bound of the dense formatter-assigned in-use record range.
+    in_use_record_count: usize,
     mft_clusters: u64,
     mirror_lcn: u64,
     mirror_clusters: u64,
@@ -881,8 +885,14 @@ fn plan_ntfs_destination_impl(
             .ok_or(NtfsSerializeError::ArithmeticOverflow)?;
     }
     placements.sort_unstable_by_key(|value| value.object);
-    let record_count = usize::try_from(next.max(FIRST_USER_RECORD))
+    let in_use_record_count = usize::try_from(next.max(FIRST_USER_RECORD))
         .map_err(|_| NtfsSerializeError::ArithmeticOverflow)?;
+    let mirror_record_count =
+        usize::try_from(mft_mirror_logical_bytes(cluster) / RECORD_BYTES as u64)
+            .map_err(|_| NtfsSerializeError::ArithmeticOverflow)?;
+    // NTFS-3G reads the full geometry-derived mirror span from `$MFT` before comparing only the
+    // reserved prefix. Keep every mirrored slot initialized as a valid (possibly free) FILE record.
+    let record_count = in_use_record_count.max(mirror_record_count);
     let mandatory = mandatory_metadata(
         cluster_count,
         inputs.cluster_bytes,
@@ -893,6 +903,7 @@ fn plan_ntfs_destination_impl(
         cluster,
         cluster_count,
         record_count,
+        in_use_record_count,
         mandatory.secure.sds.len(),
         0,
     )?;
@@ -917,6 +928,7 @@ fn plan_ntfs_destination_impl(
         cluster,
         cluster_count,
         record_count,
+        in_use_record_count,
         mandatory.secure.sds.len(),
         directory_index_clusters,
     )?;
@@ -968,7 +980,7 @@ fn plan_ntfs_destination_impl(
         "$MFTMirr",
         layout.mirror_lcn,
         layout.mirror_clusters,
-        4096,
+        mft_mirror_logical_bytes(layout.cluster),
         layout.cluster,
         inputs.timestamp,
     )?;
@@ -1101,7 +1113,8 @@ fn plan_ntfs_destination_impl(
     }
     let mirror_offset = usize::try_from(layout.mirror_lcn * cluster)
         .map_err(|_| NtfsSerializeError::ArithmeticOverflow)?;
-    let mirror_bytes = SYSTEM_RECORDS.min(4) * RECORD_BYTES;
+    let mirror_bytes = usize::try_from(mft_mirror_logical_bytes(cluster))
+        .map_err(|_| NtfsSerializeError::ArithmeticOverflow)?;
     metadata.copy_within(mft_offset..mft_offset + mirror_bytes, mirror_offset);
     write_attrdef(&mut metadata, layout, &mandatory.attrdef)?;
     write_logfile(&mut metadata, layout, &mandatory.logfile)?;
@@ -1374,6 +1387,7 @@ fn metadata_layout(
     cluster: u64,
     cluster_count: u64,
     record_count: usize,
+    in_use_record_count: usize,
     secure_sds_bytes: usize,
     directory_index_clusters: u64,
 ) -> Result<MetadataLayout, NtfsSerializeError> {
@@ -1385,10 +1399,7 @@ fn metadata_layout(
     let mirror_lcn = MFT_LCN
         .checked_add(mft_clusters)
         .ok_or(NtfsSerializeError::ArithmeticOverflow)?;
-    let mirror_clusters = div_ceil(
-        u64::try_from(SYSTEM_RECORDS.min(4) * RECORD_BYTES).unwrap(),
-        cluster,
-    )?;
+    let mirror_clusters = div_ceil(mft_mirror_logical_bytes(cluster), cluster)?;
     let logfile_lcn = mirror_lcn
         .checked_add(mirror_clusters)
         .ok_or(NtfsSerializeError::ArithmeticOverflow)?;
@@ -1434,6 +1445,7 @@ fn metadata_layout(
         cluster,
         cluster_count,
         record_count,
+        in_use_record_count,
         mft_clusters,
         mirror_lcn,
         mirror_clusters,
@@ -3084,11 +3096,11 @@ fn write_mft_bitmap(metadata: &mut [u8], layout: MetadataLayout) -> Result<(), N
         let record = usize::try_from(record).map_err(|_| NtfsSerializeError::ArithmeticOverflow)?;
         bitmap[record / 8] |= 1 << (record % 8);
     }
-    for record in FIRST_USER_RECORD..u64::try_from(layout.record_count).unwrap_or(u64::MAX) {
+    for record in FIRST_USER_RECORD..u64::try_from(layout.in_use_record_count).unwrap_or(u64::MAX) {
         let record = usize::try_from(record).map_err(|_| NtfsSerializeError::ArithmeticOverflow)?;
         if record / 8 >= bitmap.len() {
             return Err(NtfsSerializeError::MetadataLimitExceeded {
-                actual: u64::try_from(layout.record_count.div_ceil(8)).unwrap_or(u64::MAX),
+                actual: u64::try_from(layout.in_use_record_count.div_ceil(8)).unwrap_or(u64::MAX),
                 maximum: bitmap.len(),
             });
         }
@@ -3111,6 +3123,15 @@ const fn record_sequence(record_number: u64) -> u16 {
 
 const fn align_eight(value: usize) -> usize {
     value.saturating_add(7) & !7
+}
+
+const fn mft_mirror_logical_bytes(cluster: u64) -> u64 {
+    // NTFS-3G bootsect.c at d327833e: four FILE records, or one full cluster when that is larger.
+    if cluster > MIN_MFT_MIRROR_BYTES {
+        cluster
+    } else {
+        MIN_MFT_MIRROR_BYTES
+    }
 }
 
 fn div_ceil(value: u64, divisor: u64) -> Result<u64, NtfsSerializeError> {
@@ -3156,7 +3177,7 @@ mod tests {
     use crate::fs::ntfs_index::{NtfsIndexLimits, parse_index_block, parse_index_root};
     use crate::fs::ntfs_logfile::validate_ntfs_logfile;
     use crate::fs::ntfs_record::parse_file_record;
-    use crate::fs::ntfs_runlist::{MappingPairsLimits, parse_mapping_pairs};
+    use crate::fs::ntfs_runlist::{ExtentLocation, MappingPairsLimits, parse_mapping_pairs};
     use crate::fs::ntfs_secure::validate_ntfs_secure_metadata;
     use crate::object::{ObjectGraphLimits, ObjectSemantics, StreamFlags};
 
@@ -3516,6 +3537,7 @@ mod tests {
         let layout = metadata_layout(
             u64::from(plan.cluster_bytes),
             (plan.image_bytes / SECTOR_BYTES - 1) / (u64::from(plan.cluster_bytes) / SECTOR_BYTES),
+            usize::try_from(record_count).unwrap(),
             usize::try_from(record_count).unwrap(),
             0x400fc,
             0,
@@ -3980,7 +4002,8 @@ mod tests {
             NtfsSerializeLimits::default(),
         )
         .unwrap();
-        let layout = metadata_layout(4096, (IMAGE_BYTES / 512 - 1) / 8, 28, 0x400fc, 0).unwrap();
+        let layout =
+            metadata_layout(4096, (IMAGE_BYTES / 512 - 1) / 8, 28, 28, 0x400fc, 0).unwrap();
 
         let mft = parse_file_record(record(&plan, 0)).unwrap();
         let mft_attrs = parse_attribute_list(
@@ -4108,6 +4131,7 @@ mod tests {
         let layout = metadata_layout(
             4096,
             (IMAGE_BYTES / SECTOR_BYTES - 1) / 8,
+            28,
             28,
             secure.sds.len(),
             0,
@@ -4983,6 +5007,7 @@ mod tests {
     fn sub_cluster_directory_indexes_round_trip_at_large_cluster_sizes() {
         let graph = two_spilled_directories_graph(36);
         for cluster_bytes in [8192, 65_536] {
+            let expected_mirror_records = if cluster_bytes == 8192 { 8 } else { 16 };
             let mut geometry = inputs();
             geometry.cluster_bytes = cluster_bytes;
             let plan =
@@ -4992,6 +5017,17 @@ mod tests {
 
             let temp = TempImage::create(&activated_image(&plan));
             let inspection = crate::inspect::inspect_image(&temp.0).unwrap();
+            assert!(matches!(
+                inspection
+                    .ntfs_discovery
+                    .as_ref()
+                    .expect("NTFS discovery")
+                    .mft_mirror,
+                crate::fs::ntfs_discovery::MftMirrorEvidence::Exact {
+                    records_compared,
+                    ..
+                } if records_compared == expected_mirror_records
+            ));
             let inventory = inspection.ntfs_inventory.as_ref().unwrap();
             for directory in [ObjectId(2), ObjectId(3)] {
                 let record_number = plan
@@ -5009,6 +5045,107 @@ mod tests {
                 assert_eq!(inventoried.directory_entries.len(), 36);
             }
             assert!(inspection.profile.inventory_complete);
+        }
+    }
+
+    #[test]
+    fn large_cluster_mirror_padding_is_initialized_parseable_and_free() {
+        for cluster_bytes in [8192_u32, 65_536] {
+            let mut geometry = inputs();
+            geometry.cluster_bytes = cluster_bytes;
+            let plan = plan_ntfs_destination(
+                &graph(Some(b"payload".to_vec()), false),
+                geometry,
+                NtfsSerializeLimits::default(),
+            )
+            .unwrap();
+            let image = activated_image(&plan);
+            let boot = parse_boot_sector(&image[..512]).unwrap();
+            let cluster = usize::try_from(boot.cluster_size_bytes).unwrap();
+            let mirror_records = cluster / RECORD_BYTES;
+            let mft_offset = usize::try_from(boot.mft_lcn).unwrap() * cluster;
+            let mirror_offset = usize::try_from(boot.mft_mirror_lcn).unwrap() * cluster;
+
+            for record_number in 0..mirror_records {
+                let mft = parse_file_record(
+                    &image[mft_offset + record_number * RECORD_BYTES
+                        ..mft_offset + (record_number + 1) * RECORD_BYTES],
+                )
+                .unwrap();
+                let mirror = parse_file_record(
+                    &image[mirror_offset + record_number * RECORD_BYTES
+                        ..mirror_offset + (record_number + 1) * RECORD_BYTES],
+                )
+                .unwrap();
+                assert_eq!(
+                    mft.record_number,
+                    Some(u32::try_from(record_number).unwrap())
+                );
+                assert_eq!(mirror.record_number, mft.record_number);
+                let expected_in_use = record_number <= 11 || (24..=27).contains(&record_number);
+                assert_eq!(mft.flags.is_in_use(), expected_in_use);
+                assert_eq!(mirror.flags.is_in_use(), expected_in_use);
+            }
+
+            let mft = parse_file_record(&image[mft_offset..mft_offset + RECORD_BYTES]).unwrap();
+            let attributes = parse_attribute_list(
+                mft.repaired_bytes(),
+                usize::from(mft.attributes_offset),
+                usize::try_from(mft.bytes_in_use).unwrap(),
+                AttributeLimits {
+                    cluster_size_bytes: boot.cluster_size_bytes,
+                    ..attr_limits()
+                },
+            )
+            .unwrap();
+            let data = attributes
+                .attributes
+                .iter()
+                .find_map(|attribute| {
+                    (attribute.attribute_type == DATA && attribute.name.is_none())
+                        .then_some(&attribute.body)
+                })
+                .unwrap();
+            let AttributeBody::NonResident(data) = data else {
+                panic!("$MFT::$DATA must be nonresident");
+            };
+            let sizes = data.sizes.unwrap();
+            assert!(sizes.data >= u64::from(cluster_bytes));
+            assert!(sizes.initialized >= u64::from(cluster_bytes));
+
+            let bitmap = attributes
+                .attributes
+                .iter()
+                .find_map(|attribute| {
+                    (attribute.attribute_type == BITMAP && attribute.name.is_none())
+                        .then_some(&attribute.body)
+                })
+                .unwrap();
+            let AttributeBody::NonResident(bitmap) = bitmap else {
+                panic!("$MFT::$BITMAP must be nonresident");
+            };
+            let runlist = parse_mapping_pairs(
+                bitmap.mapping_pairs,
+                MappingPairsLimits {
+                    starting_vcn: 0,
+                    expected_next_vcn: Some(bitmap.expected_next_vcn),
+                    volume_cluster_count: boot.cluster_count,
+                    max_runs: 8,
+                    max_decoded_clusters: boot.cluster_count,
+                },
+            )
+            .unwrap();
+            let bitmap_lcn = match runlist.extents[0].location {
+                ExtentLocation::Physical { lcn } => lcn,
+                ExtentLocation::Sparse => panic!("sparse $MFT::$BITMAP"),
+            };
+            let bitmap_offset = usize::try_from(bitmap_lcn * boot.cluster_size_bytes).unwrap();
+            for record_number in 0..mirror_records {
+                let set =
+                    image[bitmap_offset + record_number / 8] & (1 << (record_number % 8)) != 0;
+                let expected_in_use = record_number <= 11 || (24..=27).contains(&record_number);
+                assert_eq!(set, expected_in_use, "record {record_number}");
+            }
         }
     }
 

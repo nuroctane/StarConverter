@@ -34,7 +34,7 @@ qualification remain pending separately.
 
 ## Reproducing the fixtures
 
-The ignored integration test emits six raw source images, two fixed VHD wrappers, four actual
+The ignored integration test emits seven raw source images, two fixed VHD wrappers, four actual
 cross-format copy-export candidates, four candidate-bound schema-v4 escrow sidecars, and two
 payload manifests beneath
 `target/external-validator-fixtures`:
@@ -59,6 +59,9 @@ detaches it in a trap. No physical device is discovered or selected.
   recommended up-case profile (checksum `0xE619D30D`), not the serializer's reduced unit-test table.
 - `ntfs-structural-activation-blocked.img` includes the structural NTFS metadata implemented at
   that revision. The public serializer still reports `activation_ready() == false`.
+- `ntfs-structural-64k-cluster.img` exercises the large-cluster mirror profile: 64 initialized
+  `$MFT`/`$MFTMirr` FILE slots, exact comparison through reserved record 15, and free formatted
+  padding records whose in-use flags agree with `$MFT::$BITMAP`.
 - `exfat-structural-validation.vhd` and `ntfs-structural-validation.vhd` wrap separately generated
   partition candidates at LBA 2048 behind a deterministic MBR and fixed VHD 1.0 footer. Their boot
   sectors contain that same partition offset; the core independently reparses the MBR, footer,
@@ -89,6 +92,18 @@ closed on output filesystems without hard-link support. Unix publication synchro
 directory before and after partial-link cleanup; Windows evidence explicitly reports directory
 durability as unsupported until a Rust-1.85-compatible safe platform primitive is qualified. The
 fixture command removes and recreates only its named files beneath Cargo's `target` directory.
+
+## 2026-08-29 64 KiB NTFS mirror qualification
+
+The deterministic 16 MiB `ntfs-structural-64k-cluster.img` regular file was checked directly—no
+loop device or mount—using the pinned WSL NTFS-3G validator bundle. `ntfsinfo -m` decoded NTFS 3.1,
+a 65,536-byte cluster, a 65,536-byte `$MFT`, and a 65,536-byte/64-record `$MFTMirr`; `ntfsls -s -l`
+enumerated the system namespace; and `ntfsfix -n` completed `$MFT`/`$MFTMirr` plus alternate-boot
+processing successfully. SHA-256 was identical before and after every read-only command:
+
+```text
+8E15DF062B3F29D53936B8B5B9B05380A21D2919FE0FA735C238EAE72405297A
+```
 
 ## 2026-08-21 expanded corpus
 

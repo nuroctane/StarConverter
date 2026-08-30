@@ -24,10 +24,13 @@ This repository is an engineering pre-alpha, not a drive-writing release. The CL
 regular exFAT or NTFS image read-only, validate redundant boot metadata, reconstruct allocation and
 object evidence, and feed that evidence into the preflight planner. exFAT inspection recursively
 normalizes live objects, names, allocation ownership, extents, both TexFAT bitmap/FAT pairs, and the
-Up-case Table. NTFS inspection bootstraps `$MFT`, byte-compares its first four records with the
-boot-sector `$MFTMirr` copy, validates volume/allocation metadata, and performs a bounded object,
-stream, extent, and directory-index inventory. Both formats now normalize common semantics into the
-same object graph while retaining format-specific preservation evidence.
+Up-case Table. NTFS inspection bootstraps `$MFT`, proves that record 1's unnamed nonresident `$DATA`
+owns the boot-declared `$MFTMirr` location and complete allocation, derives the mirror profile from
+cluster and FILE-record geometry, accepts NTFS-3G-compatible shorter complete-record source mirrors,
+and exactly compares repaired used FILE-record content through reserved record 15 while allowing
+Windows-compatible stale later records and unused tails. It then validates volume/allocation metadata and
+performs a bounded object, stream, extent, and directory-index inventory. Both formats normalize
+common semantics into the same object graph while retaining format-specific preservation evidence.
 Policy-bound adapters map the supported subset in both directions, including exact DOS fields,
 volume identity, canonical case tables, timestamp conversion, and schema-v4 escrow for source-only
 precision, semantics, and proven pinned NTFS security descriptors. Pure exFAT and NTFS serializers
@@ -196,7 +199,7 @@ installed. CI always tests both language stacks.
 - [x] Recursive exFAT object/allocation/extent inventory
 - [x] Lossless exFAT-to-neutral object normalization
 - [x] NTFS FILE/attribute/runlist/index parsers and bounded `$MFT` bootstrap
-- [x] Byte-exact `$MFTMirr` validation for protected `$MFT` records 0 through 3
+- [x] Runlist-owned, geometry-aware `$MFTMirr` validation of repaired used FILE-record content
 - [x] Bounded NTFS volume bitmap and object/stream/directory inventory
 - [x] Exact NTFS bitmap-to-runlist ownership reconciliation, including metadata attributes
 - [x] Complete bounded NTFS attribute census and sparse-only `$BadClus:$Bad` proof

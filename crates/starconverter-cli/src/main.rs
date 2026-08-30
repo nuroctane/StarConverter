@@ -831,14 +831,18 @@ fn print_inspection(inspection: &ImageInspection) {
             discovery.system_records.len()
         );
         let mirror = match discovery.mft_mirror {
-            starconverter_core::fs::ntfs_discovery::MftMirrorEvidence::Exact { .. } => {
-                "exact (records 0-3)"
-            }
+            starconverter_core::fs::ntfs_discovery::MftMirrorEvidence::Exact {
+                records_compared,
+                ..
+            } => format!(
+                "exact used FILE content (records 0-{})",
+                records_compared.saturating_sub(1)
+            ),
             starconverter_core::fs::ntfs_discovery::MftMirrorEvidence::Mismatch { .. } => {
-                "MISMATCH; no clean proof"
+                "MISMATCH; no clean proof".to_owned()
             }
             starconverter_core::fs::ntfs_discovery::MftMirrorEvidence::Incomplete { .. } => {
-                "incomplete; no clean proof"
+                "incomplete; no clean proof".to_owned()
             }
         };
         println!("| MFT mirror  : {mirror}");
@@ -1334,6 +1338,8 @@ mod tests {
             let offset = mft_offset + usize::try_from(record_number).expect("record number") * 1024;
             image[offset..offset + 1024].copy_from_slice(&ntfs_file_record(record_number, false));
         }
+        let mirror_offset = 128 * 4096;
+        image.copy_within(mft_offset..mft_offset + 4 * 1024, mirror_offset);
         let backup_offset = (IMAGE_SECTORS - 1) * SECTOR_BYTES;
         let (prefix, suffix) = image.split_at_mut(backup_offset);
         suffix[..SECTOR_BYTES].copy_from_slice(&prefix[..SECTOR_BYTES]);
@@ -1381,6 +1387,20 @@ mod tests {
             record[bitmap + 24] = 0b0110_1011;
             put_u32(&mut record, bitmap + 32, u32::MAX);
             bitmap + 40
+        } else if record_number == 1 {
+            let attribute = 56;
+            put_u32(&mut record, attribute, 0x80);
+            put_u32(&mut record, attribute + 4, 72);
+            record[attribute + 8] = 1;
+            put_i64(&mut record, attribute + 16, 0);
+            put_i64(&mut record, attribute + 24, 0);
+            put_u16(&mut record, attribute + 32, 64);
+            put_i64(&mut record, attribute + 40, 4096);
+            put_i64(&mut record, attribute + 48, 4096);
+            put_i64(&mut record, attribute + 56, 4096);
+            record[attribute + 64..attribute + 69].copy_from_slice(&[0x21, 1, 0x80, 0, 0]);
+            put_u32(&mut record, attribute + 72, u32::MAX);
+            136
         } else if record_number == 3 {
             let attribute = 56;
             put_u32(&mut record, attribute, 0x70);
@@ -1442,6 +1462,7 @@ mod tests {
             put_u32(&mut record, attribute + 16, 32);
             put_u16(&mut record, attribute + 20, 24);
             record[attribute + 24] = 0b0011_0000;
+            record[attribute + 40] = 0b0000_0001;
             record[attribute + 55] = 0x80;
             put_u32(&mut record, attribute + 56, u32::MAX);
             120
