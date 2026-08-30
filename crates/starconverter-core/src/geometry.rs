@@ -540,14 +540,48 @@ pub fn solve_layout(
 pub fn solve_layout_with_staging_exclusions(
     volume_bytes: u64,
     alignment: u64,
+    source: Vec<SourceAllocation>,
+    reservations: Vec<DestinationReservation>,
+    staging_exclusions: Vec<ByteRange>,
+    limits: LayoutLimits,
+) -> Result<LayoutPlan, LayoutError> {
+    solve_layout_with_staging_exclusions_and_io_alignment(
+        volume_bytes,
+        alignment,
+        alignment,
+        source,
+        reservations,
+        staging_exclusions,
+        limits,
+    )
+}
+
+/// Solves relocation placement when payload allocation and destination I/O have distinct alignment.
+///
+/// Source payload and relocation destinations obey `relocation_alignment`. Destination
+/// reservations and retired-source staging exclusions obey `io_alignment`. This models formats
+/// whose payload clusters are larger than independently writable boot or metadata sectors.
+///
+/// # Errors
+///
+/// Applies the same overlap, capacity, and resource checks as
+/// [`solve_layout_with_staging_exclusions`], and refuses either invalid alignment or a range which
+/// violates the alignment for its role.
+#[allow(clippy::too_many_arguments)]
+pub fn solve_layout_with_staging_exclusions_and_io_alignment(
+    volume_bytes: u64,
+    relocation_alignment: u64,
+    io_alignment: u64,
     mut source: Vec<SourceAllocation>,
     mut reservations: Vec<DestinationReservation>,
     mut staging_exclusions: Vec<ByteRange>,
     limits: LayoutLimits,
 ) -> Result<LayoutPlan, LayoutError> {
     validate_limits(limits)?;
-    if alignment == 0 || !alignment.is_power_of_two() {
-        return Err(LayoutError::InvalidAlignment { alignment });
+    for alignment in [relocation_alignment, io_alignment] {
+        if alignment == 0 || !alignment.is_power_of_two() {
+            return Err(LayoutError::InvalidAlignment { alignment });
+        }
     }
     let protected_count = source
         .len()
@@ -565,9 +599,15 @@ pub fn solve_layout_with_staging_exclusions(
             maximum: limits.max_reservations,
         });
     }
-    validate_ranges(volume_bytes, alignment, &source, &reservations)?;
+    validate_ranges(
+        volume_bytes,
+        relocation_alignment,
+        io_alignment,
+        &source,
+        &reservations,
+    )?;
     for range in &staging_exclusions {
-        validate_range(volume_bytes, alignment, *range)?;
+        validate_range(volume_bytes, io_alignment, *range)?;
     }
     source.sort_unstable_by_key(|value| value.range.offset);
     reservations.sort_unstable_by_key(|value| value.range.offset);
@@ -590,19 +630,24 @@ pub fn solve_layout_with_staging_exclusions(
         .map_err(|_| LayoutError::AllocationFailed)?;
     let mut relocated_bytes = 0_u64;
     for allocation in conflicts {
-        let destination =
-            allocate_first_fit(&mut free, allocation.range.length).ok_or_else(|| {
-                let largest_free_range = free.iter().map(|range| range.length).max().unwrap_or(0);
-                let total_free = free
-                    .iter()
-                    .try_fold(0_u64, |sum, range| sum.checked_add(range.length))
-                    .unwrap_or(u64::MAX);
-                LayoutError::InsufficientStagingSpace {
-                    required: allocation.range.length,
-                    largest_free_range,
-                    total_free,
-                }
-            })?;
+        let destination = allocate_first_fit_aligned(
+            &mut free,
+            allocation.range.length,
+            relocation_alignment,
+            limits.max_free_ranges,
+        )?
+        .ok_or_else(|| {
+            let largest_free_range = free.iter().map(|range| range.length).max().unwrap_or(0);
+            let total_free = free
+                .iter()
+                .try_fold(0_u64, |sum, range| sum.checked_add(range.length))
+                .unwrap_or(u64::MAX);
+            LayoutError::InsufficientStagingSpace {
+                required: allocation.range.length,
+                largest_free_range,
+                total_free,
+            }
+        })?;
         relocated_bytes = relocated_bytes
             .checked_add(allocation.range.length)
             .ok_or(LayoutError::AccountingOverflow)?;
@@ -662,15 +707,16 @@ fn validate_range(volume_bytes: u64, alignment: u64, range: ByteRange) -> Result
 
 fn validate_ranges(
     volume_bytes: u64,
-    alignment: u64,
+    source_alignment: u64,
+    reservation_alignment: u64,
     source: &[SourceAllocation],
     reservations: &[DestinationReservation],
 ) -> Result<(), LayoutError> {
     for value in source {
-        validate_range(volume_bytes, alignment, value.range)?;
+        validate_range(volume_bytes, source_alignment, value.range)?;
     }
     for value in reservations {
-        validate_range(volume_bytes, alignment, value.range)?;
+        validate_range(volume_bytes, reservation_alignment, value.range)?;
     }
     Ok(())
 }
@@ -849,19 +895,65 @@ fn complement(
     Ok(free)
 }
 
-fn allocate_first_fit(free: &mut Vec<ByteRange>, length: u64) -> Option<ByteRange> {
-    let position = free.iter().position(|range| range.length >= length)?;
-    let destination = ByteRange {
-        offset: free[position].offset,
-        length,
-    };
-    if free[position].length == length {
-        free.remove(position);
-    } else {
-        free[position].offset += length;
-        free[position].length -= length;
+fn allocate_first_fit_aligned(
+    free: &mut Vec<ByteRange>,
+    length: u64,
+    alignment: u64,
+    maximum_ranges: usize,
+) -> Result<Option<ByteRange>, LayoutError> {
+    for position in 0..free.len() {
+        let range = free[position];
+        let aligned_offset = range
+            .offset
+            .checked_add(alignment - 1)
+            .ok_or(LayoutError::AccountingOverflow)?
+            & !(alignment - 1);
+        let destination_end = aligned_offset
+            .checked_add(length)
+            .ok_or(LayoutError::AccountingOverflow)?;
+        let range_end = range.end()?;
+        if destination_end > range_end {
+            continue;
+        }
+        let prefix_length = aligned_offset - range.offset;
+        let suffix_length = range_end - destination_end;
+        match (prefix_length, suffix_length) {
+            (0, 0) => {
+                free.remove(position);
+            }
+            (0, suffix) => {
+                free[position] = ByteRange {
+                    offset: destination_end,
+                    length: suffix,
+                };
+            }
+            (prefix, 0) => {
+                free[position].length = prefix;
+            }
+            (prefix, suffix) => {
+                if free.len() >= maximum_ranges {
+                    return Err(LayoutError::FreeRangeLimitExceeded {
+                        maximum: maximum_ranges,
+                    });
+                }
+                free.try_reserve(1)
+                    .map_err(|_| LayoutError::AllocationFailed)?;
+                free[position].length = prefix;
+                free.insert(
+                    position + 1,
+                    ByteRange {
+                        offset: destination_end,
+                        length: suffix,
+                    },
+                );
+            }
+        }
+        return Ok(Some(ByteRange {
+            offset: aligned_offset,
+            length,
+        }));
     }
-    Some(destination)
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -1107,6 +1199,41 @@ mod tests {
                 .iter()
                 .all(|range| range.offset != 1024)
         );
+    }
+
+    #[test]
+    fn sector_aligned_reservations_produce_cluster_aligned_relocations() {
+        assert!(matches!(
+            solve_layout_with_staging_exclusions(
+                32 * 1024,
+                4096,
+                vec![allocation(1, 8192, 4096, true)],
+                vec![reservation(0, 512), reservation(8192, 512)],
+                Vec::new(),
+                LIMITS,
+            ),
+            Err(LayoutError::UnalignedRange {
+                alignment: 4096,
+                ..
+            })
+        ));
+        let plan = solve_layout_with_staging_exclusions_and_io_alignment(
+            32 * 1024,
+            4096,
+            512,
+            vec![allocation(1, 8192, 4096, true)],
+            vec![reservation(0, 512), reservation(8192, 512)],
+            Vec::new(),
+            LIMITS,
+        )
+        .unwrap();
+        assert_eq!(plan.relocations.len(), 1);
+        assert_eq!(plan.relocations[0].destination.offset, 4096);
+        assert_eq!(plan.relocations[0].destination.offset % 4096, 0);
+        assert!(plan.free_after_staging.contains(&ByteRange {
+            offset: 512,
+            length: 3584,
+        }));
     }
 
     #[test]

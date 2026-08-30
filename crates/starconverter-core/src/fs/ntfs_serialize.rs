@@ -12,7 +12,7 @@
 //! formatter profile.
 //!
 //! The supported object subset is intentionally narrow: one namespace link per non-root object,
-//! no security/reparse semantics, no named/sparse/compressed/encrypted streams, resident unnamed
+//! no reparse semantics, no named/sparse/compressed/encrypted streams, resident unnamed
 //! data that fits its FILE record, or cluster-aligned physical unnamed data extents. Directories
 //! must fit a resident or single-level spilled `$I30` tree. Refusal is preferable to silently
 //! weakening semantics.
@@ -222,6 +222,35 @@ pub struct NtfsDestinationPlan {
     exact_object_metadata: bool,
 }
 
+/// Pinned NTFS destination geometry produced before conflicting payload is relocated.
+///
+/// This type deliberately exposes no destination writes. It is a placement contract for the
+/// solver, not an executable plan: [`finalize_ntfs_destination`] must reserialize a relocated graph
+/// and prove that every reservation and object placement remained identical before any bytes are
+/// eligible for phase planning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NtfsDestinationDraft {
+    pub image_bytes: u64,
+    pub cluster_bytes: u32,
+    pub mft_lcn: u64,
+    pub mft_mirror_lcn: u64,
+    pub reservations: Vec<DestinationReservation>,
+    pub source_allocations: Vec<SourceAllocation>,
+    pub object_placements: Vec<NtfsObjectPlacement>,
+    inputs: NtfsDestinationInputs,
+    object_metadata: Vec<NtfsObjectMetadata>,
+    volume_label: Option<Vec<u16>>,
+    limits: NtfsSerializeLimits,
+}
+
+impl NtfsDestinationDraft {
+    /// A draft never authorizes writes or activation.
+    #[must_use]
+    pub const fn activation_ready(&self) -> bool {
+        false
+    }
+}
+
 impl NtfsDestinationPlan {
     /// Activation is intentionally gated until all mandatory NTFS system streams are canonical.
     #[must_use]
@@ -387,6 +416,7 @@ pub enum NtfsSerializeError {
         component: &'static str,
         reason: String,
     },
+    DestinationLayoutChanged,
     Upcase {
         source: NtfsUpcaseError,
     },
@@ -572,6 +602,9 @@ impl fmt::Display for NtfsSerializeError {
             Self::MandatoryMetadata { component, reason } => {
                 write!(f, "could not construct canonical {component}: {reason}")
             }
+            Self::DestinationLayoutChanged => {
+                f.write_str("relocated NTFS serialization changed the pinned destination layout")
+            }
             Self::Upcase { source } => write!(f, "could not construct pinned `$UpCase`: {source}"),
         }
     }
@@ -739,6 +772,7 @@ pub fn plan_ntfs_destination(
         NtfsVolumeProfile::default(),
         limits,
         false,
+        PayloadPlacementMode::Final,
     )
 }
 
@@ -747,8 +781,8 @@ pub fn plan_ntfs_destination(
 /// # Errors
 /// Refuses invalid/capped geometry, unsupported semantics, non-cluster-aligned physical payloads,
 /// metadata conflicts, names which cannot be represented by the strict subset, or FILE/index-root
-/// values which do not fit their bounded resident containers. A future relocation-aware second
-/// pass must rewrite mapping pairs before conflicting payload can be accepted.
+/// values which do not fit their bounded resident containers. Conflicting payload must use
+/// [`draft_ntfs_destination_with_metadata_and_volume`] and [`finalize_ntfs_destination`].
 pub fn plan_ntfs_destination_with_metadata(
     graph: &ObjectGraph,
     inputs: NtfsDestinationInputs,
@@ -781,7 +815,102 @@ pub fn plan_ntfs_destination_with_metadata_and_volume(
     volume: NtfsVolumeProfile<'_>,
     limits: NtfsSerializeLimits,
 ) -> Result<NtfsDestinationPlan, NtfsSerializeError> {
-    plan_ntfs_destination_impl(graph, inputs, metadata, volume, limits, true)
+    plan_ntfs_destination_impl(
+        graph,
+        inputs,
+        metadata,
+        volume,
+        limits,
+        true,
+        PayloadPlacementMode::Final,
+    )
+}
+
+/// Pins NTFS destination geometry while permitting file payload to occupy future metadata space.
+///
+/// The returned draft contains reservations and original source allocations but no write bytes.
+/// Only ordinary file-data extents are marked movable; directory and filesystem metadata remain
+/// protected staging exclusions.
+///
+/// # Errors
+///
+/// Returns the bounded structural errors documented by
+/// [`plan_ntfs_destination_with_metadata_and_volume`], except that payload/metadata conflicts are
+/// represented as relocation work instead of being refused.
+pub fn draft_ntfs_destination_with_metadata_and_volume(
+    graph: &ObjectGraph,
+    inputs: NtfsDestinationInputs,
+    metadata: &[NtfsObjectMetadata],
+    volume: NtfsVolumeProfile<'_>,
+    limits: NtfsSerializeLimits,
+) -> Result<NtfsDestinationDraft, NtfsSerializeError> {
+    let plan = plan_ntfs_destination_impl(
+        graph,
+        inputs,
+        metadata,
+        volume,
+        limits,
+        true,
+        PayloadPlacementMode::RelocationDraft,
+    )?;
+    Ok(NtfsDestinationDraft {
+        image_bytes: plan.image_bytes,
+        cluster_bytes: plan.cluster_bytes,
+        mft_lcn: plan.mft_lcn,
+        mft_mirror_lcn: plan.mft_mirror_lcn,
+        reservations: plan.reservations,
+        source_allocations: plan.source_allocations,
+        object_placements: plan.object_placements,
+        inputs,
+        object_metadata: metadata.to_vec(),
+        volume_label: volume.volume_label.map(<[u16]>::to_vec),
+        limits,
+    })
+}
+
+/// Reserializes a relocated graph against a pinned NTFS destination draft.
+///
+/// The finalized plan retains the draft's original source-allocation ranges so the transaction
+/// planner copies from authenticated source bytes, while every target runlist and `$Bitmap` bit is
+/// generated from `relocated_graph`.
+///
+/// # Errors
+///
+/// Refuses any remaining payload/metadata conflict, final serialization failure, or change to the
+/// draft's reservations, MFT geometry, or object-record assignments.
+pub fn finalize_ntfs_destination(
+    draft: &NtfsDestinationDraft,
+    relocated_graph: &ObjectGraph,
+) -> Result<NtfsDestinationPlan, NtfsSerializeError> {
+    let mut plan = plan_ntfs_destination_impl(
+        relocated_graph,
+        draft.inputs,
+        &draft.object_metadata,
+        NtfsVolumeProfile {
+            volume_label: draft.volume_label.as_deref(),
+        },
+        draft.limits,
+        true,
+        PayloadPlacementMode::Final,
+    )?;
+    if plan.image_bytes != draft.image_bytes
+        || plan.cluster_bytes != draft.cluster_bytes
+        || plan.mft_lcn != draft.mft_lcn
+        || plan.mft_mirror_lcn != draft.mft_mirror_lcn
+        || plan.reservations != draft.reservations
+        || plan.object_placements != draft.object_placements
+    {
+        return Err(NtfsSerializeError::DestinationLayoutChanged);
+    }
+    plan.source_allocations
+        .clone_from(&draft.source_allocations);
+    Ok(plan)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PayloadPlacementMode {
+    Final,
+    RelocationDraft,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -792,6 +921,7 @@ fn plan_ntfs_destination_impl(
     volume: NtfsVolumeProfile<'_>,
     limits: NtfsSerializeLimits,
     exact_object_metadata: bool,
+    payload_mode: PayloadPlacementMode,
 ) -> Result<NtfsDestinationPlan, NtfsSerializeError> {
     validate_limits(limits)?;
     validate_volume_profile(volume)?;
@@ -955,7 +1085,7 @@ fn plan_ntfs_destination_impl(
         });
     }
 
-    let source_allocations = collect_sources(graph, &layout)?;
+    let source_allocations = collect_sources(graph, &layout, payload_mode)?;
     let directory_index_by_object: BTreeMap<_, _> = directory_indexes
         .iter()
         .map(|index| (index.object, index))
@@ -1140,11 +1270,41 @@ fn plan_ntfs_destination_impl(
     }
 
     let backup_offset = inputs.image_bytes - SECTOR_BYTES;
-    let staging_bytes = metadata.split_off(512);
-    let staging_writes = vec![OverlayWrite {
-        offset: SECTOR_BYTES,
-        bytes: staging_bytes,
-    }];
+    let bitmap_offset = layout
+        .bitmap_lcn
+        .checked_mul(cluster)
+        .ok_or(NtfsSerializeError::ArithmeticOverflow)?;
+    let bitmap_end = layout
+        .bitmap_lcn
+        .checked_add(layout.bitmap_clusters)
+        .and_then(|lcn| lcn.checked_mul(cluster))
+        .ok_or(NtfsSerializeError::ArithmeticOverflow)?;
+    let staging_writes = vec![
+        OverlayWrite {
+            offset: SECTOR_BYTES,
+            bytes: metadata[usize::try_from(SECTOR_BYTES)
+                .map_err(|_| NtfsSerializeError::ArithmeticOverflow)?
+                ..usize::try_from(bitmap_offset)
+                    .map_err(|_| NtfsSerializeError::ArithmeticOverflow)?]
+                .to_vec(),
+        },
+        OverlayWrite {
+            offset: bitmap_offset,
+            bytes: metadata[usize::try_from(bitmap_offset)
+                .map_err(|_| NtfsSerializeError::ArithmeticOverflow)?
+                ..usize::try_from(bitmap_end)
+                    .map_err(|_| NtfsSerializeError::ArithmeticOverflow)?]
+                .to_vec(),
+        },
+        OverlayWrite {
+            offset: bitmap_end,
+            bytes: metadata[usize::try_from(bitmap_end)
+                .map_err(|_| NtfsSerializeError::ArithmeticOverflow)?
+                ..usize::try_from(metadata_bytes)
+                    .map_err(|_| NtfsSerializeError::ArithmeticOverflow)?]
+                .to_vec(),
+        },
+    ];
     let backup_boot_write = OverlayWrite {
         offset: backup_offset,
         bytes: boot.clone(),
@@ -1164,7 +1324,21 @@ fn plan_ntfs_destination_impl(
         DestinationReservation {
             range: ByteRange {
                 offset: SECTOR_BYTES,
-                length: metadata_bytes - SECTOR_BYTES,
+                length: bitmap_offset - SECTOR_BYTES,
+            },
+            kind: ReservationKind::NamespaceMetadata,
+        },
+        DestinationReservation {
+            range: ByteRange {
+                offset: bitmap_offset,
+                length: bitmap_end - bitmap_offset,
+            },
+            kind: ReservationKind::AllocationMetadata,
+        },
+        DestinationReservation {
+            range: ByteRange {
+                offset: bitmap_end,
+                length: metadata_bytes - bitmap_end,
             },
             kind: ReservationKind::NamespaceMetadata,
         },
@@ -1296,7 +1470,9 @@ fn validate_objects(
     limits: NtfsSerializeLimits,
 ) -> Result<(), NtfsSerializeError> {
     for object in objects {
-        if object.semantics.has_security_descriptor || object.semantics.is_reparse_point {
+        // The destination graph may truthfully record the pinned `$Secure` descriptor emitted for
+        // every object. Reparse semantics remain unsupported because no reparse payload is emitted.
+        if object.semantics.is_reparse_point {
             return Err(NtfsSerializeError::UnsupportedObjectSemantics { object: object.id });
         }
         if object.link_count > 1 {
@@ -1472,6 +1648,7 @@ fn metadata_layout(
 fn collect_sources(
     graph: &ObjectGraph,
     layout: &MetadataLayout,
+    payload_mode: PayloadPlacementMode,
 ) -> Result<Vec<SourceAllocation>, NtfsSerializeError> {
     let metadata_end = layout.metadata_clusters * layout.cluster;
     let backup_start = graph.extents().volume_bytes() - SECTOR_BYTES;
@@ -1506,7 +1683,10 @@ fn collect_sources(
                 stream: extent.stream,
             });
         }
-        if offset < metadata_end || end > backup_start {
+        let conflicts_with_destination = offset < metadata_end || end > backup_start;
+        if conflicts_with_destination
+            && (payload_mode == PayloadPlacementMode::Final || extent.kind != ExtentKind::FileData)
+        {
             return Err(NtfsSerializeError::PayloadMetadataConflict {
                 stream: extent.stream,
                 offset,
@@ -1519,9 +1699,11 @@ fn collect_sources(
                 offset,
                 length: extent.length,
             },
-            // Runlists and the target $Bitmap currently encode the source LCN. A relocation-aware
-            // second serialization pass must rewrite both before these allocations may move.
-            movable: false,
+            // A draft exposes no bytes. Its movable bit authorizes the solver to move only ordinary
+            // file payload; final serialization regenerates runlists and `$Bitmap` from the solved
+            // graph before a plan can expose writes.
+            movable: payload_mode == PayloadPlacementMode::RelocationDraft
+                && extent.kind == ExtentKind::FileData,
         });
     }
     sources.sort_unstable_by_key(|value| value.range.offset);
@@ -3521,9 +3703,10 @@ mod tests {
     }
 
     fn record(plan: &NtfsDestinationPlan, number: usize) -> &[u8] {
-        let offset = usize::try_from(MFT_LCN).unwrap() * 4096 + number * RECORD_BYTES;
-        let staging_offset = offset - 512;
-        &plan.staging_writes[0].bytes[staging_offset..staging_offset + RECORD_BYTES]
+        let offset =
+            u64::try_from(usize::try_from(MFT_LCN).unwrap() * 4096 + number * RECORD_BYTES)
+                .unwrap();
+        staged_bytes(plan, offset, RECORD_BYTES)
     }
 
     fn root_index_block(plan: &NtfsDestinationPlan) -> &[u8] {
@@ -3544,14 +3727,29 @@ mod tests {
         )
         .unwrap();
         let offset = usize::try_from(layout.directory_indexes_lcn * layout.cluster).unwrap();
-        let staging_offset = offset - usize::try_from(SECTOR_BYTES).unwrap();
-        &plan.staging_writes[0].bytes
-            [staging_offset..staging_offset + usize::try_from(INDEX_BLOCK_BYTES).unwrap()]
+        staged_bytes(
+            plan,
+            u64::try_from(offset).unwrap(),
+            usize::try_from(INDEX_BLOCK_BYTES).unwrap(),
+        )
     }
 
     fn staged_bytes(plan: &NtfsDestinationPlan, offset: u64, length: usize) -> &[u8] {
-        let start = usize::try_from(offset - SECTOR_BYTES).unwrap();
-        &plan.staging_writes[0].bytes[start..start + length]
+        let length_u64 = u64::try_from(length).unwrap();
+        let end = offset.checked_add(length_u64).unwrap();
+        let write = plan
+            .staging_writes
+            .iter()
+            .find(|write| {
+                let write_end = write
+                    .offset
+                    .checked_add(u64::try_from(write.bytes.len()).unwrap())
+                    .unwrap();
+                write.offset <= offset && end <= write_end
+            })
+            .unwrap();
+        let start = usize::try_from(offset - write.offset).unwrap();
+        &write.bytes[start..start + length]
     }
 
     fn directory_index_artifact(
@@ -4045,10 +4243,11 @@ mod tests {
                 lcn: layout.mft_bitmap_lcn
             }
         );
-        let bitmap_offset = usize::try_from(layout.mft_bitmap_lcn * layout.cluster).unwrap()
-            - usize::try_from(SECTOR_BYTES).unwrap();
-        let bitmap = &plan.staging_writes[0].bytes
-            [bitmap_offset..bitmap_offset + usize::try_from(MIN_MFT_BITMAP_BYTES).unwrap()];
+        let bitmap = staged_bytes(
+            &plan,
+            layout.mft_bitmap_lcn * layout.cluster,
+            usize::try_from(MIN_MFT_BITMAP_BYTES).unwrap(),
+        );
         for record in 0..=11 {
             assert_ne!(bitmap[record / 8] & (1 << (record % 8)), 0);
         }
@@ -5210,6 +5409,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn refuses_bad_geometry_caps_and_unapplied_relocation_conflicts() {
         let empty_graph = graph(Some(Vec::new()), false);
         let mut bad = inputs();
@@ -5310,5 +5510,96 @@ mod tests {
             plan_ntfs_destination(&conflict, inputs(), NtfsSerializeLimits::default()),
             Err(NtfsSerializeError::PayloadMetadataConflict { .. })
         ));
+
+        let exact_metadata: Vec<_> = conflict
+            .objects()
+            .iter()
+            .map(|object| NtfsObjectMetadata {
+                object: object.id,
+                object_kind: object.kind,
+                timestamps: NtfsObjectTimestamps::uniform(inputs().timestamp),
+                dos_file_attributes: match object.kind {
+                    ObjectKind::Directory => FILE_ATTRIBUTE_DIRECTORY,
+                    ObjectKind::File => FILE_ATTRIBUTE_ARCHIVE,
+                },
+                security_id: NTFS3G_SECURITY_ID_READ_WRITE,
+            })
+            .collect();
+        let draft = draft_ntfs_destination_with_metadata_and_volume(
+            &conflict,
+            inputs(),
+            &exact_metadata,
+            NtfsVolumeProfile::default(),
+            NtfsSerializeLimits::default(),
+        )
+        .unwrap();
+        assert!(!draft.activation_ready());
+        assert_eq!(draft.source_allocations.len(), 1);
+        assert!(draft.source_allocations[0].movable);
+        assert_eq!(draft.source_allocations[0].range.offset, 4096);
+
+        let relocated_offset = 8 * 1024 * 1024;
+        let relocated_extents = ExtentGraph::build(
+            vec![Extent {
+                stream: StreamId(9),
+                logical_offset: 0,
+                length: 4096,
+                placement: Placement::Physical {
+                    byte_offset: relocated_offset,
+                },
+                kind: ExtentKind::FileData,
+            }],
+            IMAGE_BYTES,
+            2,
+        )
+        .unwrap();
+        let relocated_graph = ObjectGraph::build(
+            conflict.root(),
+            conflict.objects().to_vec(),
+            conflict.entries().to_vec(),
+            relocated_extents,
+            ObjectGraphLimits {
+                max_objects: 4,
+                max_entries: 4,
+                max_streams: 4,
+                max_name_code_units: 255,
+            },
+        )
+        .unwrap();
+        let final_plan = finalize_ntfs_destination(&draft, &relocated_graph).unwrap();
+        assert_eq!(final_plan.source_allocations, draft.source_allocations);
+        let file = parse_file_record(record(&final_plan, 27)).unwrap();
+        let attrs = parse_attribute_list(
+            file.repaired_bytes(),
+            usize::from(file.attributes_offset),
+            usize::try_from(file.bytes_in_use).unwrap(),
+            attr_limits(),
+        )
+        .unwrap();
+        let data = attrs
+            .attributes
+            .iter()
+            .find(|attribute| attribute.attribute_type == DATA)
+            .unwrap();
+        let AttributeBody::NonResident(data) = &data.body else {
+            panic!("nonresident relocated data")
+        };
+        let runs = parse_mapping_pairs(
+            data.mapping_pairs,
+            MappingPairsLimits {
+                starting_vcn: 0,
+                expected_next_vcn: Some(1),
+                volume_cluster_count: IMAGE_BYTES / 4096,
+                max_runs: 4,
+                max_decoded_clusters: 4,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            runs.extents[0].location,
+            ExtentLocation::Physical {
+                lcn: relocated_offset / 4096
+            }
+        );
     }
 }

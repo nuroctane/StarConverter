@@ -15,7 +15,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use sha2::{Digest, Sha256};
 
 use crate::conversion::{OpaqueWriteSets, ReservedWrite};
-use crate::image::{ImageError, ImageFile, ImageIdentity, reject_device_like_path};
+use crate::geometry::{LayoutPlan, Relocation};
+use crate::image::{
+    BoundedImageReader, ImageError, ImageFile, ImageIdentity, reject_device_like_path,
+};
 use crate::inspect::{InspectionError, inspect_open_image};
 use crate::object::ObjectGraph;
 use crate::overlay::OverlayWrite;
@@ -23,7 +26,10 @@ use crate::phase::PhaseWritePreview;
 use crate::preservation::{
     PreservationError, PreservationLimits, PreservationReport, decode_escrow,
 };
-use crate::verify::{VerificationError, VerificationLimits, VerificationManifest, build_manifest};
+use crate::verify::{
+    VerificationError, VerificationLimits, VerificationManifest, build_manifest,
+    build_manifest_with_reader,
+};
 use crate::{FileSystem, GuaranteeMode};
 
 const BOUND_ESCROW_MAGIC: [u8; 8] = *b"STARXESC";
@@ -79,6 +85,7 @@ pub enum CandidateWorkPhase {
     BuildExpectedManifest,
     HashSourceBefore,
     CopySource,
+    RelocatePayload,
     ApplyCandidateWrites,
     SyncCandidate,
     InspectCandidate,
@@ -102,6 +109,7 @@ impl CandidateWorkPhase {
             Self::BuildExpectedManifest => "build expected manifest",
             Self::HashSourceBefore => "hash source before export",
             Self::CopySource => "copy source into private candidate",
+            Self::RelocatePayload => "relocate payload in private candidate",
             Self::ApplyCandidateWrites => "apply candidate writes",
             Self::SyncCandidate => "flush private candidate",
             Self::InspectCandidate => "inspect private candidate",
@@ -265,6 +273,7 @@ pub enum CandidateExportError {
     PreviewDoesNotMatchSource {
         offset: u64,
     },
+    RelocationShape(&'static str),
     ArithmeticOverflow(&'static str),
     Io {
         operation: &'static str,
@@ -395,6 +404,9 @@ impl fmt::Display for CandidateExportError {
                 formatter,
                 "preview rollback bytes do not match the source at offset {offset}"
             ),
+            Self::RelocationShape(reason) => {
+                write!(formatter, "invalid relocation layout: {reason}")
+            }
             Self::ArithmeticOverflow(calculation) => {
                 write!(formatter, "overflow while calculating {calculation}")
             }
@@ -920,6 +932,102 @@ pub fn export_candidate_image_with_progress<F>(
     target_graph: &ObjectGraph,
     preservation: &PreservationReport,
     limits: CandidateExportLimits,
+    observer: F,
+) -> Result<CandidateExportEvidence, CandidateExportError>
+where
+    F: FnMut(CandidateWorkProgress) -> CandidateWorkControl,
+{
+    export_candidate_image_impl(
+        source,
+        output_path,
+        escrow_path,
+        preview,
+        target_graph,
+        None,
+        preservation,
+        limits,
+        observer,
+    )
+}
+
+/// Creates and verifies a new candidate after copying a sealed relocation layout from the source.
+///
+/// Relocations are read only from the immutable source handle and written only to the private
+/// candidate before destination metadata is applied. The expected logical manifest uses a virtual
+/// relocation view over the source, so expected content is never derived from candidate output.
+///
+/// # Errors
+///
+/// Returns the same errors as [`export_candidate_image`] and additionally refuses malformed,
+/// overlapping, out-of-image, uncommitted, or metadata-overlapping relocation destinations.
+#[allow(clippy::too_many_arguments)]
+pub fn export_relocated_candidate_image(
+    source: &ImageFile,
+    output_path: impl AsRef<Path>,
+    escrow_path: Option<&Path>,
+    preview: &PhaseWritePreview,
+    target_graph: &ObjectGraph,
+    layout: &LayoutPlan,
+    preservation: &PreservationReport,
+    limits: CandidateExportLimits,
+) -> Result<CandidateExportEvidence, CandidateExportError> {
+    export_relocated_candidate_image_with_progress(
+        source,
+        output_path,
+        escrow_path,
+        preview,
+        target_graph,
+        layout,
+        preservation,
+        limits,
+        |_| CandidateWorkControl::Continue,
+    )
+}
+
+/// Progress-reporting variant of [`export_relocated_candidate_image`].
+///
+/// # Errors
+///
+/// Returns the same validation, cancellation, I/O, inspection, verification, and publication
+/// errors as [`export_relocated_candidate_image`].
+#[allow(clippy::too_many_arguments)]
+pub fn export_relocated_candidate_image_with_progress<F>(
+    source: &ImageFile,
+    output_path: impl AsRef<Path>,
+    escrow_path: Option<&Path>,
+    preview: &PhaseWritePreview,
+    target_graph: &ObjectGraph,
+    layout: &LayoutPlan,
+    preservation: &PreservationReport,
+    limits: CandidateExportLimits,
+    observer: F,
+) -> Result<CandidateExportEvidence, CandidateExportError>
+where
+    F: FnMut(CandidateWorkProgress) -> CandidateWorkControl,
+{
+    export_candidate_image_impl(
+        source,
+        output_path,
+        escrow_path,
+        preview,
+        target_graph,
+        Some(layout),
+        preservation,
+        limits,
+        observer,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn export_candidate_image_impl<F>(
+    source: &ImageFile,
+    output_path: impl AsRef<Path>,
+    escrow_path: Option<&Path>,
+    preview: &PhaseWritePreview,
+    target_graph: &ObjectGraph,
+    layout: Option<&LayoutPlan>,
+    preservation: &PreservationReport,
+    limits: CandidateExportLimits,
     mut observer: F,
 ) -> Result<CandidateExportEvidence, CandidateExportError>
 where
@@ -955,14 +1063,46 @@ where
         }
     }
 
-    let (write_count, replacement_bytes) = validate_preview(source, preview.writes(), limits)?;
+    let (write_count, write_bytes) = validate_preview(source, preview.writes(), limits)?;
+    let (relocation_count, relocation_bytes, sorted_relocations) = match layout {
+        Some(layout) => {
+            validate_relocations(source, target_graph, preview.writes(), layout, limits)?
+        }
+        None => (0, 0, Vec::new()),
+    };
+    let applied_write_count = write_count.checked_add(relocation_count).ok_or(
+        CandidateExportError::ArithmeticOverflow("candidate operation count"),
+    )?;
+    let replacement_bytes = write_bytes.checked_add(relocation_bytes).ok_or(
+        CandidateExportError::ArithmeticOverflow("candidate replacement byte total"),
+    )?;
+    if applied_write_count > limits.max_writes {
+        return Err(CandidateExportError::WriteLimitExceeded {
+            actual: applied_write_count,
+            maximum: limits.max_writes,
+        });
+    }
+    if replacement_bytes > u64::try_from(limits.max_replacement_bytes).unwrap_or(u64::MAX) {
+        return Err(CandidateExportError::ReplacementLimitExceeded {
+            actual: replacement_bytes,
+            maximum: limits.max_replacement_bytes,
+        });
+    }
     observe_cancellable(
         &mut observer,
         CandidateWorkPhase::BuildExpectedManifest,
         0,
         None,
     )?;
-    let expected_manifest = build_manifest(source, target_graph, limits.verification)?;
+    let expected_manifest = if layout.is_some() {
+        let relocated_source = RelocatedSourceView {
+            source,
+            relocations: &sorted_relocations,
+        };
+        build_manifest_with_reader(&relocated_source, target_graph, limits.verification)?
+    } else {
+        build_manifest(source, target_graph, limits.verification)?
+    };
     let source_sha256 = hash_image_with_progress(
         source,
         limits.copy_chunk_bytes,
@@ -977,6 +1117,16 @@ where
         limits.copy_chunk_bytes,
         &mut observer,
     )?;
+    if layout.is_some() {
+        apply_relocations_with_progress(
+            source,
+            output_guard.file_mut(),
+            &sorted_relocations,
+            limits.copy_chunk_bytes,
+            relocation_bytes,
+            &mut observer,
+        )?;
+    }
     apply_forward_writes_with_progress(
         output_guard.file_mut(),
         preview.writes(),
@@ -1054,7 +1204,7 @@ where
         escrow_path: escrow,
         target_filesystem: preview.target_filesystem(),
         image_bytes: source.len(),
-        applied_writes: write_count,
+        applied_writes: applied_write_count,
         replacement_bytes,
         source_sha256,
         candidate_sha256,
@@ -1238,6 +1388,188 @@ fn validate_preview(
     Ok((count, bytes))
 }
 
+#[derive(Debug)]
+struct RelocatedSourceView<'a> {
+    source: &'a ImageFile,
+    /// Sorted by destination offset and independently validated as disjoint.
+    relocations: &'a [Relocation],
+}
+
+impl BoundedImageReader for RelocatedSourceView<'_> {
+    fn len(&self) -> u64 {
+        self.source.len()
+    }
+
+    fn max_read_bytes(&self) -> usize {
+        BoundedImageReader::max_read_bytes(self.source)
+    }
+
+    fn read_exact_at(&self, offset: u64, length: usize) -> Result<Vec<u8>, ImageError> {
+        let length_u64 = u64::try_from(length).map_err(|_| ImageError::RangeOverflow {
+            offset,
+            length: u64::MAX,
+        })?;
+        let end = offset
+            .checked_add(length_u64)
+            .ok_or(ImageError::RangeOverflow {
+                offset,
+                length: length_u64,
+            })?;
+        let position = self
+            .relocations
+            .partition_point(|relocation| relocation.destination.offset <= offset);
+        if let Some(relocation) = position
+            .checked_sub(1)
+            .and_then(|index| self.relocations.get(index))
+        {
+            let destination_end = relocation
+                .destination
+                .offset
+                .checked_add(relocation.destination.length)
+                .ok_or(ImageError::RangeOverflow {
+                    offset: relocation.destination.offset,
+                    length: relocation.destination.length,
+                })?;
+            if end <= destination_end {
+                let source_offset = relocation
+                    .source
+                    .offset
+                    .checked_add(offset - relocation.destination.offset)
+                    .ok_or(ImageError::RangeOverflow {
+                        offset: relocation.source.offset,
+                        length: offset - relocation.destination.offset,
+                    })?;
+                return self.source.read_exact_at(source_offset, length);
+            }
+        }
+        self.source.read_exact_at(offset, length)
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn validate_relocations(
+    source: &ImageFile,
+    target_graph: &ObjectGraph,
+    writes: &OpaqueWriteSets,
+    layout: &LayoutPlan,
+    limits: CandidateExportLimits,
+) -> Result<(usize, u64, Vec<Relocation>), CandidateExportError> {
+    if layout.relocations.len() > limits.max_writes {
+        return Err(CandidateExportError::WriteLimitExceeded {
+            actual: layout.relocations.len(),
+            maximum: limits.max_writes,
+        });
+    }
+    let mut relocated_bytes = 0_u64;
+    let mut source_ranges = Vec::new();
+    let mut relocations = layout.relocations.clone();
+    source_ranges
+        .try_reserve_exact(relocations.len())
+        .map_err(|_| CandidateExportError::RelocationShape("could not allocate range proof"))?;
+    for relocation in &relocations {
+        if relocation.source.length == 0
+            || relocation.source.length != relocation.destination.length
+        {
+            return Err(CandidateExportError::RelocationShape(
+                "source and destination lengths must be equal and nonzero",
+            ));
+        }
+        let source_end = relocation
+            .source
+            .offset
+            .checked_add(relocation.source.length)
+            .ok_or(CandidateExportError::RelocationShape(
+                "source range overflows",
+            ))?;
+        let destination_end = relocation
+            .destination
+            .offset
+            .checked_add(relocation.destination.length)
+            .ok_or(CandidateExportError::RelocationShape(
+                "destination range overflows",
+            ))?;
+        if source_end > source.len() || destination_end > source.len() {
+            return Err(CandidateExportError::RelocationShape(
+                "range is outside the image",
+            ));
+        }
+        if relocation.source.offset < destination_end && relocation.destination.offset < source_end
+        {
+            return Err(CandidateExportError::RelocationShape(
+                "source and destination overlap",
+            ));
+        }
+        let committed = target_graph.extents().extents().iter().any(|extent| {
+            extent.stream == relocation.stream
+                && extent.logical_offset == relocation.logical_offset
+                && extent.length == relocation.destination.length
+                && extent.placement
+                    == crate::extent::Placement::Physical {
+                        byte_offset: relocation.destination.offset,
+                    }
+        });
+        if !committed {
+            return Err(CandidateExportError::RelocationShape(
+                "target graph does not commit a relocation destination",
+            ));
+        }
+        relocated_bytes = relocated_bytes
+            .checked_add(relocation.source.length)
+            .ok_or(CandidateExportError::ArithmeticOverflow(
+                "relocation byte total",
+            ))?;
+        source_ranges.push((relocation.source.offset, source_end));
+    }
+    if relocated_bytes != layout.relocated_bytes {
+        return Err(CandidateExportError::RelocationShape(
+            "relocated byte total disagrees with the layout",
+        ));
+    }
+    source_ranges.sort_unstable();
+    if source_ranges.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+        return Err(CandidateExportError::RelocationShape(
+            "source ranges overlap",
+        ));
+    }
+    relocations.sort_unstable_by_key(|relocation| relocation.destination.offset);
+    if relocations.windows(2).any(|pair| {
+        pair[0]
+            .destination
+            .offset
+            .checked_add(pair[0].destination.length)
+            .is_none_or(|end| end > pair[1].destination.offset)
+    }) {
+        return Err(CandidateExportError::RelocationShape(
+            "destination ranges overlap",
+        ));
+    }
+    for relocation in &relocations {
+        let destination_end = relocation.destination.offset + relocation.destination.length;
+        for write in writes
+            .target_staging
+            .iter()
+            .chain(&writes.backup_boot)
+            .chain(&writes.activation)
+        {
+            let write_end = write
+                .write
+                .offset
+                .checked_add(u64::try_from(write.write.bytes.len()).map_err(|_| {
+                    CandidateExportError::ArithmeticOverflow("candidate write length")
+                })?)
+                .ok_or(CandidateExportError::ArithmeticOverflow(
+                    "candidate write end",
+                ))?;
+            if relocation.destination.offset < write_end && write.write.offset < destination_end {
+                return Err(CandidateExportError::RelocationShape(
+                    "destination overlaps candidate metadata",
+                ));
+            }
+        }
+    }
+    Ok((relocations.len(), relocated_bytes, relocations))
+}
+
 fn validate_before_image(
     source: &ImageFile,
     forward: &ReservedWrite,
@@ -1407,6 +1739,68 @@ where
             offset,
             Some(source.len()),
         )?;
+    }
+    Ok(())
+}
+
+fn apply_relocations_with_progress<F>(
+    source: &ImageFile,
+    output: &mut File,
+    relocations: &[Relocation],
+    chunk_bytes: usize,
+    relocation_bytes: u64,
+    observer: &mut F,
+) -> Result<(), CandidateExportError>
+where
+    F: FnMut(CandidateWorkProgress) -> CandidateWorkControl,
+{
+    let mut completed = 0_u64;
+    observe_cancellable(
+        observer,
+        CandidateWorkPhase::RelocatePayload,
+        0,
+        Some(relocation_bytes),
+    )?;
+    for relocation in relocations {
+        let mut copied = 0_u64;
+        while copied < relocation.source.length {
+            let remaining = relocation.source.length - copied;
+            let length = usize::try_from(remaining.min(chunk_bytes as u64))
+                .map_err(|_| CandidateExportError::ArithmeticOverflow("relocation chunk length"))?;
+            let source_offset = relocation.source.offset.checked_add(copied).ok_or(
+                CandidateExportError::ArithmeticOverflow("relocation source offset"),
+            )?;
+            let destination_offset = relocation.destination.offset.checked_add(copied).ok_or(
+                CandidateExportError::ArithmeticOverflow("relocation destination offset"),
+            )?;
+            let bytes = source.read_exact_at(source_offset, length)?;
+            output
+                .seek(SeekFrom::Start(destination_offset))
+                .map_err(|source| {
+                    CandidateExportError::io("seek relocation destination", source)
+                })?;
+            output
+                .write_all(&bytes)
+                .map_err(|source| CandidateExportError::io("write relocated payload", source))?;
+            let length_u64 = u64::try_from(length).map_err(|_| {
+                CandidateExportError::ArithmeticOverflow("relocation progress conversion")
+            })?;
+            copied =
+                copied
+                    .checked_add(length_u64)
+                    .ok_or(CandidateExportError::ArithmeticOverflow(
+                        "relocation extent progress",
+                    ))?;
+            completed = completed.checked_add(length_u64).ok_or(
+                CandidateExportError::ArithmeticOverflow("relocation total progress"),
+            )?;
+            observe_cancellable(
+                observer,
+                CandidateWorkPhase::RelocatePayload,
+                completed,
+                Some(relocation_bytes),
+            )?;
+        }
     }
     Ok(())
 }
@@ -1815,14 +2209,29 @@ mod tests {
 
     use super::*;
     use crate::conversion::OpaqueWriteSets;
-    use crate::cross_format::{ExfatToNtfsLimits, ExfatToNtfsOptions, plan_lossless_exfat_to_ntfs};
-    use crate::extent::ExtentGraph;
+    use crate::cross_format::{
+        ExfatToNtfsLimits, ExfatToNtfsOptions, draft_lossless_exfat_to_ntfs,
+        plan_lossless_exfat_to_ntfs, solve_lossless_exfat_to_ntfs,
+    };
+    use crate::extent::{Extent, ExtentGraph, ExtentKind, Placement, StreamId};
+    use crate::fs::exfat_inventory::{ExfatPreservationEvidence, ExfatTimestamps};
+    use crate::fs::exfat_serialize::{
+        ExfatObjectMetadata, ExfatSerializeLimits, ExfatSerializeOptions, ExfatVolumeProfile,
+        serialize_exfat_destination,
+    };
+    use crate::fs::exfat_upcase_serialize::{
+        RECOMMENDED_EXFAT_UPCASE_CHECKSUM, RecommendedExfatUpcaseLimits,
+        generate_recommended_exfat_upcase,
+    };
     use crate::fs::ntfs_inventory::NtfsObjectReference;
     use crate::fs::ntfs_normalize::{
         NormalizedNtfs, NtfsPreservationSidecar, NtfsSecurityDescriptorEvidence,
     };
-    use crate::geometry::ReservationKind;
-    use crate::object::{ObjectGraphLimits, ObjectId, ObjectKind, ObjectRecord, ObjectSemantics};
+    use crate::geometry::{LayoutLimits, ReservationKind};
+    use crate::object::{
+        NamespaceEntry, ObjectGraphLimits, ObjectId, ObjectKind, ObjectRecord, ObjectSemantics,
+        ObjectStream, StreamFlags, StreamStorage,
+    };
     use crate::phase::preview_ntfs_phase_writes;
     use crate::preimage::PreimageLimits;
     use crate::preservation::evaluate_ntfs;
@@ -1984,6 +2393,132 @@ mod tests {
         image
     }
 
+    #[allow(clippy::too_many_lines)]
+    fn exfat_image_with_early_payload() -> (Vec<u8>, Vec<u8>) {
+        const VOLUME_BYTES: u64 = 16 * 1024 * 1024;
+        const CLUSTER_BYTES: u32 = 4096;
+        let root = ObjectId(1);
+        let root_record = ObjectRecord {
+            id: root,
+            kind: ObjectKind::Directory,
+            link_count: 0,
+            semantics: ObjectSemantics::default(),
+            streams: Vec::new(),
+        };
+        let graph_limits = ObjectGraphLimits {
+            max_objects: 4,
+            max_entries: 4,
+            max_streams: 4,
+            max_name_code_units: 255,
+        };
+        let empty_graph = ObjectGraph::build(
+            root,
+            vec![root_record.clone()],
+            Vec::new(),
+            ExtentGraph::build(Vec::new(), VOLUME_BYTES, 4).unwrap(),
+            graph_limits,
+        )
+        .unwrap();
+        let upcase =
+            generate_recommended_exfat_upcase(RecommendedExfatUpcaseLimits::default()).unwrap();
+        let volume = ExfatVolumeProfile {
+            volume_label: None,
+            encoded_upcase_table: upcase.encoded_bytes(),
+            upcase_checksum: RECOMMENDED_EXFAT_UPCASE_CHECKSUM,
+            source_preservation: ExfatPreservationEvidence::default(),
+            allocated_bad_clusters: 0,
+        };
+        let options = ExfatSerializeOptions {
+            bytes_per_cluster: CLUSTER_BYTES,
+            volume_serial_number: 0x1234_abcd,
+            ..ExfatSerializeOptions::default()
+        };
+        let bootstrap = serialize_exfat_destination(
+            &empty_graph,
+            &[],
+            volume,
+            options,
+            ExfatSerializeLimits::default(),
+        )
+        .unwrap();
+        let payload_offset = u64::from(bootstrap.geometry.cluster_heap_offset_sectors) * 512;
+        let payload = (0..usize::try_from(CLUSTER_BYTES).unwrap())
+            .map(|index| u8::try_from(index % 251).unwrap())
+            .collect::<Vec<_>>();
+        let file = ObjectRecord {
+            id: ObjectId(2),
+            kind: ObjectKind::File,
+            link_count: 1,
+            semantics: ObjectSemantics::default(),
+            streams: vec![ObjectStream {
+                id: StreamId(20),
+                name: None,
+                logical_bytes: u64::from(CLUSTER_BYTES),
+                initialized_bytes: u64::from(CLUSTER_BYTES),
+                mapped_bytes: u64::from(CLUSTER_BYTES),
+                allocated_bytes: u64::from(CLUSTER_BYTES),
+                flags: StreamFlags::default(),
+                storage: StreamStorage::Extents,
+            }],
+        };
+        let graph = ObjectGraph::build(
+            root,
+            vec![root_record, file],
+            vec![NamespaceEntry {
+                parent: root,
+                target: ObjectId(2),
+                name: "payload.bin".encode_utf16().collect(),
+            }],
+            ExtentGraph::build(
+                vec![Extent {
+                    stream: StreamId(20),
+                    logical_offset: 0,
+                    length: u64::from(CLUSTER_BYTES),
+                    placement: Placement::Physical {
+                        byte_offset: payload_offset,
+                    },
+                    kind: ExtentKind::FileData,
+                }],
+                VOLUME_BYTES,
+                4,
+            )
+            .unwrap(),
+            graph_limits,
+        )
+        .unwrap();
+        let timestamp = ((2024_u32 - 1980) << 25) | (1 << 21) | (1 << 16);
+        let plan = serialize_exfat_destination(
+            &graph,
+            &[ExfatObjectMetadata {
+                object: ObjectId(2),
+                file_attributes: 0x20,
+                timestamps: ExfatTimestamps {
+                    create: timestamp,
+                    modified: timestamp,
+                    accessed: timestamp,
+                    create_centiseconds: 0,
+                    modified_centiseconds: 0,
+                    create_utc_offset: 0x80,
+                    modified_utc_offset: 0x80,
+                    accessed_utc_offset: 0x80,
+                },
+            }],
+            volume,
+            options,
+            ExfatSerializeLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(plan.reused_payloads[0].stream, StreamId(20));
+        let mut image = vec![0_u8; usize::try_from(VOLUME_BYTES).unwrap()];
+        let payload_start = usize::try_from(payload_offset).unwrap();
+        image[payload_start..payload_start + payload.len()].copy_from_slice(&payload);
+        for write in plan.overlay.writes() {
+            let start = usize::try_from(write.offset).unwrap();
+            image[start..start + write.bytes.len()].copy_from_slice(&write.bytes);
+        }
+        (image, payload)
+    }
+
     fn test_ntfs_escrow_payload() -> Vec<u8> {
         let root = ObjectId(1);
         let graph = ObjectGraph::build(
@@ -2098,6 +2633,69 @@ mod tests {
             "failed export guard must remove its own file"
         );
         assert_eq!(fs::read(&source_file.path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn conflicting_exfat_payload_is_copied_relocated_and_verified_in_new_ntfs_image() {
+        let (source_bytes, payload) = exfat_image_with_early_payload();
+        let source_file = TempFile::create(&source_bytes);
+        let source = ImageFile::open(&source_file.path).unwrap();
+        let inspection = inspect_open_image(&source).unwrap();
+        let normalized = inspection.normalized_exfat.as_deref().unwrap();
+        assert!(matches!(
+            plan_lossless_exfat_to_ntfs(
+                normalized,
+                GuaranteeMode::Escrow,
+                ExfatToNtfsOptions::default(),
+                ExfatToNtfsLimits::default(),
+            ),
+            Err(crate::cross_format::ExfatToNtfsError::Serialization(
+                crate::fs::ntfs_serialize::NtfsSerializeError::PayloadMetadataConflict { .. }
+            ))
+        ));
+        let draft = draft_lossless_exfat_to_ntfs(
+            normalized,
+            GuaranteeMode::Escrow,
+            ExfatToNtfsOptions::default(),
+            ExfatToNtfsLimits::default(),
+        )
+        .unwrap();
+        let solved = solve_lossless_exfat_to_ntfs(draft, LayoutLimits::default()).unwrap();
+        assert_eq!(solved.layout.relocations.len(), 1);
+        let relocation = solved.layout.relocations[0];
+        let preview =
+            preview_ntfs_phase_writes(&source, &solved.destination, PreimageLimits::default())
+                .unwrap();
+        let destination = temp_path("relocated-candidate.ntfs.img");
+        let escrow = temp_path("relocated-candidate.escrow");
+        let evidence = export_relocated_candidate_image(
+            &source,
+            &destination,
+            Some(&escrow),
+            &preview,
+            &solved.target_graph,
+            &solved.layout,
+            &solved.preservation,
+            CandidateExportLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(evidence.target_filesystem, FileSystem::Ntfs);
+        assert_eq!(
+            evidence.applied_writes,
+            preview.writes().target_staging.len()
+                + preview.writes().backup_boot.len()
+                + preview.writes().activation.len()
+                + 1
+        );
+        let candidate_bytes = fs::read(&destination).unwrap();
+        let destination_start = usize::try_from(relocation.destination.offset).unwrap();
+        assert_eq!(
+            &candidate_bytes[destination_start..destination_start + payload.len()],
+            payload
+        );
+        assert_eq!(fs::read(&source_file.path).unwrap(), source_bytes);
+        fs::remove_file(destination).unwrap();
+        fs::remove_file(escrow).unwrap();
     }
 
     #[test]

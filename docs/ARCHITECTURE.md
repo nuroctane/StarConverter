@@ -90,11 +90,13 @@ target audit immediately before crossing the rollback boundary. The trusted init
 initial-capsule boundary is now implemented for mandatory-lock Windows regular files and
 deliberately fails closed on advisory-only hosts. This remains unreachable from frontends because
 neither serializer qualifies for activation and explicit user acceptance policy is unfinished.
-There is intentionally no executable
-in-place conversion command and no physical-device backend. The
-separate copy-based exporter can
-produce a complete target only in a brand-new regular file, so it does not consume or weaken that
-authorization boundary.
+There is intentionally no executable in-place conversion command and no physical-device backend.
+The separate copy-based exporter can produce a complete target only in a brand-new regular file,
+so it does not consume or weaken that authorization boundary. For exFAT→NTFS, it pins a
+write-ineligible NTFS layout draft, solves only ordinary file-data conflicts with separate sector
+and cluster alignment, reserializes every placement-dependent NTFS structure, copies payload from
+the immutable source handle into the private candidate, and builds expected content through a
+virtual relocation view over the source rather than trusting candidate output.
 
 Unsafe Rust is forbidden at workspace level. Platform calls should live behind small, reviewed FFI
 crates only when a safe maintained crate cannot express the operation; that policy change requires a
@@ -156,7 +158,7 @@ The proposed conversion transaction is:
 1. Discover the source without modifying it and require a clean supported filesystem.
 2. Build the complete object, semantic, and extent graph.
 3. Solve destination geometry and calculate exact reservation/relocation space.
-4. Create source-visible placeholder files for destination metadata, scratch, and the capsule.
+4. Pin destination reservations and keep the restart capsule in its separately locked regular file.
 5. Relocate only extents that conflict with mandatory target structures.
 6. Lock and dismount; revalidate stable device identity, geometry, and source metadata digest.
 7. Preserve before-images for every sector that can be overwritten.

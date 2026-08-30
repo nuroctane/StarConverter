@@ -205,7 +205,8 @@ installed. CI always tests both language stacks.
 - [x] Complete bounded NTFS attribute census and sparse-only `$BadClus:$Bad` proof
 - [x] Exact `$MFT::$BITMAP` versus FILE-record in-use reconciliation before normalization
 - [x] `$ATTRIBUTE_LIST` continuation resolution and NTFS-to-neutral normalization
-- [x] Exact relocation geometry solver
+- [x] Exact relocation geometry solver with distinct sector-I/O and payload-cluster alignments
+- [x] Semantic source/projection/relocated-target graph proof without weakening restart commitments
 - [x] Redundant append-only recovery capsule format
 - [x] Immutable overlay view for candidate metadata validation
 - [x] Logical stream/content manifest verifier over regular images
@@ -218,6 +219,10 @@ installed. CI always tests both language stacks.
 - [x] Legacy recovery-only capsules explicitly restricted from forward execution
 - [x] Pure resumable transaction coordinator with pre-activation overlay proof
 - [x] Phase-separated exFAT and NTFS structural destination serializers
+- [x] NTFS layout-draft/solve/finalize pass which regenerates runlists and `$Bitmap` after relocation
+- [x] Create-new exFAT-to-NTFS export which copies sealed relocations from the immutable source,
+      verifies through a virtual source view, reinspects the candidate, and leaves the source hash
+      unchanged
 - [x] Exact regular-image preimage capture for every source-visible write phase
 - [x] Versioned `SCRECOV2` capsule recovery bundle retaining relocation-destination and exact phase before-images
 - [x] Bounded append-only capsule store with exclusive create/resume, one-generation growth,

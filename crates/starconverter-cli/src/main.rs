@@ -9,16 +9,16 @@ use std::process::ExitCode;
 
 use starconverter_core::candidate_export::{
     CandidateExportEvidence, CandidateExportLimits, CandidateVerificationLimits,
-    export_candidate_image, verify_bound_export,
+    export_candidate_image, export_relocated_candidate_image, verify_bound_export,
 };
 use starconverter_core::cross_format::{
     ExfatToNtfsLimits, ExfatToNtfsOptions, NtfsToExfatLimits, NtfsToExfatOptions,
-    plan_lossless_exfat_to_ntfs, plan_lossless_ntfs_to_exfat,
+    draft_lossless_exfat_to_ntfs, plan_lossless_ntfs_to_exfat, solve_lossless_exfat_to_ntfs,
 };
 use starconverter_core::fs::exfat_normalize::NormalizedExfat;
 use starconverter_core::fs::exfat_region::ExfatBootRegionComparison;
 use starconverter_core::fs::ntfs_normalize::NormalizedNtfs;
-use starconverter_core::geometry::{DestinationReservation, SourceAllocation};
+use starconverter_core::geometry::{DestinationReservation, LayoutLimits, SourceAllocation};
 use starconverter_core::image::ImageFile;
 use starconverter_core::inspect::{
     BootRedundancy, BootSector, ImageInspection, inspect_image, inspect_open_image,
@@ -317,22 +317,25 @@ fn export_exfat_source(
     mode: GuaranteeMode,
     requested_escrow: Option<&Path>,
 ) -> Result<CandidateExportEvidence, String> {
-    let plan = plan_lossless_exfat_to_ntfs(
+    let draft = draft_lossless_exfat_to_ntfs(
         normalized,
         mode,
         ExfatToNtfsOptions::default(),
         ExfatToNtfsLimits::default(),
     )
     .map_err(|error| format!("cross-format plan refused: {error}"))?;
+    let plan = solve_lossless_exfat_to_ntfs(draft, LayoutLimits::default())
+        .map_err(|error| format!("payload layout refused: {error}"))?;
     let preview = preview_ntfs_phase_writes(source, &plan.destination, PreimageLimits::default())
         .map_err(|error| format!("phase preview failed: {error}"))?;
     let escrow_path = select_escrow_path(output, &plan.preservation, requested_escrow)?;
-    export_candidate_image(
+    export_relocated_candidate_image(
         source,
         output,
         escrow_path.as_deref(),
         &preview,
         &plan.target_graph,
+        &plan.layout,
         &plan.preservation,
         CandidateExportLimits::default(),
     )
@@ -442,13 +445,15 @@ fn preview_command(args: &[String]) -> Result<(), String> {
         target,
     ) {
         (Some(normalized), None, FileSystem::Ntfs) => {
-            let plan = plan_lossless_exfat_to_ntfs(
+            let draft = draft_lossless_exfat_to_ntfs(
                 normalized,
                 mode,
                 ExfatToNtfsOptions::default(),
                 ExfatToNtfsLimits::default(),
             )
             .map_err(|error| format!("cross-format plan refused: {error}"))?;
+            let plan = solve_lossless_exfat_to_ntfs(draft, LayoutLimits::default())
+                .map_err(|error| format!("payload layout refused: {error}"))?;
             let preview =
                 preview_ntfs_phase_writes(&image, &plan.destination, PreimageLimits::default())
                     .map_err(|error| format!("phase preview failed: {error}"))?;

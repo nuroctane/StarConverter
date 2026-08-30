@@ -20,7 +20,7 @@ use crate::extent::{ExtentKind, Placement};
 use crate::geometry::{
     ByteRange, DestinationReservation, LayoutError, LayoutLimits, LayoutPlan, RelocatedGraphError,
     Relocation, ReservationKind, SourceAllocation, relocate_object_graph,
-    solve_layout_with_staging_exclusions,
+    solve_layout_with_staging_exclusions_and_io_alignment,
 };
 use crate::object::{ObjectGraph, ObjectKind, StreamStorage};
 use crate::overlay::{OverlayError, OverlayLimits, OverlayPlan, OverlayWrite};
@@ -326,6 +326,41 @@ impl PreparedConversion {
     pub fn build_with_target_graph(
         source_graph: &ObjectGraph,
         target_graph: &ObjectGraph,
+        draft: ConversionDraft,
+        relocation_destination_before_images: Vec<OverlayWrite>,
+        limits: ConversionLimits,
+    ) -> Result<Self, ConversionError> {
+        Self::build_with_projected_target_graph(
+            source_graph,
+            source_graph,
+            target_graph,
+            draft,
+            relocation_destination_before_images,
+            limits,
+        )
+    }
+
+    /// Builds a conversion across a semantic filesystem projection and solved payload relocation.
+    ///
+    /// `projected_target_graph` is the destination-format object graph before physical payload
+    /// movement. Its file-data extents must therefore still identify the source allocations used by
+    /// the solver. `target_graph` must equal that projection after applying the sealed layout. The
+    /// durable envelope commits the independently authenticated source graph and the final target
+    /// graph; the projection is a checked construction witness and is never accepted as recovery
+    /// authority by itself.
+    ///
+    /// Call [`Self::build_with_target_graph`] when the conversion changes placement but not graph
+    /// semantics, or [`Self::build`] when neither changes.
+    ///
+    /// # Errors
+    ///
+    /// In addition to [`Self::build_with_target_graph`] errors, refuses a projection whose physical
+    /// file-data extents cannot accept the solved relocation layout.
+    #[allow(clippy::too_many_lines)]
+    pub fn build_with_projected_target_graph(
+        source_graph: &ObjectGraph,
+        projected_target_graph: &ObjectGraph,
+        target_graph: &ObjectGraph,
         mut draft: ConversionDraft,
         mut relocation_destination_before_images: Vec<OverlayWrite>,
         limits: ConversionLimits,
@@ -372,15 +407,16 @@ impl PreparedConversion {
 
         let (live_allocations, staging_exclusions) =
             partition_source_allocations(source_graph, &draft.source_allocations);
-        let layout = solve_layout_with_staging_exclusions(
+        let layout = solve_layout_with_staging_exclusions_and_io_alignment(
             draft.preflight.image.image_bytes,
             draft.preflight.allocation_alignment,
+            u64::from(draft.preflight.sector_bytes),
             live_allocations,
             draft.reservations.clone(),
             staging_exclusions,
             limits.layout,
         )?;
-        let relocated_target = relocate_object_graph(source_graph, &layout)?;
+        let relocated_target = relocate_object_graph(projected_target_graph, &layout)?;
         if &relocated_target != target_graph {
             return Err(ConversionError::TargetGraphMismatch);
         }
@@ -1825,7 +1861,6 @@ fn validate_required_reservations(
         ReservationKind::BootRegion,
         ReservationKind::AllocationMetadata,
         ReservationKind::NamespaceMetadata,
-        ReservationKind::Capsule,
     ] {
         if !reservations
             .iter()
@@ -2625,7 +2660,7 @@ pub(crate) mod tests {
         let mut reservations = value.reservations.clone();
         reservations.sort_unstable_by_key(reservation_sort_key);
         let (live, exclusions) = partition_source_allocations(&source, &value.source_allocations);
-        let layout = solve_layout_with_staging_exclusions(
+        let layout = crate::geometry::solve_layout_with_staging_exclusions(
             value.preflight.image.image_bytes,
             value.preflight.allocation_alignment,
             live,
@@ -2853,6 +2888,96 @@ pub(crate) mod tests {
         assert_eq!(plan.layout().relocations[0].source.offset, 4096);
         assert_ne!(plan.layout().relocations[0].destination.offset, 4096);
         assert_ne!(plan.graph_digest(), plan.target_graph_digest());
+    }
+
+    #[test]
+    fn semantic_projection_is_checked_before_relocation_without_becoming_source_authority() {
+        let (source, value, relocated_source, before_images) = relocation_fixture();
+        let mut objects = source.objects().to_vec();
+        for object in &mut objects {
+            object.semantics.has_security_descriptor = true;
+        }
+        let graph_limits = ObjectGraphLimits {
+            max_objects: objects.len().max(1),
+            max_entries: source.entries().len().max(1),
+            max_streams: objects
+                .iter()
+                .map(|object| object.streams.len())
+                .sum::<usize>()
+                .max(1),
+            max_name_code_units: source
+                .entries()
+                .iter()
+                .map(|entry| entry.name.len())
+                .max()
+                .unwrap_or(1),
+        };
+        let projected = ObjectGraph::build(
+            source.root(),
+            objects.clone(),
+            source.entries().to_vec(),
+            source.extents().clone(),
+            graph_limits,
+        )
+        .unwrap();
+        let relocated_target = ObjectGraph::build(
+            source.root(),
+            objects,
+            source.entries().to_vec(),
+            relocated_source.extents().clone(),
+            graph_limits,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            PreparedConversion::build_with_target_graph(
+                &source,
+                &relocated_target,
+                value.clone(),
+                before_images.clone(),
+                ConversionLimits::default(),
+            ),
+            Err(ConversionError::TargetGraphMismatch)
+        ));
+        let plan = PreparedConversion::build_with_projected_target_graph(
+            &source,
+            &projected,
+            &relocated_target,
+            value,
+            before_images,
+            ConversionLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(plan.layout().relocations.len(), 1);
+        assert_eq!(plan.graph_digest(), digest_graph(&source));
+        assert_eq!(plan.target_graph_digest(), digest_graph(&relocated_target));
+        assert_ne!(plan.graph_digest(), plan.target_graph_digest());
+    }
+
+    #[test]
+    fn external_capsule_store_does_not_require_an_in_image_capsule_reservation() {
+        let mut value = draft();
+        value
+            .reservations
+            .retain(|reservation| reservation.kind != ReservationKind::Capsule);
+        assert!(
+            PreparedConversion::build(&graph(false), value, ConversionLimits::default()).is_ok()
+        );
+
+        for kind in [
+            ReservationKind::BootRegion,
+            ReservationKind::AllocationMetadata,
+            ReservationKind::NamespaceMetadata,
+        ] {
+            let mut missing = draft();
+            missing
+                .reservations
+                .retain(|reservation| reservation.kind != kind);
+            assert!(matches!(
+                PreparedConversion::build(&graph(false), missing, ConversionLimits::default()),
+                Err(ConversionError::MissingReservation { kind: actual }) if actual == kind
+            ));
+        }
     }
 
     #[test]

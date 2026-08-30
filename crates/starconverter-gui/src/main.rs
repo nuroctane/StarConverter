@@ -17,13 +17,15 @@ use starconverter_core::candidate_export::{
     CandidateExportError, CandidateExportEvidence, CandidateExportLimits,
     CandidateVerificationEvidence, CandidateVerificationLimits, CandidateWorkControl,
     CandidateWorkPhase, CandidateWorkProgress, export_candidate_image_with_progress,
-    verify_bound_export_with_progress,
+    export_relocated_candidate_image_with_progress, verify_bound_export_with_progress,
 };
 use starconverter_core::cross_format::{
     ExfatToNtfsLimits, ExfatToNtfsOptions, NtfsToExfatLimits, NtfsToExfatOptions,
-    plan_lossless_exfat_to_ntfs, plan_lossless_ntfs_to_exfat,
+    draft_lossless_exfat_to_ntfs, plan_lossless_ntfs_to_exfat, solve_lossless_exfat_to_ntfs,
 };
-use starconverter_core::geometry::{DestinationReservation, SourceAllocation};
+use starconverter_core::geometry::{
+    DestinationReservation, LayoutLimits, LayoutPlan, SourceAllocation,
+};
 use starconverter_core::image::ImageFile;
 use starconverter_core::inspect::{inspect_image, inspect_open_image};
 use starconverter_core::object::ObjectGraph;
@@ -1353,13 +1355,15 @@ fn build_exact_preview(
         target,
     ) {
         (Some(normalized), None, FileSystem::Ntfs) => {
-            let plan = plan_lossless_exfat_to_ntfs(
+            let draft = draft_lossless_exfat_to_ntfs(
                 normalized,
                 mode,
                 ExfatToNtfsOptions::default(),
                 ExfatToNtfsLimits::default(),
             )
             .map_err(|error| format!("cross-format plan refused: {error}"))?;
+            let plan = solve_lossless_exfat_to_ntfs(draft, LayoutLimits::default())
+                .map_err(|error| format!("payload layout refused: {error}"))?;
             let preview =
                 preview_ntfs_phase_writes(&image, &plan.destination, PreimageLimits::default())
                     .map_err(|error| format!("phase preview failed: {error}"))?;
@@ -1441,7 +1445,7 @@ fn build_candidate_export(
         target,
     ) {
         (Some(normalized), None, FileSystem::Ntfs) => {
-            let plan = plan_lossless_exfat_to_ntfs(
+            let draft = draft_lossless_exfat_to_ntfs(
                 normalized,
                 mode,
                 ExfatToNtfsOptions::default(),
@@ -1450,6 +1454,10 @@ fn build_candidate_export(
             .map_err(|error| {
                 ControlledJobError::Failed(format!("cross-format plan refused: {error}"))
             })?;
+            let plan =
+                solve_lossless_exfat_to_ntfs(draft, LayoutLimits::default()).map_err(|error| {
+                    ControlledJobError::Failed(format!("payload layout refused: {error}"))
+                })?;
             let preview =
                 preview_ntfs_phase_writes(&image, &plan.destination, PreimageLimits::default())
                     .map_err(|error| {
@@ -1460,6 +1468,7 @@ fn build_candidate_export(
                 output_path,
                 &preview,
                 &plan.target_graph,
+                Some(&plan.layout),
                 &plan.preservation,
                 control,
             )?
@@ -1484,6 +1493,7 @@ fn build_candidate_export(
                 output_path,
                 &preview,
                 &plan.target_graph,
+                None,
                 &plan.preservation,
                 control,
             )?
@@ -2862,11 +2872,13 @@ fn exact_preview_report(
     report
 }
 
+#[allow(clippy::option_if_let_else)]
 fn export_gui_candidate(
     source: &ImageFile,
     output: &Path,
     preview: &PhaseWritePreview,
     target_graph: &ObjectGraph,
+    layout: Option<&LayoutPlan>,
     preservation: &PreservationReport,
     control: &JobControl,
 ) -> Result<CandidateExportEvidence, ControlledJobError> {
@@ -2875,17 +2887,30 @@ fn export_gui_candidate(
         name.push(".starconverter-escrow");
         PathBuf::from(name)
     });
-    export_candidate_image_with_progress(
-        source,
-        output,
-        escrow_path.as_deref(),
-        preview,
-        target_graph,
-        preservation,
-        CandidateExportLimits::default(),
-        |progress| control.observe(progress),
-    )
-    .map_err(|error| match error {
+    let result = match layout {
+        Some(layout) => export_relocated_candidate_image_with_progress(
+            source,
+            output,
+            escrow_path.as_deref(),
+            preview,
+            target_graph,
+            layout,
+            preservation,
+            CandidateExportLimits::default(),
+            |progress| control.observe(progress),
+        ),
+        None => export_candidate_image_with_progress(
+            source,
+            output,
+            escrow_path.as_deref(),
+            preview,
+            target_graph,
+            preservation,
+            CandidateExportLimits::default(),
+            |progress| control.observe(progress),
+        ),
+    };
+    result.map_err(|error| match error {
         CandidateExportError::Cancelled { phase } => ControlledJobError::Cancelled(phase),
         error => ControlledJobError::Failed(format!("candidate export failed: {error}")),
     })
