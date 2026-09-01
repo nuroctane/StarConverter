@@ -72,6 +72,50 @@ pub struct LayoutPlan {
     pub largest_free_range: u64,
 }
 
+/// Opaque proof that one exact relocation layout was applied to one exact source graph.
+///
+/// Only the geometry coordinator can create this value. Consumers may inspect its immutable
+/// source, target, and layout views, but cannot substitute a different graph or independently
+/// edited relocation list at the write boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealedRelocationPlan {
+    source_graph: ObjectGraph,
+    target_graph: ObjectGraph,
+    layout: LayoutPlan,
+}
+
+impl SealedRelocationPlan {
+    pub(crate) fn seal(
+        source_graph: ObjectGraph,
+        layout: LayoutPlan,
+    ) -> Result<Self, RelocatedGraphError> {
+        let target_graph = relocate_object_graph(&source_graph, &layout)?;
+        Ok(Self {
+            source_graph,
+            target_graph,
+            layout,
+        })
+    }
+
+    /// Exact graph whose physical payload tuples authorize relocation reads.
+    #[must_use]
+    pub const fn source_graph(&self) -> &ObjectGraph {
+        &self.source_graph
+    }
+
+    /// Exact graph derived by applying `layout` to `source_graph`.
+    #[must_use]
+    pub const fn target_graph(&self) -> &ObjectGraph {
+        &self.target_graph
+    }
+
+    /// Exact immutable relocation layout bound to both graphs.
+    #[must_use]
+    pub const fn layout(&self) -> &LayoutPlan {
+        &self.layout
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LayoutLimits {
     pub max_source_extents: usize,
@@ -98,6 +142,10 @@ pub enum LayoutError {
     },
     InvalidAlignment {
         alignment: u64,
+    },
+    IncompatibleAlignments {
+        io_alignment: u64,
+        destination_alignment: u64,
     },
     SourceLimitExceeded {
         actual: usize,
@@ -131,6 +179,12 @@ pub enum LayoutError {
         length: u64,
         alignment: u64,
     },
+    DestinationLengthUnaligned {
+        stream: StreamId,
+        logical_offset: u64,
+        length: u64,
+        alignment: u64,
+    },
     SourceOverlap {
         first_offset: u64,
         second_offset: u64,
@@ -152,6 +206,13 @@ pub enum LayoutError {
         source_offset: u64,
         reservation_offset: u64,
     },
+    ImmovableOutsideDestinationDomain {
+        stream: StreamId,
+        source_offset: u64,
+        domain_offset: u64,
+        domain_length: u64,
+        alignment: u64,
+    },
     InsufficientStagingSpace {
         required: u64,
         largest_free_range: u64,
@@ -161,12 +222,20 @@ pub enum LayoutError {
 }
 
 impl fmt::Display for LayoutError {
+    #[allow(clippy::too_many_lines)]
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidLimit { field } => write!(formatter, "layout limit {field} is zero"),
             Self::InvalidAlignment { alignment } => write!(
                 formatter,
                 "layout alignment {alignment} is not a nonzero power of two"
+            ),
+            Self::IncompatibleAlignments {
+                io_alignment,
+                destination_alignment,
+            } => write!(
+                formatter,
+                "destination alignment {destination_alignment} is not a multiple of I/O alignment {io_alignment}"
             ),
             Self::SourceLimitExceeded { actual, maximum } => write!(
                 formatter,
@@ -206,6 +275,16 @@ impl fmt::Display for LayoutError {
                 formatter,
                 "range offset {offset}, length {length} is not aligned to {alignment}"
             ),
+            Self::DestinationLengthUnaligned {
+                stream,
+                logical_offset,
+                length,
+                alignment,
+            } => write!(
+                formatter,
+                "stream {} extent at logical byte {logical_offset} has length {length}, which is not aligned to the {alignment}-byte destination allocation unit",
+                stream.0
+            ),
             Self::SourceOverlap {
                 first_offset,
                 second_offset,
@@ -241,6 +320,17 @@ impl fmt::Display for LayoutError {
             } => write!(
                 formatter,
                 "immovable stream {} at {source_offset} conflicts with destination reservation at {reservation_offset}",
+                stream.0
+            ),
+            Self::ImmovableOutsideDestinationDomain {
+                stream,
+                source_offset,
+                domain_offset,
+                domain_length,
+                alignment,
+            } => write!(
+                formatter,
+                "immovable stream {} at {source_offset} is not a {alignment}-byte-aligned placement inside destination domain {domain_offset}..+{domain_length}",
                 stream.0
             ),
             Self::InsufficientStagingSpace {
@@ -572,17 +662,91 @@ pub fn solve_layout_with_staging_exclusions_and_io_alignment(
     volume_bytes: u64,
     relocation_alignment: u64,
     io_alignment: u64,
+    source: Vec<SourceAllocation>,
+    reservations: Vec<DestinationReservation>,
+    staging_exclusions: Vec<ByteRange>,
+    limits: LayoutLimits,
+) -> Result<LayoutPlan, LayoutError> {
+    solve_layout_with_domain_and_alignments_inner(
+        volume_bytes,
+        relocation_alignment,
+        relocation_alignment,
+        io_alignment,
+        ByteRange {
+            offset: 0,
+            length: volume_bytes,
+        },
+        false,
+        source,
+        reservations,
+        staging_exclusions,
+        limits,
+    )
+}
+
+/// Solves relocation placement into one exact destination allocation domain.
+///
+/// `source_alignment` proves that input ranges can be read safely, while
+/// `destination_alignment` independently proves placements consumable by the target filesystem.
+/// Every live source extent must have a destination-aligned length. A movable extent is relocated
+/// when its current placement is outside `destination_domain`, is not destination-aligned, or
+/// overlaps a destination reservation. Relocations are allocated only inside the domain. This is
+/// the required model when a source payload is valid on its original filesystem but cannot be
+/// reused at the same byte offset in a target cluster heap.
+///
+/// # Errors
+///
+/// Applies all checks from [`solve_layout_with_staging_exclusions_and_io_alignment`], validates
+/// the destination domain and all three alignments, and refuses an immovable source which is not
+/// already a valid target placement.
+#[allow(clippy::too_many_arguments)]
+pub fn solve_layout_with_destination_domain_and_alignments(
+    volume_bytes: u64,
+    source_alignment: u64,
+    destination_alignment: u64,
+    io_alignment: u64,
+    destination_domain: ByteRange,
+    source: Vec<SourceAllocation>,
+    reservations: Vec<DestinationReservation>,
+    staging_exclusions: Vec<ByteRange>,
+    limits: LayoutLimits,
+) -> Result<LayoutPlan, LayoutError> {
+    validate_alignments([source_alignment, destination_alignment, io_alignment])?;
+    if destination_alignment % io_alignment != 0 {
+        return Err(LayoutError::IncompatibleAlignments {
+            io_alignment,
+            destination_alignment,
+        });
+    }
+    solve_layout_with_domain_and_alignments_inner(
+        volume_bytes,
+        source_alignment,
+        destination_alignment,
+        io_alignment,
+        destination_domain,
+        true,
+        source,
+        reservations,
+        staging_exclusions,
+        limits,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn solve_layout_with_domain_and_alignments_inner(
+    volume_bytes: u64,
+    source_alignment: u64,
+    destination_alignment: u64,
+    io_alignment: u64,
+    destination_domain: ByteRange,
+    require_aligned_domain: bool,
     mut source: Vec<SourceAllocation>,
     mut reservations: Vec<DestinationReservation>,
     mut staging_exclusions: Vec<ByteRange>,
     limits: LayoutLimits,
 ) -> Result<LayoutPlan, LayoutError> {
     validate_limits(limits)?;
-    for alignment in [relocation_alignment, io_alignment] {
-        if alignment == 0 || !alignment.is_power_of_two() {
-            return Err(LayoutError::InvalidAlignment { alignment });
-        }
-    }
+    validate_alignments([source_alignment, destination_alignment, io_alignment])?;
     let protected_count = source
         .len()
         .checked_add(staging_exclusions.len())
@@ -601,11 +765,17 @@ pub fn solve_layout_with_staging_exclusions_and_io_alignment(
     }
     validate_ranges(
         volume_bytes,
-        relocation_alignment,
+        source_alignment,
         io_alignment,
         &source,
         &reservations,
     )?;
+    if require_aligned_domain {
+        validate_range(volume_bytes, destination_alignment, destination_domain)?;
+    } else {
+        validate_range(volume_bytes, io_alignment, destination_domain)?;
+    }
+    validate_destination_lengths(&source, destination_alignment)?;
     for range in &staging_exclusions {
         validate_range(volume_bytes, io_alignment, *range)?;
     }
@@ -616,7 +786,13 @@ pub fn solve_layout_with_staging_exclusions_and_io_alignment(
     validate_nonoverlap_reservations(&reservations)?;
     validate_staging_exclusions(&source, &staging_exclusions)?;
 
-    let conflicts = collect_conflicts(&source, &reservations, limits.max_relocations)?;
+    let conflicts = collect_conflicts(
+        &source,
+        &reservations,
+        destination_domain,
+        destination_alignment,
+        limits.max_relocations,
+    )?;
     let occupied = union_occupied(
         &source,
         &reservations,
@@ -630,18 +806,17 @@ pub fn solve_layout_with_staging_exclusions_and_io_alignment(
         .map_err(|_| LayoutError::AllocationFailed)?;
     let mut relocated_bytes = 0_u64;
     for allocation in conflicts {
-        let destination = allocate_first_fit_aligned(
+        let destination = allocate_first_fit_aligned_within(
             &mut free,
             allocation.range.length,
-            relocation_alignment,
+            destination_alignment,
+            destination_domain,
             limits.max_free_ranges,
         )?
         .ok_or_else(|| {
-            let largest_free_range = free.iter().map(|range| range.length).max().unwrap_or(0);
-            let total_free = free
-                .iter()
-                .try_fold(0_u64, |sum, range| sum.checked_add(range.length))
-                .unwrap_or(u64::MAX);
+            let (largest_free_range, total_free) =
+                free_capacity_within(&free, destination_domain, destination_alignment)
+                    .unwrap_or((0, 0));
             LayoutError::InsufficientStagingSpace {
                 required: allocation.range.length,
                 largest_free_range,
@@ -676,6 +851,32 @@ fn validate_limits(limits: LayoutLimits) -> Result<(), LayoutError> {
     ] {
         if value == 0 {
             return Err(LayoutError::InvalidLimit { field });
+        }
+    }
+    Ok(())
+}
+
+fn validate_alignments(alignments: [u64; 3]) -> Result<(), LayoutError> {
+    for alignment in alignments {
+        if alignment == 0 || !alignment.is_power_of_two() {
+            return Err(LayoutError::InvalidAlignment { alignment });
+        }
+    }
+    Ok(())
+}
+
+fn validate_destination_lengths(
+    source: &[SourceAllocation],
+    alignment: u64,
+) -> Result<(), LayoutError> {
+    for allocation in source {
+        if allocation.range.length % alignment != 0 {
+            return Err(LayoutError::DestinationLengthUnaligned {
+                stream: allocation.stream,
+                logical_offset: allocation.logical_offset,
+                length: allocation.range.length,
+                alignment,
+            });
         }
     }
     Ok(())
@@ -781,6 +982,8 @@ fn overlaps(left: ByteRange, right: ByteRange) -> Result<bool, LayoutError> {
 fn collect_conflicts(
     source: &[SourceAllocation],
     reservations: &[DestinationReservation],
+    destination_domain: ByteRange,
+    destination_alignment: u64,
     maximum: usize,
 ) -> Result<Vec<SourceAllocation>, LayoutError> {
     let mut conflicts = Vec::new();
@@ -792,10 +995,21 @@ fn collect_conflicts(
             reservation_index += 1;
         }
         let mut current = reservation_index;
-        let mut found = false;
-        while current < reservations.len()
-            && reservations[current].range.offset < allocation.range.end()?
-        {
+        let source_end = allocation.range.end()?;
+        let domain_end = destination_domain.end()?;
+        let mut found = allocation.range.offset < destination_domain.offset
+            || source_end > domain_end
+            || allocation.range.offset % destination_alignment != 0;
+        if found && !allocation.movable {
+            return Err(LayoutError::ImmovableOutsideDestinationDomain {
+                stream: allocation.stream,
+                source_offset: allocation.range.offset,
+                domain_offset: destination_domain.offset,
+                domain_length: destination_domain.length,
+                alignment: destination_alignment,
+            });
+        }
+        while current < reservations.len() && reservations[current].range.offset < source_end {
             if overlaps(allocation.range, reservations[current].range)? {
                 if !allocation.movable {
                     return Err(LayoutError::ImmovableConflict {
@@ -895,24 +1109,30 @@ fn complement(
     Ok(free)
 }
 
-fn allocate_first_fit_aligned(
+fn allocate_first_fit_aligned_within(
     free: &mut Vec<ByteRange>,
     length: u64,
     alignment: u64,
+    domain: ByteRange,
     maximum_ranges: usize,
 ) -> Result<Option<ByteRange>, LayoutError> {
+    let domain_end = domain.end()?;
     for position in 0..free.len() {
         let range = free[position];
-        let aligned_offset = range
-            .offset
+        let range_end = range.end()?;
+        let candidate_start = range.offset.max(domain.offset);
+        let candidate_end = range_end.min(domain_end);
+        if candidate_start >= candidate_end {
+            continue;
+        }
+        let aligned_offset = candidate_start
             .checked_add(alignment - 1)
             .ok_or(LayoutError::AccountingOverflow)?
             & !(alignment - 1);
         let destination_end = aligned_offset
             .checked_add(length)
             .ok_or(LayoutError::AccountingOverflow)?;
-        let range_end = range.end()?;
-        if destination_end > range_end {
+        if destination_end > candidate_end {
             continue;
         }
         let prefix_length = aligned_offset - range.offset;
@@ -954,6 +1174,33 @@ fn allocate_first_fit_aligned(
         }));
     }
     Ok(None)
+}
+
+fn free_capacity_within(
+    free: &[ByteRange],
+    domain: ByteRange,
+    alignment: u64,
+) -> Result<(u64, u64), LayoutError> {
+    let domain_end = domain.end()?;
+    let mut largest = 0_u64;
+    let mut total = 0_u64;
+    for range in free {
+        let candidate_start = range.offset.max(domain.offset);
+        let start = candidate_start
+            .checked_add(alignment - 1)
+            .ok_or(LayoutError::AccountingOverflow)?
+            & !(alignment - 1);
+        let end = range.end()?.min(domain_end);
+        if start >= end {
+            continue;
+        }
+        let length = end - start;
+        largest = largest.max(length);
+        total = total
+            .checked_add(length)
+            .ok_or(LayoutError::AccountingOverflow)?;
+    }
+    Ok((largest, total))
 }
 
 #[cfg(test)]
@@ -1234,6 +1481,237 @@ mod tests {
             offset: 512,
             length: 3584,
         }));
+    }
+
+    #[test]
+    fn target_domain_forces_valid_source_payload_into_cluster_heap() {
+        let plan = solve_layout_with_destination_domain_and_alignments(
+            32 * 1024,
+            512,
+            4096,
+            512,
+            ByteRange {
+                offset: 8192,
+                length: 16 * 1024,
+            },
+            vec![allocation(1, 512, 4096, true)],
+            Vec::new(),
+            Vec::new(),
+            LIMITS,
+        )
+        .unwrap();
+
+        assert_eq!(plan.relocations.len(), 1);
+        assert_eq!(plan.relocations[0].source.offset, 512);
+        assert_eq!(plan.relocations[0].destination.offset, 8192);
+        assert_eq!(plan.relocations[0].destination.offset % 4096, 0);
+        assert!(
+            plan.free_after_staging
+                .iter()
+                .any(|range| range.offset == 0 && range.length == 512)
+        );
+    }
+
+    #[test]
+    fn target_domain_relocates_misaligned_payload_and_honors_exclusions() {
+        let plan = solve_layout_with_destination_domain_and_alignments(
+            32 * 1024,
+            512,
+            4096,
+            512,
+            ByteRange {
+                offset: 8192,
+                length: 16 * 1024,
+            },
+            vec![allocation(1, 8704, 4096, true)],
+            Vec::new(),
+            vec![ByteRange {
+                offset: 16 * 1024,
+                length: 4096,
+            }],
+            LIMITS,
+        )
+        .unwrap();
+
+        assert_eq!(plan.relocations[0].destination.offset, 20 * 1024);
+        assert!(plan.relocations[0].destination.offset >= 8192);
+        assert!(plan.relocations[0].destination.end().unwrap() <= 24 * 1024);
+    }
+
+    #[test]
+    fn full_volume_domain_preserves_legacy_solver_result() {
+        let source = vec![allocation(1, 8192, 4096, true)];
+        let reservations = vec![reservation(8192, 512)];
+        let legacy = solve_layout_with_staging_exclusions_and_io_alignment(
+            32 * 1024,
+            4096,
+            512,
+            source.clone(),
+            reservations.clone(),
+            Vec::new(),
+            LIMITS,
+        )
+        .unwrap();
+        let domain = solve_layout_with_destination_domain_and_alignments(
+            32 * 1024,
+            4096,
+            4096,
+            512,
+            ByteRange {
+                offset: 0,
+                length: 32 * 1024,
+            },
+            source,
+            reservations,
+            Vec::new(),
+            LIMITS,
+        )
+        .unwrap();
+
+        assert_eq!(legacy, domain);
+    }
+
+    #[test]
+    fn legacy_solver_accepts_sector_aligned_volume_with_partial_cluster_tail() {
+        let plan = solve_layout_with_staging_exclusions_and_io_alignment(
+            10_240,
+            4096,
+            512,
+            vec![allocation(1, 0, 4096, true)],
+            vec![reservation(0, 512)],
+            Vec::new(),
+            LIMITS,
+        )
+        .unwrap();
+
+        assert_eq!(plan.relocations.len(), 1);
+        assert_eq!(plan.relocations[0].destination.offset, 4096);
+        assert!(
+            plan.free_after_staging
+                .iter()
+                .any(|range| { range.offset == 8192 && range.length == 2048 })
+        );
+    }
+
+    #[test]
+    fn destination_domain_exact_fit_succeeds_but_one_cluster_short_refuses() {
+        let exact = solve_layout_with_destination_domain_and_alignments(
+            32 * 1024,
+            512,
+            4096,
+            512,
+            ByteRange {
+                offset: 8192,
+                length: 8192,
+            },
+            vec![allocation(1, 0, 8192, true)],
+            Vec::new(),
+            Vec::new(),
+            LIMITS,
+        )
+        .unwrap();
+        assert_eq!(exact.relocations[0].destination.offset, 8192);
+
+        assert!(matches!(
+            solve_layout_with_destination_domain_and_alignments(
+                32 * 1024,
+                512,
+                4096,
+                512,
+                ByteRange {
+                    offset: 8192,
+                    length: 4096,
+                },
+                vec![allocation(1, 0, 8192, true)],
+                Vec::new(),
+                Vec::new(),
+                LIMITS,
+            ),
+            Err(LayoutError::InsufficientStagingSpace {
+                required: 8192,
+                largest_free_range: 4096,
+                total_free: 4096,
+            })
+        ));
+    }
+
+    #[test]
+    fn target_domain_refuses_immovable_or_unrepresentable_payload() {
+        assert!(matches!(
+            solve_layout_with_destination_domain_and_alignments(
+                32 * 1024,
+                512,
+                4096,
+                512,
+                ByteRange {
+                    offset: 8192,
+                    length: 16 * 1024,
+                },
+                vec![allocation(1, 512, 4096, false)],
+                Vec::new(),
+                Vec::new(),
+                LIMITS,
+            ),
+            Err(LayoutError::ImmovableOutsideDestinationDomain { .. })
+        ));
+        assert!(matches!(
+            solve_layout_with_destination_domain_and_alignments(
+                32 * 1024,
+                512,
+                4096,
+                512,
+                ByteRange {
+                    offset: 8192,
+                    length: 16 * 1024,
+                },
+                vec![allocation(1, 8192, 512, true)],
+                Vec::new(),
+                Vec::new(),
+                LIMITS,
+            ),
+            Err(LayoutError::DestinationLengthUnaligned { .. })
+        ));
+        assert!(matches!(
+            solve_layout_with_destination_domain_and_alignments(
+                32 * 1024,
+                512,
+                512,
+                4096,
+                ByteRange {
+                    offset: 8192,
+                    length: 16 * 1024,
+                },
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                LIMITS,
+            ),
+            Err(LayoutError::IncompatibleAlignments {
+                io_alignment: 4096,
+                destination_alignment: 512
+            })
+        ));
+        assert!(matches!(
+            solve_layout_with_destination_domain_and_alignments(
+                32 * 1024,
+                512,
+                4096,
+                512,
+                ByteRange {
+                    offset: 512,
+                    length: 16 * 1024,
+                },
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                LIMITS,
+            ),
+            Err(LayoutError::UnalignedRange {
+                offset: 512,
+                alignment: 4096,
+                ..
+            })
+        ));
     }
 
     #[test]

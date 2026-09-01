@@ -33,6 +33,10 @@ $convertedEdgeNtfsEscrow = Join-Path $fixtureRoot "converted-edge-exfat-to-ntfs.
 $convertedEdgeExfatImage = Join-Path $fixtureRoot "converted-edge-ntfs-to-exfat.img"
 $convertedEdgeExfatEscrow = Join-Path $fixtureRoot "converted-edge-ntfs-to-exfat.img.starconverter-escrow"
 $edgeManifest = Join-Path $fixtureRoot "edge-corpus-manifest.tsv"
+$misalignedNtfsImage = Join-Path $fixtureRoot "ntfs-misaligned-8k-payload.img"
+$relocatedExfatImage = Join-Path $fixtureRoot "converted-misaligned-ntfs-to-exfat.img"
+$relocatedExfatEscrow = Join-Path $fixtureRoot "converted-misaligned-ntfs-to-exfat.img.starconverter-escrow"
+$relocationManifest = Join-Path $fixtureRoot "misaligned-relocation-manifest.tsv"
 $allFixtures = @(
     $exfatImage,
     $ntfsImage,
@@ -58,7 +62,11 @@ $allFixtures = @(
     $convertedEdgeNtfsEscrow,
     $convertedEdgeExfatImage,
     $convertedEdgeExfatEscrow,
-    $edgeManifest
+    $edgeManifest,
+    $misalignedNtfsImage,
+    $relocatedExfatImage,
+    $relocatedExfatEscrow,
+    $relocationManifest
 )
 
 function Convert-ToWslPath {
@@ -122,6 +130,9 @@ try {
     $convertedEdgeNtfsWsl = Convert-ToWslPath $convertedEdgeNtfsImage
     $convertedEdgeExfatWsl = Convert-ToWslPath $convertedEdgeExfatImage
     $edgeManifestWsl = Convert-ToWslPath $edgeManifest
+    $misalignedNtfsWsl = Convert-ToWslPath $misalignedNtfsImage
+    $relocatedExfatWsl = Convert-ToWslPath $relocatedExfatImage
+    $relocationManifestWsl = Convert-ToWslPath $relocationManifest
     $exfatMountValidatorWsl = Convert-ToWslPath (Join-Path $repoRoot "scripts\validate-exfat-readonly-mount.sh")
     $mountValidatorWsl = Convert-ToWslPath (Join-Path $repoRoot "scripts\validate-ntfs-readonly-mount.sh")
     Invoke-WslValidator "usr/sbin/fsck.exfat" @("-n", $exfatWsl)
@@ -181,6 +192,13 @@ try {
     & wsl.exe -u root -- sh $mountValidatorWsl $ValidatorRoot $convertedEdgeNtfsWsl $edgeManifestWsl
     if ($LASTEXITCODE -ne 0) {
         throw "Read-only converted edge-corpus NTFS mount validation failed with exit code $LASTEXITCODE"
+    }
+    Invoke-WslValidator "bin/ntfsinfo" @("-m", $misalignedNtfsWsl)
+    Invoke-WslValidator "bin/ntfsfix" @("-n", $misalignedNtfsWsl)
+    Invoke-WslValidator "usr/sbin/fsck.exfat" @("-n", $relocatedExfatWsl)
+    & wsl.exe -u root -- sh $exfatMountValidatorWsl $ValidatorRoot $relocatedExfatWsl $relocationManifestWsl
+    if ($LASTEXITCODE -ne 0) {
+        throw "Read-only relocated exFAT mount validation failed with exit code $LASTEXITCODE"
     }
 
     foreach ($path in $allFixtures) {

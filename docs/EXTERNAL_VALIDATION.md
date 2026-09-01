@@ -4,6 +4,34 @@ StarConverter's own parsers are not sufficient evidence of interoperability. Thi
 independent, read-only checks against regular-file candidates. It does **not** authorize activation,
 image conversion, writable mounting, repair, or physical-device access.
 
+## 2026-09-01 forced NTFS-to-exFAT relocation qualification
+
+A dedicated 32 MiB NTFS 3.1 regular image placed one 8,192-byte file at byte
+`24 MiB + 4 KiB`: valid for the 4 KiB NTFS source, deliberately misaligned for an 8 KiB exFAT
+target cluster. The legacy one-pass serializer refused that placement. The draft/solve/finalize
+path produced exactly one sealed relocation inside the pinned exFAT cluster heap, regenerated FAT,
+allocation-bitmap, directory-stream, first-cluster, `NoFatChain`, and `PercentInUse` metadata, and
+exported a new regular image. The source graph, derived target graph, and exact layout were carried
+as one opaque authority; the export was also bound to a pre-planning source SHA-256 snapshot.
+
+Independent read-only results:
+
+- NTFS-3G `ntfsinfo -m` and `ntfsfix -n` accepted the source.
+- exfatprogs 1.2.2 `fsck.exfat -n` reported the candidate clean with one directory and one file.
+- the verified read-only loop/FUSE path opened `/relocated.bin`, proved length 8,192, and matched
+  SHA-256 `9ef93d4a62d53c78329eadfde79292b3f613be077f4e1af67ad28e75cea3d777`.
+- all 29 regular-file corpus artifacts had identical SHA-256 values before and after validation.
+
+```text
+NTFS source             7B85A37FEFD4C1C4312A0DEF7BC59E07A72DE4625CD94EAD0C446666176D5502
+relocated exFAT         C2B1C7057E4FCA78929D66C74D92BFCCB1C9699FC970E76B28803E5523285ED1
+bound escrow            49F92F4FB284A049244675E6391E1A4504FF6CFB88F48F06855ACB32706FAA87
+relocation manifest     8E757C5317E4B569B8F8FC5C3101EFC6A505913AD16B75006A367DE0348407FA
+```
+
+This qualifies the current create-new reverse-relocation bytes against the listed Linux tools. It
+does not qualify Windows attachment/CHKDSK, in-place activation, or physical media.
+
 ## 2026-08-25 generated boot-code revision requalification
 
 The exFAT serializer now emits the specification-mandated `F4` formatter BootCode bytes when no
@@ -34,8 +62,8 @@ qualification remain pending separately.
 
 ## Reproducing the fixtures
 
-The ignored integration test emits seven raw source images, two fixed VHD wrappers, four actual
-cross-format copy-export candidates, four candidate-bound schema-v4 escrow sidecars, and two
+The ignored integration test emits eight raw source images, four fixed VHD wrappers, seven actual
+cross-format copy-export candidates, seven candidate-bound schema-v4 escrow sidecars, and three
 payload manifests beneath
 `target/external-validator-fixtures`:
 
@@ -79,6 +107,9 @@ detaches it in a trap. No physical device is discovered or selected.
   before-images to the source, writes only the new file, reinspects it, proves logical manifest
   equality, persists escrow bound to the source/candidate/manifest hashes and direction, and
   re-hashes the source before returning evidence.
+- `ntfs-misaligned-8k-payload.img` and `converted-misaligned-ntfs-to-exfat.img` are the forced
+  reverse-relocation pair described above. `misaligned-relocation-manifest.tsv` binds the one
+  relocated path, length, and payload digest to the read-only driver check.
 - `exfat-edge-corpus.img`, `ntfs-edge-corpus.img`, and their converted counterparts add a nested
   Unicode path, a surrogate-pair filename, a 255-UTF-16-unit filename, an empty file, 1/4095/4096/
   4097/8191/9000-byte payloads, and a 9,000-byte file split over three physical extents.

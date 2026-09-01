@@ -92,11 +92,16 @@ deliberately fails closed on advisory-only hosts. This remains unreachable from 
 neither serializer qualifies for activation and explicit user acceptance policy is unfinished.
 There is intentionally no executable in-place conversion command and no physical-device backend.
 The separate copy-based exporter can produce a complete target only in a brand-new regular file,
-so it does not consume or weaken that authorization boundary. For exFAT→NTFS, it pins a
-write-ineligible NTFS layout draft, solves only ordinary file-data conflicts with separate sector
-and cluster alignment, reserializes every placement-dependent NTFS structure, copies payload from
-the immutable source handle into the private candidate, and builds expected content through a
-virtual relocation view over the source rather than trusting candidate output.
+so it does not consume or weaken that authorization boundary. Both directions now pin a
+write-ineligible target layout, solve only ordinary file-data conflicts with separate source-I/O
+and target-cluster alignment, and reserialize every placement-dependent target structure. The
+exFAT finalizer pins its cluster heap plus bitmap/upcase/directory allocations and regenerates FAT,
+allocation bits, directory first-cluster fields, and `NoFatChain`; the NTFS finalizer regenerates
+runlists and `$Bitmap`. Export copies payload from the immutable source handle into the private
+candidate and builds expected content through a virtual relocation view over the source rather
+than trusting candidate output. The solver seals the exact source graph, derived target graph, and
+layout behind an opaque relocation authority; export also requires a whole-image SHA-256/container
+snapshot captured before planning and refuses stale source content before creating a candidate.
 
 Unsafe Rust is forbidden at workspace level. Platform calls should live behind small, reviewed FFI
 crates only when a safe maintained crate cannot express the operation; that policy change requires a
@@ -199,5 +204,6 @@ capsule holds the larger records.
 | Reparse points/symlinks | Refuse | Policy-controlled placeholder/materialization |
 | Case-colliding names | Refuse | Reversible rename policy only |
 
-The first image converter supports the native common subset only. Escrow is a later format with its
-own versioning and compatibility tests.
+The create-new image converter supports the native common subset. Schema-v4 escrow capture,
+integrity, and candidate binding exist, but restoration/materialization of source-only NTFS
+semantics remains a later capability with its own compatibility and round-trip tests.

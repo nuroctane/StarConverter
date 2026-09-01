@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use sha2::{Digest, Sha256};
 
 use crate::conversion::{OpaqueWriteSets, ReservedWrite};
-use crate::geometry::{LayoutPlan, Relocation};
+use crate::geometry::{Relocation, SealedRelocationPlan};
 use crate::image::{
     BoundedImageReader, ImageError, ImageFile, ImageIdentity, reject_device_like_path,
 };
@@ -76,6 +76,46 @@ pub struct CandidateExportEvidence {
     pub manifest_sha256: [u8; 32],
     pub output_directory_durability: DirectoryDurability,
     pub escrow_directory_durability: Option<DirectoryDurability>,
+}
+
+/// Exact regular-file identity and content digest captured before relocation planning.
+///
+/// Relocated exports require this evidence so a payload-only edit between inspection/solve and
+/// candidate creation cannot silently become the new expected content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceImageSnapshot {
+    container_token: [u8; 32],
+    image_bytes: u64,
+    sha256: [u8; 32],
+}
+
+/// Hashes the read-only source before planning and binds the result to its stable container.
+///
+/// # Errors
+///
+/// Refuses invalid limits, oversized images, and any source read failure.
+pub fn capture_source_image_snapshot(
+    source: &ImageFile,
+    limits: CandidateExportLimits,
+) -> Result<SourceImageSnapshot, CandidateExportError> {
+    validate_limits(limits)?;
+    if source.len() > limits.max_image_bytes {
+        return Err(CandidateExportError::ImageTooLarge {
+            actual: source.len(),
+            maximum: limits.max_image_bytes,
+        });
+    }
+    let sha256 = hash_image_with_progress(
+        source,
+        limits.copy_chunk_bytes,
+        CandidateWorkPhase::HashSourceBefore,
+        &mut |_| CandidateWorkControl::Continue,
+    )?;
+    Ok(SourceImageSnapshot {
+        container_token: source.identity().stable_container_token(),
+        image_bytes: source.len(),
+        sha256,
+    })
 }
 
 /// Stable stage identifiers for copy-only export and read-only bound verification progress.
@@ -283,6 +323,7 @@ pub enum CandidateExportError {
     Preservation(PreservationError),
     Inspection(InspectionError),
     SourceInspectionMismatch,
+    SourceChangedSincePlanning,
     TargetInspectionMismatch,
     Verification(VerificationError),
     ManifestMismatch,
@@ -418,6 +459,9 @@ impl fmt::Display for CandidateExportError {
             }
             Self::SourceInspectionMismatch => formatter.write_str(
                 "pinned source inspection does not match the preservation direction or is incomplete",
+            ),
+            Self::SourceChangedSincePlanning => formatter.write_str(
+                "source identity or content changed after the planning snapshot was captured",
             ),
             Self::TargetInspectionMismatch => formatter
                 .write_str("candidate reinspection did not produce the expected complete target"),
@@ -944,6 +988,7 @@ where
         preview,
         target_graph,
         None,
+        None,
         preservation,
         limits,
         observer,
@@ -966,8 +1011,8 @@ pub fn export_relocated_candidate_image(
     output_path: impl AsRef<Path>,
     escrow_path: Option<&Path>,
     preview: &PhaseWritePreview,
-    target_graph: &ObjectGraph,
-    layout: &LayoutPlan,
+    source_snapshot: &SourceImageSnapshot,
+    relocation: &SealedRelocationPlan,
     preservation: &PreservationReport,
     limits: CandidateExportLimits,
 ) -> Result<CandidateExportEvidence, CandidateExportError> {
@@ -976,8 +1021,8 @@ pub fn export_relocated_candidate_image(
         output_path,
         escrow_path,
         preview,
-        target_graph,
-        layout,
+        source_snapshot,
+        relocation,
         preservation,
         limits,
         |_| CandidateWorkControl::Continue,
@@ -996,8 +1041,8 @@ pub fn export_relocated_candidate_image_with_progress<F>(
     output_path: impl AsRef<Path>,
     escrow_path: Option<&Path>,
     preview: &PhaseWritePreview,
-    target_graph: &ObjectGraph,
-    layout: &LayoutPlan,
+    source_snapshot: &SourceImageSnapshot,
+    relocation: &SealedRelocationPlan,
     preservation: &PreservationReport,
     limits: CandidateExportLimits,
     observer: F,
@@ -1010,8 +1055,9 @@ where
         output_path,
         escrow_path,
         preview,
-        target_graph,
-        Some(layout),
+        relocation.target_graph(),
+        Some(relocation),
+        Some(source_snapshot),
         preservation,
         limits,
         observer,
@@ -1025,7 +1071,8 @@ fn export_candidate_image_impl<F>(
     escrow_path: Option<&Path>,
     preview: &PhaseWritePreview,
     target_graph: &ObjectGraph,
-    layout: Option<&LayoutPlan>,
+    relocation: Option<&SealedRelocationPlan>,
+    source_snapshot: Option<&SourceImageSnapshot>,
     preservation: &PreservationReport,
     limits: CandidateExportLimits,
     mut observer: F,
@@ -1064,10 +1111,8 @@ where
     }
 
     let (write_count, write_bytes) = validate_preview(source, preview.writes(), limits)?;
-    let (relocation_count, relocation_bytes, sorted_relocations) = match layout {
-        Some(layout) => {
-            validate_relocations(source, target_graph, preview.writes(), layout, limits)?
-        }
+    let (relocation_count, relocation_bytes, sorted_relocations) = match relocation {
+        Some(relocation) => validate_relocations(source, relocation, preview.writes(), limits)?,
         None => (0, 0, Vec::new()),
     };
     let applied_write_count = write_count.checked_add(relocation_count).ok_or(
@@ -1094,7 +1139,7 @@ where
         0,
         None,
     )?;
-    let expected_manifest = if layout.is_some() {
+    let expected_manifest = if relocation.is_some() {
         let relocated_source = RelocatedSourceView {
             source,
             relocations: &sorted_relocations,
@@ -1109,6 +1154,14 @@ where
         CandidateWorkPhase::HashSourceBefore,
         &mut observer,
     )?;
+    if let Some(snapshot) = source_snapshot {
+        if snapshot.container_token != source.identity().stable_container_token()
+            || snapshot.image_bytes != source.len()
+            || snapshot.sha256 != source_sha256
+        {
+            return Err(CandidateExportError::SourceChangedSincePlanning);
+        }
+    }
 
     let mut output_guard = NewFileGuard::create_partial(&output)?;
     copy_source_with_progress(
@@ -1117,7 +1170,7 @@ where
         limits.copy_chunk_bytes,
         &mut observer,
     )?;
-    if layout.is_some() {
+    if relocation.is_some() {
         apply_relocations_with_progress(
             source,
             output_guard.file_mut(),
@@ -1449,11 +1502,13 @@ impl BoundedImageReader for RelocatedSourceView<'_> {
 #[allow(clippy::too_many_lines)]
 fn validate_relocations(
     source: &ImageFile,
-    target_graph: &ObjectGraph,
+    authority: &SealedRelocationPlan,
     writes: &OpaqueWriteSets,
-    layout: &LayoutPlan,
     limits: CandidateExportLimits,
 ) -> Result<(usize, u64, Vec<Relocation>), CandidateExportError> {
+    let source_graph = authority.source_graph();
+    let target_graph = authority.target_graph();
+    let layout = authority.layout();
     if layout.relocations.len() > limits.max_writes {
         return Err(CandidateExportError::WriteLimitExceeded {
             actual: layout.relocations.len(),
@@ -1497,6 +1552,21 @@ fn validate_relocations(
         {
             return Err(CandidateExportError::RelocationShape(
                 "source and destination overlap",
+            ));
+        }
+        let authorized_source = source_graph.extents().extents().iter().any(|extent| {
+            extent.kind == crate::extent::ExtentKind::FileData
+                && extent.stream == relocation.stream
+                && extent.logical_offset == relocation.logical_offset
+                && extent.length == relocation.source.length
+                && extent.placement
+                    == crate::extent::Placement::Physical {
+                        byte_offset: relocation.source.offset,
+                    }
+        });
+        if !authorized_source {
+            return Err(CandidateExportError::RelocationShape(
+                "source graph does not authorize a relocation read",
             ));
         }
         let committed = target_graph.extents().extents().iter().any(|extent| {
@@ -2210,8 +2280,9 @@ mod tests {
     use super::*;
     use crate::conversion::OpaqueWriteSets;
     use crate::cross_format::{
-        ExfatToNtfsLimits, ExfatToNtfsOptions, draft_lossless_exfat_to_ntfs,
-        plan_lossless_exfat_to_ntfs, solve_lossless_exfat_to_ntfs,
+        ExfatToNtfsLimits, ExfatToNtfsOptions, NtfsToExfatLimits, NtfsToExfatOptions,
+        draft_lossless_exfat_to_ntfs, draft_lossless_ntfs_to_exfat, plan_lossless_exfat_to_ntfs,
+        plan_lossless_ntfs_to_exfat, solve_lossless_exfat_to_ntfs, solve_lossless_ntfs_to_exfat,
     };
     use crate::extent::{Extent, ExtentGraph, ExtentKind, Placement, StreamId};
     use crate::fs::exfat_inventory::{ExfatPreservationEvidence, ExfatTimestamps};
@@ -2227,12 +2298,16 @@ mod tests {
     use crate::fs::ntfs_normalize::{
         NormalizedNtfs, NtfsPreservationSidecar, NtfsSecurityDescriptorEvidence,
     };
+    use crate::fs::ntfs_serialize::{
+        NtfsDestinationInputs, NtfsSerializeLimits, plan_ntfs_destination,
+    };
     use crate::geometry::{LayoutLimits, ReservationKind};
+    use crate::inspect::inspect_image;
     use crate::object::{
         NamespaceEntry, ObjectGraphLimits, ObjectId, ObjectKind, ObjectRecord, ObjectSemantics,
         ObjectStream, StreamFlags, StreamStorage,
     };
-    use crate::phase::preview_ntfs_phase_writes;
+    use crate::phase::{preview_exfat_phase_writes, preview_ntfs_phase_writes};
     use crate::preimage::PreimageLimits;
     use crate::preservation::evaluate_ntfs;
 
@@ -2519,6 +2594,98 @@ mod tests {
         (image, payload)
     }
 
+    #[allow(clippy::too_many_lines)]
+    fn ntfs_image_with_payload_misaligned_for_8k_exfat() -> (Vec<u8>, Vec<u8>, u64) {
+        const VOLUME_BYTES: u64 = 64 * 1024 * 1024;
+        const PAYLOAD_BYTES: u64 = 8192;
+        let payload = (0..usize::try_from(PAYLOAD_BYTES).unwrap())
+            .map(|index| u8::try_from((index * 7) % 251).unwrap())
+            .collect::<Vec<_>>();
+        let root = ObjectRecord {
+            id: ObjectId(1),
+            kind: ObjectKind::Directory,
+            link_count: 0,
+            semantics: ObjectSemantics::default(),
+            streams: Vec::new(),
+        };
+        let file = ObjectRecord {
+            id: ObjectId(2),
+            kind: ObjectKind::File,
+            link_count: 1,
+            semantics: ObjectSemantics::default(),
+            streams: vec![ObjectStream {
+                id: StreamId(2),
+                name: None,
+                logical_bytes: PAYLOAD_BYTES,
+                initialized_bytes: PAYLOAD_BYTES,
+                mapped_bytes: PAYLOAD_BYTES,
+                allocated_bytes: PAYLOAD_BYTES,
+                flags: StreamFlags::default(),
+                storage: StreamStorage::Extents,
+            }],
+        };
+        let limits = ObjectGraphLimits {
+            max_objects: 4,
+            max_entries: 4,
+            max_streams: 4,
+            max_name_code_units: 255,
+        };
+        for offset in (4 * 1024 * 1024 + 4096..48 * 1024 * 1024).step_by(8192) {
+            let graph = ObjectGraph::build(
+                ObjectId(1),
+                vec![root.clone(), file.clone()],
+                vec![NamespaceEntry {
+                    parent: ObjectId(1),
+                    target: ObjectId(2),
+                    name: "payload.bin".encode_utf16().collect(),
+                }],
+                ExtentGraph::build(
+                    vec![Extent {
+                        stream: StreamId(2),
+                        logical_offset: 0,
+                        length: PAYLOAD_BYTES,
+                        placement: Placement::Physical {
+                            byte_offset: offset,
+                        },
+                        kind: ExtentKind::FileData,
+                    }],
+                    VOLUME_BYTES,
+                    4,
+                )
+                .unwrap(),
+                limits,
+            )
+            .unwrap();
+            let Ok(plan) = plan_ntfs_destination(
+                &graph,
+                NtfsDestinationInputs {
+                    image_bytes: VOLUME_BYTES,
+                    partition_offset_sectors: 0,
+                    cluster_bytes: 4096,
+                    volume_serial_number: 0x1122_3344_5566_7788,
+                    timestamp: 0x01dc_0000_0000_0000,
+                },
+                NtfsSerializeLimits::default(),
+            ) else {
+                continue;
+            };
+            let mut image = vec![0_u8; usize::try_from(VOLUME_BYTES).unwrap()];
+            let payload_start = usize::try_from(offset).unwrap();
+            image[payload_start..payload_start + payload.len()].copy_from_slice(&payload);
+            for write in plan
+                .staging_writes
+                .iter()
+                .chain(std::iter::once(&plan.backup_boot_write))
+                .chain(std::iter::once(&plan.primary_boot_write))
+            {
+                let start = usize::try_from(write.offset).unwrap();
+                image[start..start + write.bytes.len()].copy_from_slice(&write.bytes);
+            }
+            return (image, payload, offset);
+        }
+        panic!("could not find a target-misaligned NTFS payload placement outside NTFS metadata");
+    }
+
     fn test_ntfs_escrow_payload() -> Vec<u8> {
         let root = ObjectId(1);
         let graph = ObjectGraph::build(
@@ -2640,6 +2807,8 @@ mod tests {
         let (source_bytes, payload) = exfat_image_with_early_payload();
         let source_file = TempFile::create(&source_bytes);
         let source = ImageFile::open(&source_file.path).unwrap();
+        let source_snapshot =
+            capture_source_image_snapshot(&source, CandidateExportLimits::default()).unwrap();
         let inspection = inspect_open_image(&source).unwrap();
         let normalized = inspection.normalized_exfat.as_deref().unwrap();
         assert!(matches!(
@@ -2661,8 +2830,8 @@ mod tests {
         )
         .unwrap();
         let solved = solve_lossless_exfat_to_ntfs(draft, LayoutLimits::default()).unwrap();
-        assert_eq!(solved.layout.relocations.len(), 1);
-        let relocation = solved.layout.relocations[0];
+        assert_eq!(solved.layout().relocations.len(), 1);
+        let relocation = solved.layout().relocations[0];
         let preview =
             preview_ntfs_phase_writes(&source, &solved.destination, PreimageLimits::default())
                 .unwrap();
@@ -2673,8 +2842,8 @@ mod tests {
             &destination,
             Some(&escrow),
             &preview,
-            &solved.target_graph,
-            &solved.layout,
+            &source_snapshot,
+            solved.relocation(),
             &solved.preservation,
             CandidateExportLimits::default(),
         )
@@ -2696,6 +2865,203 @@ mod tests {
         assert_eq!(fs::read(&source_file.path).unwrap(), source_bytes);
         fs::remove_file(destination).unwrap();
         fs::remove_file(escrow).unwrap();
+    }
+
+    #[test]
+    fn cancellation_during_relocation_cleans_partial_and_preserves_source() {
+        let (source_bytes, _) = exfat_image_with_early_payload();
+        let source_file = TempFile::create(&source_bytes);
+        let source = ImageFile::open(&source_file.path).unwrap();
+        let source_snapshot =
+            capture_source_image_snapshot(&source, CandidateExportLimits::default()).unwrap();
+        let inspection = inspect_open_image(&source).unwrap();
+        let normalized = inspection.normalized_exfat.as_deref().unwrap();
+        let draft = draft_lossless_exfat_to_ntfs(
+            normalized,
+            GuaranteeMode::Escrow,
+            ExfatToNtfsOptions::default(),
+            ExfatToNtfsLimits::default(),
+        )
+        .unwrap();
+        let solved = solve_lossless_exfat_to_ntfs(draft, LayoutLimits::default()).unwrap();
+        let preview =
+            preview_ntfs_phase_writes(&source, &solved.destination, PreimageLimits::default())
+                .unwrap();
+        let parent = temp_path("cancelled-during-relocation-dir");
+        fs::create_dir(&parent).unwrap();
+        let destination = parent.join("candidate.img");
+        let escrow = parent.join("candidate.escrow");
+
+        let error = export_relocated_candidate_image_with_progress(
+            &source,
+            &destination,
+            Some(&escrow),
+            &preview,
+            &source_snapshot,
+            solved.relocation(),
+            &solved.preservation,
+            CandidateExportLimits {
+                copy_chunk_bytes: 512,
+                ..CandidateExportLimits::default()
+            },
+            |progress| {
+                if progress.phase == CandidateWorkPhase::RelocatePayload
+                    && progress.completed_bytes >= 512
+                {
+                    CandidateWorkControl::Cancel
+                } else {
+                    CandidateWorkControl::Continue
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            CandidateExportError::Cancelled {
+                phase: CandidateWorkPhase::RelocatePayload
+            }
+        ));
+        assert_eq!(fs::read_dir(&parent).unwrap().count(), 0);
+        assert!(!destination.exists());
+        assert!(!escrow.exists());
+        assert_eq!(fs::read(&source_file.path).unwrap(), source_bytes);
+        fs::remove_dir(parent).unwrap();
+    }
+
+    #[test]
+    fn misaligned_ntfs_payload_is_copied_relocated_and_verified_in_new_exfat_image() {
+        let (source_bytes, payload, source_offset) =
+            ntfs_image_with_payload_misaligned_for_8k_exfat();
+        assert_eq!(source_offset % 8192, 4096);
+        let source_file = TempFile::create(&source_bytes);
+        let source = ImageFile::open(&source_file.path).unwrap();
+        let source_snapshot =
+            capture_source_image_snapshot(&source, CandidateExportLimits::default()).unwrap();
+        let inspection = inspect_open_image(&source).unwrap();
+        let normalized = inspection.normalized_ntfs.as_deref().unwrap();
+        let options = NtfsToExfatOptions {
+            bytes_per_cluster: 8192,
+            ..NtfsToExfatOptions::default()
+        };
+        assert!(matches!(
+            plan_lossless_ntfs_to_exfat(
+                normalized,
+                GuaranteeMode::Escrow,
+                options,
+                NtfsToExfatLimits::default(),
+            ),
+            Err(crate::cross_format::NtfsToExfatError::Serialization(
+                crate::fs::exfat_serialize::ExfatSerializeError::PayloadNotClusterAligned(_)
+            ))
+        ));
+        let draft = draft_lossless_ntfs_to_exfat(
+            normalized,
+            GuaranteeMode::Escrow,
+            options,
+            NtfsToExfatLimits::default(),
+        )
+        .unwrap();
+        let solved = solve_lossless_ntfs_to_exfat(draft, LayoutLimits::default()).unwrap();
+        assert_eq!(solved.layout().relocations.len(), 1);
+        let relocation = solved.layout().relocations[0];
+        assert_eq!(relocation.source.offset, source_offset);
+        assert_eq!(relocation.destination.offset % 8192, 0);
+        let preview =
+            preview_exfat_phase_writes(&source, &solved.destination, PreimageLimits::default())
+                .unwrap();
+        let destination = temp_path("relocated-candidate.exfat.img");
+        let escrow = temp_path("relocated-exfat-candidate.escrow");
+        let evidence = export_relocated_candidate_image(
+            &source,
+            &destination,
+            Some(&escrow),
+            &preview,
+            &source_snapshot,
+            solved.relocation(),
+            &solved.preservation,
+            CandidateExportLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(evidence.target_filesystem, FileSystem::ExFat);
+        let candidate_bytes = fs::read(&destination).unwrap();
+        let destination_start = usize::try_from(relocation.destination.offset).unwrap();
+        assert_eq!(
+            &candidate_bytes[destination_start..destination_start + payload.len()],
+            payload
+        );
+        let candidate = inspect_image(&destination).unwrap();
+        assert_eq!(candidate.profile.filesystem, FileSystem::ExFat);
+        assert!(candidate.profile.inventory_complete);
+        let verification = verify_bound_export(
+            &destination,
+            &escrow,
+            Some(&source_file.path),
+            CandidateVerificationLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(verification.target_filesystem, FileSystem::ExFat);
+        assert_eq!(fs::read(&source_file.path).unwrap(), source_bytes);
+        fs::remove_file(destination).unwrap();
+        fs::remove_file(escrow).unwrap();
+    }
+
+    #[test]
+    fn payload_edit_after_snapshot_is_refused_before_candidate_creation() {
+        let (source_bytes, _, source_offset) = ntfs_image_with_payload_misaligned_for_8k_exfat();
+        let source_file = TempFile::create(&source_bytes);
+        let source = ImageFile::open(&source_file.path).unwrap();
+        let source_snapshot =
+            capture_source_image_snapshot(&source, CandidateExportLimits::default()).unwrap();
+        let inspection = inspect_open_image(&source).unwrap();
+        let normalized = inspection.normalized_ntfs.as_deref().unwrap();
+        let draft = draft_lossless_ntfs_to_exfat(
+            normalized,
+            GuaranteeMode::Escrow,
+            NtfsToExfatOptions {
+                bytes_per_cluster: 8192,
+                ..NtfsToExfatOptions::default()
+            },
+            NtfsToExfatLimits::default(),
+        )
+        .unwrap();
+        let solved = solve_lossless_ntfs_to_exfat(draft, LayoutLimits::default()).unwrap();
+        let preview =
+            preview_exfat_phase_writes(&source, &solved.destination, PreimageLimits::default())
+                .unwrap();
+
+        let mut writer = OpenOptions::new()
+            .write(true)
+            .open(&source_file.path)
+            .unwrap();
+        writer.seek(SeekFrom::Start(source_offset)).unwrap();
+        writer
+            .write_all(&[source_bytes[usize::try_from(source_offset).unwrap()] ^ 0xff])
+            .unwrap();
+        writer.sync_all().unwrap();
+        writer
+            .set_times(fs::FileTimes::new().set_modified(source.identity().modified().unwrap()))
+            .unwrap();
+        drop(writer);
+
+        let destination = temp_path("stale-plan-candidate.exfat.img");
+        let escrow = temp_path("stale-plan-candidate.escrow");
+        let error = export_relocated_candidate_image(
+            &source,
+            &destination,
+            Some(&escrow),
+            &preview,
+            &source_snapshot,
+            solved.relocation(),
+            &solved.preservation,
+            CandidateExportLimits::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, CandidateExportError::SourceChangedSincePlanning),
+            "unexpected stale-plan error: {error:?}"
+        );
+        assert!(!destination.exists());
+        assert!(!escrow.exists());
     }
 
     #[test]

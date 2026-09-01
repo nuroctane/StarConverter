@@ -16,19 +16,19 @@ use eframe::egui::{
 use starconverter_core::candidate_export::{
     CandidateExportError, CandidateExportEvidence, CandidateExportLimits,
     CandidateVerificationEvidence, CandidateVerificationLimits, CandidateWorkControl,
-    CandidateWorkPhase, CandidateWorkProgress, export_candidate_image_with_progress,
+    CandidateWorkPhase, CandidateWorkProgress, SourceImageSnapshot, capture_source_image_snapshot,
     export_relocated_candidate_image_with_progress, verify_bound_export_with_progress,
 };
 use starconverter_core::cross_format::{
     ExfatToNtfsLimits, ExfatToNtfsOptions, NtfsToExfatLimits, NtfsToExfatOptions,
-    draft_lossless_exfat_to_ntfs, plan_lossless_ntfs_to_exfat, solve_lossless_exfat_to_ntfs,
+    draft_lossless_exfat_to_ntfs, draft_lossless_ntfs_to_exfat, solve_lossless_exfat_to_ntfs,
+    solve_lossless_ntfs_to_exfat,
 };
 use starconverter_core::geometry::{
     DestinationReservation, LayoutLimits, LayoutPlan, SourceAllocation,
 };
 use starconverter_core::image::ImageFile;
 use starconverter_core::inspect::{inspect_image, inspect_open_image};
-use starconverter_core::object::ObjectGraph;
 use starconverter_core::phase::{
     PhaseWritePreview, preview_exfat_phase_writes, preview_ntfs_phase_writes,
 };
@@ -1371,17 +1371,20 @@ fn build_exact_preview(
                 &preview,
                 &plan.destination.reservations,
                 &plan.destination.source_allocations,
+                plan.layout(),
                 &plan.preservation,
             )
         }
         (None, Some(normalized), FileSystem::ExFat) => {
-            let plan = plan_lossless_ntfs_to_exfat(
+            let draft = draft_lossless_ntfs_to_exfat(
                 normalized,
                 mode,
                 NtfsToExfatOptions::default(),
                 NtfsToExfatLimits::default(),
             )
             .map_err(|error| format!("cross-format plan refused: {error}"))?;
+            let plan = solve_lossless_ntfs_to_exfat(draft, LayoutLimits::default())
+                .map_err(|error| format!("payload layout refused: {error}"))?;
             let preview =
                 preview_exfat_phase_writes(&image, &plan.destination, PreimageLimits::default())
                     .map_err(|error| format!("phase preview failed: {error}"))?;
@@ -1389,6 +1392,7 @@ fn build_exact_preview(
                 &preview,
                 &plan.destination.reservations,
                 &plan.destination.source_allocations,
+                plan.layout(),
                 &plan.preservation,
             )
         }
@@ -1417,6 +1421,7 @@ enum ControlledJobError {
     Failed(String),
 }
 
+#[allow(clippy::too_many_lines)]
 fn build_candidate_export(
     source_path: &str,
     output_path: &Path,
@@ -1430,6 +1435,10 @@ fn build_candidate_export(
         .map_err(|error| ControlledJobError::Failed(error.to_string()))?;
     let inspection = inspect_open_image(&image)
         .map_err(|error| ControlledJobError::Failed(error.to_string()))?;
+    let source_snapshot = capture_source_image_snapshot(&image, CandidateExportLimits::default())
+        .map_err(|error| {
+        ControlledJobError::Failed(format!("source snapshot failed: {error}"))
+    })?;
     control
         .checkpoint(CandidateWorkPhase::BuildExpectedManifest)
         .map_err(ControlledJobError::Cancelled)?;
@@ -1467,14 +1476,14 @@ fn build_candidate_export(
                 &image,
                 output_path,
                 &preview,
-                &plan.target_graph,
-                Some(&plan.layout),
+                &source_snapshot,
+                plan.relocation(),
                 &plan.preservation,
                 control,
             )?
         }
         (None, Some(normalized), FileSystem::ExFat) => {
-            let plan = plan_lossless_ntfs_to_exfat(
+            let draft = draft_lossless_ntfs_to_exfat(
                 normalized,
                 mode,
                 NtfsToExfatOptions::default(),
@@ -1483,6 +1492,10 @@ fn build_candidate_export(
             .map_err(|error| {
                 ControlledJobError::Failed(format!("cross-format plan refused: {error}"))
             })?;
+            let plan =
+                solve_lossless_ntfs_to_exfat(draft, LayoutLimits::default()).map_err(|error| {
+                    ControlledJobError::Failed(format!("payload layout refused: {error}"))
+                })?;
             let preview =
                 preview_exfat_phase_writes(&image, &plan.destination, PreimageLimits::default())
                     .map_err(|error| {
@@ -1492,8 +1505,8 @@ fn build_candidate_export(
                 &image,
                 output_path,
                 &preview,
-                &plan.target_graph,
-                None,
+                &source_snapshot,
+                plan.relocation(),
                 &plan.preservation,
                 control,
             )?
@@ -2805,6 +2818,7 @@ fn exact_preview_report(
     preview: &PhaseWritePreview,
     reservations: &[DestinationReservation],
     allocations: &[SourceAllocation],
+    layout: &LayoutPlan,
     preservation: &PreservationReport,
 ) -> String {
     let writes = preview.writes();
@@ -2853,6 +2867,7 @@ fn exact_preview_report(
         reservations.len(),
         allocations.len()
     );
+    report.push_str(&relocation_preview_report(layout));
     let _ = writeln!(
         report,
         "forward={forward_count} writes / {}",
@@ -2872,13 +2887,45 @@ fn exact_preview_report(
     report
 }
 
+fn relocation_preview_report(layout: &LayoutPlan) -> String {
+    const MAX_PLACEMENTS: usize = 4;
+    let mut report = format!(
+        "relocation={} spans / {}\n",
+        layout.relocations.len(),
+        format_byte_count(usize::try_from(layout.relocated_bytes).unwrap_or(usize::MAX))
+    );
+    if layout.relocations.is_empty() {
+        report.push_str("[CREATE-NEW RELOCATION] none required\n");
+        return report;
+    }
+    for relocation in layout.relocations.iter().take(MAX_PLACEMENTS) {
+        let _ = writeln!(
+            report,
+            "[CREATE-NEW RELOCATION] stream={} logical={} source={} destination={} bytes={}",
+            relocation.stream.0,
+            relocation.logical_offset,
+            relocation.source.offset,
+            relocation.destination.offset,
+            relocation.source.length
+        );
+    }
+    if layout.relocations.len() > MAX_PLACEMENTS {
+        let _ = writeln!(
+            report,
+            "[CREATE-NEW RELOCATION] ... {} additional placements",
+            layout.relocations.len() - MAX_PLACEMENTS
+        );
+    }
+    report
+}
+
 #[allow(clippy::option_if_let_else)]
 fn export_gui_candidate(
     source: &ImageFile,
     output: &Path,
     preview: &PhaseWritePreview,
-    target_graph: &ObjectGraph,
-    layout: Option<&LayoutPlan>,
+    source_snapshot: &SourceImageSnapshot,
+    relocation: &starconverter_core::geometry::SealedRelocationPlan,
     preservation: &PreservationReport,
     control: &JobControl,
 ) -> Result<CandidateExportEvidence, ControlledJobError> {
@@ -2887,29 +2934,17 @@ fn export_gui_candidate(
         name.push(".starconverter-escrow");
         PathBuf::from(name)
     });
-    let result = match layout {
-        Some(layout) => export_relocated_candidate_image_with_progress(
-            source,
-            output,
-            escrow_path.as_deref(),
-            preview,
-            target_graph,
-            layout,
-            preservation,
-            CandidateExportLimits::default(),
-            |progress| control.observe(progress),
-        ),
-        None => export_candidate_image_with_progress(
-            source,
-            output,
-            escrow_path.as_deref(),
-            preview,
-            target_graph,
-            preservation,
-            CandidateExportLimits::default(),
-            |progress| control.observe(progress),
-        ),
-    };
+    let result = export_relocated_candidate_image_with_progress(
+        source,
+        output,
+        escrow_path.as_deref(),
+        preview,
+        source_snapshot,
+        relocation,
+        preservation,
+        CandidateExportLimits::default(),
+        |progress| control.observe(progress),
+    );
     result.map_err(|error| match error {
         CandidateExportError::Cancelled { phase } => ControlledJobError::Cancelled(phase),
         error => ControlledJobError::Failed(format!("candidate export failed: {error}")),
@@ -3209,6 +3244,45 @@ mod tests {
         assert_eq!(first, plan_report(&plan));
         assert!(first.contains("NOT AN EXECUTABLE WRITE AUTHORIZATION"));
         assert!(first.contains("direction=exFAT -> NTFS"));
+    }
+
+    #[test]
+    fn exact_preview_reports_create_new_relocation_work() {
+        use starconverter_core::extent::StreamId;
+        use starconverter_core::geometry::{ByteRange, Relocation};
+
+        let empty = LayoutPlan {
+            relocations: Vec::new(),
+            free_after_staging: Vec::new(),
+            relocated_bytes: 0,
+            largest_free_range: 0,
+        };
+        let empty_report = relocation_preview_report(&empty);
+        assert!(empty_report.contains("relocation=0 spans"));
+        assert!(empty_report.contains("none required"));
+
+        let relocated = LayoutPlan {
+            relocations: vec![Relocation {
+                stream: StreamId(9),
+                logical_offset: 0,
+                source: ByteRange {
+                    offset: 4096,
+                    length: 8192,
+                },
+                destination: ByteRange {
+                    offset: 65_536,
+                    length: 8192,
+                },
+            }],
+            free_after_staging: Vec::new(),
+            relocated_bytes: 8192,
+            largest_free_range: 0,
+        };
+        let report = relocation_preview_report(&relocated);
+        assert!(report.contains("relocation=1 spans"));
+        assert!(report.contains("stream=9"));
+        assert!(report.contains("source=4096"));
+        assert!(report.contains("destination=65536"));
     }
 
     #[test]

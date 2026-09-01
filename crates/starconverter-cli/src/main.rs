@@ -9,16 +9,19 @@ use std::process::ExitCode;
 
 use starconverter_core::candidate_export::{
     CandidateExportEvidence, CandidateExportLimits, CandidateVerificationLimits,
-    export_candidate_image, export_relocated_candidate_image, verify_bound_export,
+    capture_source_image_snapshot, export_relocated_candidate_image, verify_bound_export,
 };
 use starconverter_core::cross_format::{
     ExfatToNtfsLimits, ExfatToNtfsOptions, NtfsToExfatLimits, NtfsToExfatOptions,
-    draft_lossless_exfat_to_ntfs, plan_lossless_ntfs_to_exfat, solve_lossless_exfat_to_ntfs,
+    draft_lossless_exfat_to_ntfs, draft_lossless_ntfs_to_exfat, solve_lossless_exfat_to_ntfs,
+    solve_lossless_ntfs_to_exfat,
 };
 use starconverter_core::fs::exfat_normalize::NormalizedExfat;
 use starconverter_core::fs::exfat_region::ExfatBootRegionComparison;
 use starconverter_core::fs::ntfs_normalize::NormalizedNtfs;
-use starconverter_core::geometry::{DestinationReservation, LayoutLimits, SourceAllocation};
+use starconverter_core::geometry::{
+    DestinationReservation, LayoutLimits, LayoutPlan, SourceAllocation,
+};
 use starconverter_core::image::ImageFile;
 use starconverter_core::inspect::{
     BootRedundancy, BootSector, ImageInspection, inspect_image, inspect_open_image,
@@ -317,6 +320,9 @@ fn export_exfat_source(
     mode: GuaranteeMode,
     requested_escrow: Option<&Path>,
 ) -> Result<CandidateExportEvidence, String> {
+    let export_limits = CandidateExportLimits::default();
+    let source_snapshot = capture_source_image_snapshot(source, export_limits)
+        .map_err(|error| format!("source snapshot failed: {error}"))?;
     let draft = draft_lossless_exfat_to_ntfs(
         normalized,
         mode,
@@ -334,10 +340,10 @@ fn export_exfat_source(
         output,
         escrow_path.as_deref(),
         &preview,
-        &plan.target_graph,
-        &plan.layout,
+        &source_snapshot,
+        plan.relocation(),
         &plan.preservation,
-        CandidateExportLimits::default(),
+        export_limits,
     )
     .map_err(|error| format!("candidate export failed: {error}"))
 }
@@ -349,24 +355,30 @@ fn export_ntfs_source(
     mode: GuaranteeMode,
     requested_escrow: Option<&Path>,
 ) -> Result<CandidateExportEvidence, String> {
-    let plan = plan_lossless_ntfs_to_exfat(
+    let export_limits = CandidateExportLimits::default();
+    let source_snapshot = capture_source_image_snapshot(source, export_limits)
+        .map_err(|error| format!("source snapshot failed: {error}"))?;
+    let draft = draft_lossless_ntfs_to_exfat(
         normalized,
         mode,
         NtfsToExfatOptions::default(),
         NtfsToExfatLimits::default(),
     )
     .map_err(|error| format!("cross-format plan refused: {error}"))?;
+    let plan = solve_lossless_ntfs_to_exfat(draft, LayoutLimits::default())
+        .map_err(|error| format!("payload layout refused: {error}"))?;
     let preview = preview_exfat_phase_writes(source, &plan.destination, PreimageLimits::default())
         .map_err(|error| format!("phase preview failed: {error}"))?;
     let escrow_path = select_escrow_path(output, &plan.preservation, requested_escrow)?;
-    export_candidate_image(
+    export_relocated_candidate_image(
         source,
         output,
         escrow_path.as_deref(),
         &preview,
-        &plan.target_graph,
+        &source_snapshot,
+        plan.relocation(),
         &plan.preservation,
-        CandidateExportLimits::default(),
+        export_limits,
     )
     .map_err(|error| format!("candidate export failed: {error}"))
 }
@@ -462,16 +474,19 @@ fn preview_command(args: &[String]) -> Result<(), String> {
                 &preview,
                 &plan.destination.reservations,
                 &plan.destination.source_allocations,
+                plan.layout(),
             );
         }
         (None, Some(normalized), FileSystem::ExFat) => {
-            let plan = plan_lossless_ntfs_to_exfat(
+            let draft = draft_lossless_ntfs_to_exfat(
                 normalized,
                 mode,
                 NtfsToExfatOptions::default(),
                 NtfsToExfatLimits::default(),
             )
             .map_err(|error| format!("cross-format plan refused: {error}"))?;
+            let plan = solve_lossless_ntfs_to_exfat(draft, LayoutLimits::default())
+                .map_err(|error| format!("payload layout refused: {error}"))?;
             let preview =
                 preview_exfat_phase_writes(&image, &plan.destination, PreimageLimits::default())
                     .map_err(|error| format!("phase preview failed: {error}"))?;
@@ -480,6 +495,7 @@ fn preview_command(args: &[String]) -> Result<(), String> {
                 &preview,
                 &plan.destination.reservations,
                 &plan.destination.source_allocations,
+                plan.layout(),
             );
         }
         (Some(_), None, _) | (None, Some(_), _) => {
@@ -524,6 +540,7 @@ fn print_transaction_preview(
     preview: &PhaseWritePreview,
     reservations: &[DestinationReservation],
     allocations: &[SourceAllocation],
+    layout: &LayoutPlan,
 ) {
     let writes = preview.writes();
     let forward_count =
@@ -553,6 +570,11 @@ fn print_transaction_preview(
     println!("| source spans: {}", allocations.len());
     println!("| non-movable : {staging_exclusions}");
     println!(
+        "| relocation  : {} spans / {}",
+        layout.relocations.len(),
+        format_bytes(layout.relocated_bytes)
+    );
+    println!(
         "| forward     : {forward_count} writes / {}",
         format_bytes(u64::try_from(forward_bytes).unwrap_or(u64::MAX))
     );
@@ -569,11 +591,43 @@ fn print_transaction_preview(
         }
     );
     println!("+-------------------------------------------------------------------+");
+    for line in relocation_preview_lines(layout) {
+        println!("{line}");
+    }
     for gap in preview.activation_gaps() {
         println!("[BLOCK] {gap}");
     }
     println!("[READ-ONLY] Exact before-images were captured in memory; no bytes were written.");
     println!("[NO AUTHORITY] This preview cannot be submitted to the mutation executor.");
+}
+
+fn relocation_preview_lines(layout: &LayoutPlan) -> Vec<String> {
+    const MAX_PLACEMENTS: usize = 4;
+    let mut lines = layout
+        .relocations
+        .iter()
+        .take(MAX_PLACEMENTS)
+        .map(|relocation| {
+            format!(
+                "[CREATE-NEW RELOCATION] stream={} logical={} source={} destination={} bytes={}",
+                relocation.stream.0,
+                relocation.logical_offset,
+                relocation.source.offset,
+                relocation.destination.offset,
+                relocation.source.length
+            )
+        })
+        .collect::<Vec<_>>();
+    if layout.relocations.len() > MAX_PLACEMENTS {
+        lines.push(format!(
+            "[CREATE-NEW RELOCATION] ... {} additional placements",
+            layout.relocations.len() - MAX_PLACEMENTS
+        ));
+    }
+    if layout.relocations.is_empty() {
+        lines.push("[CREATE-NEW RELOCATION] none required".to_owned());
+    }
+    lines
 }
 
 fn inspect_command(args: &[String]) -> Result<(), String> {
@@ -1503,6 +1557,47 @@ mod tests {
         assert_eq!(format_bytes(1024_u64.pow(3)), "1.00 GiB");
         assert_eq!(format_bytes(4096), "4.00 KiB");
         assert_eq!(format_bytes(512), "512 B");
+    }
+
+    #[test]
+    fn relocation_preview_is_explicit_for_zero_and_nonzero_layouts() {
+        use starconverter_core::extent::StreamId;
+        use starconverter_core::geometry::{ByteRange, Relocation};
+
+        let empty = LayoutPlan {
+            relocations: Vec::new(),
+            free_after_staging: Vec::new(),
+            relocated_bytes: 0,
+            largest_free_range: 0,
+        };
+        assert_eq!(
+            relocation_preview_lines(&empty),
+            vec!["[CREATE-NEW RELOCATION] none required"]
+        );
+
+        let relocated = LayoutPlan {
+            relocations: vec![Relocation {
+                stream: StreamId(7),
+                logical_offset: 4096,
+                source: ByteRange {
+                    offset: 12_288,
+                    length: 8192,
+                },
+                destination: ByteRange {
+                    offset: 32_768,
+                    length: 8192,
+                },
+            }],
+            free_after_staging: Vec::new(),
+            relocated_bytes: 8192,
+            largest_free_range: 0,
+        };
+        let lines = relocation_preview_lines(&relocated);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("stream=7"));
+        assert!(lines[0].contains("source=12288"));
+        assert!(lines[0].contains("destination=32768"));
+        assert!(lines[0].contains("bytes=8192"));
     }
 
     #[test]

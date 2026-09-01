@@ -9,11 +9,13 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 use starconverter_core::candidate_export::{
-    CandidateExportEvidence, CandidateExportLimits, decode_bound_escrow, export_candidate_image,
+    CandidateExportEvidence, CandidateExportLimits, capture_source_image_snapshot,
+    decode_bound_escrow, export_relocated_candidate_image,
 };
 use starconverter_core::cross_format::{
     ExfatToNtfsLimits, ExfatToNtfsOptions, NtfsToExfatLimits, NtfsToExfatOptions,
-    plan_lossless_exfat_to_ntfs, plan_lossless_ntfs_to_exfat,
+    draft_lossless_exfat_to_ntfs, draft_lossless_ntfs_to_exfat, solve_lossless_exfat_to_ntfs,
+    solve_lossless_ntfs_to_exfat,
 };
 use starconverter_core::extent::{Extent, ExtentGraph, ExtentKind, Placement, StreamId};
 use starconverter_core::fs::exfat_inventory::{ExfatPreservationEvidence, ExfatTimestamps};
@@ -28,6 +30,7 @@ use starconverter_core::fs::exfat_upcase_serialize::{
 use starconverter_core::fs::ntfs_serialize::{
     NtfsDestinationInputs, NtfsSerializeLimits, plan_ntfs_destination,
 };
+use starconverter_core::geometry::LayoutLimits;
 use starconverter_core::object::{
     NamespaceEntry, ObjectGraph, ObjectGraphLimits, ObjectId, ObjectKind, ObjectRecord,
     ObjectSemantics, ObjectStream, StreamFlags, StreamStorage,
@@ -38,7 +41,7 @@ use starconverter_core::preimage::PreimageLimits;
 use starconverter_core::validation_vhd::{
     FixedVhdConfig, FixedVhdLimits, ONE_MIB_PARTITION_ALIGNMENT_SECTORS, wrap_fixed_vhd,
 };
-use starconverter_core::{GuaranteeMode, image::ImageFile, inspect::inspect_image};
+use starconverter_core::{GuaranteeMode, image::ImageFile, inspect::inspect_open_image};
 
 const IMAGE_BYTES: u64 = 32 * 1024 * 1024;
 const GRAPH_LIMITS: ObjectGraphLimits = ObjectGraphLimits {
@@ -411,6 +414,65 @@ fn payload_digest(stream: u64, logical_bytes: u64) -> String {
     output
 }
 
+fn misaligned_relocation_graph() -> ObjectGraph {
+    const STREAM: u64 = 140;
+    const PAYLOAD_BYTES: u64 = 8192;
+    ObjectGraph::build(
+        ObjectId(1),
+        vec![
+            ObjectRecord {
+                id: ObjectId(1),
+                kind: ObjectKind::Directory,
+                link_count: 0,
+                semantics: ObjectSemantics::default(),
+                streams: Vec::new(),
+            },
+            ObjectRecord {
+                id: ObjectId(2),
+                kind: ObjectKind::File,
+                link_count: 1,
+                semantics: ObjectSemantics::default(),
+                streams: vec![ObjectStream {
+                    id: StreamId(STREAM),
+                    name: None,
+                    logical_bytes: PAYLOAD_BYTES,
+                    initialized_bytes: PAYLOAD_BYTES,
+                    mapped_bytes: PAYLOAD_BYTES,
+                    allocated_bytes: PAYLOAD_BYTES,
+                    flags: StreamFlags::default(),
+                    storage: StreamStorage::Extents,
+                }],
+            },
+        ],
+        vec![NamespaceEntry {
+            parent: ObjectId(1),
+            target: ObjectId(2),
+            name: "relocated.bin".encode_utf16().collect(),
+        }],
+        ExtentGraph::build(
+            vec![Extent {
+                stream: StreamId(STREAM),
+                logical_offset: 0,
+                length: PAYLOAD_BYTES,
+                placement: Placement::Physical {
+                    // Valid for 4 KiB NTFS, deliberately misaligned for the 8 KiB exFAT target.
+                    byte_offset: 24 * 1024 * 1024 + 4096,
+                },
+                kind: ExtentKind::FileData,
+            }],
+            IMAGE_BYTES,
+            GRAPH_LIMITS.max_streams,
+        )
+        .unwrap(),
+        GRAPH_LIMITS,
+    )
+    .unwrap()
+}
+
+fn misaligned_relocation_manifest() -> String {
+    format!("/relocated.bin\t8192\t{}\n", payload_digest(140, 8192))
+}
+
 fn edge_manifest() -> String {
     let long_name = format!("{}.bin", "n".repeat(251));
     let files = [
@@ -564,9 +626,12 @@ fn export_ntfs_candidate(
             fs::remove_file(path).unwrap();
         }
     }
-    let inspection = inspect_image(source_path).unwrap();
+    let source = ImageFile::open(source_path).unwrap();
+    let inspection = inspect_open_image(&source).unwrap();
+    let export_limits = CandidateExportLimits::default();
+    let source_snapshot = capture_source_image_snapshot(&source, export_limits).unwrap();
     let normalized = inspection.normalized_exfat.as_deref().unwrap();
-    let plan = plan_lossless_exfat_to_ntfs(
+    let draft = draft_lossless_exfat_to_ntfs(
         normalized,
         GuaranteeMode::Escrow,
         ExfatToNtfsOptions {
@@ -576,17 +641,18 @@ fn export_ntfs_candidate(
         ExfatToNtfsLimits::default(),
     )
     .unwrap();
-    let source = ImageFile::open(source_path).unwrap();
+    let plan = solve_lossless_exfat_to_ntfs(draft, LayoutLimits::default()).unwrap();
     let preview =
         preview_ntfs_phase_writes(&source, &plan.destination, PreimageLimits::default()).unwrap();
-    let evidence = export_candidate_image(
+    let evidence = export_relocated_candidate_image(
         &source,
         &output,
         Some(&escrow),
         &preview,
-        &plan.target_graph,
+        &source_snapshot,
+        plan.relocation(),
         &plan.preservation,
-        CandidateExportLimits::default(),
+        export_limits,
     )
     .unwrap();
     let bound = decode_bound_escrow(&fs::read(&escrow).unwrap(), 64 * 1024 * 1024).unwrap();
@@ -607,6 +673,8 @@ fn export_exfat_candidate(
     source_path: &Path,
     output_name: &str,
     partition_offset_sectors: u64,
+    bytes_per_cluster: u32,
+    expected_relocations: usize,
 ) -> CandidateExportEvidence {
     let output = directory.join(output_name);
     let escrow = directory.join(format!("{output_name}.starconverter-escrow"));
@@ -615,29 +683,35 @@ fn export_exfat_candidate(
             fs::remove_file(path).unwrap();
         }
     }
-    let inspection = inspect_image(source_path).unwrap();
+    let source = ImageFile::open(source_path).unwrap();
+    let inspection = inspect_open_image(&source).unwrap();
+    let export_limits = CandidateExportLimits::default();
+    let source_snapshot = capture_source_image_snapshot(&source, export_limits).unwrap();
     let normalized = inspection.normalized_ntfs.as_deref().unwrap();
-    let plan = plan_lossless_ntfs_to_exfat(
+    let draft = draft_lossless_ntfs_to_exfat(
         normalized,
         GuaranteeMode::Escrow,
         NtfsToExfatOptions {
             partition_offset_sectors,
+            bytes_per_cluster,
             ..NtfsToExfatOptions::default()
         },
         NtfsToExfatLimits::default(),
     )
     .unwrap();
-    let source = ImageFile::open(source_path).unwrap();
+    let plan = solve_lossless_ntfs_to_exfat(draft, LayoutLimits::default()).unwrap();
+    assert_eq!(plan.layout().relocations.len(), expected_relocations);
     let preview =
         preview_exfat_phase_writes(&source, &plan.destination, PreimageLimits::default()).unwrap();
-    let evidence = export_candidate_image(
+    let evidence = export_relocated_candidate_image(
         &source,
         &output,
         Some(&escrow),
         &preview,
-        &plan.target_graph,
+        &source_snapshot,
+        plan.relocation(),
         &plan.preservation,
-        CandidateExportLimits::default(),
+        export_limits,
     )
     .unwrap();
     let bound = decode_bound_escrow(&fs::read(&escrow).unwrap(), 64 * 1024 * 1024).unwrap();
@@ -678,6 +752,8 @@ fn export_windows_vhd_candidates(
         rich_ntfs_path,
         "converted-rich-ntfs-to-exfat-windows-partition.img",
         ONE_MIB_PARTITION_ALIGNMENT_SECTORS,
+        4096,
+        0,
     );
     let exfat_vhd = wrap_fixed_vhd(
         &fs::read(&exfat_partition.output_path).unwrap(),
@@ -711,8 +787,14 @@ fn export_edge_corpus(
         "converted-edge-exfat-to-ntfs.img",
         0,
     );
-    let converted_exfat =
-        export_exfat_candidate(directory, &ntfs_path, "converted-edge-ntfs-to-exfat.img", 0);
+    let converted_exfat = export_exfat_candidate(
+        directory,
+        &ntfs_path,
+        "converted-edge-ntfs-to-exfat.img",
+        0,
+        4096,
+        0,
+    );
     let manifest_path = directory.join("edge-corpus-manifest.tsv");
     fs::write(&manifest_path, edge_manifest()).unwrap();
     (
@@ -752,6 +834,7 @@ fn print_windows_vhd_paths(ntfs: &Path, exfat: &Path) {
 
 #[test]
 #[ignore = "writes regular image fixtures under target for independent tools"]
+#[allow(clippy::too_many_lines)]
 fn export_structural_candidate_images() {
     let directory = fixture_directory();
     fs::create_dir_all(&directory).unwrap();
@@ -816,6 +899,8 @@ fn export_structural_candidate_images() {
         &rich_ntfs_path,
         "converted-rich-ntfs-to-exfat.img",
         0,
+        4096,
+        0,
     );
     let (windows_ntfs_vhd_path, windows_exfat_vhd_path) =
         export_windows_vhd_candidates(&directory, &rich_exfat_path, &rich_ntfs_path);
@@ -830,6 +915,20 @@ fn export_structural_candidate_images() {
         ),
     )
     .unwrap();
+
+    let relocation_graph = misaligned_relocation_graph();
+    let relocation_source_path = directory.join("ntfs-misaligned-8k-payload.img");
+    fs::write(&relocation_source_path, ntfs_image(&relocation_graph, 0)).unwrap();
+    let relocated_exfat = export_exfat_candidate(
+        &directory,
+        &relocation_source_path,
+        "converted-misaligned-ntfs-to-exfat.img",
+        0,
+        8192,
+        1,
+    );
+    let relocation_manifest_path = directory.join("misaligned-relocation-manifest.tsv");
+    fs::write(&relocation_manifest_path, misaligned_relocation_manifest()).unwrap();
 
     let (
         edge_exfat_path,
@@ -852,6 +951,15 @@ fn export_structural_candidate_images() {
     println!("converted exFAT candidate: {exported_exfat:?}");
     print_windows_vhd_paths(&windows_ntfs_vhd_path, &windows_exfat_vhd_path);
     println!("rich manifest: {}", manifest_path.display());
+    println!(
+        "misaligned NTFS source: {}",
+        relocation_source_path.display()
+    );
+    println!("relocated exFAT candidate: {relocated_exfat:?}");
+    println!(
+        "misaligned relocation manifest: {}",
+        relocation_manifest_path.display()
+    );
     println!("edge exFAT fixture: {}", edge_exfat_path.display());
     println!("edge NTFS fixture: {}", edge_ntfs_path.display());
     println!("converted edge NTFS candidate: {exported_edge_ntfs:?}");

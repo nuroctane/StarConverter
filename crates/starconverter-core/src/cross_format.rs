@@ -24,8 +24,9 @@ use crate::extent::{ExtentKind, Placement, StreamId};
 use crate::fs::exfat_inventory::{ExfatPreservationEvidence, ExfatTimestamps};
 use crate::fs::exfat_normalize::NormalizedExfat;
 use crate::fs::exfat_serialize::{
-    ExfatObjectMetadata, ExfatSerializationPlan, ExfatSerializeError, ExfatSerializeLimits,
-    ExfatSerializeOptions, ExfatVolumeProfile, serialize_exfat_destination,
+    ExfatDestinationDraft, ExfatObjectMetadata, ExfatSerializationPlan, ExfatSerializeError,
+    ExfatSerializeLimits, ExfatSerializeOptions, ExfatVolumeProfile, draft_exfat_destination,
+    finalize_exfat_destination, serialize_exfat_destination,
 };
 use crate::fs::exfat_upcase_serialize::{
     RECOMMENDED_EXFAT_UPCASE_CHECKSUM, RecommendedExfatUpcaseError, RecommendedExfatUpcaseLimits,
@@ -40,8 +41,9 @@ use crate::fs::ntfs_serialize::{
     finalize_ntfs_destination, plan_ntfs_destination_with_metadata_and_volume,
 };
 use crate::geometry::{
-    ByteRange, LayoutError, LayoutLimits, LayoutPlan, RelocatedGraphError, SourceAllocation,
-    relocate_object_graph, solve_layout_with_staging_exclusions_and_io_alignment,
+    ByteRange, LayoutError, LayoutLimits, LayoutPlan, RelocatedGraphError, SealedRelocationPlan,
+    SourceAllocation, solve_layout_with_destination_domain_and_alignments,
+    solve_layout_with_staging_exclusions_and_io_alignment,
 };
 use crate::object::{ObjectGraph, ObjectGraphError, ObjectGraphLimits, ObjectId, ObjectKind};
 use crate::preservation::{
@@ -102,22 +104,55 @@ pub struct ExfatToNtfsPlan {
 /// call [`crate::fs::ntfs_serialize::finalize_ntfs_destination`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExfatToNtfsRelocationDraft {
-    pub preservation: PreservationReport,
-    pub target_graph: ObjectGraph,
-    pub object_metadata: Vec<NtfsObjectMetadata>,
-    pub volume_label: Option<Vec<u16>>,
-    pub destination: NtfsDestinationDraft,
+    preservation: PreservationReport,
+    target_graph: ObjectGraph,
+    object_metadata: Vec<NtfsObjectMetadata>,
+    volume_label: Option<Vec<u16>>,
+    destination: NtfsDestinationDraft,
 }
 
 /// Fully reserialized NTFS proposal after deterministic payload placement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExfatToNtfsSolvedPlan {
     pub preservation: PreservationReport,
-    pub target_graph: ObjectGraph,
     pub object_metadata: Vec<NtfsObjectMetadata>,
     pub volume_label: Option<Vec<u16>>,
-    pub layout: LayoutPlan,
     pub destination: NtfsDestinationPlan,
+    relocation: SealedRelocationPlan,
+}
+
+impl ExfatToNtfsRelocationDraft {
+    #[must_use]
+    pub const fn preservation(&self) -> &PreservationReport {
+        &self.preservation
+    }
+
+    #[must_use]
+    pub const fn target_graph(&self) -> &ObjectGraph {
+        &self.target_graph
+    }
+
+    #[must_use]
+    pub const fn destination(&self) -> &NtfsDestinationDraft {
+        &self.destination
+    }
+}
+
+impl ExfatToNtfsSolvedPlan {
+    #[must_use]
+    pub const fn relocation(&self) -> &SealedRelocationPlan {
+        &self.relocation
+    }
+
+    #[must_use]
+    pub const fn target_graph(&self) -> &ObjectGraph {
+        self.relocation.target_graph()
+    }
+
+    #[must_use]
+    pub const fn layout(&self) -> &LayoutPlan {
+        self.relocation.layout()
+    }
 }
 
 /// Deterministic exFAT geometry choices for a normalized NTFS source.
@@ -163,6 +198,62 @@ pub struct NtfsToExfatPlan {
     /// Deterministic 32-bit target identity. The exact 64-bit NTFS serial remains in escrow.
     pub destination_volume_serial_number: u32,
     pub destination: ExfatSerializationPlan,
+}
+
+/// Policy-bound, write-ineligible exFAT layout for a source whose payload may need relocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NtfsToExfatRelocationDraft {
+    preservation: PreservationReport,
+    target_graph: ObjectGraph,
+    object_metadata: Vec<ExfatObjectMetadata>,
+    destination_volume_label: Option<Vec<u16>>,
+    destination_volume_serial_number: u32,
+    destination: ExfatDestinationDraft,
+}
+
+/// Fully reserialized exFAT proposal after deterministic target-heap placement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NtfsToExfatSolvedPlan {
+    pub preservation: PreservationReport,
+    pub object_metadata: Vec<ExfatObjectMetadata>,
+    pub destination_volume_label: Option<Vec<u16>>,
+    pub destination_volume_serial_number: u32,
+    pub destination: ExfatSerializationPlan,
+    relocation: SealedRelocationPlan,
+}
+
+impl NtfsToExfatRelocationDraft {
+    #[must_use]
+    pub const fn preservation(&self) -> &PreservationReport {
+        &self.preservation
+    }
+
+    #[must_use]
+    pub const fn target_graph(&self) -> &ObjectGraph {
+        &self.target_graph
+    }
+
+    #[must_use]
+    pub const fn destination(&self) -> &ExfatDestinationDraft {
+        &self.destination
+    }
+}
+
+impl NtfsToExfatSolvedPlan {
+    #[must_use]
+    pub const fn relocation(&self) -> &SealedRelocationPlan {
+        &self.relocation
+    }
+
+    #[must_use]
+    pub const fn target_graph(&self) -> &ObjectGraph {
+        self.relocation.target_graph()
+    }
+
+    #[must_use]
+    pub const fn layout(&self) -> &LayoutPlan {
+        self.relocation.layout()
+    }
 }
 
 /// Refusal from policy, exact metadata conversion, or structural NTFS serialization.
@@ -310,6 +401,8 @@ pub enum NtfsToExfatError {
     SourceMetadataLimitExceeded { actual: usize, maximum: usize },
     GraphProjection(ObjectGraphError),
     Upcase(RecommendedExfatUpcaseError),
+    Layout(LayoutError),
+    RelocatedGraph(RelocatedGraphError),
     Serialization(ExfatSerializeError),
 }
 
@@ -368,6 +461,10 @@ impl fmt::Display for NtfsToExfatError {
                     "could not generate recommended exFAT up-case table: {error}"
                 )
             }
+            Self::Layout(error) => write!(formatter, "payload layout failed: {error}"),
+            Self::RelocatedGraph(error) => {
+                write!(formatter, "target graph relocation failed: {error}")
+            }
             Self::Serialization(error) => write!(formatter, "exFAT serialization failed: {error}"),
         }
     }
@@ -380,6 +477,8 @@ impl std::error::Error for NtfsToExfatError {
             Self::Upcase(error) => Some(error),
             Self::Serialization(error) => Some(error),
             Self::GraphProjection(error) => Some(error),
+            Self::Layout(error) => Some(error),
+            Self::RelocatedGraph(error) => Some(error),
             _ => None,
         }
     }
@@ -400,6 +499,18 @@ impl From<RecommendedExfatUpcaseError> for NtfsToExfatError {
 impl From<ExfatSerializeError> for NtfsToExfatError {
     fn from(value: ExfatSerializeError) -> Self {
         Self::Serialization(value)
+    }
+}
+
+impl From<LayoutError> for NtfsToExfatError {
+    fn from(value: LayoutError) -> Self {
+        Self::Layout(value)
+    }
+}
+
+impl From<RelocatedGraphError> for NtfsToExfatError {
+    fn from(value: RelocatedGraphError) -> Self {
+        Self::RelocatedGraph(value)
     }
 }
 
@@ -596,15 +707,14 @@ pub fn solve_lossless_exfat_to_ntfs(
         staging_exclusions,
         limits,
     )?;
-    let target_graph = relocate_object_graph(&draft.target_graph, &layout)?;
-    let destination = finalize_ntfs_destination(&draft.destination, &target_graph)?;
+    let relocation = SealedRelocationPlan::seal(draft.target_graph, layout)?;
+    let destination = finalize_ntfs_destination(&draft.destination, relocation.target_graph())?;
     Ok(ExfatToNtfsSolvedPlan {
         preservation: draft.preservation,
-        target_graph,
         object_metadata: draft.object_metadata,
         volume_label: draft.volume_label,
-        layout,
         destination,
+        relocation,
     })
 }
 
@@ -708,6 +818,135 @@ pub fn plan_lossless_ntfs_to_exfat(
         destination_volume_label,
         destination_volume_serial_number: serial,
         destination,
+    })
+}
+
+/// Produces a policy-bound, write-ineligible exFAT layout draft for relocation planning.
+///
+/// The draft pins target metadata without requiring ordinary NTFS file payloads to already occupy
+/// valid exFAT cluster-heap positions. Source filesystem metadata remains protected and is never
+/// marked movable.
+///
+/// # Errors
+///
+/// Returns the same preservation, metadata, profile, and serializer refusals as
+/// [`plan_lossless_ntfs_to_exfat`], except that target-placement conflicts are deferred to
+/// [`solve_lossless_ntfs_to_exfat`].
+pub fn draft_lossless_ntfs_to_exfat(
+    normalized: &NormalizedNtfs,
+    mode: GuaranteeMode,
+    options: NtfsToExfatOptions,
+    limits: NtfsToExfatLimits,
+) -> Result<NtfsToExfatRelocationDraft, NtfsToExfatError> {
+    if mode == GuaranteeMode::ContentOnly {
+        return Err(NtfsToExfatError::ContentOnlyIsNotLossless);
+    }
+    let preservation = evaluate_ntfs(normalized, FileSystem::ExFat, mode, limits.preservation)?;
+    if !preservation.permitted {
+        return Err(NtfsToExfatError::PreservationRefused {
+            blockers: preservation.blockers,
+        });
+    }
+    let object_metadata = map_ntfs_object_metadata(normalized)?;
+    let destination_volume_label = normalized
+        .preservation
+        .volume_label
+        .as_ref()
+        .filter(|label| is_representable_exfat_label(label))
+        .cloned();
+    let serial = fold_ntfs_volume_serial(normalized.preservation.volume_serial_number);
+    let upcase = generate_recommended_exfat_upcase(limits.upcase)?;
+    let target_graph = project_ntfs_graph_for_exfat(normalized)?;
+    let mut destination = draft_exfat_destination(
+        &target_graph,
+        &object_metadata,
+        ExfatVolumeProfile {
+            volume_label: destination_volume_label.as_deref(),
+            encoded_upcase_table: upcase.encoded_bytes(),
+            upcase_checksum: RECOMMENDED_EXFAT_UPCASE_CHECKSUM,
+            source_preservation: ExfatPreservationEvidence::default(),
+            allocated_bad_clusters: 0,
+        },
+        ExfatSerializeOptions {
+            bytes_per_sector: options.bytes_per_sector,
+            bytes_per_cluster: options.bytes_per_cluster,
+            partition_offset_sectors: options.partition_offset_sectors,
+            volume_serial_number: serial,
+            drive_select: options.drive_select,
+        },
+        limits.serializer,
+    )?;
+    retain_ntfs_source_metadata(
+        destination.source_allocations_mut(),
+        normalized,
+        limits.serializer.max_extents,
+    )?;
+    Ok(NtfsToExfatRelocationDraft {
+        preservation,
+        target_graph,
+        object_metadata,
+        destination_volume_label,
+        destination_volume_serial_number: serial,
+        destination,
+    })
+}
+
+/// Solves an NTFS-to-exFAT draft inside its pinned cluster heap and regenerates target metadata.
+///
+/// # Errors
+///
+/// Refuses insufficient heap space, target-unrepresentable extent lengths, immovable conflicts,
+/// graph relocation disagreement, or any final exFAT layout drift.
+pub fn solve_lossless_ntfs_to_exfat(
+    draft: NtfsToExfatRelocationDraft,
+    limits: LayoutLimits,
+) -> Result<NtfsToExfatSolvedPlan, NtfsToExfatError> {
+    let mut live_allocations = Vec::new();
+    let mut staging_exclusions = Vec::new();
+    live_allocations
+        .try_reserve(draft.destination.source_allocations().len())
+        .map_err(|_| NtfsToExfatError::AllocationFailed)?;
+    staging_exclusions
+        .try_reserve(draft.destination.source_allocations().len())
+        .map_err(|_| NtfsToExfatError::AllocationFailed)?;
+    for allocation in draft.destination.source_allocations() {
+        let graph_backed_file_data = allocation.movable
+            && draft.target_graph.extents().extents().iter().any(|extent| {
+                extent.kind == ExtentKind::FileData
+                    && extent.stream == allocation.stream
+                    && extent.logical_offset == allocation.logical_offset
+                    && extent.length == allocation.range.length
+                    && extent.placement
+                        == Placement::Physical {
+                            byte_offset: allocation.range.offset,
+                        }
+            });
+        if graph_backed_file_data {
+            live_allocations.push(*allocation);
+        } else {
+            staging_exclusions.push(allocation.range);
+        }
+    }
+    let layout = solve_layout_with_destination_domain_and_alignments(
+        draft.destination.geometry().volume_bytes,
+        512,
+        u64::from(draft.destination.geometry().bytes_per_cluster),
+        512,
+        draft.destination.cluster_heap_range(),
+        live_allocations,
+        draft.destination.reservations().to_vec(),
+        staging_exclusions,
+        limits,
+    )?;
+    let relocation = SealedRelocationPlan::seal(draft.target_graph, layout)?;
+    let destination = finalize_exfat_destination(&draft.destination, &relocation)?;
+    Ok(NtfsToExfatSolvedPlan {
+        preservation: draft.preservation,
+        object_metadata: draft.object_metadata,
+        destination_volume_label: draft.destination_volume_label,
+        destination_volume_serial_number: draft.destination_volume_serial_number,
+        destination,
+        relocation,
     })
 }
 
@@ -1493,6 +1732,85 @@ mod tests {
         }
     }
 
+    fn normalized_ntfs_with_payload(byte_offset: u64) -> NormalizedNtfs {
+        let mut normalized = normalized_ntfs();
+        let stream_id = (27_u64 << 16) | 2;
+        let mut objects = normalized.graph.objects().to_vec();
+        let stream = &mut objects
+            .iter_mut()
+            .find(|object| object.id == ObjectId(27))
+            .unwrap()
+            .streams[0];
+        stream.id = StreamId(stream_id);
+        stream.logical_bytes = 4096;
+        stream.initialized_bytes = 4096;
+        stream.mapped_bytes = 4096;
+        stream.allocated_bytes = 4096;
+        stream.storage = StreamStorage::Extents;
+        let source_extent = NtfsInventoryExtent {
+            stream_id,
+            logical_offset: 0,
+            length: 4096,
+            placement: NtfsExtentPlacement::Physical { byte_offset },
+        };
+        normalized.graph = ObjectGraph::build(
+            normalized.graph.root(),
+            objects,
+            normalized.graph.entries().to_vec(),
+            ExtentGraph::build(
+                vec![crate::extent::Extent {
+                    stream: StreamId(stream_id),
+                    logical_offset: 0,
+                    length: 4096,
+                    placement: Placement::Physical { byte_offset },
+                    kind: ExtentKind::FileData,
+                }],
+                normalized.graph.extents().volume_bytes(),
+                8,
+            )
+            .unwrap(),
+            ObjectGraphLimits {
+                max_objects: 4,
+                max_entries: 4,
+                max_streams: 4,
+                max_name_code_units: 255,
+            },
+        )
+        .unwrap();
+        let source = &mut normalized
+            .preservation
+            .objects
+            .iter_mut()
+            .find(|object| object.object == ObjectId(27))
+            .unwrap()
+            .source;
+        source.data_streams.push(NtfsDataStream {
+            attribute_id: 2,
+            name: None,
+            compressed: false,
+            encrypted: false,
+            sparse: false,
+            storage: NtfsStreamStorage::NonResident {
+                allocated_bytes: 4096,
+                data_bytes: 4096,
+                initialized_bytes: 4096,
+                compressed_bytes: None,
+                mapping_complete: true,
+                extents: vec![source_extent],
+            },
+        });
+        source.attribute_census.push(NtfsAttributeEvidence {
+            attribute_type: 0x80,
+            name: None,
+            flags_raw: 0,
+            flags_unknown_bits: 0,
+            attribute_id: 2,
+            resident: false,
+        });
+        normalized.preservation.source_extents.push(source_extent);
+        normalized
+    }
+
     #[test]
     fn exfat_timestamp_maps_epoch_offset_increment_and_leap_day_exactly() {
         // 1980-01-01 is 138,426 days after the FILETIME epoch.
@@ -1643,9 +1961,9 @@ mod tests {
                 .any(|allocation| allocation.stream == StreamId(20) && allocation.movable)
         );
         let solved = solve_lossless_exfat_to_ntfs(draft, LayoutLimits::default()).unwrap();
-        assert_eq!(solved.layout.relocations.len(), 1);
-        assert_eq!(solved.layout.relocations[0].source.offset, 4096);
-        assert_ne!(solved.layout.relocations[0].destination.offset, 4096);
+        assert_eq!(solved.layout().relocations.len(), 1);
+        assert_eq!(solved.layout().relocations[0].source.offset, 4096);
+        assert_ne!(solved.layout().relocations[0].destination.offset, 4096);
         assert!(solved.destination.reservations.iter().any(|reservation| {
             reservation.kind == crate::geometry::ReservationKind::AllocationMetadata
         }));
@@ -1661,7 +1979,7 @@ mod tests {
                 })
         );
         let target_extent = solved
-            .target_graph
+            .target_graph()
             .extents()
             .extents()
             .iter()
@@ -1670,9 +1988,58 @@ mod tests {
         assert_eq!(
             target_extent.placement,
             Placement::Physical {
-                byte_offset: solved.layout.relocations[0].destination.offset
+                byte_offset: solved.layout().relocations[0].destination.offset
             }
         );
+    }
+
+    #[test]
+    fn ntfs_payload_outside_exfat_heap_is_relocated_and_reserialized() {
+        let normalized = normalized_ntfs_with_payload(4096);
+        assert!(matches!(
+            plan_lossless_ntfs_to_exfat(
+                &normalized,
+                GuaranteeMode::Escrow,
+                NtfsToExfatOptions::default(),
+                NtfsToExfatLimits::default(),
+            ),
+            Err(NtfsToExfatError::Serialization(
+                ExfatSerializeError::PayloadNotClusterAligned(_)
+            ))
+        ));
+
+        let draft = draft_lossless_ntfs_to_exfat(
+            &normalized,
+            GuaranteeMode::Escrow,
+            NtfsToExfatOptions::default(),
+            NtfsToExfatLimits::default(),
+        )
+        .unwrap();
+        assert!(draft.destination.cluster_heap_range().offset > 4096);
+        assert!(draft.destination.source_allocations().iter().any(|item| {
+            item.stream == StreamId((27_u64 << 16) | 2) && item.range.offset == 4096 && item.movable
+        }));
+
+        let solved = solve_lossless_ntfs_to_exfat(draft, LayoutLimits::default()).unwrap();
+        assert_eq!(solved.layout().relocations.len(), 1);
+        let relocation = solved.layout().relocations[0];
+        assert_eq!(relocation.source.offset, 4096);
+        assert_eq!(relocation.destination.offset % 4096, 0);
+        let heap = u64::from(solved.destination.geometry.cluster_heap_offset_sectors)
+            * u64::from(solved.destination.geometry.bytes_per_sector);
+        let heap_end = heap
+            + u64::from(solved.destination.geometry.cluster_count)
+                * u64::from(solved.destination.geometry.bytes_per_cluster);
+        assert!(relocation.destination.offset >= heap);
+        assert!(relocation.destination.offset + relocation.destination.length <= heap_end);
+        assert_eq!(solved.destination.reused_payloads.len(), 1);
+        assert_eq!(
+            solved.destination.reused_payloads[0].clusters[0],
+            u32::try_from((relocation.destination.offset - heap) / 4096 + 2).unwrap()
+        );
+        assert!(solved.destination.source_allocations.iter().any(|item| {
+            item.stream == StreamId((27_u64 << 16) | 2) && item.range.offset == 4096 && item.movable
+        }));
     }
 
     #[test]

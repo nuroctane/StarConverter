@@ -51,10 +51,10 @@ point produces an ambiguous writable mount.
 
 ## 4. Image-only NTFS -> exFAT
 
-- strict common-subset conversion
+- strict common-subset structural conversion and relocation-aware create-new export (implemented)
 - hard-link, sparse, compression, case-collision, and reparse-point space/policy handling
-- versioned semantic escrow capsule
-- exFAT benign vendor entry object IDs
+- versioned semantic escrow capture and integrity binding (implemented); restoration remains pending
+- exFAT benign vendor entry object IDs (target contract, not current capability)
 - round-trip restoration to NTFS
 
 Exit evidence: strict mode refuses every non-native semantic; escrow mode restores exact tested

@@ -15,10 +15,10 @@
 
 </div>
 
-StarConverter is being built to convert compatible exFAT and NTFS volumes without copying every
-file to another disk. The design keeps file-data extents in place where possible, relocates only
-conflicts, constructs new filesystem metadata transactionally, and retains an explicit rollback
-record until the user finalizes the conversion.
+StarConverter is currently a copy-based regular-image conversion workbench for compatible exFAT
+and NTFS images. Its longer-term in-place design keeps file-data extents in place where possible,
+relocates only conflicts, constructs new filesystem metadata transactionally, and retains an
+explicit rollback record until the user finalizes the conversion.
 
 This repository is an engineering pre-alpha, not a drive-writing release. The CLI can open a
 regular exFAT or NTFS image read-only, validate redundant boot metadata, reconstruct allocation and
@@ -67,6 +67,10 @@ cannot:
 | **Strict** | Refuse any object that cannot round-trip natively. |
 | **Escrow** | Preserve ordinary exFAT usability and store NTFS-only semantics in a checksummed capsule for restoration. |
 | **Content only** | Preserve file bytes and common metadata, with no full semantic round-trip promise. |
+
+Escrow capture, checksumming, and candidate binding are implemented, but the command which reapplies
+that evidence during a later exFAT→NTFS restoration is not. Escrow output is therefore preservation
+evidence in this pre-alpha, not yet a completed round-trip restoration workflow.
 
 No mode can protect against physical media failure, faulty firmware, bad RAM, or a device that lies
 about completed cache flushes. A backup remains mandatory for valuable data.
@@ -158,8 +162,11 @@ post-publication cleanup/durability failures retain and report the exact partial
 recovery rather than deleting by pathname. The final candidate name is published only after
 verification; escrow is bound to the exact source, candidate, manifest, and direction.
 Inspection, planning, preimage capture, copying, and final source hashing share one pinned read-only
-file identity. The command hashes the source again before success and never uses the in-place
-activation-authority type. See [`docs/RECOVERY.md`](docs/RECOVERY.md) for interrupted-export and
+file identity. Relocation export additionally seals the source graph, derived target graph, and
+layout as one opaque capability and compares a pre-planning source snapshot before creating a
+candidate, so a payload-only edit cannot silently become the new plan. The command hashes the
+source again before success and never uses the in-place activation-authority type. See
+[`docs/RECOVERY.md`](docs/RECOVERY.md) for interrupted-export and
 sidecar verification guidance. Current atomic no-clobber publication requires the candidate and
 escrow destination directories to support hard links; exFAT/FAT destination directories and other
 filesystems without hard-link support are refused. Parent-directory crash durability remains a
@@ -220,9 +227,11 @@ installed. CI always tests both language stacks.
 - [x] Pure resumable transaction coordinator with pre-activation overlay proof
 - [x] Phase-separated exFAT and NTFS structural destination serializers
 - [x] NTFS layout-draft/solve/finalize pass which regenerates runlists and `$Bitmap` after relocation
-- [x] Create-new exFAT-to-NTFS export which copies sealed relocations from the immutable source,
-      verifies through a virtual source view, reinspects the candidate, and leaves the source hash
-      unchanged
+- [x] exFAT layout-draft/solve/finalize pass which pins the cluster heap and metadata allocations,
+      then regenerates FAT chains, allocation bitmap, directory stream placement, and `NoFatChain`
+- [x] Bidirectional create-new relocation export which copies sealed relocations from the immutable
+      source, rejects stale plan-time source content, verifies through a virtual source view,
+      reinspects the candidate, and leaves the source hash unchanged
 - [x] Exact regular-image preimage capture for every source-visible write phase
 - [x] Versioned `SCRECOV2` capsule recovery bundle retaining relocation-destination and exact phase before-images
 - [x] Bounded append-only capsule store with exclusive create/resume, one-generation growth,
@@ -262,6 +271,8 @@ installed. CI always tests both language stacks.
 - [x] Stable responsive accessibility traversal from Source through Activity, independent of panel paint order
 - [x] Create-new exFAT→NTFS and NTFS→exFAT export with reinspection, manifest equality, source re-hash, and escrow sidecar
 - [x] Independently mount both exported rich cross-format candidates read-only and verify exact payload hashes
+- [x] Independently force an 8 KiB NTFS payload relocation into the exFAT cluster heap, then pass
+      `fsck.exfat -n` and a read-only FUSE length/hash manifest check
 - [x] Read-only candidate/source/sidecar verifier and candidate-bound escrow envelope
 - [x] Uniquely named partial construction and atomic no-clobber publication on hard-link-capable filesystems
 - [x] Deterministic converted fixed-VHD fixtures and fail-closed Windows validation harness
