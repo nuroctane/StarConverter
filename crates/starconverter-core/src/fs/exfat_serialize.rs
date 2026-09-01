@@ -2880,7 +2880,7 @@ mod tests {
         )
     }
 
-    fn relocation_metadata() -> [ExfatObjectMetadata; 1] {
+    const fn relocation_metadata() -> [ExfatObjectMetadata; 1] {
         [ExfatObjectMetadata {
             object: ObjectId(2),
             file_attributes: 0x20,
