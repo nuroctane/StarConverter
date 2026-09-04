@@ -464,12 +464,16 @@ pub fn normalize_inventory(
             }
             streams.push(normalized);
         }
+        let mut graph_links = 0_u32;
         for file_name in &source.file_names {
             if source.reference.record_number == NTFS_ROOT_RECORD {
                 if file_name.parent != source.reference {
                     return Err(NtfsNormalizeError::RootHasExternalName);
                 }
-            } else {
+            } else if !is_dos_short_name_companion(file_name, &source.file_names) {
+                graph_links = graph_links
+                    .checked_add(1)
+                    .ok_or(NtfsNormalizeError::ArithmeticOverflow)?;
                 entries.push(NamespaceEntry {
                     parent: ObjectId(file_name.parent.record_number),
                     target: id,
@@ -484,12 +488,7 @@ pub fn normalize_inventory(
             } else {
                 ObjectKind::File
             },
-            link_count: if source.reference.record_number == NTFS_ROOT_RECORD {
-                0
-            } else {
-                u32::try_from(source.file_names.len())
-                    .map_err(|_| NtfsNormalizeError::ArithmeticOverflow)?
-            },
+            link_count: graph_links,
             semantics: ObjectSemantics {
                 has_security_descriptor: standard.security_id.is_some(),
                 is_reparse_point: source.has_reparse_point,
@@ -791,8 +790,12 @@ fn normalize_stream(
         sparse: source.sparse,
         compressed: source.compressed,
         encrypted: source.encrypted,
+        compression_block_bytes: source.compression_block_bytes,
     };
     if source.compressed && source.encrypted {
+        return Err(NtfsNormalizeError::ConflictingStreamFlags(id));
+    }
+    if source.compressed != (source.compression_block_bytes != 0) {
         return Err(NtfsNormalizeError::ConflictingStreamFlags(id));
     }
     match &source.storage {
@@ -820,6 +823,7 @@ fn normalize_stream(
             compressed_bytes,
             mapping_complete,
             extents,
+            captured_payload: _,
         } => {
             if !mapping_complete {
                 return Err(NtfsNormalizeError::IncompleteStream(id));
@@ -1017,7 +1021,12 @@ fn preservation_bytes(inventory: &NtfsInventory) -> Result<u64, NtfsNormalizeErr
                     let resident = match &stream.storage {
                         NtfsStreamStorage::Resident { bytes } => u64::try_from(bytes.len())
                             .map_err(|_| NtfsNormalizeError::ArithmeticOverflow)?,
-                        NtfsStreamStorage::NonResident { .. } => 0,
+                        NtfsStreamStorage::NonResident {
+                            captured_payload, ..
+                        } => captured_payload.as_ref().map_or(Ok(0), |bytes| {
+                            u64::try_from(bytes.len())
+                                .map_err(|_| NtfsNormalizeError::ArithmeticOverflow)
+                        })?,
                     };
                     sum.checked_add(name_bytes)
                         .and_then(|value| value.checked_add(resident))
@@ -1035,12 +1044,24 @@ const fn namespace_id(namespace: FileNameNamespace) -> u8 {
     }
 }
 
+fn is_dos_short_name_companion(name: &NtfsFileName, names: &[NtfsFileName]) -> bool {
+    name.namespace == FileNameNamespace::Dos
+        && names.iter().any(|other| {
+            other.parent == name.parent
+                && matches!(
+                    other.namespace,
+                    FileNameNamespace::Win32 | FileNameNamespace::Win32AndDos
+                )
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::SemanticFeature;
     use crate::fs::ntfs_inventory::{
-        NtfsDirectoryEntry, NtfsExtentPlacement, NtfsName, NtfsStandardInformation,
+        NtfsDirectoryEntry, NtfsExtentPlacement, NtfsName, NtfsReparseIndexEvidence,
+        NtfsStandardInformation,
     };
 
     const LIMITS: NtfsNormalizeLimits = NtfsNormalizeLimits {
@@ -1101,6 +1122,7 @@ mod tests {
             compressed: false,
             encrypted: false,
             sparse: false,
+            compression_block_bytes: 0,
             storage: NtfsStreamStorage::Resident {
                 bytes: bytes.to_vec(),
             },
@@ -1120,6 +1142,7 @@ mod tests {
             attribute_census: Vec::new(),
             directory_entries: entries,
             has_reparse_point: false,
+            reparse_point: None,
             has_attribute_list: false,
             directory_index_complete: true,
         }
@@ -1137,6 +1160,7 @@ mod tests {
             attribute_census: Vec::new(),
             directory_entries: Vec::new(),
             has_reparse_point: false,
+            reparse_point: None,
             has_attribute_list: false,
             directory_index_complete: true,
         }
@@ -1154,6 +1178,7 @@ mod tests {
             attribute_census: Vec::new(),
             directory_entries: Vec::new(),
             has_reparse_point: false,
+            reparse_point: None,
             has_attribute_list: false,
             directory_index_complete: true,
         }
@@ -1181,6 +1206,7 @@ mod tests {
         NtfsInventory {
             volume_serial_number: 0x0123_4567_89ab_cdef,
             volume_label: NtfsVolumeLabelEvidence::Absent,
+            reparse_index: NtfsReparseIndexEvidence::Absent,
             objects: vec![root(entries), file],
             extents,
             physical_allocations: Vec::new(),
@@ -1229,6 +1255,88 @@ mod tests {
                 SemanticFeature::AlternateDataStreams,
                 SemanticFeature::HardLinks,
             ]
+        );
+    }
+
+    fn file_name_with_namespace(
+        parent: NtfsObjectReference,
+        name: &str,
+        namespace: FileNameNamespace,
+    ) -> NtfsFileName {
+        let mut value = file_name(parent, name);
+        value.namespace = namespace;
+        value
+    }
+
+    #[test]
+    fn dos_short_name_companions_are_sidecar_aliases_not_graph_hard_links() {
+        let parent = reference(5, 2);
+        let source = inventory(file(
+            vec![
+                file_name(parent, "Long Document.txt"),
+                file_name_with_namespace(parent, "LONGDO~1.TXT", FileNameNamespace::Dos),
+            ],
+            vec![resident(1, None, b"abc")],
+        ));
+        let normalized = normalize_inventory(&source, 65_536, LIMITS).unwrap();
+        assert_eq!(normalized.graph.entries().len(), 1);
+        assert_eq!(normalized.graph.objects()[1].link_count, 1);
+        assert_eq!(
+            normalized.graph.entries()[0].name,
+            "Long Document.txt".encode_utf16().collect::<Vec<u16>>()
+        );
+        assert!(
+            !normalized
+                .graph
+                .features()
+                .contains(&SemanticFeature::HardLinks)
+        );
+        assert_eq!(
+            normalized.preservation.objects[1].source.file_names.len(),
+            2
+        );
+        assert_eq!(
+            normalized.preservation.objects[1].source.file_names[1].namespace,
+            FileNameNamespace::Dos
+        );
+
+        let hard_linked = inventory(file(
+            vec![
+                file_name(parent, "alpha"),
+                file_name_with_namespace(parent, "ALPHA~1", FileNameNamespace::Dos),
+                file_name(parent, "beta"),
+                file_name_with_namespace(parent, "BETA~1", FileNameNamespace::Dos),
+            ],
+            vec![resident(1, None, b"abc")],
+        ));
+        let normalized = normalize_inventory(&hard_linked, 65_536, LIMITS).unwrap();
+        assert_eq!(normalized.graph.entries().len(), 2);
+        assert_eq!(normalized.graph.objects()[1].link_count, 2);
+        assert!(
+            normalized
+                .graph
+                .features()
+                .contains(&SemanticFeature::HardLinks)
+        );
+        assert_eq!(
+            normalized.preservation.objects[1].source.file_names.len(),
+            4
+        );
+
+        let dos_only = inventory(file(
+            vec![file_name_with_namespace(
+                parent,
+                "README.TXT",
+                FileNameNamespace::Dos,
+            )],
+            vec![resident(1, None, b"abc")],
+        ));
+        let normalized = normalize_inventory(&dos_only, 65_536, LIMITS).unwrap();
+        assert_eq!(normalized.graph.entries().len(), 1);
+        assert_eq!(normalized.graph.objects()[1].link_count, 1);
+        assert_eq!(
+            normalized.graph.entries()[0].name,
+            "README.TXT".encode_utf16().collect::<Vec<u16>>()
         );
     }
 
@@ -1391,6 +1499,7 @@ mod tests {
             compressed: false,
             encrypted: false,
             sparse: true,
+            compression_block_bytes: 0,
             storage: NtfsStreamStorage::NonResident {
                 allocated_bytes: 4096,
                 data_bytes: 7000,
@@ -1411,6 +1520,7 @@ mod tests {
                         placement: NtfsExtentPlacement::Sparse,
                     },
                 ],
+                captured_payload: None,
             },
         };
         let source = inventory(file(
@@ -1430,6 +1540,49 @@ mod tests {
         );
         assert_eq!(normalized.graph.extents().sparse_bytes(), 4096);
         assert_eq!(normalized.preservation.source_extents, source.extents);
+    }
+
+    #[test]
+    fn preserves_ntfs_compression_unit_on_the_graph() {
+        let stream = NtfsDataStream {
+            attribute_id: 9,
+            name: None,
+            compressed: true,
+            encrypted: false,
+            sparse: false,
+            compression_block_bytes: 8192,
+            storage: NtfsStreamStorage::NonResident {
+                allocated_bytes: 4096,
+                data_bytes: 6,
+                initialized_bytes: 6,
+                compressed_bytes: Some(4096),
+                mapping_complete: true,
+                extents: vec![
+                    NtfsInventoryExtent {
+                        stream_id: (6 << 16) + 9,
+                        logical_offset: 0,
+                        length: 4096,
+                        placement: NtfsExtentPlacement::Physical { byte_offset: 8192 },
+                    },
+                    NtfsInventoryExtent {
+                        stream_id: (6 << 16) + 9,
+                        logical_offset: 4096,
+                        length: 4096,
+                        placement: NtfsExtentPlacement::Sparse,
+                    },
+                ],
+                captured_payload: None,
+            },
+        };
+        let source = inventory(file(
+            vec![file_name(reference(5, 2), "packed")],
+            vec![stream],
+        ));
+        let normalized = normalize_inventory(&source, 65_536, LIMITS).unwrap();
+        let flags = normalized.graph.objects()[1].streams[0].flags;
+        assert!(flags.compressed);
+        assert_eq!(flags.compression_block_bytes, 8192);
+        assert!(!flags.sparse);
     }
 
     #[test]
@@ -1530,6 +1683,7 @@ mod tests {
             attribute_census: Vec::new(),
             directory_entries: Vec::new(),
             has_reparse_point: false,
+            reparse_point: None,
             has_attribute_list: false,
             directory_index_complete: true,
         });
@@ -1585,6 +1739,7 @@ mod tests {
             compressed: false,
             encrypted: false,
             sparse: false,
+            compression_block_bytes: 0,
             storage: NtfsStreamStorage::NonResident {
                 allocated_bytes: 4096,
                 data_bytes: 1,
@@ -1597,6 +1752,7 @@ mod tests {
                     length: 4096,
                     placement: NtfsExtentPlacement::Physical { byte_offset: 4096 },
                 }],
+                captured_payload: None,
             },
         });
         assert!(matches!(

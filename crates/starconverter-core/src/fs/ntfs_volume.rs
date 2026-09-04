@@ -1,14 +1,21 @@
 //! Bounded discovery of NTFS `$Volume` metadata and the volume allocation bitmap.
 //!
 //! This layer consumes an already validated `$MFT` bootstrap and reads only regular image files.
-//! Attribute-list continuations are not followed yet: their absence is represented as explicit
-//! incomplete evidence rather than being mistaken for a complete allocation view.
+//! When a system record carries an `$ATTRIBUTE_LIST`, its attributes are resolved through the
+//! list (resident or non-resident) and VCN-split `$MFT::$BITMAP` / `$Bitmap::$DATA` extents are
+//! concatenated in order. The only remaining incomplete outcome is a continuation host that lies
+//! outside the decoded `$MFT` mapping, which is reported as explicit incomplete evidence rather
+//! than being mistaken for a complete allocation view.
 
 use std::fmt;
 
 use crate::fs::ntfs::NtfsBootSector;
 use crate::fs::ntfs_attribute::{
-    AttributeBody, AttributeLimits, NtfsAttributeError, parse_attribute_list,
+    AttributeBody, AttributeLimits, NtfsAttribute, NtfsAttributeError, parse_attribute,
+    parse_attribute_list,
+};
+use crate::fs::ntfs_attribute_list::{
+    AttributeListError, AttributeListLimits, resolve_attribute_list_with_reader,
 };
 use crate::fs::ntfs_bitmap::{NtfsBitmapError, TailEvidence, parse_bitmap};
 use crate::fs::ntfs_discovery::{MftBootstrap, NtfsDiscoveryError, read_mft_record_with_reader};
@@ -175,6 +182,7 @@ pub enum NtfsVolumeError {
     Discovery(NtfsDiscoveryError),
     Image(ImageError),
     Attribute(NtfsAttributeError),
+    AttributeList(AttributeListError),
     MappingPairs(MappingPairsError),
     Bitmap(NtfsBitmapError),
     SystemRecordNotInUse { record_number: u64 },
@@ -219,6 +227,10 @@ impl fmt::Display for NtfsVolumeError {
             Self::Attribute(error) => {
                 write!(formatter, "invalid NTFS system-record attribute: {error}")
             }
+            Self::AttributeList(error) => write!(
+                formatter,
+                "could not resolve NTFS system-record $ATTRIBUTE_LIST: {error}"
+            ),
             Self::MappingPairs(error) => {
                 write!(formatter, "invalid NTFS bitmap mapping pairs: {error}")
             }
@@ -282,10 +294,17 @@ impl std::error::Error for NtfsVolumeError {
             Self::Discovery(error) => Some(error),
             Self::Image(error) => Some(error),
             Self::Attribute(error) => Some(error),
+            Self::AttributeList(error) => Some(error),
             Self::MappingPairs(error) => Some(error),
             Self::Bitmap(error) => Some(error),
             _ => None,
         }
+    }
+}
+
+impl From<AttributeListError> for NtfsVolumeError {
+    fn from(value: AttributeListError) -> Self {
+        Self::AttributeList(value)
     }
 }
 
@@ -360,9 +379,23 @@ pub(crate) fn discover_volume_and_bitmap_with_reader(
         boot.mft_record_size.bytes,
     )?;
     validate_system_record(&mft_record, MFT_RECORD_NUMBER)?;
-    let mft_attributes = attributes(&mft_record, boot, limits)?;
-    let mft_bitmap =
-        parse_mft_bitmap_evidence(image, boot, &mft_attributes.attributes, limits, &mut budget)?;
+    let mft_bitmap = match system_record_attribute_bytes(
+        image,
+        boot,
+        mft,
+        MFT_RECORD_NUMBER,
+        &mft_record,
+        limits,
+        &mut budget,
+    )? {
+        SystemRecordAttributes::Resolved(raw) => {
+            let parsed = parse_owned_attributes(&raw, boot, limits)?;
+            parse_mft_bitmap_evidence(image, boot, &parsed, limits, &mut budget)?
+        }
+        SystemRecordAttributes::ContinuationHostUnmapped => NtfsMftBitmapEvidence::Incomplete {
+            reason: NtfsMetadataIncompleteReason::MftBitmapAttributeListContinuationRequired,
+        },
+    };
 
     let volume_record = read_mft_record_with_reader(
         image,
@@ -372,8 +405,23 @@ pub(crate) fn discover_volume_and_bitmap_with_reader(
         boot.mft_record_size.bytes,
     )?;
     validate_system_record(&volume_record, VOLUME_RECORD_NUMBER)?;
-    let volume_attributes = attributes(&volume_record, boot, limits)?;
-    let volume = parse_volume_evidence(&volume_attributes.attributes)?;
+    let volume = match system_record_attribute_bytes(
+        image,
+        boot,
+        mft,
+        VOLUME_RECORD_NUMBER,
+        &volume_record,
+        limits,
+        &mut budget,
+    )? {
+        SystemRecordAttributes::Resolved(raw) => {
+            let parsed = parse_owned_attributes(&raw, boot, limits)?;
+            parse_volume_evidence(&parsed)?
+        }
+        SystemRecordAttributes::ContinuationHostUnmapped => NtfsVolumeEvidence::Incomplete {
+            reason: NtfsMetadataIncompleteReason::AttributeListContinuationRequired,
+        },
+    };
 
     let bitmap_record = read_mft_record_with_reader(
         image,
@@ -383,14 +431,23 @@ pub(crate) fn discover_volume_and_bitmap_with_reader(
         boot.mft_record_size.bytes,
     )?;
     validate_system_record(&bitmap_record, BITMAP_RECORD_NUMBER)?;
-    let bitmap_attributes = attributes(&bitmap_record, boot, limits)?;
-    let bitmap = parse_bitmap_evidence(
+    let bitmap = match system_record_attribute_bytes(
         image,
         boot,
-        &bitmap_attributes.attributes,
+        mft,
+        BITMAP_RECORD_NUMBER,
+        &bitmap_record,
         limits,
         &mut budget,
-    )?;
+    )? {
+        SystemRecordAttributes::Resolved(raw) => {
+            let parsed = parse_owned_attributes(&raw, boot, limits)?;
+            parse_bitmap_evidence(image, boot, &parsed, limits, &mut budget)?
+        }
+        SystemRecordAttributes::ContinuationHostUnmapped => NtfsBitmapEvidence::Incomplete {
+            reason: NtfsMetadataIncompleteReason::AttributeListContinuationRequired,
+        },
+    };
 
     Ok(NtfsVolumeDiscovery {
         volume,
@@ -433,6 +490,15 @@ const fn validate_system_record(
     Ok(())
 }
 
+const fn attribute_limits(boot: &NtfsBootSector, limits: NtfsVolumeLimits) -> AttributeLimits {
+    AttributeLimits {
+        cluster_size_bytes: boot.cluster_size_bytes,
+        max_attribute_bytes: limits.max_attribute_bytes,
+        max_name_code_units: limits.max_name_code_units,
+        max_attributes: limits.max_attributes,
+    }
+}
+
 fn attributes<'a>(
     record: &'a NtfsFileRecord,
     boot: &NtfsBootSector,
@@ -444,21 +510,100 @@ fn attributes<'a>(
         usize::try_from(record.bytes_in_use).map_err(|_| NtfsVolumeError::GeometryOverflow {
             calculation: "system-record bytes in use",
         })?,
-        AttributeLimits {
-            cluster_size_bytes: boot.cluster_size_bytes,
-            max_attribute_bytes: limits.max_attribute_bytes,
-            max_name_code_units: limits.max_name_code_units,
-            max_attributes: limits.max_attributes,
-        },
+        attribute_limits(boot, limits),
     )?)
 }
 
-fn parse_volume_evidence(
-    attributes: &[crate::fs::ntfs_attribute::NtfsAttribute<'_>],
-) -> Result<NtfsVolumeEvidence, NtfsVolumeError> {
-    let has_attribute_list = attributes
+/// The complete attribute set of a system record, or the reason it cannot be assembled yet.
+enum SystemRecordAttributes {
+    /// Raw attribute records in on-disk (`$ATTRIBUTE_LIST`) order.
+    Resolved(Vec<Vec<u8>>),
+    /// The record's `$ATTRIBUTE_LIST` names a continuation record outside the decoded `$MFT`
+    /// mapping, so the attribute set is knowingly incomplete.
+    ContinuationHostUnmapped,
+}
+
+/// Collects every attribute of a system record, following its `$ATTRIBUTE_LIST` when present.
+///
+/// Without an `$ATTRIBUTE_LIST` the record's own attributes are authoritative. With one, the list
+/// is resolved (resident or non-resident) and every listed extent is gathered from its host
+/// record, so VCN-split streams and attributes moved to extension records become visible.
+fn system_record_attribute_bytes(
+    image: &dyn BoundedImageReader,
+    boot: &NtfsBootSector,
+    mft: &MftBootstrap,
+    record_number: u64,
+    record: &NtfsFileRecord,
+    limits: NtfsVolumeLimits,
+    budget: &mut ReadBudget,
+) -> Result<SystemRecordAttributes, NtfsVolumeError> {
+    let own = attributes(record, boot, limits)?;
+    let has_attribute_list = own
+        .attributes
         .iter()
         .any(|attribute| attribute.attribute_type == ATTRIBUTE_LIST_TYPE);
+    if !has_attribute_list {
+        let mut raw = Vec::new();
+        raw.try_reserve_exact(own.attributes.len()).map_err(|_| {
+            NtfsVolumeError::GeometryOverflow {
+                calculation: "system-record attribute allocation",
+            }
+        })?;
+        raw.extend(
+            own.attributes
+                .iter()
+                .map(|attribute| attribute.raw.to_vec()),
+        );
+        return Ok(SystemRecordAttributes::Resolved(raw));
+    }
+
+    let remaining = budget.remaining();
+    if remaining == 0 {
+        return Err(NtfsVolumeError::ByteLimitExceeded {
+            requested_total: budget.used.saturating_add(1),
+            maximum: budget.maximum,
+        });
+    }
+    let list_limits = AttributeListLimits {
+        max_attributes_per_record: limits.max_attributes,
+        max_attribute_bytes: limits.max_attribute_bytes,
+        max_name_code_units: limits.max_name_code_units,
+        max_runs: limits.max_runs,
+        max_read_bytes: remaining,
+        ..AttributeListLimits::default()
+    };
+    match resolve_attribute_list_with_reader(image, boot, mft, record_number, record, list_limits) {
+        Ok(resolved) => {
+            budget.charge(resolved.bytes_read)?;
+            Ok(SystemRecordAttributes::Resolved(
+                resolved
+                    .extents
+                    .into_iter()
+                    .map(|extent| extent.raw_attribute)
+                    .collect(),
+            ))
+        }
+        Err(AttributeListError::Discovery(NtfsDiscoveryError::MftRecordOutsideMapping {
+            ..
+        })) => Ok(SystemRecordAttributes::ContinuationHostUnmapped),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn parse_owned_attributes<'a>(
+    raw: &'a [Vec<u8>],
+    boot: &NtfsBootSector,
+    limits: NtfsVolumeLimits,
+) -> Result<Vec<NtfsAttribute<'a>>, NtfsVolumeError> {
+    let attribute_limits = attribute_limits(boot, limits);
+    raw.iter()
+        .map(|bytes| parse_attribute(bytes, attribute_limits).map_err(NtfsVolumeError::from))
+        .collect()
+}
+
+fn parse_volume_evidence(
+    attributes: &[NtfsAttribute<'_>],
+) -> Result<NtfsVolumeEvidence, NtfsVolumeError> {
     let mut found = None;
     for attribute in attributes {
         if attribute.attribute_type != VOLUME_INFORMATION_TYPE {
@@ -498,316 +643,341 @@ fn parse_volume_evidence(
             flags: NtfsVolumeFlags::from_raw(raw_flags),
         });
     }
-    match found {
-        Some(info) => Ok(NtfsVolumeEvidence::Complete(info)),
-        None if has_attribute_list => Ok(NtfsVolumeEvidence::Incomplete {
-            reason: NtfsMetadataIncompleteReason::AttributeListContinuationRequired,
-        }),
-        None => Err(NtfsVolumeError::MissingVolumeInformation),
+    found
+        .map(NtfsVolumeEvidence::Complete)
+        .ok_or(NtfsVolumeError::MissingVolumeInformation)
+}
+
+/// Which unnamed bitmap-carrying stream is being assembled; selects error and reason vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BitmapStream {
+    /// `$MFT::$BITMAP` (record 0, attribute type `0xb0`).
+    MftBitmap,
+    /// `$Bitmap::$DATA` (record 6, attribute type `0x80`).
+    VolumeBitmap,
+}
+
+impl BitmapStream {
+    const fn attribute_type(self) -> u32 {
+        match self {
+            Self::MftBitmap => BITMAP_TYPE,
+            Self::VolumeBitmap => DATA_TYPE,
+        }
     }
+
+    const fn unsupported(self, reason: &'static str) -> NtfsVolumeError {
+        match self {
+            Self::MftBitmap => NtfsVolumeError::UnsupportedMftBitmapStorage { reason },
+            Self::VolumeBitmap => NtfsVolumeError::UnsupportedBitmapStorage { reason },
+        }
+    }
+
+    const fn missing(self) -> NtfsVolumeError {
+        match self {
+            Self::MftBitmap => NtfsVolumeError::MissingMftBitmap,
+            Self::VolumeBitmap => NtfsVolumeError::MissingBitmapData,
+        }
+    }
+
+    const fn duplicate(self) -> NtfsVolumeError {
+        match self {
+            Self::MftBitmap => NtfsVolumeError::DuplicateMftBitmap,
+            Self::VolumeBitmap => NtfsVolumeError::DuplicateBitmapData,
+        }
+    }
+
+    const fn too_large(self, actual: u64, maximum: usize) -> NtfsVolumeError {
+        match self {
+            Self::MftBitmap => NtfsVolumeError::MftBitmapTooLarge { actual, maximum },
+            Self::VolumeBitmap => NtfsVolumeError::BitmapTooLarge { actual, maximum },
+        }
+    }
+
+    const fn uninitialized(self) -> NtfsMetadataIncompleteReason {
+        match self {
+            Self::MftBitmap => NtfsMetadataIncompleteReason::MftBitmapContainsUninitializedBytes,
+            Self::VolumeBitmap => NtfsMetadataIncompleteReason::BitmapContainsUninitializedBytes,
+        }
+    }
+
+    const fn mapping_continuation(self) -> NtfsMetadataIncompleteReason {
+        match self {
+            Self::MftBitmap => NtfsMetadataIncompleteReason::MftBitmapMappingContinuationRequired,
+            Self::VolumeBitmap => NtfsMetadataIncompleteReason::BitmapMappingContinuationRequired,
+        }
+    }
+
+    const fn overflow(self, what: StreamCalculation) -> NtfsVolumeError {
+        let calculation = match (self, what) {
+            (Self::MftBitmap, StreamCalculation::MappedBytes) => "$MFT::$BITMAP mapped byte length",
+            (Self::MftBitmap, StreamCalculation::ExtentBytes) => "$MFT::$BITMAP extent byte length",
+            (Self::MftBitmap, StreamCalculation::ExtentOffset) => {
+                "$MFT::$BITMAP extent image offset"
+            }
+            (Self::MftBitmap, StreamCalculation::CopiedBytes) => "$MFT::$BITMAP copied byte count",
+            (Self::MftBitmap, StreamCalculation::RunlistMerge) => "$MFT::$BITMAP runlist merge",
+            (Self::VolumeBitmap, StreamCalculation::MappedBytes) => "$Bitmap mapped byte length",
+            (Self::VolumeBitmap, StreamCalculation::ExtentBytes) => "$Bitmap extent byte length",
+            (Self::VolumeBitmap, StreamCalculation::ExtentOffset) => "$Bitmap extent image offset",
+            (Self::VolumeBitmap, StreamCalculation::CopiedBytes) => "$Bitmap copied byte count",
+            (Self::VolumeBitmap, StreamCalculation::RunlistMerge) => "$Bitmap runlist merge",
+        };
+        NtfsVolumeError::GeometryOverflow { calculation }
+    }
+
+    fn ensure_len(self, actual: u64, maximum: usize) -> Result<(), NtfsVolumeError> {
+        let maximum_u64 = u64::try_from(maximum).unwrap_or(u64::MAX);
+        if actual > maximum_u64 {
+            Err(self.too_large(actual, maximum))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StreamCalculation {
+    MappedBytes,
+    ExtentBytes,
+    ExtentOffset,
+    CopiedBytes,
+    RunlistMerge,
+}
+
+/// Outcome of assembling one bitmap stream's bytes.
+enum StreamBytes {
+    Complete(Vec<u8>),
+    Incomplete(NtfsMetadataIncompleteReason),
 }
 
 fn parse_mft_bitmap_evidence(
     image: &dyn BoundedImageReader,
     boot: &NtfsBootSector,
-    attributes: &[crate::fs::ntfs_attribute::NtfsAttribute<'_>],
+    attributes: &[NtfsAttribute<'_>],
     limits: NtfsVolumeLimits,
     budget: &mut ReadBudget,
 ) -> Result<NtfsMftBitmapEvidence, NtfsVolumeError> {
-    let has_attribute_list = attributes
-        .iter()
-        .any(|attribute| attribute.attribute_type == ATTRIBUTE_LIST_TYPE);
-    let mut selected = None;
-    let mut has_continuation = false;
-    for attribute in attributes {
-        if attribute.attribute_type != BITMAP_TYPE || attribute.name.is_some() {
-            continue;
-        }
-        let is_first_extent = match &attribute.body {
-            AttributeBody::Resident(_) => true,
-            AttributeBody::NonResident(bitmap) => bitmap.lowest_vcn == 0,
-        };
-        if !is_first_extent {
-            has_continuation = true;
-            continue;
-        }
-        if selected.is_some() {
-            return Err(NtfsVolumeError::DuplicateMftBitmap);
-        }
-        selected = Some(attribute);
-    }
-    if has_attribute_list {
-        return Ok(NtfsMftBitmapEvidence::Incomplete {
-            reason: NtfsMetadataIncompleteReason::MftBitmapAttributeListContinuationRequired,
-        });
-    }
-    if has_continuation {
-        return Ok(NtfsMftBitmapEvidence::Incomplete {
-            reason: NtfsMetadataIncompleteReason::MftBitmapMappingContinuationRequired,
-        });
-    }
-    let Some(attribute) = selected else {
-        return Err(NtfsVolumeError::MissingMftBitmap);
-    };
-
-    let bytes = match &attribute.body {
-        AttributeBody::Resident(resident) => {
-            ensure_mft_bitmap_len(resident.value.len() as u64, limits.max_bitmap_bytes)?;
-            resident.value.to_vec()
-        }
-        AttributeBody::NonResident(bitmap) => {
-            if attribute.flags.is_compressed()
-                || attribute.flags.encrypted
-                || attribute.flags.sparse
-            {
-                return Err(NtfsVolumeError::UnsupportedMftBitmapStorage {
-                    reason: "attribute is compressed, encrypted, or sparse",
-                });
-            }
-            let sizes = bitmap
-                .sizes
-                .ok_or(NtfsVolumeError::UnsupportedMftBitmapStorage {
-                    reason: "first extent has no authoritative size fields",
-                })?;
-            ensure_mft_bitmap_len(sizes.data, limits.max_bitmap_bytes)?;
-            if sizes.initialized < sizes.data {
-                return Ok(NtfsMftBitmapEvidence::Incomplete {
-                    reason: NtfsMetadataIncompleteReason::MftBitmapContainsUninitializedBytes,
-                });
-            }
-            let runlist = parse_mapping_pairs(
-                bitmap.mapping_pairs,
-                MappingPairsLimits {
-                    starting_vcn: bitmap.lowest_vcn,
-                    expected_next_vcn: Some(bitmap.expected_next_vcn),
-                    volume_cluster_count: boot.cluster_count,
-                    max_runs: limits.max_runs,
-                    max_decoded_clusters: boot.cluster_count,
-                },
-            )?;
-            if runlist.sparse_clusters != 0 {
-                return Err(NtfsVolumeError::UnsupportedMftBitmapStorage {
-                    reason: "runlist contains sparse clusters",
-                });
-            }
-            let mapped_bytes = runlist
-                .next_vcn
-                .checked_mul(boot.cluster_size_bytes)
-                .ok_or(NtfsVolumeError::GeometryOverflow {
-                    calculation: "$MFT::$BITMAP mapped byte length",
-                })?;
-            if mapped_bytes > sizes.allocated {
-                return Err(NtfsVolumeError::UnsupportedMftBitmapStorage {
-                    reason: "runlist maps more bytes than the allocation size",
-                });
-            }
-            if mapped_bytes < sizes.allocated {
-                return Ok(NtfsMftBitmapEvidence::Incomplete {
-                    reason: NtfsMetadataIncompleteReason::MftBitmapMappingContinuationRequired,
-                });
-            }
-            budget.charge(sizes.data)?;
-            read_mft_bitmap_stream(image, boot, &runlist, sizes.data)?
-        }
-    };
-    Ok(NtfsMftBitmapEvidence::Complete(NtfsMftBitmap {
-        bitmap_bytes: bytes.len() as u64,
-        canonical_bitmap: bytes,
-    }))
-}
-
-fn ensure_mft_bitmap_len(actual: u64, maximum: usize) -> Result<(), NtfsVolumeError> {
-    let maximum_u64 = u64::try_from(maximum).unwrap_or(u64::MAX);
-    if actual > maximum_u64 {
-        Err(NtfsVolumeError::MftBitmapTooLarge { actual, maximum })
-    } else {
-        Ok(())
+    match read_bitmap_stream(
+        BitmapStream::MftBitmap,
+        image,
+        boot,
+        attributes,
+        limits,
+        budget,
+    )? {
+        StreamBytes::Complete(bytes) => Ok(NtfsMftBitmapEvidence::Complete(NtfsMftBitmap {
+            bitmap_bytes: bytes.len() as u64,
+            canonical_bitmap: bytes,
+        })),
+        StreamBytes::Incomplete(reason) => Ok(NtfsMftBitmapEvidence::Incomplete { reason }),
     }
 }
 
 fn parse_bitmap_evidence(
     image: &dyn BoundedImageReader,
     boot: &NtfsBootSector,
-    attributes: &[crate::fs::ntfs_attribute::NtfsAttribute<'_>],
+    attributes: &[NtfsAttribute<'_>],
     limits: NtfsVolumeLimits,
     budget: &mut ReadBudget,
 ) -> Result<NtfsBitmapEvidence, NtfsVolumeError> {
-    let has_attribute_list = attributes
-        .iter()
-        .any(|attribute| attribute.attribute_type == ATTRIBUTE_LIST_TYPE);
-    let mut selected = None;
+    match read_bitmap_stream(
+        BitmapStream::VolumeBitmap,
+        image,
+        boot,
+        attributes,
+        limits,
+        budget,
+    )? {
+        StreamBytes::Complete(bytes) => {
+            allocation_evidence(boot, bytes).map(NtfsBitmapEvidence::Complete)
+        }
+        StreamBytes::Incomplete(reason) => Ok(NtfsBitmapEvidence::Incomplete { reason }),
+    }
+}
+
+/// Selects the unnamed first extent of `kind` and every VCN continuation extent of the same
+/// stream. `attributes` must already be the record's complete (list-resolved) attribute set.
+fn select_stream_extents<'a, 'b>(
+    kind: BitmapStream,
+    attributes: &'b [NtfsAttribute<'a>],
+) -> Result<(&'b NtfsAttribute<'a>, Vec<&'b NtfsAttribute<'a>>), NtfsVolumeError> {
+    let mut first = None;
+    let mut continuations = Vec::new();
     for attribute in attributes {
-        if attribute.attribute_type != DATA_TYPE || attribute.name.is_some() {
+        if attribute.attribute_type != kind.attribute_type() || attribute.name.is_some() {
             continue;
         }
         let is_first_extent = match &attribute.body {
             AttributeBody::Resident(_) => true,
-            AttributeBody::NonResident(data) => data.lowest_vcn == 0,
+            AttributeBody::NonResident(body) => body.lowest_vcn == 0,
         };
         if !is_first_extent {
+            continuations.push(attribute);
             continue;
         }
-        if selected.is_some() {
-            return Err(NtfsVolumeError::DuplicateBitmapData);
+        if first.is_some() {
+            return Err(kind.duplicate());
         }
-        selected = Some(attribute);
+        first = Some(attribute);
     }
-    let Some(attribute) = selected else {
-        return if has_attribute_list {
-            Ok(NtfsBitmapEvidence::Incomplete {
-                reason: NtfsMetadataIncompleteReason::AttributeListContinuationRequired,
-            })
-        } else {
-            Err(NtfsVolumeError::MissingBitmapData)
-        };
-    };
-
-    let bytes = match &attribute.body {
-        AttributeBody::Resident(resident) => {
-            ensure_bitmap_len(resident.value.len() as u64, limits.max_bitmap_bytes)?;
-            resident.value.to_vec()
-        }
-        AttributeBody::NonResident(data) => {
-            if attribute.flags.is_compressed()
-                || attribute.flags.encrypted
-                || attribute.flags.sparse
-            {
-                return Err(NtfsVolumeError::UnsupportedBitmapStorage {
-                    reason: "unnamed $DATA is compressed, encrypted, or sparse",
-                });
-            }
-            let sizes = data
-                .sizes
-                .ok_or(NtfsVolumeError::UnsupportedBitmapStorage {
-                    reason: "first extent has no authoritative size fields",
-                })?;
-            ensure_bitmap_len(sizes.data, limits.max_bitmap_bytes)?;
-            if sizes.initialized < sizes.data {
-                return Ok(NtfsBitmapEvidence::Incomplete {
-                    reason: NtfsMetadataIncompleteReason::BitmapContainsUninitializedBytes,
-                });
-            }
-            let runlist = parse_mapping_pairs(
-                data.mapping_pairs,
-                MappingPairsLimits {
-                    starting_vcn: data.lowest_vcn,
-                    expected_next_vcn: Some(data.expected_next_vcn),
-                    volume_cluster_count: boot.cluster_count,
-                    max_runs: limits.max_runs,
-                    max_decoded_clusters: boot.cluster_count,
-                },
-            )?;
-            if runlist.sparse_clusters != 0 {
-                return Err(NtfsVolumeError::UnsupportedBitmapStorage {
-                    reason: "runlist contains sparse clusters",
-                });
-            }
-            let mapped_bytes = runlist
-                .next_vcn
-                .checked_mul(boot.cluster_size_bytes)
-                .ok_or(NtfsVolumeError::GeometryOverflow {
-                    calculation: "$Bitmap mapped byte length",
-                })?;
-            if mapped_bytes > sizes.allocated {
-                return Err(NtfsVolumeError::UnsupportedBitmapStorage {
-                    reason: "runlist maps more bytes than the allocation size",
-                });
-            }
-            if mapped_bytes < sizes.allocated {
-                return Ok(NtfsBitmapEvidence::Incomplete {
-                    reason: NtfsMetadataIncompleteReason::BitmapMappingContinuationRequired,
-                });
-            }
-            budget.charge(sizes.data)?;
-            read_nonresident_stream(image, boot, &runlist, sizes.data)?
-        }
-    };
-    allocation_evidence(boot, bytes).map(NtfsBitmapEvidence::Complete)
+    let first = first.ok_or_else(|| kind.missing())?;
+    continuations.sort_by_key(|attribute| match &attribute.body {
+        AttributeBody::NonResident(body) => body.lowest_vcn,
+        AttributeBody::Resident(_) => 0,
+    });
+    Ok((first, continuations))
 }
 
-fn ensure_bitmap_len(actual: u64, maximum: usize) -> Result<(), NtfsVolumeError> {
-    let maximum_u64 = u64::try_from(maximum).unwrap_or(u64::MAX);
-    if actual > maximum_u64 {
-        Err(NtfsVolumeError::BitmapTooLarge { actual, maximum })
-    } else {
-        Ok(())
-    }
-}
-
-fn read_nonresident_stream(
+/// Reads the complete unnamed bitmap stream of `kind`, concatenating VCN-split extents.
+fn read_bitmap_stream(
+    kind: BitmapStream,
     image: &dyn BoundedImageReader,
     boot: &NtfsBootSector,
-    runlist: &NtfsRunlist,
-    data_bytes: u64,
-) -> Result<Vec<u8>, NtfsVolumeError> {
-    let output_len = usize::try_from(data_bytes).map_err(|_| NtfsVolumeError::BitmapTooLarge {
-        actual: data_bytes,
-        maximum: usize::MAX,
-    })?;
-    let mut output = vec![0_u8; output_len];
-    let mut copied = 0_u64;
-    for extent in &runlist.extents {
-        if copied == data_bytes {
-            break;
+    attributes: &[NtfsAttribute<'_>],
+    limits: NtfsVolumeLimits,
+    budget: &mut ReadBudget,
+) -> Result<StreamBytes, NtfsVolumeError> {
+    let (first, continuations) = select_stream_extents(kind, attributes)?;
+    let body = match &first.body {
+        AttributeBody::Resident(resident) => {
+            if !continuations.is_empty() {
+                return Err(kind.unsupported(
+                    "resident first extent is followed by non-resident continuation extents",
+                ));
+            }
+            kind.ensure_len(resident.value.len() as u64, limits.max_bitmap_bytes)?;
+            return Ok(StreamBytes::Complete(resident.value.to_vec()));
         }
-        let ExtentLocation::Physical { lcn } = extent.location else {
-            return Err(NtfsVolumeError::UnsupportedBitmapStorage {
-                reason: "runlist contains a sparse extent",
-            });
+        AttributeBody::NonResident(body) => body,
+    };
+    if first.flags.is_compressed() || first.flags.encrypted || first.flags.sparse {
+        return Err(kind.unsupported("attribute is compressed, encrypted, or sparse"));
+    }
+    let sizes = body
+        .sizes
+        .ok_or_else(|| kind.unsupported("first extent has no authoritative size fields"))?;
+    kind.ensure_len(sizes.data, limits.max_bitmap_bytes)?;
+    if sizes.initialized < sizes.data {
+        return Ok(StreamBytes::Incomplete(kind.uninitialized()));
+    }
+
+    let mut runlist = parse_stream_extent_runlist(kind, boot, first, 0, limits.max_runs)?;
+    for continuation in continuations {
+        if continuation.flags != first.flags {
+            return Err(kind.unsupported("continuation extent changes the attribute flags"));
+        }
+        let AttributeBody::NonResident(continuation_body) = &continuation.body else {
+            return Err(kind.unsupported("continuation extent is resident"));
         };
-        let extent_bytes = extent.length.checked_mul(boot.cluster_size_bytes).ok_or(
-            NtfsVolumeError::GeometryOverflow {
-                calculation: "$Bitmap extent byte length",
-            },
+        if continuation_body.lowest_vcn != runlist.next_vcn {
+            return Err(kind.unsupported("continuation extent is not VCN-contiguous"));
+        }
+        let remaining_runs = limits
+            .max_runs
+            .checked_sub(runlist.encoded_runs)
+            .filter(|remaining| *remaining > 0)
+            .ok_or(NtfsVolumeError::MappingPairs(
+                MappingPairsError::RunLimitExceeded {
+                    maximum: limits.max_runs,
+                },
+            ))?;
+        let extra = parse_stream_extent_runlist(
+            kind,
+            boot,
+            continuation,
+            runlist.next_vcn,
+            remaining_runs,
         )?;
-        let count_u64 = extent_bytes.min(data_bytes - copied);
-        let count = usize::try_from(count_u64).map_err(|_| NtfsVolumeError::BitmapTooLarge {
-            actual: count_u64,
-            maximum: usize::MAX,
-        })?;
-        let offset =
-            lcn.checked_mul(boot.cluster_size_bytes)
-                .ok_or(NtfsVolumeError::GeometryOverflow {
-                    calculation: "$Bitmap extent image offset",
-                })?;
-        let output_offset =
-            usize::try_from(copied).map_err(|_| NtfsVolumeError::BitmapTooLarge {
-                actual: copied,
-                maximum: usize::MAX,
-            })?;
-        read_chunked(image, offset, &mut output[output_offset..][..count])?;
-        copied = copied
-            .checked_add(count_u64)
-            .ok_or(NtfsVolumeError::GeometryOverflow {
-                calculation: "$Bitmap copied byte count",
-            })?;
+        append_runlist(kind, &mut runlist, extra)?;
     }
-    if copied != data_bytes {
-        return Err(NtfsVolumeError::UnsupportedBitmapStorage {
-            reason: "runlist does not cover the logical data size",
-        });
+
+    let mapped_bytes = runlist
+        .next_vcn
+        .checked_mul(boot.cluster_size_bytes)
+        .ok_or_else(|| kind.overflow(StreamCalculation::MappedBytes))?;
+    if mapped_bytes > sizes.allocated {
+        return Err(kind.unsupported("runlist maps more bytes than the allocation size"));
     }
-    Ok(output)
+    if mapped_bytes < sizes.allocated {
+        return Ok(StreamBytes::Incomplete(kind.mapping_continuation()));
+    }
+    budget.charge(sizes.data)?;
+    read_stream(kind, image, boot, &runlist, sizes.data).map(StreamBytes::Complete)
 }
 
-fn read_mft_bitmap_stream(
+fn parse_stream_extent_runlist(
+    kind: BitmapStream,
+    boot: &NtfsBootSector,
+    attribute: &NtfsAttribute<'_>,
+    starting_vcn: u64,
+    max_runs: usize,
+) -> Result<NtfsRunlist, NtfsVolumeError> {
+    let AttributeBody::NonResident(body) = &attribute.body else {
+        return Err(kind.unsupported("extent is resident"));
+    };
+    let runlist = parse_mapping_pairs(
+        body.mapping_pairs,
+        MappingPairsLimits {
+            starting_vcn,
+            expected_next_vcn: Some(body.expected_next_vcn),
+            volume_cluster_count: boot.cluster_count,
+            max_runs,
+            max_decoded_clusters: boot.cluster_count,
+        },
+    )?;
+    if runlist.sparse_clusters != 0 {
+        return Err(kind.unsupported("runlist contains sparse clusters"));
+    }
+    Ok(runlist)
+}
+
+fn append_runlist(
+    kind: BitmapStream,
+    into: &mut NtfsRunlist,
+    extra: NtfsRunlist,
+) -> Result<(), NtfsVolumeError> {
+    let overflow = || kind.overflow(StreamCalculation::RunlistMerge);
+    into.extents
+        .try_reserve(extra.extents.len())
+        .map_err(|_| overflow())?;
+    into.extents.extend(extra.extents);
+    into.next_vcn = extra.next_vcn;
+    into.encoded_runs = into
+        .encoded_runs
+        .checked_add(extra.encoded_runs)
+        .ok_or_else(overflow)?;
+    into.bytes_consumed = into
+        .bytes_consumed
+        .checked_add(extra.bytes_consumed)
+        .ok_or_else(overflow)?;
+    into.decoded_clusters = into
+        .decoded_clusters
+        .checked_add(extra.decoded_clusters)
+        .ok_or_else(overflow)?;
+    into.physical_clusters = into
+        .physical_clusters
+        .checked_add(extra.physical_clusters)
+        .ok_or_else(overflow)?;
+    into.sparse_clusters = into
+        .sparse_clusters
+        .checked_add(extra.sparse_clusters)
+        .ok_or_else(overflow)?;
+    Ok(())
+}
+
+fn read_stream(
+    kind: BitmapStream,
     image: &dyn BoundedImageReader,
     boot: &NtfsBootSector,
     runlist: &NtfsRunlist,
     data_bytes: u64,
 ) -> Result<Vec<u8>, NtfsVolumeError> {
     let output_len =
-        usize::try_from(data_bytes).map_err(|_| NtfsVolumeError::MftBitmapTooLarge {
-            actual: data_bytes,
-            maximum: usize::MAX,
-        })?;
+        usize::try_from(data_bytes).map_err(|_| kind.too_large(data_bytes, usize::MAX))?;
     let mut output = Vec::new();
     output
         .try_reserve_exact(output_len)
-        .map_err(|_| NtfsVolumeError::MftBitmapTooLarge {
-            actual: data_bytes,
-            maximum: usize::MAX,
-        })?;
+        .map_err(|_| kind.too_large(data_bytes, usize::MAX))?;
     output.resize(output_len, 0);
     let mut copied = 0_u64;
     for extent in &runlist.extents {
@@ -815,41 +985,27 @@ fn read_mft_bitmap_stream(
             break;
         }
         let ExtentLocation::Physical { lcn } = extent.location else {
-            return Err(NtfsVolumeError::UnsupportedMftBitmapStorage {
-                reason: "runlist contains a sparse extent",
-            });
+            return Err(kind.unsupported("runlist contains a sparse extent"));
         };
-        let extent_bytes = extent.length.checked_mul(boot.cluster_size_bytes).ok_or(
-            NtfsVolumeError::GeometryOverflow {
-                calculation: "$MFT::$BITMAP extent byte length",
-            },
-        )?;
+        let extent_bytes = extent
+            .length
+            .checked_mul(boot.cluster_size_bytes)
+            .ok_or_else(|| kind.overflow(StreamCalculation::ExtentBytes))?;
         let count_u64 = extent_bytes.min(data_bytes - copied);
-        let count = usize::try_from(count_u64).map_err(|_| NtfsVolumeError::MftBitmapTooLarge {
-            actual: count_u64,
-            maximum: usize::MAX,
-        })?;
-        let offset =
-            lcn.checked_mul(boot.cluster_size_bytes)
-                .ok_or(NtfsVolumeError::GeometryOverflow {
-                    calculation: "$MFT::$BITMAP extent image offset",
-                })?;
+        let count =
+            usize::try_from(count_u64).map_err(|_| kind.too_large(count_u64, usize::MAX))?;
+        let offset = lcn
+            .checked_mul(boot.cluster_size_bytes)
+            .ok_or_else(|| kind.overflow(StreamCalculation::ExtentOffset))?;
         let output_offset =
-            usize::try_from(copied).map_err(|_| NtfsVolumeError::MftBitmapTooLarge {
-                actual: copied,
-                maximum: usize::MAX,
-            })?;
+            usize::try_from(copied).map_err(|_| kind.too_large(copied, usize::MAX))?;
         read_chunked(image, offset, &mut output[output_offset..][..count])?;
         copied = copied
             .checked_add(count_u64)
-            .ok_or(NtfsVolumeError::GeometryOverflow {
-                calculation: "$MFT::$BITMAP copied byte count",
-            })?;
+            .ok_or_else(|| kind.overflow(StreamCalculation::CopiedBytes))?;
     }
     if copied != data_bytes {
-        return Err(NtfsVolumeError::UnsupportedMftBitmapStorage {
-            reason: "runlist does not cover the logical data size",
-        });
+        return Err(kind.unsupported("runlist does not cover the logical data size"));
     }
     Ok(output)
 }
@@ -913,6 +1069,10 @@ struct ReadBudget {
 impl ReadBudget {
     const fn new(maximum: u64) -> Self {
         Self { used: 0, maximum }
+    }
+
+    const fn remaining(&self) -> u64 {
+        self.maximum.saturating_sub(self.used)
     }
 
     fn charge(&mut self, bytes: u64) -> Result<(), NtfsVolumeError> {
@@ -1166,6 +1326,74 @@ mod tests {
         finish_record(record, attr + 72)
     }
 
+    /// A `FILE` record whose base reference points at `base` with sequence 1.
+    fn extension_record(number: u32, base: u64) -> Vec<u8> {
+        let mut record = base_record(number);
+        record[32..40].copy_from_slice(&(base | (1_u64 << 48)).to_le_bytes());
+        record
+    }
+
+    /// One 32-byte unnamed `$ATTRIBUTE_LIST` entry naming `instance` in `record_number` (seq 1).
+    fn attribute_list_entry(
+        kind: u32,
+        lowest_vcn: i64,
+        record_number: u64,
+        instance: u16,
+    ) -> Vec<u8> {
+        let mut bytes = vec![0_u8; 32];
+        set_u32(&mut bytes, 0, kind);
+        set_u16(&mut bytes, 4, 32);
+        set_i64(&mut bytes, 8, lowest_vcn);
+        bytes[16..24].copy_from_slice(&(record_number | (1_u64 << 48)).to_le_bytes());
+        set_u16(&mut bytes, 24, instance);
+        bytes
+    }
+
+    /// Writes a non-resident unnamed attribute extent mapping `run.1` clusters at LCN `run.0`.
+    /// `sizes` is `(allocated, data, initialized)` and is only written on the first extent.
+    fn nonresident_attribute(
+        record: &mut [u8],
+        offset: usize,
+        kind: u32,
+        lowest_vcn: i64,
+        run: (u8, u8),
+        sizes: Option<(u64, u64, u64)>,
+        id: u16,
+    ) -> usize {
+        let (lcn, clusters) = run;
+        set_u32(record, offset, kind);
+        set_u32(record, offset + 4, 72);
+        record[offset + 8] = 1;
+        set_u16(record, offset + 14, id);
+        set_i64(record, offset + 16, lowest_vcn);
+        set_i64(record, offset + 24, lowest_vcn + i64::from(clusters) - 1);
+        set_u16(record, offset + 32, 64);
+        if let Some((allocated, data, initialized)) = sizes {
+            set_i64(
+                record,
+                offset + 40,
+                i64::try_from(allocated).expect("fixture allocation fits i64"),
+            );
+            set_i64(
+                record,
+                offset + 48,
+                i64::try_from(data).expect("fixture data size fits i64"),
+            );
+            set_i64(
+                record,
+                offset + 56,
+                i64::try_from(initialized).expect("fixture initialized size fits i64"),
+            );
+        }
+        record[offset + 64..offset + 68].copy_from_slice(&[0x11, clusters, lcn, 0]);
+        offset + 72
+    }
+
+    fn write_record(image: &mut [u8], record_number: usize, record: &[u8]) {
+        let offset = 4 * CLUSTER_SIZE + record_number * RECORD_SIZE;
+        image[offset..offset + RECORD_SIZE].copy_from_slice(record);
+    }
+
     fn set_u16(bytes: &mut [u8], offset: usize, value: u16) {
         bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
     }
@@ -1211,13 +1439,16 @@ mod tests {
 
     #[test]
     fn mft_attribute_list_prevents_overclaiming_bitmap_completeness() {
+        // The `$MFT` bootstrap maps records 0..8; the list names record 9, which is unmapped.
         let volume = volume_record(0);
         let bitmap = resident_bitmap_record(&[0xff; 8]);
         let mut bytes = image_with_records(&volume, &bitmap);
-        let mft_offset = 4 * CLUSTER_SIZE;
-        let mft_record =
-            mft_record_with_attributes(&[(ATTRIBUTE_LIST_TYPE, &[]), (BITMAP_TYPE, &[0xff])]);
-        bytes[mft_offset..mft_offset + RECORD_SIZE].copy_from_slice(&mft_record);
+        let list = attribute_list_entry(BITMAP_TYPE, 0, 9, 0);
+        write_record(
+            &mut bytes,
+            0,
+            &mft_record_with_attributes(&[(ATTRIBUTE_LIST_TYPE, &list)]),
+        );
         let temp = TempImage::create(&bytes);
         let image = ImageFile::open(&temp.0).expect("open synthetic image");
 
@@ -1231,6 +1462,110 @@ mod tests {
                 reason: NtfsMetadataIncompleteReason::MftBitmapAttributeListContinuationRequired,
             }
         );
+        assert!(matches!(discovered.volume, NtfsVolumeEvidence::Complete(_)));
+        assert!(matches!(discovered.bitmap, NtfsBitmapEvidence::Complete(_)));
+        assert_eq!(discovered.bytes_read, 3 * RECORD_SIZE as u64);
+    }
+
+    #[test]
+    fn resolves_mft_bitmap_behind_attribute_list_in_mapped_extension_record() {
+        let mut bytes = image_with_records(&volume_record(0), &resident_bitmap_record(&[0xff; 8]));
+        let list = attribute_list_entry(BITMAP_TYPE, 0, 5, 0);
+        write_record(
+            &mut bytes,
+            0,
+            &mft_record_with_attributes(&[(ATTRIBUTE_LIST_TYPE, &list)]),
+        );
+        let mut extension = extension_record(5, MFT_RECORD_NUMBER);
+        let end = resident_attribute(&mut extension, 56, BITMAP_TYPE, &[0xff, 0x03], 0);
+        write_record(&mut bytes, 5, &finish_record(extension, end));
+        let temp = TempImage::create(&bytes);
+        let image = ImageFile::open(&temp.0).expect("open synthetic image");
+
+        let discovered =
+            discover_volume_and_bitmap(&image, &boot(), &mft(), NtfsVolumeLimits::default())
+                .expect("resolve list-hosted $MFT::$BITMAP");
+
+        assert_eq!(
+            discovered.mft_bitmap,
+            NtfsMftBitmapEvidence::Complete(NtfsMftBitmap {
+                bitmap_bytes: 2,
+                canonical_bitmap: vec![0xff, 0x03],
+            })
+        );
+        assert_eq!(discovered.bytes_read, 4 * RECORD_SIZE as u64);
+    }
+
+    #[test]
+    fn concatenates_vcn_split_volume_bitmap_through_attribute_list() {
+        let mut bytes = image_with_records(&volume_record(0), &resident_bitmap_record(&[0xff; 8]));
+        // `$Bitmap` (record 6): list + first `$DATA` extent (VCN 0) hosted locally as id 1.
+        let mut list = attribute_list_entry(DATA_TYPE, 0, BITMAP_RECORD_NUMBER, 1);
+        list.extend(attribute_list_entry(DATA_TYPE, 1, 7, 0));
+        let mut record = base_record(
+            u32::try_from(BITMAP_RECORD_NUMBER).expect("fixture record number fits u32"),
+        );
+        let end = resident_attribute(&mut record, 56, ATTRIBUTE_LIST_TYPE, &list, 0);
+        let end = nonresident_attribute(
+            &mut record,
+            end,
+            DATA_TYPE,
+            0,
+            (10, 1),
+            Some((2 * CLUSTER_SIZE as u64, 8, 8)),
+            1,
+        );
+        write_record(&mut bytes, 6, &finish_record(record, end));
+        // Extension record 7 hosts the VCN 1 continuation.
+        let mut extension = extension_record(7, BITMAP_RECORD_NUMBER);
+        let end = nonresident_attribute(&mut extension, 56, DATA_TYPE, 1, (12, 1), None, 0);
+        write_record(&mut bytes, 7, &finish_record(extension, end));
+        bytes[10 * CLUSTER_SIZE..10 * CLUSTER_SIZE + 8].copy_from_slice(&[0xff; 8]);
+        let temp = TempImage::create(&bytes);
+        let image = ImageFile::open(&temp.0).expect("open synthetic image");
+
+        let discovered =
+            discover_volume_and_bitmap(&image, &boot(), &mft(), NtfsVolumeLimits::default())
+                .expect("concatenate split $Bitmap extents");
+
+        let NtfsBitmapEvidence::Complete(allocation) = discovered.bitmap else {
+            panic!("complete bitmap, got {:?}", discovered.bitmap)
+        };
+        assert_eq!(allocation.allocated_clusters, 64);
+        assert_eq!(discovered.bytes_read, 4 * RECORD_SIZE as u64 + 8);
+    }
+
+    #[test]
+    fn rejects_non_contiguous_split_volume_bitmap_extents() {
+        let mut bytes = image_with_records(&volume_record(0), &resident_bitmap_record(&[0xff; 8]));
+        let mut list = attribute_list_entry(DATA_TYPE, 0, BITMAP_RECORD_NUMBER, 1);
+        list.extend(attribute_list_entry(DATA_TYPE, 2, 7, 0));
+        let mut record = base_record(
+            u32::try_from(BITMAP_RECORD_NUMBER).expect("fixture record number fits u32"),
+        );
+        let end = resident_attribute(&mut record, 56, ATTRIBUTE_LIST_TYPE, &list, 0);
+        let end = nonresident_attribute(
+            &mut record,
+            end,
+            DATA_TYPE,
+            0,
+            (10, 1),
+            Some((3 * CLUSTER_SIZE as u64, 8, 8)),
+            1,
+        );
+        write_record(&mut bytes, 6, &finish_record(record, end));
+        let mut extension = extension_record(7, BITMAP_RECORD_NUMBER);
+        let end = nonresident_attribute(&mut extension, 56, DATA_TYPE, 2, (12, 1), None, 0);
+        write_record(&mut bytes, 7, &finish_record(extension, end));
+        let temp = TempImage::create(&bytes);
+        let image = ImageFile::open(&temp.0).expect("open synthetic image");
+
+        assert!(matches!(
+            discover_volume_and_bitmap(&image, &boot(), &mft(), NtfsVolumeLimits::default()),
+            Err(NtfsVolumeError::UnsupportedBitmapStorage {
+                reason: "continuation extent is not VCN-contiguous"
+            })
+        ));
     }
 
     #[test]
@@ -1365,36 +1700,75 @@ mod tests {
     }
 
     #[test]
-    fn reports_attribute_list_dependency_when_metadata_is_not_in_base_record() {
-        let mut record = base_record(
+    fn reports_attribute_list_dependency_when_metadata_host_is_unmapped() {
+        // Both `$Volume` and `$Bitmap` move their payload to record 9, beyond the mapped `$MFT`.
+        let mut volume = base_record(
             u32::try_from(VOLUME_RECORD_NUMBER).expect("fixture record number fits u32"),
         );
-        let end = resident_attribute(&mut record, 56, ATTRIBUTE_LIST_TYPE, &[], 0);
-        let record = parse_file_record(&finish_record(record, end)).unwrap();
-        let parsed = attributes(&record, &boot(), NtfsVolumeLimits::default()).unwrap();
+        let list = attribute_list_entry(VOLUME_INFORMATION_TYPE, 0, 9, 0);
+        let end = resident_attribute(&mut volume, 56, ATTRIBUTE_LIST_TYPE, &list, 0);
+        let volume = finish_record(volume, end);
+        let mut bitmap = base_record(
+            u32::try_from(BITMAP_RECORD_NUMBER).expect("fixture record number fits u32"),
+        );
+        let list = attribute_list_entry(DATA_TYPE, 0, 9, 0);
+        let end = resident_attribute(&mut bitmap, 56, ATTRIBUTE_LIST_TYPE, &list, 0);
+        let bitmap = finish_record(bitmap, end);
+        let bytes = image_with_records(&volume, &bitmap);
+        let temp = TempImage::create(&bytes);
+        let image = ImageFile::open(&temp.0).unwrap();
+
+        let discovered =
+            discover_volume_and_bitmap(&image, &boot(), &mft(), NtfsVolumeLimits::default())
+                .expect("retain bounded incomplete evidence");
+
         assert_eq!(
-            parse_volume_evidence(&parsed.attributes).unwrap(),
+            discovered.volume,
             NtfsVolumeEvidence::Incomplete {
                 reason: NtfsMetadataIncompleteReason::AttributeListContinuationRequired
             }
         );
-
-        let temp = TempImage::create(&vec![0_u8; 513 * 512]);
-        let image = ImageFile::open(&temp.0).unwrap();
-        let mut budget = ReadBudget::new(1);
         assert_eq!(
-            parse_bitmap_evidence(
-                &image,
-                &boot(),
-                &parsed.attributes,
-                NtfsVolumeLimits::default(),
-                &mut budget,
-            )
-            .unwrap(),
+            discovered.bitmap,
             NtfsBitmapEvidence::Incomplete {
                 reason: NtfsMetadataIncompleteReason::AttributeListContinuationRequired
             }
         );
-        assert_eq!(budget.used, 0);
+        assert!(matches!(
+            discovered.mft_bitmap,
+            NtfsMftBitmapEvidence::Complete(_)
+        ));
+        assert_eq!(discovered.bytes_read, 3 * RECORD_SIZE as u64);
+    }
+
+    #[test]
+    fn resolves_volume_information_behind_attribute_list() {
+        let mut volume = base_record(
+            u32::try_from(VOLUME_RECORD_NUMBER).expect("fixture record number fits u32"),
+        );
+        let list = attribute_list_entry(VOLUME_INFORMATION_TYPE, 0, 4, 0);
+        let end = resident_attribute(&mut volume, 56, ATTRIBUTE_LIST_TYPE, &list, 0);
+        let volume = finish_record(volume, end);
+        let mut bytes = image_with_records(&volume, &resident_bitmap_record(&[0xff; 8]));
+        let mut extension = extension_record(4, VOLUME_RECORD_NUMBER);
+        let mut value = [0_u8; VOLUME_INFORMATION_LENGTH];
+        value[8] = 3;
+        value[9] = 1;
+        set_u16(&mut value, 10, 0x0001);
+        let end = resident_attribute(&mut extension, 56, VOLUME_INFORMATION_TYPE, &value, 0);
+        write_record(&mut bytes, 4, &finish_record(extension, end));
+        let temp = TempImage::create(&bytes);
+        let image = ImageFile::open(&temp.0).unwrap();
+
+        let discovered =
+            discover_volume_and_bitmap(&image, &boot(), &mft(), NtfsVolumeLimits::default())
+                .expect("resolve list-hosted $VOLUME_INFORMATION");
+
+        let NtfsVolumeEvidence::Complete(info) = discovered.volume else {
+            panic!("complete volume, got {:?}", discovered.volume)
+        };
+        assert_eq!((info.major_version, info.minor_version), (3, 1));
+        assert!(info.flags.dirty);
+        assert_eq!(discovered.bytes_read, 4 * RECORD_SIZE as u64);
     }
 }

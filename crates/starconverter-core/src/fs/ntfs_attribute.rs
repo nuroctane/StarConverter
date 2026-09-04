@@ -367,7 +367,7 @@ impl fmt::Display for NtfsAttributeError {
                 block_size,
             } => write!(
                 formatter,
-                "compressed allocation {allocated} is not aligned to compression block {block_size}"
+                "compressed mapping {allocated} is not aligned to compression block {block_size}"
             ),
             Self::InvalidRecordBounds {
                 attributes_offset,
@@ -704,6 +704,10 @@ fn parse_non_resident(
             flags,
             cluster_size,
             compression_block_bytes,
+            expected_next_vcn
+                .checked_sub(lowest_vcn)
+                .and_then(|clusters| clusters.checked_mul(cluster_size))
+                .ok_or(NtfsAttributeError::CompressionBlockOverflow)?,
         )?)
     } else {
         None
@@ -776,6 +780,7 @@ fn parse_sizes(
     flags: AttributeFlags,
     cluster_size: u64,
     compression_block: Option<u64>,
+    mapped_bytes: u64,
 ) -> Result<NonResidentSizes, NtfsAttributeError> {
     let allocated = nonnegative_size(raw, 40, "allocated size")?;
     let data = nonnegative_size(raw, 48, "data size")?;
@@ -788,9 +793,9 @@ fn parse_sizes(
         return Err(NtfsAttributeError::DataExceedsAllocation { data, allocated });
     }
     match compression_block {
-        Some(block_size) if allocated % block_size != 0 => {
+        Some(block_size) if mapped_bytes > 0 && mapped_bytes % block_size != 0 => {
             return Err(NtfsAttributeError::AllocationNotCompressionBlockAligned {
-                allocated,
+                allocated: mapped_bytes,
                 block_size,
             });
         }
@@ -1028,6 +1033,15 @@ mod tests {
         };
         assert_eq!(body.compression_block_bytes, Some(8192));
         assert_eq!(body.sizes.expect("sizes").compressed, Some(4096));
+
+        let mut physical_less_than_cu = compressed;
+        set_i64(&mut physical_less_than_cu, 40, 4096);
+        let parsed = parse_attribute(&physical_less_than_cu, limits())
+            .expect("physical allocation may be smaller than the compression unit");
+        let AttributeBody::NonResident(body) = parsed.body else {
+            panic!("nonresident")
+        };
+        assert_eq!(body.sizes.expect("sizes").allocated, 4096);
 
         let sparse = nonresident(SPARSE);
         assert!(parse_attribute(&sparse, limits()).is_ok());

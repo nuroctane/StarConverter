@@ -5,10 +5,13 @@
 //! complement of *all* source allocation and destination reservations. Source metadata that may
 //! disappear after activation is deliberately not treated as staging scratch.
 
+use std::collections::BTreeSet;
 use std::fmt;
 
-use crate::extent::{ExtentGraph, ExtentGraphError, ExtentKind, Placement, StreamId};
-use crate::object::{ObjectGraph, ObjectGraphError, ObjectGraphLimits};
+use crate::extent::{Extent, ExtentGraph, ExtentGraphError, ExtentKind, Placement, StreamId};
+use crate::object::{
+    ObjectGraph, ObjectGraphError, ObjectGraphLimits, ObjectKind, ObjectStream, StreamStorage,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ByteRange {
@@ -25,6 +28,48 @@ impl ByteRange {
                 length: self.length,
             })
     }
+}
+
+/// Dest-cluster indices whose byte span overlaps any caller-supplied unusable range.
+///
+/// A source mark that is not dest-cluster aligned expands to every dest cluster it touches so the
+/// converted volume never allocates known-bad media. Ranges must be nonzero and inside `volume_bytes`.
+///
+/// # Errors
+/// Returns [`LayoutError`] for a zero cluster size that is not a power of two, a zero-length
+/// range, overflow, or a range that extends past the volume.
+pub fn clusters_covering_ranges(
+    ranges: &[ByteRange],
+    cluster_bytes: u64,
+    volume_bytes: u64,
+) -> Result<Vec<u64>, LayoutError> {
+    if cluster_bytes == 0 || !cluster_bytes.is_power_of_two() {
+        return Err(LayoutError::InvalidAlignment {
+            alignment: cluster_bytes,
+        });
+    }
+    let mut lcns = BTreeSet::new();
+    for range in ranges {
+        if range.length == 0 {
+            return Err(LayoutError::ZeroLengthRange {
+                offset: range.offset,
+            });
+        }
+        let end = range.end()?;
+        if end > volume_bytes {
+            return Err(LayoutError::RangeOutsideVolume {
+                offset: range.offset,
+                length: range.length,
+                volume_bytes,
+            });
+        }
+        let first = range.offset / cluster_bytes;
+        let last = (end - 1) / cluster_bytes;
+        for lcn in first..=last {
+            lcns.insert(lcn);
+        }
+    }
+    Ok(lcns.into_iter().collect())
 }
 
 /// One physically allocated source extent relevant to destination placement.
@@ -62,13 +107,35 @@ pub struct Relocation {
     pub destination: ByteRange,
 }
 
-/// Deterministic layout proof. `free_after_staging` excludes all source allocation, reservations,
-/// and relocation destinations; it therefore remains usable before source activation.
+/// One destination-aligned payload assembled from the bound source graph.
+///
+/// Callers name only the stream and the required destination length. Source bytes are never
+/// supplied as copy tuples; sealing reconstructs them from resident storage or the stream's
+/// existing physical extents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaterializationRequest {
+    pub stream: StreamId,
+    pub destination_length: u64,
+}
+
+/// Sealed destination span for one materialized stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Materialization {
+    pub stream: StreamId,
+    pub destination: ByteRange,
+}
+
+/// Deterministic layout proof.
+///
+/// `free_after_staging` excludes all source allocation, reservations, relocation destinations,
+/// and materialization destinations; it therefore remains usable before source activation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LayoutPlan {
     pub relocations: Vec<Relocation>,
+    pub materializations: Vec<Materialization>,
     pub free_after_staging: Vec<ByteRange>,
     pub relocated_bytes: u64,
+    pub materialized_bytes: u64,
     pub largest_free_range: u64,
 }
 
@@ -218,6 +285,12 @@ pub enum LayoutError {
         largest_free_range: u64,
         total_free: u64,
     },
+    DuplicateMaterialization {
+        stream: StreamId,
+    },
+    MaterializationConflictsWithLiveSource {
+        stream: StreamId,
+    },
     AccountingOverflow,
 }
 
@@ -341,6 +414,16 @@ impl fmt::Display for LayoutError {
                 formatter,
                 "no staging range fits {required} bytes (largest {largest_free_range}, total {total_free})"
             ),
+            Self::DuplicateMaterialization { stream } => write!(
+                formatter,
+                "stream {} has multiple materialization requests",
+                stream.0
+            ),
+            Self::MaterializationConflictsWithLiveSource { stream } => write!(
+                formatter,
+                "stream {} cannot be both 1:1 relocated and materialized",
+                stream.0
+            ),
             Self::AccountingOverflow => formatter.write_str("layout byte accounting overflow"),
         }
     }
@@ -370,6 +453,22 @@ pub enum RelocatedGraphError {
         kind: ExtentKind,
     },
     RelocatedByteCountMismatch {
+        declared: u64,
+        actual: u64,
+    },
+    DuplicateMaterialization {
+        stream: StreamId,
+    },
+    MaterializationUnknownStream {
+        stream: StreamId,
+    },
+    MaterializationConflictsWithRelocation {
+        stream: StreamId,
+    },
+    InvalidMaterialization {
+        stream: StreamId,
+    },
+    MaterializedByteCountMismatch {
         declared: u64,
         actual: u64,
     },
@@ -420,6 +519,30 @@ impl fmt::Display for RelocatedGraphError {
                 formatter,
                 "layout declares {declared} relocated bytes but exact relocation records contain {actual}"
             ),
+            Self::DuplicateMaterialization { stream } => write!(
+                formatter,
+                "stream {} has multiple materialization records",
+                stream.0
+            ),
+            Self::MaterializationUnknownStream { stream } => write!(
+                formatter,
+                "stream {} materialization is absent from the source graph",
+                stream.0
+            ),
+            Self::MaterializationConflictsWithRelocation { stream } => write!(
+                formatter,
+                "stream {} cannot be both 1:1 relocated and materialized",
+                stream.0
+            ),
+            Self::InvalidMaterialization { stream } => write!(
+                formatter,
+                "stream {} materialization has invalid destination geometry",
+                stream.0
+            ),
+            Self::MaterializedByteCountMismatch { declared, actual } => write!(
+                formatter,
+                "layout declares {declared} materialized bytes but exact materialization records contain {actual}"
+            ),
             Self::Extents(error) => write!(formatter, "relocated extent graph is invalid: {error}"),
             Self::Objects(error) => write!(formatter, "relocated object graph is invalid: {error}"),
         }
@@ -436,17 +559,22 @@ impl std::error::Error for RelocatedGraphError {
     }
 }
 
-/// Rebuilds an object graph with each exact file-payload extent moved to its planned destination.
+/// Rebuilds an object graph with 1:1 payload relocations and sealed stream materializations.
 ///
 /// The source graph is not modified. Every relocation must name one complete physical
-/// [`ExtentKind::FileData`] extent by stream, logical offset, source offset, and length. The rebuilt
-/// extent graph independently rejects destination overlap and out-of-volume placement. Object,
-/// namespace, stream, and semantic-feature evidence is retained byte-for-byte.
+/// [`ExtentKind::FileData`] extent by stream, logical offset, source offset, and length.
+/// Every materialization names one stream whose destination span is reconstructed from resident
+/// bytes or from that stream's source extents; the rebuilt graph replaces those extents with one
+/// destination-aligned [`ExtentKind::FileData`] run. The rebuilt extent graph independently
+/// rejects destination overlap and out-of-volume placement. Object identity, namespace, and
+/// semantic-feature evidence is retained; only allocated/mapped stream storage may change for
+/// materialized streams.
 ///
 /// # Errors
 ///
 /// Refuses partial, duplicate, missing, non-payload, overlapping, out-of-volume, or incorrectly
-/// accounted relocations, and any graph which is no longer internally consistent after remapping.
+/// accounted relocations or materializations, and any graph which is no longer internally
+/// consistent after remapping.
 pub fn relocate_object_graph(
     source: &ObjectGraph,
     layout: &LayoutPlan,
@@ -470,6 +598,17 @@ pub fn relocate_object_graph(
     let mut actual_bytes = 0_u64;
 
     for relocation in &layout.relocations {
+        if layout
+            .materializations
+            .iter()
+            .any(|materialization| materialization.stream == relocation.stream)
+        {
+            return Err(
+                RelocatedGraphError::MaterializationConflictsWithRelocation {
+                    stream: relocation.stream,
+                },
+            );
+        }
         if relocation.source.length == 0
             || relocation.source.length != relocation.destination.length
             || overlaps(relocation.source, relocation.destination).map_err(|_| {
@@ -518,7 +657,10 @@ pub fn relocate_object_graph(
             actual: actual_bytes,
         });
     }
-    rebuild_relocated_graph(source, relocated)
+
+    let mut objects = source.objects().to_vec();
+    apply_materializations(&mut objects, &mut relocated, layout)?;
+    rebuild_relocated_graph_with_objects(source, objects, relocated)
 }
 
 type PhysicalExtentKey = (StreamId, u64, u64, u64);
@@ -533,7 +675,7 @@ const fn relocation_key(relocation: &Relocation) -> PhysicalExtentKey {
 }
 
 fn physical_extent_index(
-    extents: &[crate::extent::Extent],
+    extents: &[Extent],
 ) -> Result<Vec<(PhysicalExtentKey, usize)>, RelocatedGraphError> {
     let mut sources = Vec::new();
     sources
@@ -556,21 +698,121 @@ fn physical_extent_index(
     Ok(sources)
 }
 
-fn rebuild_relocated_graph(
+fn apply_materializations(
+    objects: &mut [crate::object::ObjectRecord],
+    extents: &mut Vec<Extent>,
+    layout: &LayoutPlan,
+) -> Result<(), RelocatedGraphError> {
+    let mut keys: Vec<StreamId> = layout
+        .materializations
+        .iter()
+        .map(|materialization| materialization.stream)
+        .collect();
+    keys.sort_unstable();
+    if let Some(duplicate) = keys.windows(2).find(|pair| pair[0] == pair[1]) {
+        return Err(RelocatedGraphError::DuplicateMaterialization {
+            stream: duplicate[0],
+        });
+    }
+    let mut actual_bytes = 0_u64;
+    for materialization in &layout.materializations {
+        if materialization.destination.length == 0 {
+            return Err(RelocatedGraphError::InvalidMaterialization {
+                stream: materialization.stream,
+            });
+        }
+        actual_bytes = actual_bytes
+            .checked_add(materialization.destination.length)
+            .ok_or(RelocatedGraphError::MaterializedByteCountMismatch {
+                declared: layout.materialized_bytes,
+                actual: u64::MAX,
+            })?;
+        let stream = find_file_stream_mut(objects, materialization.stream)?;
+        if materialization.destination.length < stream.logical_bytes {
+            return Err(RelocatedGraphError::InvalidMaterialization {
+                stream: materialization.stream,
+            });
+        }
+        stream.storage = StreamStorage::Extents;
+        stream.mapped_bytes = materialization.destination.length;
+        stream.allocated_bytes = materialization.destination.length;
+        extents.retain(|extent| {
+            !(extent.stream == materialization.stream && extent.kind == ExtentKind::FileData)
+        });
+        extents
+            .try_reserve(1)
+            .map_err(|_| RelocatedGraphError::AllocationFailed)?;
+        extents.push(Extent {
+            stream: materialization.stream,
+            logical_offset: 0,
+            length: materialization.destination.length,
+            placement: Placement::Physical {
+                byte_offset: materialization.destination.offset,
+            },
+            kind: ExtentKind::FileData,
+        });
+    }
+    if actual_bytes != layout.materialized_bytes {
+        return Err(RelocatedGraphError::MaterializedByteCountMismatch {
+            declared: layout.materialized_bytes,
+            actual: actual_bytes,
+        });
+    }
+    for object in objects.iter_mut() {
+        for stream in &mut object.streams {
+            stream.flags.compressed = false;
+            stream.flags.compression_block_bytes = 0;
+        }
+    }
+    Ok(())
+}
+
+fn find_file_stream_mut(
+    objects: &mut [crate::object::ObjectRecord],
+    stream: StreamId,
+) -> Result<&mut ObjectStream, RelocatedGraphError> {
+    for object in objects.iter_mut() {
+        if object.kind != ObjectKind::File {
+            if object
+                .streams
+                .iter()
+                .any(|candidate| candidate.id == stream)
+            {
+                return Err(RelocatedGraphError::InvalidMaterialization { stream });
+            }
+            continue;
+        }
+        if let Some(found) = object
+            .streams
+            .iter_mut()
+            .find(|candidate| candidate.id == stream)
+        {
+            return Ok(found);
+        }
+    }
+    Err(RelocatedGraphError::MaterializationUnknownStream { stream })
+}
+
+fn rebuild_relocated_graph_with_objects(
     source: &ObjectGraph,
-    relocated: Vec<crate::extent::Extent>,
+    objects: Vec<crate::object::ObjectRecord>,
+    relocated: Vec<Extent>,
 ) -> Result<ObjectGraph, RelocatedGraphError> {
     let extents = ExtentGraph::build(
         relocated,
         source.extents().volume_bytes(),
-        source.extents().extents().len(),
+        source
+            .extents()
+            .extents()
+            .len()
+            .saturating_add(objects.len())
+            .max(1),
     )
     .map_err(RelocatedGraphError::Extents)?;
     let limits = ObjectGraphLimits {
-        max_objects: source.objects().len().max(1),
+        max_objects: objects.len().max(1),
         max_entries: source.entries().len().max(1),
-        max_streams: source
-            .objects()
+        max_streams: objects
             .iter()
             .map(|object| object.streams.len())
             .sum::<usize>()
@@ -585,7 +827,7 @@ fn rebuild_relocated_graph(
     };
     ObjectGraph::build(
         source.root(),
-        source.objects().to_vec(),
+        objects,
         source.entries().to_vec(),
         extents,
         limits,
@@ -680,6 +922,7 @@ pub fn solve_layout_with_staging_exclusions_and_io_alignment(
         source,
         reservations,
         staging_exclusions,
+        &[],
         limits,
     )
 }
@@ -728,11 +971,58 @@ pub fn solve_layout_with_destination_domain_and_alignments(
         source,
         reservations,
         staging_exclusions,
+        &[],
         limits,
     )
 }
 
+/// Solves destination-domain relocation together with sealed stream materializations.
+///
+/// Materialization destinations are allocated first from proven free heap space. Remaining
+/// destination-aligned live extents are then 1:1 relocated as in
+/// [`solve_layout_with_destination_domain_and_alignments`].
+///
+/// # Errors
+///
+/// Returns the same refusals as [`solve_layout_with_destination_domain_and_alignments`], plus
+/// duplicate materialization requests, requests that name a live 1:1 source, or destination
+/// lengths that are not destination-aligned.
 #[allow(clippy::too_many_arguments)]
+pub fn solve_layout_with_destination_domain_alignments_and_materializations(
+    volume_bytes: u64,
+    source_alignment: u64,
+    destination_alignment: u64,
+    io_alignment: u64,
+    destination_domain: ByteRange,
+    source: Vec<SourceAllocation>,
+    reservations: Vec<DestinationReservation>,
+    staging_exclusions: Vec<ByteRange>,
+    materializations: &[MaterializationRequest],
+    limits: LayoutLimits,
+) -> Result<LayoutPlan, LayoutError> {
+    validate_alignments([source_alignment, destination_alignment, io_alignment])?;
+    if destination_alignment % io_alignment != 0 {
+        return Err(LayoutError::IncompatibleAlignments {
+            io_alignment,
+            destination_alignment,
+        });
+    }
+    solve_layout_with_domain_and_alignments_inner(
+        volume_bytes,
+        source_alignment,
+        destination_alignment,
+        io_alignment,
+        destination_domain,
+        true,
+        source,
+        reservations,
+        staging_exclusions,
+        materializations,
+        limits,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn solve_layout_with_domain_and_alignments_inner(
     volume_bytes: u64,
     source_alignment: u64,
@@ -743,6 +1033,7 @@ fn solve_layout_with_domain_and_alignments_inner(
     mut source: Vec<SourceAllocation>,
     mut reservations: Vec<DestinationReservation>,
     mut staging_exclusions: Vec<ByteRange>,
+    materialization_requests: &[MaterializationRequest],
     limits: LayoutLimits,
 ) -> Result<LayoutPlan, LayoutError> {
     validate_limits(limits)?;
@@ -776,6 +1067,12 @@ fn solve_layout_with_domain_and_alignments_inner(
         validate_range(volume_bytes, io_alignment, destination_domain)?;
     }
     validate_destination_lengths(&source, destination_alignment)?;
+    validate_materialization_requests(
+        &source,
+        materialization_requests,
+        destination_alignment,
+        limits.max_relocations,
+    )?;
     for range in &staging_exclusions {
         validate_range(volume_bytes, io_alignment, *range)?;
     }
@@ -800,6 +1097,37 @@ fn solve_layout_with_domain_and_alignments_inner(
         limits.max_free_ranges,
     )?;
     let mut free = complement(volume_bytes, &occupied, limits.max_free_ranges)?;
+    let mut materializations = Vec::new();
+    materializations
+        .try_reserve(materialization_requests.len())
+        .map_err(|_| LayoutError::AllocationFailed)?;
+    let mut materialized_bytes = 0_u64;
+    for request in materialization_requests {
+        let destination = allocate_first_fit_aligned_within(
+            &mut free,
+            request.destination_length,
+            destination_alignment,
+            destination_domain,
+            limits.max_free_ranges,
+        )?
+        .ok_or_else(|| {
+            let (largest_free_range, total_free) =
+                free_capacity_within(&free, destination_domain, destination_alignment)
+                    .unwrap_or((0, 0));
+            LayoutError::InsufficientStagingSpace {
+                required: request.destination_length,
+                largest_free_range,
+                total_free,
+            }
+        })?;
+        materialized_bytes = materialized_bytes
+            .checked_add(request.destination_length)
+            .ok_or(LayoutError::AccountingOverflow)?;
+        materializations.push(Materialization {
+            stream: request.stream,
+            destination,
+        });
+    }
     let mut relocations = Vec::new();
     relocations
         .try_reserve(conflicts.len())
@@ -836,8 +1164,10 @@ fn solve_layout_with_domain_and_alignments_inner(
     let largest_free_range = free.iter().map(|range| range.length).max().unwrap_or(0);
     Ok(LayoutPlan {
         relocations,
+        materializations,
         free_after_staging: free,
         relocated_bytes,
+        materialized_bytes,
         largest_free_range,
     })
 }
@@ -880,6 +1210,114 @@ fn validate_destination_lengths(
         }
     }
     Ok(())
+}
+
+fn validate_materialization_requests(
+    source: &[SourceAllocation],
+    requests: &[MaterializationRequest],
+    alignment: u64,
+    maximum: usize,
+) -> Result<(), LayoutError> {
+    if requests.len() > maximum {
+        return Err(LayoutError::RelocationLimitExceeded { maximum });
+    }
+    let mut seen = requests
+        .iter()
+        .map(|request| request.stream)
+        .collect::<Vec<_>>();
+    seen.sort_unstable();
+    if let Some(duplicate) = seen.windows(2).find(|pair| pair[0] == pair[1]) {
+        return Err(LayoutError::DuplicateMaterialization {
+            stream: duplicate[0],
+        });
+    }
+    for request in requests {
+        if request.destination_length == 0 || request.destination_length % alignment != 0 {
+            return Err(LayoutError::DestinationLengthUnaligned {
+                stream: request.stream,
+                logical_offset: 0,
+                length: request.destination_length,
+                alignment,
+            });
+        }
+        if source
+            .iter()
+            .any(|allocation| allocation.stream == request.stream)
+        {
+            return Err(LayoutError::MaterializationConflictsWithLiveSource {
+                stream: request.stream,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Destination-aligned allocation length required to materialize one file stream, if any.
+///
+/// Empty resident files stay resident. Destination-aligned physical file-data extents remain
+/// eligible for 1:1 relocation only when initialized bytes fill the destination span. Resident
+/// payloads, sparse runs, uninitialized destination slack, and extent lengths that are not
+/// divisible by `destination_alignment` require materialization.
+#[must_use]
+pub fn materialization_length_for_stream(
+    graph: &ObjectGraph,
+    stream: StreamId,
+    destination_alignment: u64,
+) -> Option<u64> {
+    if destination_alignment == 0 || !destination_alignment.is_power_of_two() {
+        return None;
+    }
+    let object_stream = graph.objects().iter().find_map(|object| {
+        object
+            .streams
+            .iter()
+            .find(|candidate| candidate.id == stream)
+            .map(|candidate| (object.kind, candidate))
+    })?;
+    if object_stream.0 != ObjectKind::File {
+        return None;
+    }
+    let stream = object_stream.1;
+    if stream.logical_bytes == 0 {
+        return None;
+    }
+    let dest_length = align_up(stream.logical_bytes, destination_alignment)?;
+    if stream.flags.compression_block_bytes != 0 {
+        return Some(dest_length);
+    }
+    if stream.initialized_bytes < dest_length {
+        return Some(dest_length);
+    }
+    match &stream.storage {
+        StreamStorage::Resident(bytes) if !bytes.is_empty() => Some(dest_length),
+        StreamStorage::Resident(_) => None,
+        StreamStorage::Extents => {
+            let extents: Vec<_> = graph
+                .extents()
+                .extents()
+                .iter()
+                .filter(|extent| extent.stream == stream.id && extent.kind == ExtentKind::FileData)
+                .collect();
+            let representable = !extents.is_empty()
+                && extents.iter().all(|extent| {
+                    extent.length % destination_alignment == 0
+                        && matches!(extent.placement, Placement::Physical { .. })
+                });
+            if representable {
+                None
+            } else {
+                Some(dest_length)
+            }
+        }
+    }
+}
+
+fn align_up(value: u64, alignment: u64) -> Option<u64> {
+    if value == 0 {
+        return Some(0);
+    }
+    let mask = alignment - 1;
+    Some(value.checked_add(mask)? & !mask)
 }
 
 fn validate_range(volume_bytes: u64, alignment: u64, range: ByteRange) -> Result<(), LayoutError> {
@@ -1233,6 +1671,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn dest_clusters_cover_every_byte_of_an_unaligned_bad_range() {
+        assert_eq!(
+            clusters_covering_ranges(
+                &[ByteRange {
+                    offset: 6 * 1024,
+                    length: 8 * 1024,
+                }],
+                4096,
+                64 * 1024,
+            )
+            .unwrap(),
+            vec![1, 2, 3]
+        );
+    }
+
     fn payload_graph(kind: ExtentKind, offset: u64) -> ObjectGraph {
         let stream = ObjectStream {
             id: StreamId(7),
@@ -1306,8 +1760,10 @@ mod tests {
                     length: 512,
                 },
             }],
+            materializations: Vec::new(),
             free_after_staging: Vec::new(),
             relocated_bytes: 512,
+            materialized_bytes: 0,
             largest_free_range: 0,
         }
     }
@@ -1824,6 +2280,386 @@ mod tests {
             Err(RelocatedGraphError::Extents(
                 ExtentGraphError::PhysicalOverlap { .. }
             ))
+        ));
+    }
+
+    fn resident_payload_graph() -> ObjectGraph {
+        let stream = ObjectStream {
+            id: StreamId(7),
+            name: None,
+            logical_bytes: 3,
+            initialized_bytes: 3,
+            mapped_bytes: 3,
+            allocated_bytes: 0,
+            flags: StreamFlags::default(),
+            storage: StreamStorage::Resident(b"abc".to_vec()),
+        };
+        ObjectGraph::build(
+            ObjectId(0),
+            vec![
+                ObjectRecord {
+                    id: ObjectId(0),
+                    kind: ObjectKind::Directory,
+                    link_count: 0,
+                    semantics: ObjectSemantics::default(),
+                    streams: Vec::new(),
+                },
+                ObjectRecord {
+                    id: ObjectId(1),
+                    kind: ObjectKind::File,
+                    link_count: 1,
+                    semantics: ObjectSemantics::default(),
+                    streams: vec![stream],
+                },
+            ],
+            vec![NamespaceEntry {
+                parent: ObjectId(0),
+                target: ObjectId(1),
+                name: "payload.bin".encode_utf16().collect(),
+            }],
+            ExtentGraph::build(Vec::new(), 32 * 1024, 1).unwrap(),
+            ObjectGraphLimits {
+                max_objects: 2,
+                max_entries: 1,
+                max_streams: 1,
+                max_name_code_units: 11,
+            },
+        )
+        .unwrap()
+    }
+
+    fn aligned_file_extent_graph(
+        logical: u64,
+        initialized: u64,
+        extent_length: u64,
+    ) -> ObjectGraph {
+        let stream = ObjectStream {
+            id: StreamId(7),
+            name: None,
+            logical_bytes: logical,
+            initialized_bytes: initialized,
+            mapped_bytes: extent_length,
+            allocated_bytes: extent_length,
+            flags: StreamFlags::default(),
+            storage: StreamStorage::Extents,
+        };
+        ObjectGraph::build(
+            ObjectId(0),
+            vec![
+                ObjectRecord {
+                    id: ObjectId(0),
+                    kind: ObjectKind::Directory,
+                    link_count: 0,
+                    semantics: ObjectSemantics::default(),
+                    streams: Vec::new(),
+                },
+                ObjectRecord {
+                    id: ObjectId(1),
+                    kind: ObjectKind::File,
+                    link_count: 1,
+                    semantics: ObjectSemantics::default(),
+                    streams: vec![stream],
+                },
+            ],
+            vec![NamespaceEntry {
+                parent: ObjectId(0),
+                target: ObjectId(1),
+                name: "payload.bin".encode_utf16().collect(),
+            }],
+            ExtentGraph::build(
+                vec![Extent {
+                    stream: StreamId(7),
+                    logical_offset: 0,
+                    length: extent_length,
+                    placement: Placement::Physical { byte_offset: 8192 },
+                    kind: ExtentKind::FileData,
+                }],
+                32 * 1024,
+                1,
+            )
+            .unwrap(),
+            ObjectGraphLimits {
+                max_objects: 2,
+                max_entries: 1,
+                max_streams: 1,
+                max_name_code_units: 11,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn materializes_unaligned_request_into_destination_aligned_heap() {
+        let plan = solve_layout_with_destination_domain_alignments_and_materializations(
+            32 * 1024,
+            512,
+            4096,
+            512,
+            ByteRange {
+                offset: 8192,
+                length: 16 * 1024,
+            },
+            Vec::new(),
+            Vec::new(),
+            vec![ByteRange {
+                offset: 0,
+                length: 4096,
+            }],
+            &[MaterializationRequest {
+                stream: StreamId(7),
+                destination_length: 4096,
+            }],
+            LIMITS,
+        )
+        .unwrap();
+
+        assert!(plan.relocations.is_empty());
+        assert_eq!(plan.materializations.len(), 1);
+        assert_eq!(plan.materializations[0].stream, StreamId(7));
+        assert_eq!(plan.materializations[0].destination.offset, 8192);
+        assert_eq!(plan.materializations[0].destination.length, 4096);
+        assert_eq!(plan.materialized_bytes, 4096);
+        assert_eq!(
+            materialization_length_for_stream(&resident_payload_graph(), StreamId(7), 4096),
+            Some(4096)
+        );
+    }
+
+    #[test]
+    fn dest_aligned_extents_materialize_when_initialized_bytes_leave_slack() {
+        let slack = aligned_file_extent_graph(8192, 5000, 8192);
+        assert_eq!(
+            materialization_length_for_stream(&slack, StreamId(7), 8192),
+            Some(8192)
+        );
+        let filled = aligned_file_extent_graph(8192, 8192, 8192);
+        assert_eq!(
+            materialization_length_for_stream(&filled, StreamId(7), 8192),
+            None
+        );
+    }
+
+    #[test]
+    fn sparse_file_data_requires_whole_stream_materialization() {
+        let stream = ObjectStream {
+            id: StreamId(7),
+            name: None,
+            logical_bytes: 8192,
+            initialized_bytes: 8192,
+            mapped_bytes: 8192,
+            allocated_bytes: 4096,
+            flags: StreamFlags {
+                sparse: true,
+                compressed: false,
+                encrypted: false,
+                compression_block_bytes: 0,
+            },
+            storage: StreamStorage::Extents,
+        };
+        let graph = ObjectGraph::build(
+            ObjectId(0),
+            vec![
+                ObjectRecord {
+                    id: ObjectId(0),
+                    kind: ObjectKind::Directory,
+                    link_count: 0,
+                    semantics: ObjectSemantics::default(),
+                    streams: Vec::new(),
+                },
+                ObjectRecord {
+                    id: ObjectId(1),
+                    kind: ObjectKind::File,
+                    link_count: 1,
+                    semantics: ObjectSemantics::default(),
+                    streams: vec![stream],
+                },
+            ],
+            vec![NamespaceEntry {
+                parent: ObjectId(0),
+                target: ObjectId(1),
+                name: "payload.bin".encode_utf16().collect(),
+            }],
+            ExtentGraph::build(
+                vec![
+                    Extent {
+                        stream: StreamId(7),
+                        logical_offset: 0,
+                        length: 4096,
+                        placement: Placement::Physical { byte_offset: 8192 },
+                        kind: ExtentKind::FileData,
+                    },
+                    Extent {
+                        stream: StreamId(7),
+                        logical_offset: 4096,
+                        length: 4096,
+                        placement: Placement::Sparse,
+                        kind: ExtentKind::FileData,
+                    },
+                ],
+                32 * 1024,
+                2,
+            )
+            .unwrap(),
+            ObjectGraphLimits {
+                max_objects: 2,
+                max_entries: 1,
+                max_streams: 1,
+                max_name_code_units: 11,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            materialization_length_for_stream(&graph, StreamId(7), 4096),
+            Some(8192)
+        );
+    }
+
+    #[test]
+    fn compressed_stream_requires_materialization_even_when_physical() {
+        let stream = ObjectStream {
+            id: StreamId(7),
+            name: None,
+            logical_bytes: 8192,
+            initialized_bytes: 8192,
+            mapped_bytes: 8192,
+            allocated_bytes: 8192,
+            flags: StreamFlags {
+                compression_block_bytes: 8192,
+                ..StreamFlags::default()
+            },
+            storage: StreamStorage::Extents,
+        };
+        let graph = ObjectGraph::build(
+            ObjectId(0),
+            vec![
+                ObjectRecord {
+                    id: ObjectId(0),
+                    kind: ObjectKind::Directory,
+                    link_count: 0,
+                    semantics: ObjectSemantics::default(),
+                    streams: Vec::new(),
+                },
+                ObjectRecord {
+                    id: ObjectId(1),
+                    kind: ObjectKind::File,
+                    link_count: 1,
+                    semantics: ObjectSemantics::default(),
+                    streams: vec![stream],
+                },
+            ],
+            vec![NamespaceEntry {
+                parent: ObjectId(0),
+                target: ObjectId(1),
+                name: "packed.bin".encode_utf16().collect(),
+            }],
+            ExtentGraph::build(
+                vec![Extent {
+                    stream: StreamId(7),
+                    logical_offset: 0,
+                    length: 8192,
+                    placement: Placement::Physical { byte_offset: 8192 },
+                    kind: ExtentKind::FileData,
+                }],
+                32 * 1024,
+                1,
+            )
+            .unwrap(),
+            ObjectGraphLimits {
+                max_objects: 2,
+                max_entries: 1,
+                max_streams: 1,
+                max_name_code_units: 11,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            materialization_length_for_stream(&graph, StreamId(7), 4096),
+            Some(8192)
+        );
+    }
+
+    #[test]
+    fn seal_converts_resident_stream_into_destination_extents() {
+        let source = resident_payload_graph();
+        let layout = LayoutPlan {
+            relocations: Vec::new(),
+            materializations: vec![Materialization {
+                stream: StreamId(7),
+                destination: ByteRange {
+                    offset: 8192,
+                    length: 4096,
+                },
+            }],
+            free_after_staging: Vec::new(),
+            relocated_bytes: 0,
+            materialized_bytes: 4096,
+            largest_free_range: 0,
+        };
+        let sealed = SealedRelocationPlan::seal(source, layout).unwrap();
+        let stream = &sealed.target_graph().objects()[1].streams[0];
+        assert!(matches!(stream.storage, StreamStorage::Extents));
+        assert_eq!(stream.logical_bytes, 3);
+        assert_eq!(stream.mapped_bytes, 4096);
+        assert_eq!(stream.allocated_bytes, 4096);
+        assert_eq!(
+            sealed.target_graph().extents().extents(),
+            [Extent {
+                stream: StreamId(7),
+                logical_offset: 0,
+                length: 4096,
+                placement: Placement::Physical { byte_offset: 8192 },
+                kind: ExtentKind::FileData,
+            }]
+        );
+        assert_eq!(
+            sealed.source_graph().objects()[1].streams[0].storage,
+            StreamStorage::Resident(b"abc".to_vec())
+        );
+    }
+
+    #[test]
+    fn materialization_refuses_live_source_conflict_and_unaligned_length() {
+        assert!(matches!(
+            solve_layout_with_destination_domain_alignments_and_materializations(
+                32 * 1024,
+                512,
+                4096,
+                512,
+                ByteRange {
+                    offset: 8192,
+                    length: 16 * 1024,
+                },
+                vec![allocation(7, 512, 4096, true)],
+                Vec::new(),
+                Vec::new(),
+                &[MaterializationRequest {
+                    stream: StreamId(7),
+                    destination_length: 4096,
+                }],
+                LIMITS,
+            ),
+            Err(LayoutError::MaterializationConflictsWithLiveSource { .. })
+        ));
+        assert!(matches!(
+            solve_layout_with_destination_domain_alignments_and_materializations(
+                32 * 1024,
+                512,
+                4096,
+                512,
+                ByteRange {
+                    offset: 8192,
+                    length: 16 * 1024,
+                },
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                &[MaterializationRequest {
+                    stream: StreamId(7),
+                    destination_length: 512,
+                }],
+                LIMITS,
+            ),
+            Err(LayoutError::DestinationLengthUnaligned { .. })
         ));
     }
 }

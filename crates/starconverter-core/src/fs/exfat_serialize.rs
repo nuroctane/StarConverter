@@ -20,7 +20,8 @@ use super::exfat_region::{
 use super::exfat_upcase::{MAX_FILE_NAME_CODE_UNITS, UpcaseLimits, UpcaseTable, table_checksum};
 use crate::extent::{ExtentKind, Placement, StreamId};
 use crate::geometry::{
-    ByteRange, DestinationReservation, ReservationKind, SealedRelocationPlan, SourceAllocation,
+    ByteRange, DestinationReservation, LayoutError, LayoutPlan, ReservationKind,
+    SealedRelocationPlan, SourceAllocation, clusters_covering_ranges,
 };
 use crate::object::{ObjectGraph, ObjectId, ObjectKind, StreamStorage};
 use crate::overlay::{OverlayError, OverlayLimits, OverlayPlan, OverlayWrite};
@@ -28,6 +29,7 @@ use crate::overlay::{OverlayError, OverlayLimits, OverlayPlan, OverlayWrite};
 const FAT_OFFSET_SECTORS: u64 = 24;
 const ENTRY_BYTES: usize = 32;
 const END_OF_CHAIN: u32 = u32::MAX;
+const FAT_BAD_CLUSTER: u32 = 0xffff_fff7;
 const FAT_MEDIA_ENTRY: u32 = 0xffff_fff8;
 const DIRECTORY_ATTRIBUTE: u16 = 0x0010;
 const VALID_FILE_ATTRIBUTES: u16 = 0x0037;
@@ -60,6 +62,8 @@ pub struct ExfatVolumeProfile<'a> {
     pub upcase_checksum: u32,
     pub source_preservation: ExfatPreservationEvidence,
     pub allocated_bad_clusters: u64,
+    /// Source-absolute byte ranges that must stay unusable on the destination heap.
+    pub bad_cluster_ranges: &'a [ByteRange],
 }
 
 /// Deterministic destination geometry and stable formatting choices.
@@ -230,6 +234,7 @@ struct OwnedExfatVolumeProfile {
     upcase_checksum: u32,
     source_preservation: ExfatPreservationEvidence,
     allocated_bad_clusters: u64,
+    bad_cluster_ranges: Vec<ByteRange>,
 }
 
 impl OwnedExfatVolumeProfile {
@@ -240,6 +245,7 @@ impl OwnedExfatVolumeProfile {
             upcase_checksum: self.upcase_checksum,
             source_preservation: self.source_preservation,
             allocated_bad_clusters: self.allocated_bad_clusters,
+            bad_cluster_ranges: &self.bad_cluster_ranges,
         }
     }
 }
@@ -307,6 +313,9 @@ pub enum ExfatSerializeError {
     },
     PayloadOutsideHeap(StreamId),
     PayloadNotClusterAligned(StreamId),
+    BadClusterOverlapsDestinationMetadata {
+        offset: u64,
+    },
     MetadataSpaceExhausted {
         clusters: u64,
     },
@@ -402,6 +411,10 @@ impl fmt::Display for ExfatSerializeError {
                 formatter,
                 "stream {} is not exactly cluster-aligned for in-place reuse",
                 stream.0
+            ),
+            Self::BadClusterOverlapsDestinationMetadata { offset } => write!(
+                formatter,
+                "bad-cluster range at {offset} overlaps destination exFAT metadata or leaves the cluster heap"
             ),
             Self::MetadataSpaceExhausted { clusters } => write!(
                 formatter,
@@ -547,6 +560,7 @@ pub fn draft_exfat_destination(
         upcase_checksum: profile.upcase_checksum,
         source_preservation: profile.source_preservation,
         allocated_bad_clusters: profile.allocated_bad_clusters,
+        bad_cluster_ranges: profile.bad_cluster_ranges.to_vec(),
     };
     let output = serialize_exfat_destination_impl(
         graph,
@@ -613,11 +627,7 @@ pub(crate) fn finalize_exfat_destination(
         return Err(ExfatSerializeError::GraphSubstitution);
     }
     let relocated_graph = relocation.target_graph();
-    if relocated_graph.root() != draft.root
-        || relocated_graph.objects() != draft.objects
-        || relocated_graph.entries() != draft.entries
-        || relocated_graph.extents().volume_bytes() != draft.geometry.volume_bytes
-    {
+    if !draft_graph_identity_holds(draft, relocated_graph, relocation.layout()) {
         return Err(ExfatSerializeError::GraphSubstitution);
     }
     let pinned = pinned_from_draft(draft)?;
@@ -641,6 +651,60 @@ pub(crate) fn finalize_exfat_destination(
         .source_allocations
         .clone_from(&draft.source_allocations);
     Ok(output.plan)
+}
+
+fn draft_graph_identity_holds(
+    draft: &ExfatDestinationDraft,
+    relocated: &ObjectGraph,
+    layout: &LayoutPlan,
+) -> bool {
+    if relocated.root() != draft.root
+        || relocated.entries() != draft.entries
+        || relocated.extents().volume_bytes() != draft.geometry.volume_bytes
+        || relocated.objects().len() != draft.objects.len()
+    {
+        return false;
+    }
+    let materialized: BTreeSet<_> = layout
+        .materializations
+        .iter()
+        .map(|materialization| materialization.stream)
+        .collect();
+    for (source, target) in draft.objects.iter().zip(relocated.objects()) {
+        if source.id != target.id
+            || source.kind != target.kind
+            || source.link_count != target.link_count
+            || source.semantics != target.semantics
+            || source.streams.len() != target.streams.len()
+        {
+            return false;
+        }
+        for (source_stream, target_stream) in source.streams.iter().zip(&target.streams) {
+            if source_stream.id != target_stream.id
+                || source_stream.name != target_stream.name
+                || source_stream.logical_bytes != target_stream.logical_bytes
+                || source_stream.initialized_bytes != target_stream.initialized_bytes
+            {
+                return false;
+            }
+            if materialized.contains(&source_stream.id) {
+                // Dest-native materialization may clear the NTFS compression-unit that the
+                // projected source graph retains so reconstruct can still decompress LZNT1.
+                if source_stream.flags.sparse != target_stream.flags.sparse
+                    || source_stream.flags.encrypted != target_stream.flags.encrypted
+                    || target_stream.flags.compressed
+                    || target_stream.flags.compression_block_bytes != 0
+                    || !matches!(target_stream.storage, StreamStorage::Extents)
+                    || target_stream.mapped_bytes != target_stream.allocated_bytes
+                {
+                    return false;
+                }
+            } else if source_stream != target_stream {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn pinned_from_draft(
@@ -689,10 +753,22 @@ fn serialize_exfat_destination_impl(
     )
     .map_err(|_| ExfatSerializeError::InvalidUpcaseTable)?;
 
-    let mut layouts = build_object_layouts(graph, metadata, &geometry, &upcase, limits)?;
+    let mut layouts =
+        build_object_layouts(graph, metadata, &geometry, &upcase, limits, payload_mode)?;
     let cluster_count = usize::try_from(geometry.cluster_count)
         .map_err(|_| ExfatSerializeError::ArithmeticOverflow("cluster bitmap size"))?;
     let mut occupied = vec![false; cluster_count];
+    let bad_clusters = dest_exfat_bad_clusters(&geometry, profile.bad_cluster_ranges)?;
+    for cluster in &bad_clusters {
+        let slot = usize::try_from(cluster.saturating_sub(2))
+            .map_err(|_| ExfatSerializeError::ArithmeticOverflow("bad cluster index"))?;
+        if slot >= occupied.len() || occupied[slot] {
+            return Err(ExfatSerializeError::BadClusterOverlapsDestinationMetadata {
+                offset: cluster_offset(&geometry, *cluster)?,
+            });
+        }
+        occupied[slot] = true;
+    }
     let (source_allocations, reused_payloads) = map_payloads(
         graph,
         &geometry,
@@ -798,6 +874,9 @@ fn serialize_exfat_destination_impl(
     put_u32(&mut fat, 4, END_OF_CHAIN);
     write_chain(&mut fat, &expand_allocation(bitmap)?)?;
     write_chain(&mut fat, &expand_allocation(upcase_allocation)?)?;
+    for cluster in &bad_clusters {
+        write_fat_entry(&mut fat, *cluster, FAT_BAD_CLUSTER)?;
+    }
     for object in &directory_order {
         if *object == graph.root() {
             write_chain(&mut fat, &layouts[object].directory_clusters)?;
@@ -822,6 +901,11 @@ fn serialize_exfat_destination_impl(
     }
     mark_allocation(&mut destination_allocated, bitmap)?;
     mark_allocation(&mut destination_allocated, upcase_allocation)?;
+    for cluster in &bad_clusters {
+        let index = usize::try_from(cluster.saturating_sub(2))
+            .map_err(|_| ExfatSerializeError::ArithmeticOverflow("bad bitmap index"))?;
+        destination_allocated[index] = true;
+    }
     for object in &directory_order {
         for cluster in &layouts[object].directory_clusters {
             let index = usize::try_from(cluster.saturating_sub(2))
@@ -906,6 +990,7 @@ fn serialize_exfat_destination_impl(
         upcase_allocation,
         &directory_order,
         &layouts,
+        &bad_clusters,
     )?;
     let overlay = OverlayPlan::build(
         geometry.volume_bytes,
@@ -1012,7 +1097,8 @@ fn validate_volume_profile(profile: ExfatVolumeProfile<'_>) -> Result<(), ExfatS
             "nonzero recommended filename or volume-label padding is present",
         ));
     }
-    if profile.allocated_bad_clusters != 0 {
+    let reported = usize::try_from(profile.allocated_bad_clusters).unwrap_or(usize::MAX);
+    if reported != profile.bad_cluster_ranges.len() {
         return Err(ExfatSerializeError::UnsupportedPreservationEvidence(
             "allocated bad-cluster markings are present",
         ));
@@ -1140,6 +1226,7 @@ fn build_object_layouts(
     geometry: &ExfatDestinationGeometry,
     upcase: &UpcaseTable,
     limits: ExfatSerializeLimits,
+    payload_mode: PayloadPlacementMode,
 ) -> Result<BTreeMap<ObjectId, ObjectLayout>, ExfatSerializeError> {
     if graph.objects().len() > limits.max_objects {
         return Err(ExfatSerializeError::LimitExceeded {
@@ -1203,7 +1290,12 @@ fn build_object_layouts(
                 validate_directory_streams(object.id, &object.streams, graph)?;
                 None
             }
-            ObjectKind::File => Some(validate_file_stream(object.id, &object.streams, geometry)?),
+            ObjectKind::File => Some(validate_file_stream(
+                object.id,
+                &object.streams,
+                geometry,
+                payload_mode,
+            )?),
         };
         layouts.insert(
             object.id,
@@ -1363,6 +1455,7 @@ fn validate_file_stream(
     object: ObjectId,
     streams: &[crate::object::ObjectStream],
     geometry: &ExfatDestinationGeometry,
+    payload_mode: PayloadPlacementMode,
 ) -> Result<StreamLayout, ExfatSerializeError> {
     if streams.is_empty() {
         return Ok(StreamLayout {
@@ -1387,6 +1480,7 @@ fn validate_file_stream(
             reason: "sparse, compressed, or encrypted data cannot be represented",
         });
     }
+    let cluster_bytes = u64::from(geometry.bytes_per_cluster);
     if stream.logical_bytes == 0 {
         if !matches!(&stream.storage, StreamStorage::Resident(bytes) if bytes.is_empty()) {
             return Err(ExfatSerializeError::UnsupportedObject {
@@ -1394,8 +1488,22 @@ fn validate_file_stream(
                 reason: "empty files must use empty resident storage",
             });
         }
+    } else if payload_mode == PayloadPlacementMode::RelocationDraft {
+        match &stream.storage {
+            StreamStorage::Resident(bytes)
+                if u64::try_from(bytes.len()).ok() == Some(stream.logical_bytes)
+                    && stream.allocated_bytes == 0
+                    && stream.mapped_bytes == stream.logical_bytes => {}
+            StreamStorage::Extents => {}
+            StreamStorage::Resident(_) => {
+                return Err(ExfatSerializeError::UnsupportedObject {
+                    object,
+                    reason: "resident payload length does not match stream sizes",
+                });
+            }
+        }
     } else if !matches!(stream.storage, StreamStorage::Extents)
-        || stream.mapped_bytes % u64::from(geometry.bytes_per_cluster) != 0
+        || stream.mapped_bytes % cluster_bytes != 0
         || stream.allocated_bytes != stream.mapped_bytes
     {
         return Err(ExfatSerializeError::UnsupportedObject {
@@ -1509,6 +1617,20 @@ fn map_payloads(
         if stream.mapped_bytes == 0 {
             continue;
         }
+        if payload_mode == PayloadPlacementMode::RelocationDraft
+            && (graph.objects().iter().any(|object| {
+                object.streams.iter().any(|candidate| {
+                    candidate.id == stream.stream
+                        && matches!(candidate.storage, StreamStorage::Resident(_))
+                })
+            }) || graph.extents().extents().iter().any(|extent| {
+                extent.stream == stream.stream
+                    && extent.kind == ExtentKind::FileData
+                    && matches!(extent.placement, Placement::Sparse)
+            }))
+        {
+            continue;
+        }
         let mut expected_logical = 0_u64;
         for extent in graph
             .extents()
@@ -1516,10 +1638,7 @@ fn map_payloads(
             .iter()
             .filter(|extent| extent.stream == stream.stream)
         {
-            if extent.kind != ExtentKind::FileData
-                || extent.logical_offset != expected_logical
-                || extent.length % cluster_bytes != 0
-            {
+            if extent.kind != ExtentKind::FileData || extent.logical_offset != expected_logical {
                 return Err(ExfatSerializeError::PayloadNotClusterAligned(stream.stream));
             }
             let physical = match extent.placement {
@@ -1531,6 +1650,11 @@ fn map_payloads(
                     });
                 }
             };
+            if payload_mode != PayloadPlacementMode::RelocationDraft
+                && extent.length % cluster_bytes != 0
+            {
+                return Err(ExfatSerializeError::PayloadNotClusterAligned(stream.stream));
+            }
             source.push(SourceAllocation {
                 stream: stream.stream,
                 logical_offset: extent.logical_offset,
@@ -1544,9 +1668,9 @@ fn map_payloads(
                 ExfatSerializeError::ArithmeticOverflow("payload logical length"),
             )?;
             if payload_mode == PayloadPlacementMode::RelocationDraft {
-                // The source placement only needs to be readable. Target-heap membership and
-                // target-cluster offset alignment are constraints for the geometry solver and
-                // finalizer, not preconditions for producing a write-ineligible draft.
+                // The source placement only needs to be readable. Target-heap membership,
+                // target-cluster offset alignment, and stream-level packing are constraints for
+                // the geometry solver and finalizer, not preconditions for a write-ineligible draft.
                 continue;
             }
             if physical < heap || (physical - heap) % cluster_bytes != 0 {
@@ -1941,6 +2065,7 @@ fn reservations_for(
     upcase: Allocation,
     directories: &[ObjectId],
     layouts: &BTreeMap<ObjectId, ObjectLayout>,
+    bad_clusters: &[u32],
 ) -> Result<Vec<DestinationReservation>, ExfatSerializeError> {
     let sector = u64::from(geometry.bytes_per_sector);
     let mut output = vec![
@@ -1974,6 +2099,15 @@ fn reservations_for(
             allocation_from_clusters(&layouts[object].directory_clusters)?,
             ReservationKind::NamespaceMetadata,
         )?);
+    }
+    for cluster in bad_clusters {
+        output.push(DestinationReservation {
+            range: ByteRange {
+                offset: cluster_offset(geometry, *cluster)?,
+                length: u64::from(geometry.bytes_per_cluster),
+            },
+            kind: ReservationKind::Other,
+        });
     }
     output.sort_unstable_by_key(|item| item.range.offset);
     Ok(output)
@@ -2047,6 +2181,66 @@ fn expand_allocation(allocation: Allocation) -> Result<Vec<u32>, ExfatSerializeE
                 .ok_or(ExfatSerializeError::ArithmeticOverflow("cluster chain"))
         })
         .collect()
+}
+
+fn dest_exfat_bad_clusters(
+    geometry: &ExfatDestinationGeometry,
+    ranges: &[ByteRange],
+) -> Result<Vec<u32>, ExfatSerializeError> {
+    let cluster = u64::from(geometry.bytes_per_cluster);
+    let heap =
+        u64::from(geometry.cluster_heap_offset_sectors) * u64::from(geometry.bytes_per_sector);
+    let heap_end = heap
+        .checked_add(u64::from(geometry.cluster_count) * cluster)
+        .ok_or(ExfatSerializeError::ArithmeticOverflow("heap end"))?;
+    let lcns =
+        clusters_covering_ranges(ranges, cluster, geometry.volume_bytes).map_err(|error| {
+            match error {
+                LayoutError::RangeOutsideVolume { offset, .. }
+                | LayoutError::RangeOverflow { offset, .. }
+                | LayoutError::ZeroLengthRange { offset } => {
+                    ExfatSerializeError::BadClusterOverlapsDestinationMetadata { offset }
+                }
+                _ => ExfatSerializeError::InvalidGeometry(
+                    "bad-cluster range is not dest-cluster mappable",
+                ),
+            }
+        })?;
+    let mut clusters = Vec::new();
+    clusters
+        .try_reserve(lcns.len())
+        .map_err(|_| ExfatSerializeError::AllocationFailed)?;
+    for lcn in lcns {
+        let offset = lcn
+            .checked_mul(cluster)
+            .ok_or(ExfatSerializeError::ArithmeticOverflow("bad LCN offset"))?;
+        let end = offset
+            .checked_add(cluster)
+            .ok_or(ExfatSerializeError::ArithmeticOverflow("bad LCN end"))?;
+        if offset < heap || end > heap_end {
+            return Err(ExfatSerializeError::BadClusterOverlapsDestinationMetadata { offset });
+        }
+        let relative = (offset - heap) / cluster;
+        clusters.push(
+            u32::try_from(relative + 2)
+                .map_err(|_| ExfatSerializeError::ArithmeticOverflow("bad heap cluster"))?,
+        );
+    }
+    Ok(clusters)
+}
+
+fn write_fat_entry(fat: &mut [u8], cluster: u32, value: u32) -> Result<(), ExfatSerializeError> {
+    let offset = usize::try_from(cluster)
+        .map_err(|_| ExfatSerializeError::ArithmeticOverflow("FAT cluster index"))?
+        .checked_mul(4)
+        .ok_or(ExfatSerializeError::ArithmeticOverflow("FAT byte offset"))?;
+    if offset + 4 > fat.len() {
+        return Err(ExfatSerializeError::InvalidGeometry(
+            "FAT entry exceeds FAT",
+        ));
+    }
+    put_u32(fat, offset, value);
+    Ok(())
 }
 
 fn write_chain(fat: &mut [u8], clusters: &[u32]) -> Result<(), ExfatSerializeError> {
@@ -2197,6 +2391,7 @@ mod tests {
             upcase_checksum: table_checksum(upcase),
             source_preservation: ExfatPreservationEvidence::default(),
             allocated_bad_clusters: 0,
+            bad_cluster_ranges: &[],
         }
     }
 
@@ -2745,6 +2940,7 @@ mod tests {
                 upcase_checksum: checksum,
                 source_preservation: ExfatPreservationEvidence::default(),
                 allocated_bad_clusters: 0,
+                bad_cluster_ranges: &[],
             },
             ExfatSerializeOptions::default(),
             ExfatSerializeLimits::default(),
@@ -2829,6 +3025,48 @@ mod tests {
             ),
             Err(ExfatSerializeError::UnsupportedPreservationEvidence(_))
         ));
+    }
+
+    #[test]
+    fn nonempty_bad_clusters_are_reserved_on_the_destination_heap() {
+        let graph = graph(vec![root()], Vec::new(), Vec::new());
+        let upcase = complete_upcase_with_non_ascii_mapping();
+        let bad_offset = 2 * 1024 * 1024;
+        let plan = serialize_exfat_destination(
+            &graph,
+            &[],
+            ExfatVolumeProfile {
+                allocated_bad_clusters: 1,
+                bad_cluster_ranges: &[ByteRange {
+                    offset: bad_offset,
+                    length: 4096,
+                }],
+                ..profile(&upcase)
+            },
+            ExfatSerializeOptions::default(),
+            ExfatSerializeLimits::default(),
+        )
+        .expect("heap-resident bad ranges are dest-native FAT/bitmap marks");
+        assert!(plan.reservations.iter().any(|reservation| {
+            reservation.kind == ReservationKind::Other
+                && reservation.range.offset == bad_offset
+                && reservation.range.length == 4096
+        }));
+        let heap = u64::from(plan.geometry.cluster_heap_offset_sectors)
+            * u64::from(plan.geometry.bytes_per_sector);
+        let cluster =
+            u32::try_from((bad_offset - heap) / u64::from(plan.geometry.bytes_per_cluster) + 2)
+                .unwrap();
+        let fat_offset = usize::try_from(
+            u64::from(plan.geometry.fat_offset_sectors) * u64::from(plan.geometry.bytes_per_sector)
+                + u64::from(cluster) * 4,
+        )
+        .unwrap();
+        let image = candidate(&plan);
+        assert_eq!(
+            u32::from_le_bytes(image[fat_offset..fat_offset + 4].try_into().unwrap()),
+            FAT_BAD_CLUSTER
+        );
     }
 
     fn relocation_graph(offsets: [u64; 2]) -> ObjectGraph {
@@ -2936,8 +3174,10 @@ mod tests {
             source.clone(),
             LayoutPlan {
                 relocations,
+                materializations: Vec::new(),
                 free_after_staging: Vec::new(),
                 relocated_bytes,
+                materialized_bytes: 0,
                 largest_free_range: 0,
             },
         )

@@ -389,11 +389,14 @@ fn validate_extent_stream_encodings(graph: &ObjectGraph) -> Result<(), Verificat
     for object in graph.objects() {
         for stream in &object.streams {
             if matches!(stream.storage, StreamStorage::Extents)
-                && (stream.flags.compressed || stream.flags.encrypted)
+                && (stream.flags.compressed
+                    || stream.flags.encrypted
+                    || stream.flags.compression_block_bytes != 0)
             {
                 return Err(VerificationError::ExtentStreamRequiresDecoding {
                     stream: stream.id,
-                    compressed: stream.flags.compressed,
+                    compressed: stream.flags.compressed
+                        || stream.flags.compression_block_bytes != 0,
                     encrypted: stream.flags.encrypted,
                 });
             }
@@ -604,6 +607,7 @@ fn hash_metadata(objects: &[ObjectManifest]) -> [u8; 32] {
                 u8::from(stream.flags.compressed),
                 u8::from(stream.flags.encrypted),
             ]);
+            put_u64(&mut hasher, stream.flags.compression_block_bytes);
             hasher.update(stream.sha256);
         }
     }
@@ -817,6 +821,24 @@ mod tests {
             sparse: true,
             compressed: true,
             encrypted: false,
+            compression_block_bytes: 8192,
+        });
+
+        assert!(matches!(
+            build_manifest_with_reader(&PanicOnRead, &encoded, VerificationLimits::default()),
+            Err(VerificationError::ExtentStreamRequiresDecoding {
+                stream: StreamId(1),
+                compressed: true,
+                encrypted: false,
+            })
+        ));
+    }
+
+    #[test]
+    fn refuses_projected_lznt1_extent_stream_before_hashing_raw_storage() {
+        let encoded = graph_with_extent_stream_flags(StreamFlags {
+            compression_block_bytes: 8192,
+            ..StreamFlags::default()
         });
 
         assert!(matches!(
@@ -835,6 +857,7 @@ mod tests {
             sparse: true,
             compressed: false,
             encrypted: true,
+            compression_block_bytes: 0,
         });
 
         assert!(matches!(

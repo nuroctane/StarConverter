@@ -41,7 +41,7 @@ pub struct AttributeListLimits {
     pub max_list_bytes: usize,
     /// Maximum UTF-16 code units in one attribute name.
     pub max_name_code_units: usize,
-    /// Maximum mapping pairs in a non-resident `$ATTRIBUTE_LIST` first extent.
+    /// Maximum mapping pairs across every non-resident `$ATTRIBUTE_LIST` extent.
     pub max_runs: usize,
     /// Maximum aggregate image bytes read for list data and extension records.
     pub max_read_bytes: u64,
@@ -132,6 +132,10 @@ pub enum AttributeListError {
     ListMappingIncomplete {
         mapped_bytes: u64,
         data_bytes: u64,
+    },
+    NoncontiguousAttributeListExtent {
+        expected_vcn: u64,
+        found_vcn: u64,
     },
     EntryTruncated {
         offset: usize,
@@ -255,6 +259,13 @@ impl fmt::Display for AttributeListError {
             } => write!(
                 formatter,
                 "$ATTRIBUTE_LIST mapping covers {mapped_bytes} bytes but its data size is {data_bytes}"
+            ),
+            Self::NoncontiguousAttributeListExtent {
+                expected_vcn,
+                found_vcn,
+            } => write!(
+                formatter,
+                "$ATTRIBUTE_LIST continuation begins at VCN {found_vcn}, expected {expected_vcn}"
             ),
             Self::EntryTruncated { offset, remaining } => write!(
                 formatter,
@@ -431,6 +442,28 @@ pub fn parse_attribute_list_value(
     max_entries: usize,
     max_name_code_units: usize,
 ) -> Result<Vec<AttributeListEntry>, AttributeListError> {
+    parse_attribute_list_entries(bytes, max_entries, max_name_code_units, false)
+}
+
+/// Parses the leading complete entries of a possibly truncated `$ATTRIBUTE_LIST` value.
+///
+/// A trailing entry whose declared length overruns `bytes` ends the parse instead of failing, so
+/// callers can inspect the mapped prefix of a VCN-split list before its continuation is resolved.
+pub(crate) fn parse_attribute_list_prefix(
+    bytes: &[u8],
+    max_entries: usize,
+    max_name_code_units: usize,
+) -> Result<Vec<AttributeListEntry>, AttributeListError> {
+    parse_attribute_list_entries(bytes, max_entries, max_name_code_units, true)
+}
+
+#[allow(clippy::too_many_lines)]
+fn parse_attribute_list_entries(
+    bytes: &[u8],
+    max_entries: usize,
+    max_name_code_units: usize,
+    allow_truncated_tail: bool,
+) -> Result<Vec<AttributeListEntry>, AttributeListError> {
     if max_entries == 0 {
         return Err(AttributeListError::InvalidLimit {
             field: "max_entries",
@@ -461,6 +494,9 @@ pub fn parse_attribute_list_value(
         let length = le_u16(bytes, offset + 4);
         let length_usize = usize::from(length);
         if length_usize < ENTRY_HEADER_LEN || length_usize % 8 != 0 || length_usize > remaining {
+            if allow_truncated_tail && !result.is_empty() {
+                return Ok(result);
+            }
             return Err(AttributeListError::InvalidEntryLength {
                 offset,
                 value: length,
@@ -552,6 +588,9 @@ pub fn parse_attribute_list_value(
                 calculation: "next attribute-list entry",
             })?;
     }
+    if allow_truncated_tail {
+        return Ok(result);
+    }
     for (tail_offset, value) in bytes[offset..].iter().copied().enumerate() {
         if value != 0 {
             return Err(AttributeListError::TrailingNonzeroByte {
@@ -634,8 +673,17 @@ pub(crate) fn resolve_attribute_list_with_reader(
     }
     let list_attribute = selected.ok_or(AttributeListError::MissingAttributeList)?;
     let mut budget = ReadBudget::new(limits.max_read_bytes);
-    let (list_bytes, list_was_resident) =
-        read_list_value(image, boot, list_attribute, limits, &mut budget)?;
+    let (list_bytes, list_was_resident) = read_list_value(
+        image,
+        boot,
+        mft,
+        base_record_number,
+        base_record,
+        list_attribute,
+        limits,
+        attribute_limits,
+        &mut budget,
+    )?;
     let entries =
         parse_attribute_list_value(&list_bytes, limits.max_entries, limits.max_name_code_units)?;
     if entries.is_empty() {
@@ -845,11 +893,16 @@ fn parse_record_attributes(
     )?)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn read_list_value(
     image: &dyn BoundedImageReader,
     boot: &NtfsBootSector,
+    mft: &MftBootstrap,
+    base_record_number: u64,
+    base_record: &NtfsFileRecord,
     attribute: &NtfsAttribute<'_>,
     limits: AttributeListLimits,
+    attribute_limits: AttributeLimits,
     budget: &mut ReadBudget,
 ) -> Result<(Vec<u8>, bool), AttributeListError> {
     match &attribute.body {
@@ -887,7 +940,7 @@ fn read_list_value(
                     reason: "stream contains uninitialized bytes",
                 });
             }
-            let runlist = parse_mapping_pairs(
+            let mut runlist = parse_mapping_pairs(
                 data.mapping_pairs,
                 MappingPairsLimits {
                     starting_vcn: 0,
@@ -896,6 +949,18 @@ fn read_list_value(
                     max_runs: limits.max_runs,
                     max_decoded_clusters: boot.cluster_count,
                 },
+            )?;
+            extend_attribute_list_runlist(
+                image,
+                boot,
+                mft,
+                base_record_number,
+                base_record,
+                &mut runlist,
+                sizes.data,
+                limits,
+                attribute_limits,
+                budget,
             )?;
             let mapped_bytes = runlist
                 .next_vcn
@@ -918,6 +983,261 @@ fn read_list_value(
             Ok((read_stream(image, boot, &runlist, count)?, false))
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn extend_attribute_list_runlist(
+    image: &dyn BoundedImageReader,
+    boot: &NtfsBootSector,
+    mft: &MftBootstrap,
+    base_record_number: u64,
+    base_record: &NtfsFileRecord,
+    runlist: &mut NtfsRunlist,
+    data_bytes: u64,
+    limits: AttributeListLimits,
+    attribute_limits: AttributeLimits,
+    budget: &mut ReadBudget,
+) -> Result<(), AttributeListError> {
+    let mut loaded: BTreeMap<u64, NtfsFileRecord> = BTreeMap::new();
+    let expected_base = MftReference {
+        record_number: base_record_number,
+        sequence_number: base_record.sequence_number,
+    };
+    for _ in 0..limits.max_records {
+        let mapped_bytes = runlist
+            .next_vcn
+            .checked_mul(boot.cluster_size_bytes)
+            .ok_or(AttributeListError::GeometryOverflow {
+                calculation: "$ATTRIBUTE_LIST mapped bytes",
+            })?;
+        if mapped_bytes >= data_bytes {
+            return Ok(());
+        }
+        let prefix_len = usize::try_from(mapped_bytes.min(data_bytes)).map_err(|_| {
+            AttributeListError::ListTooLarge {
+                actual: mapped_bytes,
+                maximum: limits.max_list_bytes,
+            }
+        })?;
+        if prefix_len == 0 {
+            return Err(AttributeListError::ListMappingIncomplete {
+                mapped_bytes,
+                data_bytes,
+            });
+        }
+        let prefix = read_stream(image, boot, runlist, prefix_len)?;
+        let entries =
+            parse_attribute_list_prefix(&prefix, limits.max_entries, limits.max_name_code_units)?;
+        let expected_vcn = runlist.next_vcn;
+        let Some(entry) = entries.iter().find(|entry| {
+            entry.attribute_type == ATTRIBUTE_LIST_TYPE
+                && entry.name.is_empty()
+                && entry.lowest_vcn == expected_vcn
+        }) else {
+            return Err(AttributeListError::ListMappingIncomplete {
+                mapped_bytes,
+                data_bytes,
+            });
+        };
+        let continuation = load_attribute_list_continuation(
+            image,
+            boot,
+            mft,
+            base_record_number,
+            base_record,
+            entry,
+            &expected_base,
+            &mut loaded,
+            limits,
+            attribute_limits,
+            budget,
+        )?;
+        append_runlist(runlist, continuation)?;
+    }
+    let mapped_bytes = runlist
+        .next_vcn
+        .checked_mul(boot.cluster_size_bytes)
+        .ok_or(AttributeListError::GeometryOverflow {
+            calculation: "$ATTRIBUTE_LIST mapped bytes",
+        })?;
+    Err(AttributeListError::ListMappingIncomplete {
+        mapped_bytes,
+        data_bytes,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_attribute_list_continuation(
+    image: &dyn BoundedImageReader,
+    boot: &NtfsBootSector,
+    mft: &MftBootstrap,
+    base_record_number: u64,
+    base_record: &NtfsFileRecord,
+    entry: &AttributeListEntry,
+    expected_base: &MftReference,
+    loaded: &mut BTreeMap<u64, NtfsFileRecord>,
+    limits: AttributeListLimits,
+    attribute_limits: AttributeLimits,
+    budget: &mut ReadBudget,
+) -> Result<NtfsRunlist, AttributeListError> {
+    if entry.file_reference.record_number == base_record_number {
+        if entry.file_reference.sequence_number != base_record.sequence_number {
+            return Err(AttributeListError::RecordSequenceMismatch {
+                record_number: base_record_number,
+                expected: entry.file_reference.sequence_number,
+                found: base_record.sequence_number,
+            });
+        }
+        return attribute_list_continuation_runlist(
+            base_record,
+            entry,
+            boot,
+            limits,
+            attribute_limits,
+        );
+    }
+    if let Some(previous) = loaded.get(&entry.file_reference.record_number) {
+        if previous.sequence_number != entry.file_reference.sequence_number {
+            return Err(AttributeListError::RecordSequenceMismatch {
+                record_number: entry.file_reference.record_number,
+                expected: entry.file_reference.sequence_number,
+                found: previous.sequence_number,
+            });
+        }
+    } else {
+        budget.charge(boot.mft_record_size.bytes)?;
+        let record = read_mft_record_with_reader(
+            image,
+            boot,
+            mft,
+            entry.file_reference.record_number,
+            boot.mft_record_size.bytes,
+        )?;
+        if record.sequence_number != entry.file_reference.sequence_number {
+            return Err(AttributeListError::RecordSequenceMismatch {
+                record_number: entry.file_reference.record_number,
+                expected: entry.file_reference.sequence_number,
+                found: record.sequence_number,
+            });
+        }
+        if !record.flags.is_in_use() {
+            return Err(AttributeListError::ExtensionNotInUse {
+                record_number: entry.file_reference.record_number,
+            });
+        }
+        if record.base_record != Some(*expected_base) {
+            return Err(AttributeListError::ExtensionBaseMismatch {
+                record_number: entry.file_reference.record_number,
+                expected: *expected_base,
+                found: record.base_record,
+            });
+        }
+        loaded.insert(entry.file_reference.record_number, record);
+    }
+    attribute_list_continuation_runlist(
+        &loaded[&entry.file_reference.record_number],
+        entry,
+        boot,
+        limits,
+        attribute_limits,
+    )
+}
+
+fn attribute_list_continuation_runlist(
+    record: &NtfsFileRecord,
+    entry: &AttributeListEntry,
+    boot: &NtfsBootSector,
+    limits: AttributeListLimits,
+    attribute_limits: AttributeLimits,
+) -> Result<NtfsRunlist, AttributeListError> {
+    let attributes = parse_record_attributes(record, attribute_limits)?;
+    let mut matches = attributes
+        .attributes
+        .iter()
+        .filter(|attribute| attribute_matches(entry, attribute));
+    let Some(attribute) = matches.next() else {
+        return Err(AttributeListError::AttributeNotFound {
+            entry_index: 0,
+            record_number: entry.file_reference.record_number,
+        });
+    };
+    if matches.next().is_some() {
+        return Err(AttributeListError::AttributeMatchedMultipleTimes {
+            entry_index: 0,
+            record_number: entry.file_reference.record_number,
+        });
+    }
+    if attribute.flags.is_compressed() || attribute.flags.encrypted || attribute.flags.sparse {
+        return Err(AttributeListError::UnsupportedAttributeListStorage {
+            reason: "continuation stream is compressed, encrypted, or sparse",
+        });
+    }
+    let AttributeBody::NonResident(body) = &attribute.body else {
+        return Err(AttributeListError::UnsupportedAttributeListStorage {
+            reason: "continuation is resident",
+        });
+    };
+    if body.lowest_vcn != entry.lowest_vcn {
+        return Err(AttributeListError::NoncontiguousAttributeListExtent {
+            expected_vcn: entry.lowest_vcn,
+            found_vcn: body.lowest_vcn,
+        });
+    }
+    Ok(parse_mapping_pairs(
+        body.mapping_pairs,
+        MappingPairsLimits {
+            starting_vcn: body.lowest_vcn,
+            expected_next_vcn: Some(body.expected_next_vcn),
+            volume_cluster_count: boot.cluster_count,
+            max_runs: limits.max_runs,
+            max_decoded_clusters: boot.cluster_count,
+        },
+    )?)
+}
+
+fn append_runlist(into: &mut NtfsRunlist, extra: NtfsRunlist) -> Result<(), AttributeListError> {
+    let found_vcn = extra
+        .extents
+        .first()
+        .map_or(extra.next_vcn, |extent| extent.vcn);
+    if found_vcn != into.next_vcn {
+        return Err(AttributeListError::NoncontiguousAttributeListExtent {
+            expected_vcn: into.next_vcn,
+            found_vcn,
+        });
+    }
+    into.extents.extend(extra.extents);
+    into.next_vcn = extra.next_vcn;
+    into.encoded_runs = into.encoded_runs.checked_add(extra.encoded_runs).ok_or(
+        AttributeListError::GeometryOverflow {
+            calculation: "$ATTRIBUTE_LIST run count",
+        },
+    )?;
+    into.bytes_consumed = into
+        .bytes_consumed
+        .checked_add(extra.bytes_consumed)
+        .ok_or(AttributeListError::GeometryOverflow {
+            calculation: "$ATTRIBUTE_LIST mapping-pair bytes",
+        })?;
+    into.decoded_clusters = into
+        .decoded_clusters
+        .checked_add(extra.decoded_clusters)
+        .ok_or(AttributeListError::GeometryOverflow {
+            calculation: "$ATTRIBUTE_LIST decoded clusters",
+        })?;
+    into.physical_clusters = into
+        .physical_clusters
+        .checked_add(extra.physical_clusters)
+        .ok_or(AttributeListError::GeometryOverflow {
+            calculation: "$ATTRIBUTE_LIST physical clusters",
+        })?;
+    into.sparse_clusters = into
+        .sparse_clusters
+        .checked_add(extra.sparse_clusters)
+        .ok_or(AttributeListError::GeometryOverflow {
+            calculation: "$ATTRIBUTE_LIST sparse clusters",
+        })?;
+    Ok(())
 }
 
 fn read_stream(

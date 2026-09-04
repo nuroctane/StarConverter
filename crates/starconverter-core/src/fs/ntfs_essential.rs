@@ -1,4 +1,4 @@
-//! Pure codecs for the NTFS `$AttrDef` payload and empty `$BadClus:$Bad` stream.
+//! Pure codecs for the NTFS `$AttrDef` payload and `$BadClus:$Bad` stream.
 //!
 //! Microsoft normatively identifies `$AttrDef` as the attribute-definition system file,
 //! `$BadClus` as the bad-cluster list, and publishes the NTFS attribute type names. The 160-byte
@@ -7,7 +7,8 @@
 //! `d327833ec1d5eb1358b6f2c37139f10a3460944d` (`layout.h`, `attrdef.c`, `runlist.c`,
 //! and `mkntfs.c`), not claims that Microsoft's public Open Specifications require those exact
 //! bytes. In particular, NTFS-3G encodes both mapping-pair run lengths and LCN deltas as the
-//! shortest unambiguous *signed* little-endian integers.
+//! shortest unambiguous *signed* little-endian integers. Nonempty `$Bad` keeps the same
+//! volume-sized virtual stream and encodes each known-bad LCN as an identity-mapped physical run.
 //!
 //! This module has no I/O or path/device API. Every parser borrows caller-owned bytes and every
 //! allocation is preceded by an explicit size limit and a fallible reservation.
@@ -763,11 +764,13 @@ impl Default for BadClusLimits {
     }
 }
 
-/// Serializer-ready metadata for the empty, named `$BadClus:$Bad` `$DATA` stream.
+/// Serializer-ready metadata for the named `$BadClus:$Bad` `$DATA` stream.
 ///
-/// `mapping_pairs` owns no file data: it describes a single sparse range spanning the volume.
-/// The containing MFT record must additionally contain an empty unnamed resident `$DATA`
-/// attribute; that separate record-level invariant is intentionally outside this stream plan.
+/// `mapping_pairs` owns no file data. The empty plan is one sparse run spanning the volume.
+/// A nonempty plan inserts identity-mapped physical runs at each known-bad LCN and keeps every
+/// other VCN sparse. The containing MFT record must additionally contain an empty unnamed
+/// resident `$DATA` attribute; that separate record-level invariant is intentionally outside
+/// this stream plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmptyBadClusPlan {
     pub attribute_type: u32,
@@ -843,6 +846,9 @@ pub enum BadClusError {
     WrongSparseRunLength { expected: u64, actual: u64 },
     NonZeroMappingPairsPadding { offset: usize, value: u8 },
     AllocationFailed,
+    DuplicateBadLcn { lcn: u64 },
+    BadLcnOutOfRange { lcn: u64, volume_clusters: u64 },
+    NoncanonicalMappingPairs,
 }
 
 impl fmt::Display for BadClusError {
@@ -931,6 +937,19 @@ impl fmt::Display for BadClusError {
             Self::AllocationFailed => {
                 formatter.write_str("could not allocate bounded $BadClus mapping pairs")
             }
+            Self::DuplicateBadLcn { lcn } => {
+                write!(formatter, "$BadClus bad LCN {lcn} is duplicated")
+            }
+            Self::BadLcnOutOfRange {
+                lcn,
+                volume_clusters,
+            } => write!(
+                formatter,
+                "$BadClus bad LCN {lcn} is outside the {volume_clusters}-cluster volume"
+            ),
+            Self::NoncanonicalMappingPairs => formatter.write_str(
+                "$BadClus:$Bad mapping pairs are not the canonical identity-run encoding",
+            ),
         }
     }
 }
@@ -938,10 +957,6 @@ impl fmt::Display for BadClusError {
 impl std::error::Error for BadClusError {}
 
 /// Plans the empty `$BadClus:$Bad` representation emitted by the pinned NTFS-3G formatter.
-///
-/// This intentionally has no parameter for bad clusters. Conversion must not silently discard
-/// source bad-cluster evidence; a future nonempty implementation needs an independently validated
-/// physical runlist and matching `$Bitmap` reservations.
 ///
 /// # Errors
 /// Returns [`BadClusError`] for unsupported geometry, limit violations, overflow, or allocation
@@ -951,22 +966,27 @@ pub fn plan_empty_badclus(
     cluster_bytes: u32,
     limits: BadClusLimits,
 ) -> Result<EmptyBadClusPlan, BadClusError> {
+    plan_badclus(volume_clusters, cluster_bytes, limits, &[])
+}
+
+/// Plans `$BadClus:$Bad` as a volume-sized virtual stream with identity-mapped physical runs at
+/// each known-bad LCN and sparse holes everywhere else.
+///
+/// An empty `bad_lcns` slice is byte-identical to [`plan_empty_badclus`]. Duplicate LCNs are
+/// refused. Conversion must still reserve matching `$Bitmap` bits and refuse destination metadata
+/// that would occupy the same clusters.
+///
+/// # Errors
+/// Returns [`BadClusError`] for unsupported geometry, duplicate or out-of-range LCNs, limit
+/// violations, overflow, or allocation failure.
+pub fn plan_badclus(
+    volume_clusters: u64,
+    cluster_bytes: u32,
+    limits: BadClusLimits,
+    bad_lcns: &[u64],
+) -> Result<EmptyBadClusPlan, BadClusError> {
     let logical_size = validate_badclus_geometry(volume_clusters, cluster_bytes, limits)?;
-    let width = positive_signed_width(volume_clusters);
-    let mapping_len = usize::from(width) + 2;
-    if mapping_len > limits.max_mapping_pairs_bytes {
-        return Err(BadClusError::MappingPairsLimitExceeded {
-            actual: mapping_len,
-            maximum: limits.max_mapping_pairs_bytes,
-        });
-    }
-    let mut mapping_pairs = Vec::new();
-    mapping_pairs
-        .try_reserve_exact(mapping_len)
-        .map_err(|_| BadClusError::AllocationFailed)?;
-    mapping_pairs.push(width);
-    append_unsigned(&mut mapping_pairs, volume_clusters, width);
-    mapping_pairs.push(0);
+    let mapping_pairs = encode_badclus_mapping_pairs(volume_clusters, bad_lcns, limits)?;
 
     Ok(EmptyBadClusPlan {
         attribute_type: DATA_ATTRIBUTE_TYPE,
@@ -975,7 +995,7 @@ pub fn plan_empty_badclus(
         compression_unit: 0,
         lowest_vcn: 0,
         highest_vcn: volume_clusters - 1,
-        // This is deliberately the pinned mkntfs field value, even though the run is sparse.
+        // This is deliberately the pinned mkntfs field value, even though holes are sparse.
         allocated_size: logical_size,
         data_size: logical_size,
         initialized_size: 0,
@@ -1052,6 +1072,90 @@ pub fn validate_empty_badclus(
         });
     }
     validate_empty_badclus_mapping_pairs(stream.mapping_pairs, volume_clusters)
+}
+
+/// Validates `$BadClus:$Bad` against the canonical empty or identity-run nonempty encoding.
+///
+/// Zero bytes after the mapping-pairs terminator are accepted as containing-attribute alignment
+/// padding.
+///
+/// # Errors
+/// Returns [`BadClusError`] for field disagreement, a non-canonical runlist, unsupported
+/// geometry, or a caller limit violation.
+pub fn validate_badclus(
+    stream: EmptyBadClusRef<'_>,
+    volume_clusters: u64,
+    cluster_bytes: u32,
+    limits: BadClusLimits,
+    bad_lcns: &[u64],
+) -> Result<(), BadClusError> {
+    if bad_lcns.is_empty() {
+        return validate_empty_badclus(stream, volume_clusters, cluster_bytes, limits);
+    }
+    let expected = plan_badclus(volume_clusters, cluster_bytes, limits, bad_lcns)?;
+    if stream.attribute_type != expected.attribute_type {
+        return Err(BadClusError::WrongAttributeType {
+            actual: stream.attribute_type,
+        });
+    }
+    if stream.name != expected.name {
+        return Err(BadClusError::WrongName);
+    }
+    if stream.attribute_flags != expected.attribute_flags {
+        return Err(BadClusError::WrongAttributeFlags {
+            actual: stream.attribute_flags,
+        });
+    }
+    if stream.compression_unit != expected.compression_unit {
+        return Err(BadClusError::WrongCompressionUnit {
+            actual: stream.compression_unit,
+        });
+    }
+    if stream.lowest_vcn != expected.lowest_vcn {
+        return Err(BadClusError::WrongLowestVcn {
+            actual: stream.lowest_vcn,
+        });
+    }
+    if stream.highest_vcn != expected.highest_vcn {
+        return Err(BadClusError::WrongHighestVcn {
+            expected: expected.highest_vcn,
+            actual: stream.highest_vcn,
+        });
+    }
+    if stream.allocated_size != expected.allocated_size {
+        return Err(BadClusError::WrongAllocatedSize {
+            expected: expected.allocated_size,
+            actual: stream.allocated_size,
+        });
+    }
+    if stream.data_size != expected.data_size {
+        return Err(BadClusError::WrongDataSize {
+            expected: expected.data_size,
+            actual: stream.data_size,
+        });
+    }
+    if stream.initialized_size != expected.initialized_size {
+        return Err(BadClusError::WrongInitializedSize {
+            actual: stream.initialized_size,
+        });
+    }
+    if stream.mapping_pairs.len() < expected.mapping_pairs.len()
+        || stream.mapping_pairs[..expected.mapping_pairs.len()] != expected.mapping_pairs
+    {
+        return Err(BadClusError::NoncanonicalMappingPairs);
+    }
+    if let Some((relative, value)) = stream.mapping_pairs[expected.mapping_pairs.len()..]
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, value)| *value != 0)
+    {
+        return Err(BadClusError::NonZeroMappingPairsPadding {
+            offset: expected.mapping_pairs.len() + relative,
+            value,
+        });
+    }
+    Ok(())
 }
 
 fn validate_badclus_geometry(
@@ -1153,8 +1257,119 @@ fn positive_signed_width(value: u64) -> u8 {
         .expect("a positive signed u64 value uses at most nine bytes")
 }
 
+fn encode_badclus_mapping_pairs(
+    volume_clusters: u64,
+    bad_lcns: &[u64],
+    limits: BadClusLimits,
+) -> Result<Vec<u8>, BadClusError> {
+    let runs = badclus_runs(volume_clusters, bad_lcns)?;
+    let mut mapping_pairs = Vec::new();
+    let mut previous_lcn = 0_i64;
+    for run in runs {
+        match run {
+            BadClusRun::Sparse { length } => {
+                let width = positive_signed_width(length);
+                mapping_pairs.push(width);
+                append_unsigned(&mut mapping_pairs, length, width);
+            }
+            BadClusRun::Physical { lcn, length } => {
+                let length_width = positive_signed_width(length);
+                let delta = i64::try_from(lcn).map_err(|_| BadClusError::LogicalSizeOverflow)?
+                    - previous_lcn;
+                let delta_width = signed_integer_width(delta);
+                mapping_pairs.push((delta_width << 4) | length_width);
+                append_unsigned(&mut mapping_pairs, length, length_width);
+                append_signed(&mut mapping_pairs, delta, delta_width);
+                previous_lcn = i64::try_from(lcn).map_err(|_| BadClusError::LogicalSizeOverflow)?;
+            }
+        }
+    }
+    mapping_pairs.push(0);
+    if mapping_pairs.len() > limits.max_mapping_pairs_bytes {
+        return Err(BadClusError::MappingPairsLimitExceeded {
+            actual: mapping_pairs.len(),
+            maximum: limits.max_mapping_pairs_bytes,
+        });
+    }
+    Ok(mapping_pairs)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BadClusRun {
+    Sparse { length: u64 },
+    Physical { lcn: u64, length: u64 },
+}
+
+fn badclus_runs(volume_clusters: u64, bad_lcns: &[u64]) -> Result<Vec<BadClusRun>, BadClusError> {
+    let lcns = normalize_bad_lcns(bad_lcns, volume_clusters)?;
+    if lcns.is_empty() {
+        return Ok(vec![BadClusRun::Sparse {
+            length: volume_clusters,
+        }]);
+    }
+    let mut runs = Vec::new();
+    let mut cursor = 0_u64;
+    let mut index = 0_usize;
+    while cursor < volume_clusters {
+        if lcns.get(index).copied() == Some(cursor) {
+            let start = cursor;
+            while lcns.get(index).copied() == Some(cursor) {
+                cursor = cursor
+                    .checked_add(1)
+                    .ok_or(BadClusError::LogicalSizeOverflow)?;
+                index += 1;
+            }
+            runs.push(BadClusRun::Physical {
+                lcn: start,
+                length: cursor - start,
+            });
+        } else {
+            let end = lcns.get(index).copied().unwrap_or(volume_clusters);
+            runs.push(BadClusRun::Sparse {
+                length: end - cursor,
+            });
+            cursor = end;
+        }
+    }
+    Ok(runs)
+}
+
+fn normalize_bad_lcns(bad_lcns: &[u64], volume_clusters: u64) -> Result<Vec<u64>, BadClusError> {
+    let mut lcns = bad_lcns.to_vec();
+    lcns.sort_unstable();
+    if let Some(window) = lcns.windows(2).find(|window| window[0] == window[1]) {
+        return Err(BadClusError::DuplicateBadLcn { lcn: window[0] });
+    }
+    if let Some(&lcn) = lcns.iter().find(|lcn| **lcn >= volume_clusters) {
+        return Err(BadClusError::BadLcnOutOfRange {
+            lcn,
+            volume_clusters,
+        });
+    }
+    Ok(lcns)
+}
+
 fn append_unsigned(bytes: &mut Vec<u8>, value: u64, width: u8) {
     bytes.extend_from_slice(&value.to_le_bytes()[..usize::from(width)]);
+}
+
+fn append_signed(bytes: &mut Vec<u8>, value: i64, width: u8) {
+    bytes.extend_from_slice(&value.to_le_bytes()[..usize::from(width)]);
+}
+
+fn signed_integer_width(value: i64) -> u8 {
+    let raw = value.to_le_bytes();
+    let mut length = 8_usize;
+    while length > 1 {
+        let top = raw[length - 1];
+        let next = raw[length - 2];
+        if (top == 0 && next & 0x80 == 0) || (top == 0xff && next & 0x80 != 0) {
+            length -= 1;
+        } else {
+            break;
+        }
+    }
+    u8::try_from(length).expect("a signed i64 uses at most eight bytes")
 }
 
 fn decode_unsigned(bytes: &[u8]) -> u64 {
@@ -1718,5 +1933,45 @@ mod tests {
                 Err(error)
             );
         }
+    }
+
+    fn nonempty_limits() -> BadClusLimits {
+        BadClusLimits {
+            max_volume_clusters: u64::from(u32::MAX),
+            max_mapping_pairs_bytes: 512,
+        }
+    }
+
+    #[test]
+    fn nonempty_badclus_encodes_identity_runs_and_round_trips() {
+        let plan = plan_badclus(256, 4096, nonempty_limits(), &[10, 11, 200]).expect("plan");
+        assert_eq!(plan.initialized_size, 0);
+        assert_eq!(plan.data_size, 256 * 4096);
+        assert_eq!(plan.allocated_size, plan.data_size);
+        validate_badclus(plan.as_ref(), 256, 4096, nonempty_limits(), &[10, 11, 200])
+            .expect("canonical nonempty $Bad");
+        assert_eq!(
+            plan_badclus(256, 4096, nonempty_limits(), &[200, 11, 10]).expect("sorted"),
+            plan
+        );
+        assert_eq!(
+            plan_empty_badclus(256, 4096, nonempty_limits()).expect("empty"),
+            plan_badclus(256, 4096, nonempty_limits(), &[]).expect("empty via nonempty planner")
+        );
+    }
+
+    #[test]
+    fn nonempty_badclus_refuses_duplicates_and_out_of_range_lcns() {
+        assert_eq!(
+            plan_badclus(256, 4096, nonempty_limits(), &[10, 10]),
+            Err(BadClusError::DuplicateBadLcn { lcn: 10 })
+        );
+        assert_eq!(
+            plan_badclus(256, 4096, nonempty_limits(), &[256]),
+            Err(BadClusError::BadLcnOutOfRange {
+                lcn: 256,
+                volume_clusters: 256
+            })
+        );
     }
 }

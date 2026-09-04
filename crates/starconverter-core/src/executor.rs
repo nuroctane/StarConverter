@@ -537,6 +537,9 @@ impl ImageExecutor {
         }
         let (evidence, completed_phase) = match intent {
             TransactionIntent::Relocate(relocations) => {
+                if !prepared.layout().materializations.is_empty() {
+                    return Err(ExecutorError::IntentNotAuthorized);
+                }
                 if relocations != prepared.layout().relocations {
                     return Err(ExecutorError::IntentNotAuthorized);
                 }

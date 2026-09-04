@@ -133,6 +133,7 @@ fn exfat_plan(graph: &ObjectGraph, metadata: &[ExfatObjectMetadata]) -> ExfatSer
             upcase_checksum: table_checksum(&upcase),
             source_preservation: ExfatPreservationEvidence::default(),
             allocated_bad_clusters: 0,
+            bad_cluster_ranges: &[],
         },
         ExfatSerializeOptions::default(),
         ExfatSerializeLimits::default(),

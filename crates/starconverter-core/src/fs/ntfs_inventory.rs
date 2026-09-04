@@ -20,11 +20,13 @@ use crate::fs::ntfs_attribute_list::{
 use crate::fs::ntfs_discovery::{
     MftBootstrap, NtfsDiscoveryError, read_mft_record_for_inventory_with_reader,
 };
+use crate::fs::ntfs_extend::ReparseIndexKey;
 use crate::fs::ntfs_index::{
     FileNameNamespace, NtfsFileReference, NtfsIndexError, NtfsIndexLimits, NtfsIndexRoot,
     parse_index_block, parse_index_root,
 };
 use crate::fs::ntfs_record::NtfsFileRecord;
+use crate::fs::ntfs_reparse_index::{read_reparse_index_block, read_reparse_index_root};
 use crate::fs::ntfs_runlist::{
     ExtentLocation, MappingPairsError, MappingPairsLimits, NtfsExtent, NtfsRunlist,
     parse_mapping_pairs,
@@ -106,6 +108,15 @@ pub struct NtfsObjectReference {
     pub sequence_number: u16,
 }
 
+impl NtfsObjectReference {
+    /// The packed `MFT_REF` form (48-bit record number, 16-bit sequence number) that index keys
+    /// and `$FILE_NAME` parents carry on disk.
+    #[must_use]
+    pub const fn file_reference(self) -> u64 {
+        (self.record_number & 0x0000_ffff_ffff_ffff) | ((self.sequence_number as u64) << 48)
+    }
+}
+
 /// Selected `$STANDARD_INFORMATION` fields needed for faithful planning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NtfsStandardInformation {
@@ -176,6 +187,10 @@ pub enum NtfsStreamStorage {
         compressed_bytes: Option<u64>,
         mapping_complete: bool,
         extents: Vec<NtfsInventoryExtent>,
+        /// Initialized named-stream bytes captured for dest-native restore. Unnamed streams,
+        /// compressed/encrypted/sparse mappings, incomplete runlists, and payloads above
+        /// [`NtfsInventoryLimits::max_resident_data_bytes`] leave this `None`.
+        captured_payload: Option<Vec<u8>>,
     },
 }
 
@@ -187,6 +202,8 @@ pub struct NtfsDataStream {
     pub compressed: bool,
     pub encrypted: bool,
     pub sparse: bool,
+    /// Compression-unit size in bytes when `compressed`; zero otherwise.
+    pub compression_block_bytes: u64,
     pub storage: NtfsStreamStorage,
 }
 
@@ -228,6 +245,8 @@ pub struct NtfsObject {
     pub attribute_census: Vec<NtfsAttributeEvidence>,
     pub directory_entries: Vec<NtfsDirectoryEntry>,
     pub has_reparse_point: bool,
+    /// Exact unnamed `$REPARSE_POINT` attribute bytes when the mapping is complete.
+    pub reparse_point: Option<Vec<u8>>,
     pub has_attribute_list: bool,
     pub directory_index_complete: bool,
 }
@@ -243,11 +262,38 @@ pub enum NtfsVolumeLabelEvidence {
     Exact(Vec<u16>),
 }
 
+/// Whether `$Extend\$Reparse:$R` was reconciled against the `$REPARSE_POINT` census.
+///
+/// A complete inventory only returns `Absent` or `Reconciled`; every disagreement between the
+/// view index and the attributes it is supposed to mirror is a hard [`NtfsInventoryError`]
+/// because a converter cannot know which side to trust.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NtfsReparseIndexEvidence {
+    /// The scan was bounded or `$Extend\$Reparse` could not be fully resolved, so the index was
+    /// not compared against the census.
+    Unavailable,
+    /// No `$Extend\$Reparse` record exists and no in-use record carries `$REPARSE_POINT`
+    /// (NTFS versions before 3.0 have no view indexes).
+    Absent,
+    /// Every `$R` key names exactly one in-use record whose unnamed `$REPARSE_POINT` carries the
+    /// same tag, and every such record is keyed exactly once.
+    Reconciled {
+        /// Number of `$R` keys, equal to the number of reparse-point records.
+        keys: usize,
+        /// Whether the index used `$INDEX_ALLOCATION:$R` blocks.
+        spilled: bool,
+        /// Number of `INDX` records walked (zero for a resident index).
+        index_blocks: usize,
+    },
+}
+
 /// Complete bounded scan result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NtfsInventory {
     pub volume_serial_number: u64,
     pub volume_label: NtfsVolumeLabelEvidence,
+    /// Outcome of reconciling `$Extend\$Reparse:$R` against the reparse-point census.
+    pub reparse_index: NtfsReparseIndexEvidence,
     pub objects: Vec<NtfsObject>,
     pub extents: Vec<NtfsInventoryExtent>,
     /// Complete physical-cluster ownership census when [`Self::is_complete`] is true.
@@ -327,6 +373,16 @@ pub enum NtfsInventoryError {
         record_number: u64,
         actual: usize,
     },
+    DuplicateReparsePoint {
+        record_number: u64,
+    },
+    NamedReparsePoint {
+        record_number: u64,
+    },
+    InvalidReparsePoint {
+        record_number: u64,
+        actual: usize,
+    },
     DuplicateDataStream {
         record_number: u64,
         attribute_id: u16,
@@ -392,6 +448,41 @@ pub enum NtfsInventoryError {
     },
     ReferenceToUnusedRecord {
         record_number: u64,
+    },
+    /// More than one in-use record is named `$Extend\$Reparse`.
+    DuplicateReparseRecord {
+        record_number: u64,
+    },
+    /// `$Extend\$Reparse` exists but has no `$INDEX_ROOT:$R`, or its `$R` streams are malformed.
+    ReparseIndexMalformed {
+        record_number: u64,
+        reason: String,
+    },
+    /// A record carries `$REPARSE_POINT` but `$Extend\$Reparse` does not exist.
+    ReparseIndexMissing {
+        record_number: u64,
+    },
+    /// A record carries `$REPARSE_POINT` but no `$R` key names it.
+    ReparseIndexNotListed {
+        record_number: u64,
+        reparse_tag: Option<u32>,
+    },
+    /// A `$R` key names a record that is unused, is not a base record, has a different sequence
+    /// number, or has no `$REPARSE_POINT`.
+    ReparseIndexStaleKey {
+        reparse_tag: u32,
+        file_reference: u64,
+    },
+    /// A `$R` key and the record's `$REPARSE_POINT` disagree about the tag.
+    ReparseIndexTagMismatch {
+        record_number: u64,
+        index_tag: u32,
+        attribute_tag: u32,
+    },
+    /// Two `$R` entries collate equal.
+    ReparseIndexDuplicateKey {
+        reparse_tag: u32,
+        file_reference: u64,
     },
     Attribute(NtfsAttributeError),
     AttributeList(AttributeListError),
@@ -489,6 +580,21 @@ impl fmt::Display for NtfsInventoryError {
             } => write!(
                 formatter,
                 "MFT record {record_number} has invalid {actual}-byte file name"
+            ),
+            Self::DuplicateReparsePoint { record_number } => write!(
+                formatter,
+                "MFT record {record_number} has duplicate $REPARSE_POINT attributes"
+            ),
+            Self::NamedReparsePoint { record_number } => write!(
+                formatter,
+                "MFT record {record_number} has a named $REPARSE_POINT attribute"
+            ),
+            Self::InvalidReparsePoint {
+                record_number,
+                actual,
+            } => write!(
+                formatter,
+                "MFT record {record_number} has invalid {actual}-byte $REPARSE_POINT value"
             ),
             Self::DuplicateDataStream {
                 record_number,
@@ -594,6 +700,56 @@ impl fmt::Display for NtfsInventoryError {
             Self::ReferenceToUnusedRecord { record_number } => write!(
                 formatter,
                 "directory index references unused MFT record {record_number}"
+            ),
+            Self::DuplicateReparseRecord { record_number } => write!(
+                formatter,
+                "record {record_number} is a second $Extend\\$Reparse"
+            ),
+            Self::ReparseIndexMalformed {
+                record_number,
+                reason,
+            } => write!(
+                formatter,
+                "$Extend\\$Reparse record {record_number} has a malformed $R index: {reason}"
+            ),
+            Self::ReparseIndexMissing { record_number } => write!(
+                formatter,
+                "record {record_number} carries $REPARSE_POINT but the volume has no $Extend\\$Reparse"
+            ),
+            Self::ReparseIndexNotListed {
+                record_number,
+                reparse_tag,
+            } => match reparse_tag {
+                Some(tag) => write!(
+                    formatter,
+                    "record {record_number} carries $REPARSE_POINT tag 0x{tag:08x} but $Reparse:$R does not list it"
+                ),
+                None => write!(
+                    formatter,
+                    "record {record_number} carries $REPARSE_POINT but $Reparse:$R does not list it"
+                ),
+            },
+            Self::ReparseIndexStaleKey {
+                reparse_tag,
+                file_reference,
+            } => write!(
+                formatter,
+                "$Reparse:$R key tag 0x{reparse_tag:08x} names MFT reference 0x{file_reference:016x}, which carries no matching $REPARSE_POINT"
+            ),
+            Self::ReparseIndexTagMismatch {
+                record_number,
+                index_tag,
+                attribute_tag,
+            } => write!(
+                formatter,
+                "$Reparse:$R lists record {record_number} with tag 0x{index_tag:08x} but its $REPARSE_POINT carries 0x{attribute_tag:08x}"
+            ),
+            Self::ReparseIndexDuplicateKey {
+                reparse_tag,
+                file_reference,
+            } => write!(
+                formatter,
+                "$Reparse:$R lists tag 0x{reparse_tag:08x} reference 0x{file_reference:016x} more than once"
             ),
             Self::Attribute(error) => write!(formatter, "invalid NTFS attribute: {error}"),
             Self::AttributeList(error) => {
@@ -731,6 +887,7 @@ pub(crate) fn inventory_ntfs_with_reader(
     let mut extension_records = 0_u64;
     let mut bytes_read = 0_u64;
     let mut volume_label = NtfsVolumeLabelEvidence::Unavailable;
+    let mut reparse_scan = ReparseIndexScan::NoRecord;
     for record_number in 0..scan_records {
         let requested_total =
             bytes_read
@@ -804,6 +961,8 @@ pub(crate) fn inventory_ntfs_with_reader(
             resolved.as_ref(),
             &mut extents,
             &mut physical_allocations,
+            image,
+            &mut bytes_read,
         )?;
         if record_number == NTFS_VOLUME_RECORD {
             volume_label = inventoried.volume_label.map_or(
@@ -825,12 +984,30 @@ pub(crate) fn inventory_ntfs_with_reader(
                 &mut object,
             )?;
         }
+        if is_extend_reparse_record(&object) {
+            if !matches!(reparse_scan, ReparseIndexScan::NoRecord) {
+                return Err(NtfsInventoryError::DuplicateReparseRecord { record_number });
+            }
+            reparse_scan = inventory_reparse_index(
+                image,
+                boot,
+                record_number,
+                &record,
+                resolved.as_ref(),
+                limits,
+                &mut bytes_read,
+                &mut incomplete,
+                &object,
+            )?;
+        }
         objects.push(object);
     }
     validate_references(&objects, scan_records, &mut incomplete)?;
+    let reparse_index = reconcile_reparse_index(&objects, reparse_scan, &incomplete)?;
     Ok(NtfsInventory {
         volume_serial_number: boot.volume_serial_number,
         volume_label,
+        reparse_index,
         in_use_base_records: u64::try_from(objects.len()).unwrap_or(u64::MAX),
         objects,
         extents,
@@ -941,7 +1118,7 @@ const fn attribute_limits(boot: &NtfsBootSector, limits: NtfsInventoryLimits) ->
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn inventory_base_record(
     record_number: u64,
     record: &NtfsFileRecord,
@@ -950,6 +1127,8 @@ fn inventory_base_record(
     resolved: Option<&ResolvedAttributeList>,
     all_extents: &mut Vec<NtfsInventoryExtent>,
     physical_allocations: &mut Vec<NtfsPhysicalAllocation>,
+    image: &dyn BoundedImageReader,
+    bytes_read: &mut u64,
 ) -> Result<InventoriedBaseRecord, NtfsInventoryError> {
     let base_attributes = parse_attribute_list(
         record.repaired_bytes(),
@@ -999,7 +1178,6 @@ fn inventory_base_record(
     }
     let mut standard_information = None;
     let mut file_names = Vec::new();
-    let mut has_reparse_point = false;
     let mut volume_label = None;
     let has_attribute_list = base_attributes
         .attributes
@@ -1068,10 +1246,11 @@ fn inventory_base_record(
                 }
                 volume_label = Some(units);
             }
-            REPARSE_POINT => has_reparse_point = true,
             _ => {}
         }
     }
+    let (has_reparse_point, reparse_point) =
+        inventory_reparse_point(record_number, attributes, limits)?;
     inventory_physical_allocations(
         record_number,
         attributes,
@@ -1079,6 +1258,22 @@ fn inventory_base_record(
         limits,
         physical_allocations,
     )?;
+    if resolved.is_some() {
+        inventory_physical_allocations_where(
+            record_number,
+            &base_attributes.attributes,
+            boot,
+            limits,
+            physical_allocations,
+            |attribute| {
+                attribute.attribute_type == ATTRIBUTE_LIST
+                    && matches!(
+                        &attribute.body,
+                        AttributeBody::NonResident(body) if body.lowest_vcn == 0
+                    )
+            },
+        )?;
+    }
     let mut stream_groups: Vec<Vec<&NtfsAttribute<'_>>> = Vec::new();
     for attribute in attributes
         .iter()
@@ -1095,7 +1290,8 @@ fn inventory_base_record(
     }
     let mut data_streams = Vec::new();
     for group in stream_groups {
-        let stream = inventory_data_stream(record_number, &group, boot, limits)?;
+        let stream =
+            inventory_data_stream(record_number, &group, boot, limits, Some(image), bytes_read)?;
         if data_streams
             .iter()
             .any(|existing: &NtfsDataStream| existing.attribute_id == stream.attribute_id)
@@ -1138,11 +1334,64 @@ fn inventory_base_record(
             attribute_census,
             directory_entries: Vec::new(),
             has_reparse_point,
+            reparse_point,
             has_attribute_list,
             directory_index_complete: !record.flags.is_directory(),
         },
         volume_label,
     })
+}
+
+fn inventory_reparse_point(
+    record_number: u64,
+    attributes: &[NtfsAttribute<'_>],
+    limits: NtfsInventoryLimits,
+) -> Result<(bool, Option<Vec<u8>>), NtfsInventoryError> {
+    let mut found = None;
+    for attribute in attributes
+        .iter()
+        .filter(|attribute| attribute.attribute_type == REPARSE_POINT)
+    {
+        if attribute.name.is_some() {
+            return Err(NtfsInventoryError::NamedReparsePoint { record_number });
+        }
+        if found.is_some() {
+            return Err(NtfsInventoryError::DuplicateReparsePoint { record_number });
+        }
+        let AttributeBody::Resident(body) = &attribute.body else {
+            found = Some(None);
+            continue;
+        };
+        if body.value.len() > limits.max_resident_data_bytes {
+            return Err(NtfsInventoryError::ResidentDataLimitExceeded {
+                actual: body.value.len(),
+                maximum: limits.max_resident_data_bytes,
+            });
+        }
+        if body.value.len() < 8 {
+            return Err(NtfsInventoryError::InvalidReparsePoint {
+                record_number,
+                actual: body.value.len(),
+            });
+        }
+        let data_length = u16::from_le_bytes([body.value[4], body.value[5]]);
+        if usize::from(data_length)
+            .checked_add(8)
+            .is_none_or(|expected| expected != body.value.len())
+        {
+            return Err(NtfsInventoryError::InvalidReparsePoint {
+                record_number,
+                actual: body.value.len(),
+            });
+        }
+        let mut payload = Vec::new();
+        payload
+            .try_reserve_exact(body.value.len())
+            .map_err(|_| NtfsInventoryError::AllocationFailed)?;
+        payload.extend_from_slice(body.value);
+        found = Some(Some(payload));
+    }
+    Ok(found.map_or((false, None), |payload| (true, payload)))
 }
 
 fn inventory_physical_allocations(
@@ -1152,7 +1401,21 @@ fn inventory_physical_allocations(
     limits: NtfsInventoryLimits,
     output: &mut Vec<NtfsPhysicalAllocation>,
 ) -> Result<(), NtfsInventoryError> {
+    inventory_physical_allocations_where(record_number, attributes, boot, limits, output, |_| true)
+}
+
+fn inventory_physical_allocations_where(
+    record_number: u64,
+    attributes: &[NtfsAttribute<'_>],
+    boot: &NtfsBootSector,
+    limits: NtfsInventoryLimits,
+    output: &mut Vec<NtfsPhysicalAllocation>,
+    include: impl Fn(&NtfsAttribute<'_>) -> bool,
+) -> Result<(), NtfsInventoryError> {
     for attribute in attributes {
+        if !include(attribute) {
+            continue;
+        }
         let AttributeBody::NonResident(body) = &attribute.body else {
             continue;
         };
@@ -1206,6 +1469,8 @@ fn inventory_data_stream(
     attributes: &[&NtfsAttribute<'_>],
     boot: &NtfsBootSector,
     limits: NtfsInventoryLimits,
+    image: Option<&dyn BoundedImageReader>,
+    bytes_read: &mut u64,
 ) -> Result<NtfsDataStream, NtfsInventoryError> {
     let attribute = attributes[0];
     let name = attribute.name.as_ref().map(|name| NtfsName {
@@ -1342,14 +1607,30 @@ fn inventory_data_stream(
                 &runlist,
                 boot.cluster_size_bytes,
             )?;
+            let mapping_complete = mapped_bytes
+                >= required_stream_coverage(attribute, sizes, boot.cluster_size_bytes)?;
+            let captured_payload = capture_named_nonresident_payload(
+                image,
+                record_number,
+                name.as_ref(),
+                mapping_complete
+                    && !attribute.flags.is_compressed()
+                    && !attribute.flags.encrypted
+                    && !attribute.flags.sparse,
+                sizes.data,
+                sizes.initialized,
+                &extents,
+                limits,
+                bytes_read,
+            )?;
             NtfsStreamStorage::NonResident {
                 allocated_bytes: sizes.allocated,
                 data_bytes: sizes.data,
                 initialized_bytes: sizes.initialized,
                 compressed_bytes: sizes.compressed,
-                mapping_complete: mapped_bytes
-                    >= required_stream_coverage(attribute, sizes, boot.cluster_size_bytes)?,
+                mapping_complete,
                 extents,
+                captured_payload,
             }
         }
     };
@@ -1359,8 +1640,113 @@ fn inventory_data_stream(
         compressed: attribute.flags.is_compressed(),
         encrypted: attribute.flags.encrypted,
         sparse: attribute.flags.sparse,
+        compression_block_bytes: match &attribute.body {
+            AttributeBody::NonResident(body) => body.compression_block_bytes.unwrap_or(0),
+            AttributeBody::Resident(_) => 0,
+        },
         storage,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn capture_named_nonresident_payload(
+    image: Option<&dyn BoundedImageReader>,
+    record_number: u64,
+    name: Option<&NtfsName>,
+    eligible: bool,
+    data_bytes: u64,
+    initialized_bytes: u64,
+    extents: &[NtfsInventoryExtent],
+    limits: NtfsInventoryLimits,
+    bytes_read: &mut u64,
+) -> Result<Option<Vec<u8>>, NtfsInventoryError> {
+    let max_capture = u64::try_from(limits.max_resident_data_bytes).unwrap_or(u64::MAX);
+    if name.is_none()
+        || record_number < NTFS_FIRST_USER_RECORD
+        || !eligible
+        || data_bytes > max_capture
+        || initialized_bytes > data_bytes
+    {
+        return Ok(None);
+    }
+    let Some(image) = image else {
+        return Ok(None);
+    };
+    let mut ordered = extents.to_vec();
+    ordered.sort_unstable_by_key(|extent| extent.logical_offset);
+    let mut expected = 0_u64;
+    for extent in &ordered {
+        if expected >= initialized_bytes {
+            break;
+        }
+        if extent.length == 0
+            || extent.logical_offset != expected
+            || matches!(extent.placement, NtfsExtentPlacement::Sparse)
+        {
+            return Ok(None);
+        }
+        expected =
+            expected
+                .checked_add(extent.length)
+                .ok_or(NtfsInventoryError::GeometryOverflow {
+                    calculation: "named stream capture coverage",
+                })?;
+    }
+    if expected < initialized_bytes {
+        return Ok(None);
+    }
+    let length =
+        usize::try_from(initialized_bytes).map_err(|_| NtfsInventoryError::GeometryOverflow {
+            calculation: "named stream capture length",
+        })?;
+    let total =
+        bytes_read
+            .checked_add(initialized_bytes)
+            .ok_or(NtfsInventoryError::GeometryOverflow {
+                calculation: "inventory bytes read",
+            })?;
+    if total > limits.max_bytes {
+        return Err(NtfsInventoryError::ByteLimitExceeded {
+            requested_total: total,
+            maximum: limits.max_bytes,
+        });
+    }
+    if length == 0 {
+        *bytes_read = total;
+        return Ok(Some(Vec::new()));
+    }
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(length)
+        .map_err(|_| NtfsInventoryError::AllocationFailed)?;
+    output.resize(length, 0);
+    let mut cursor = 0_u64;
+    for extent in &ordered {
+        if cursor >= initialized_bytes {
+            break;
+        }
+        let NtfsExtentPlacement::Physical { byte_offset } = extent.placement else {
+            return Err(NtfsInventoryError::GeometryOverflow {
+                calculation: "named stream capture sparse run",
+            });
+        };
+        let chunk = (initialized_bytes - cursor).min(extent.length);
+        let chunk_len =
+            usize::try_from(chunk).map_err(|_| NtfsInventoryError::GeometryOverflow {
+                calculation: "named stream capture chunk",
+            })?;
+        let dest = usize::try_from(cursor).map_err(|_| NtfsInventoryError::GeometryOverflow {
+            calculation: "named stream capture offset",
+        })?;
+        read_chunked(image, byte_offset, &mut output[dest..dest + chunk_len])?;
+        cursor = cursor
+            .checked_add(chunk)
+            .ok_or(NtfsInventoryError::GeometryOverflow {
+                calculation: "named stream capture cursor",
+            })?;
+    }
+    *bytes_read = total;
+    Ok(Some(output))
 }
 
 fn attribute_names_equal(left: &NtfsAttribute<'_>, right: &NtfsAttribute<'_>) -> bool {
@@ -1677,6 +2063,297 @@ fn attribute_name_eq(attribute: &NtfsAttribute<'_>, expected: &[u16]) -> bool {
         .is_some_and(|name| name.code_units == expected)
 }
 
+/// Outcome of walking `$Extend\$Reparse:$R` during the record scan.
+enum ReparseIndexScan {
+    /// No in-use base record is named `$Extend\$Reparse`.
+    NoRecord,
+    /// The record exists but its `$R` streams could not be fully resolved within the caps.
+    Unavailable,
+    /// Every reachable `$R` key, in on-disk traversal order.
+    Walked {
+        keys: Vec<ReparseIndexKey>,
+        spilled: bool,
+        index_blocks: usize,
+    },
+}
+
+/// Whether `object` is the `$Reparse` metafile: a record whose `$FILE_NAME` names it
+/// `$Reparse` under `$Extend` (record 11). The record number is not assumed because only the
+/// first sixteen NTFS records have fixed positions.
+fn is_extend_reparse_record(object: &NtfsObject) -> bool {
+    let expected: Vec<u16> = "$Reparse".encode_utf16().collect();
+    object.file_names.iter().any(|name| {
+        name.parent.record_number == NTFS_EXTEND_RECORD && name.name.code_units == expected
+    })
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn inventory_reparse_index(
+    image: &dyn BoundedImageReader,
+    boot: &NtfsBootSector,
+    record_number: u64,
+    record: &NtfsFileRecord,
+    resolved: Option<&ResolvedAttributeList>,
+    limits: NtfsInventoryLimits,
+    bytes_read: &mut u64,
+    incomplete: &mut BTreeSet<NtfsInventoryIncompleteReason>,
+    object: &NtfsObject,
+) -> Result<ReparseIndexScan, NtfsInventoryError> {
+    let malformed = |reason: String| NtfsInventoryError::ReparseIndexMalformed {
+        record_number,
+        reason,
+    };
+    let parsed = parse_attribute_list(
+        record.repaired_bytes(),
+        usize::from(record.attributes_offset),
+        usize::try_from(record.bytes_in_use).unwrap_or(usize::MAX),
+        attribute_limits(boot, limits),
+    )?;
+    let resolved_attributes = resolved
+        .map(|list| {
+            list.extents
+                .iter()
+                .map(|extent| {
+                    parse_attribute(&extent.raw_attribute, attribute_limits(boot, limits))
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?;
+    let attributes = resolved_attributes.as_deref().unwrap_or(&parsed.attributes);
+    let unresolved_attribute_list = object.has_attribute_list && resolved.is_none();
+    let unavailable = ReparseIndexScan::Unavailable;
+    let r_name = b"$R".map(u16::from);
+    let roots: Vec<_> = attributes
+        .iter()
+        .filter(|attribute| {
+            attribute.attribute_type == INDEX_ROOT && attribute_name_eq(attribute, &r_name)
+        })
+        .collect();
+    if roots.len() > 1 {
+        return Err(malformed("more than one $INDEX_ROOT:$R".to_owned()));
+    }
+    let Some(root_attribute) = roots.first() else {
+        if unresolved_attribute_list {
+            incomplete.insert(NtfsInventoryIncompleteReason::AttributeListContinuationRequired);
+            return Ok(unavailable);
+        }
+        return Err(malformed("missing $INDEX_ROOT:$R".to_owned()));
+    };
+    let AttributeBody::Resident(root_body) = &root_attribute.body else {
+        return Err(malformed("$INDEX_ROOT:$R is not resident".to_owned()));
+    };
+    let root = read_reparse_index_root(root_body.value, limits.max_index_entries)
+        .map_err(|error| malformed(error.to_string()))?;
+    let mut keys = Vec::new();
+    push_reparse_keys(&mut keys, &root.node.keys, limits.max_index_entries)?;
+    let mut children: VecDeque<u64> = root.node.child_vcns.iter().copied().collect();
+    if children.is_empty() {
+        return Ok(ReparseIndexScan::Walked {
+            keys,
+            spilled: false,
+            index_blocks: 0,
+        });
+    }
+
+    let allocation = attributes.iter().find(|attribute| {
+        attribute.attribute_type == INDEX_ALLOCATION && attribute_name_eq(attribute, &r_name)
+    });
+    let bitmap = attributes.iter().find(|attribute| {
+        attribute.attribute_type == BITMAP && attribute_name_eq(attribute, &r_name)
+    });
+    let (Some(allocation), Some(bitmap)) = (allocation, bitmap) else {
+        if unresolved_attribute_list {
+            incomplete.insert(NtfsInventoryIncompleteReason::AttributeListContinuationRequired);
+            return Ok(unavailable);
+        }
+        return Err(malformed(if allocation.is_none() {
+            "root has children but $INDEX_ALLOCATION:$R is missing".to_owned()
+        } else {
+            "root has children but $BITMAP:$R is missing".to_owned()
+        }));
+    };
+    let Some((allocation_runlist, allocation_bytes, allocation_complete)) =
+        parse_index_allocation(record_number, allocation, boot, limits)?
+    else {
+        return Err(malformed("$INDEX_ALLOCATION:$R is resident".to_owned()));
+    };
+    if !allocation_complete {
+        incomplete.insert(NtfsInventoryIncompleteReason::IndexAllocationContinuationRequired);
+        return Ok(unavailable);
+    }
+    let Some(bitmap_bytes) = read_attribute_value(image, bitmap, boot, limits, bytes_read)? else {
+        incomplete.insert(NtfsInventoryIncompleteReason::IndexBitmapContinuationRequired);
+        return Ok(unavailable);
+    };
+    let block_size = usize::try_from(root.index_block_bytes).map_err(|_| {
+        NtfsInventoryError::GeometryOverflow {
+            calculation: "$R index block size",
+        }
+    })?;
+    let mut visited = BTreeSet::new();
+    while let Some(child_vcn) = children.pop_front() {
+        if !visited.insert(child_vcn) {
+            return Err(malformed(format!(
+                "INDX record at VCN {child_vcn} is reachable more than once"
+            )));
+        }
+        if visited.len() > limits.max_index_blocks {
+            incomplete.insert(NtfsInventoryIncompleteReason::IndexTraversalLimit);
+            return Ok(unavailable);
+        }
+        let (stream_offset, block_number) = index_child_offset_for(
+            record_number,
+            child_vcn,
+            root.index_block_bytes,
+            root.clusters_per_index_block,
+            boot.cluster_size_bytes,
+        )?;
+        let byte_index = usize::try_from(block_number / 8)
+            .map_err(|_| NtfsInventoryError::InvalidIndexBitmap { record_number })?;
+        if byte_index >= bitmap_bytes.len() {
+            return Err(NtfsInventoryError::InvalidIndexBitmap { record_number });
+        }
+        if bitmap_bytes[byte_index] & (1_u8 << (block_number % 8)) == 0 {
+            return Err(NtfsInventoryError::IndexChildNotAllocated {
+                record_number,
+                child_vcn,
+            });
+        }
+        let block = read_runlist_range(
+            image,
+            &allocation_runlist,
+            stream_offset,
+            block_size,
+            boot.cluster_size_bytes,
+            allocation_bytes,
+            bytes_read,
+            limits.max_bytes,
+        )?;
+        let node = read_reparse_index_block(&block, child_vcn, limits.max_index_entries)
+            .map_err(|error| malformed(error.to_string()))?;
+        push_reparse_keys(&mut keys, &node.keys, limits.max_index_entries)?;
+        children.extend(node.child_vcns.iter().copied());
+    }
+    Ok(ReparseIndexScan::Walked {
+        keys,
+        spilled: true,
+        index_blocks: visited.len(),
+    })
+}
+
+fn push_reparse_keys(
+    keys: &mut Vec<ReparseIndexKey>,
+    additional: &[ReparseIndexKey],
+    maximum: usize,
+) -> Result<(), NtfsInventoryError> {
+    if keys
+        .len()
+        .checked_add(additional.len())
+        .is_none_or(|total| total > maximum)
+    {
+        return Err(NtfsInventoryError::ObjectLimitExceeded { maximum });
+    }
+    keys.try_reserve(additional.len())
+        .map_err(|_| NtfsInventoryError::AllocationFailed)?;
+    keys.extend_from_slice(additional);
+    Ok(())
+}
+
+/// Compares the walked `$R` keys against every in-use base record's `$REPARSE_POINT`.
+fn reconcile_reparse_index(
+    objects: &[NtfsObject],
+    scan: ReparseIndexScan,
+    incomplete: &BTreeSet<NtfsInventoryIncompleteReason>,
+) -> Result<NtfsReparseIndexEvidence, NtfsInventoryError> {
+    // Any gap in the record census could hide a reparse-point record or the `$Reparse`
+    // metafile itself, so reconciliation is only claimed when the census is complete.
+    let census_incomplete = incomplete.iter().any(|reason| {
+        matches!(
+            reason,
+            NtfsInventoryIncompleteReason::RecordLimit
+                | NtfsInventoryIncompleteReason::MftMappingContinuationRequired
+                | NtfsInventoryIncompleteReason::AttributeListContinuationRequired
+                | NtfsInventoryIncompleteReason::ReferenceOutsideScan
+        )
+    });
+    if census_incomplete {
+        return Ok(NtfsReparseIndexEvidence::Unavailable);
+    }
+    // Reparse-point records keyed by the exact MFT reference `$R` must carry.
+    let mut expected: BTreeMap<u64, (u64, Option<u32>, bool)> = BTreeMap::new();
+    for object in objects.iter().filter(|object| object.has_reparse_point) {
+        let tag = object
+            .reparse_point
+            .as_deref()
+            .and_then(|payload| payload.get(..4))
+            .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+        expected.insert(
+            object.reference.file_reference(),
+            (object.reference.record_number, tag, false),
+        );
+    }
+    let (keys, spilled, index_blocks) = match scan {
+        ReparseIndexScan::Unavailable => return Ok(NtfsReparseIndexEvidence::Unavailable),
+        ReparseIndexScan::NoRecord => {
+            return match expected.values().next() {
+                Some((record_number, _, _)) => Err(NtfsInventoryError::ReparseIndexMissing {
+                    record_number: *record_number,
+                }),
+                None => Ok(NtfsReparseIndexEvidence::Absent),
+            };
+        }
+        ReparseIndexScan::Walked {
+            keys,
+            spilled,
+            index_blocks,
+        } => (keys, spilled, index_blocks),
+    };
+    let mut seen_keys = BTreeSet::new();
+    for key in &keys {
+        if !seen_keys.insert(key.collation_ulongs()) {
+            return Err(NtfsInventoryError::ReparseIndexDuplicateKey {
+                reparse_tag: key.reparse_tag,
+                file_reference: key.file_reference,
+            });
+        }
+        let Some((record_number, attribute_tag, listed)) = expected.get_mut(&key.file_reference)
+        else {
+            return Err(NtfsInventoryError::ReparseIndexStaleKey {
+                reparse_tag: key.reparse_tag,
+                file_reference: key.file_reference,
+            });
+        };
+        if let Some(attribute_tag) = *attribute_tag {
+            if attribute_tag != key.reparse_tag {
+                return Err(NtfsInventoryError::ReparseIndexTagMismatch {
+                    record_number: *record_number,
+                    index_tag: key.reparse_tag,
+                    attribute_tag,
+                });
+            }
+        }
+        if *listed {
+            // A record carries at most one `$REPARSE_POINT`, so a second key for it is stale.
+            return Err(NtfsInventoryError::ReparseIndexStaleKey {
+                reparse_tag: key.reparse_tag,
+                file_reference: key.file_reference,
+            });
+        }
+        *listed = true;
+    }
+    if let Some((record_number, tag, _)) = expected.values().find(|(_, _, listed)| !listed) {
+        return Err(NtfsInventoryError::ReparseIndexNotListed {
+            record_number: *record_number,
+            reparse_tag: *tag,
+        });
+    }
+    Ok(NtfsReparseIndexEvidence::Reconciled {
+        keys: keys.len(),
+        spilled,
+        index_blocks,
+    })
+}
+
 fn append_index_entries<'a>(
     directory: NtfsObjectReference,
     entries: impl Iterator<Item = crate::fs::ntfs_index::NtfsIndexEntry<'a>>,
@@ -1837,35 +2514,47 @@ fn index_child_offset(
     root: &NtfsIndexRoot<'_>,
     cluster_bytes: u64,
 ) -> Result<(u64, u64), NtfsInventoryError> {
-    let index_block_bytes = u64::from(root.index_block_size);
+    index_child_offset_for(
+        record_number,
+        child_vcn,
+        root.index_block_size,
+        root.clusters_per_index_block,
+        cluster_bytes,
+    )
+}
+
+/// Maps a child VCN to `(stream byte offset, block number)` for an index whose root declares
+/// `index_block_size` and `clusters_per_index_block`.
+fn index_child_offset_for(
+    record_number: u64,
+    child_vcn: u64,
+    index_block_size: u32,
+    clusters_per_index_block: u8,
+    cluster_bytes: u64,
+) -> Result<(u64, u64), NtfsInventoryError> {
+    let index_block_bytes = u64::from(index_block_size);
+    let geometry_error = || NtfsInventoryError::InvalidIndexRootGeometry {
+        record_number,
+        cluster_bytes,
+        index_block_bytes: index_block_size,
+        encoded_units: clusters_per_index_block,
+    };
+    if index_block_bytes == 0 {
+        return Err(geometry_error());
+    }
     let (expected_units, unit_bytes) = if index_block_bytes >= cluster_bytes {
         if index_block_bytes % cluster_bytes != 0 {
-            return Err(NtfsInventoryError::InvalidIndexRootGeometry {
-                record_number,
-                cluster_bytes,
-                index_block_bytes: root.index_block_size,
-                encoded_units: root.clusters_per_index_block,
-            });
+            return Err(geometry_error());
         }
         (index_block_bytes / cluster_bytes, cluster_bytes)
     } else {
         if cluster_bytes % index_block_bytes != 0 || index_block_bytes % 512 != 0 {
-            return Err(NtfsInventoryError::InvalidIndexRootGeometry {
-                record_number,
-                cluster_bytes,
-                index_block_bytes: root.index_block_size,
-                encoded_units: root.clusters_per_index_block,
-            });
+            return Err(geometry_error());
         }
         (index_block_bytes / 512, 512)
     };
-    if u64::from(root.clusters_per_index_block) != expected_units {
-        return Err(NtfsInventoryError::InvalidIndexRootGeometry {
-            record_number,
-            cluster_bytes,
-            index_block_bytes: root.index_block_size,
-            encoded_units: root.clusters_per_index_block,
-        });
+    if u64::from(clusters_per_index_block) != expected_units {
+        return Err(geometry_error());
     }
     if child_vcn % expected_units != 0 {
         return Err(NtfsInventoryError::IndexChildVcnMisaligned {
@@ -2323,6 +3012,9 @@ mod tests {
         if header == 72 {
             attribute[64..72].copy_from_slice(&compressed.to_le_bytes());
         }
+        if flags & 0x00ff != 0 {
+            attribute[34] = 1;
+        }
         attribute[header..header + mapping_pairs.len()].copy_from_slice(mapping_pairs);
         attribute
     }
@@ -2513,6 +3205,35 @@ mod tests {
     }
 
     #[test]
+    fn inventories_compressed_stream_compression_unit() {
+        let file_name =
+            resident_attribute(FILE_NAME, 1, &file_name_value(5, 1, &[u16::from(b'c')], 1));
+        let data = nonresident_attribute(2, 0, 1, 1, 4096, 6, 6, 4096, &[0x11, 1, 8, 0x01, 1, 0]);
+        let record = record_with_attributes(0, 1, None, &[file_name, data]);
+        let mut bytes = vec![0_u8; 128 * 512];
+        let offset = 4 * 4096;
+        bytes[offset..offset + 1024].copy_from_slice(&record);
+        let temp = TempImage::create(&bytes);
+        let image = ImageFile::open(&temp.0).unwrap();
+        let inventory = inventory_ntfs(
+            &image,
+            &boot(),
+            &bootstrap(1024),
+            NtfsInventoryLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(inventory.objects.len(), 1);
+        let stream = &inventory.objects[0].data_streams[0];
+        assert!(stream.compressed);
+        assert_eq!(stream.compression_block_bytes, 8192);
+        let NtfsStreamStorage::NonResident { extents, .. } = &stream.storage else {
+            panic!("non-resident");
+        };
+        assert_eq!(extents.len(), 2);
+        assert!(matches!(extents[1].placement, NtfsExtentPlacement::Sparse));
+    }
+
+    #[test]
     fn stale_directory_reference_is_fatal() {
         let target = NtfsObject {
             reference: NtfsObjectReference {
@@ -2528,6 +3249,7 @@ mod tests {
             attribute_census: Vec::new(),
             directory_entries: Vec::new(),
             has_reparse_point: false,
+            reparse_point: None,
             has_attribute_list: false,
             directory_index_complete: true,
         };
@@ -2597,6 +3319,7 @@ mod tests {
                 },
             }],
             has_reparse_point: false,
+            reparse_point: None,
             has_attribute_list: false,
             directory_index_complete: true,
         };
@@ -2663,6 +3386,392 @@ mod tests {
         assert_eq!(
             census[0].name.as_ref().unwrap().code_units,
             "opaque".encode_utf16().collect::<Vec<_>>()
+        );
+    }
+
+    fn symlink_reparse_payload() -> Vec<u8> {
+        let mut payload = vec![0_u8; 16];
+        payload[..4].copy_from_slice(&0xa000_000c_u32.to_le_bytes());
+        payload[4..6].copy_from_slice(&8_u16.to_le_bytes());
+        payload
+    }
+
+    fn parse_test_attribute(bytes: &[u8]) -> NtfsAttribute<'_> {
+        parse_attribute(
+            bytes,
+            attribute_limits(&boot(), NtfsInventoryLimits::default()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn captures_resident_reparse_point_bytes_and_refuses_incomplete_forms() {
+        let payload = symlink_reparse_payload();
+        let encoded = resident_attribute(REPARSE_POINT, 8, &payload);
+        let parsed = parse_test_attribute(&encoded);
+        let (present, captured) =
+            inventory_reparse_point(16, &[parsed], NtfsInventoryLimits::default()).unwrap();
+        assert!(present);
+        assert_eq!(captured.as_deref(), Some(payload.as_slice()));
+
+        let named = named_resident_attribute(
+            REPARSE_POINT,
+            8,
+            &"rp".encode_utf16().collect::<Vec<_>>(),
+            &payload,
+        );
+        let parsed = parse_test_attribute(&named);
+        assert!(matches!(
+            inventory_reparse_point(16, &[parsed], NtfsInventoryLimits::default()),
+            Err(NtfsInventoryError::NamedReparsePoint { record_number: 16 })
+        ));
+
+        let first = resident_attribute(REPARSE_POINT, 8, &payload);
+        let second = resident_attribute(REPARSE_POINT, 9, &payload);
+        let parsed_first = parse_test_attribute(&first);
+        let parsed_second = parse_test_attribute(&second);
+        assert!(matches!(
+            inventory_reparse_point(
+                16,
+                &[parsed_first, parsed_second],
+                NtfsInventoryLimits::default()
+            ),
+            Err(NtfsInventoryError::DuplicateReparsePoint { record_number: 16 })
+        ));
+
+        let short = resident_attribute(REPARSE_POINT, 8, &[0; 7]);
+        let parsed = parse_test_attribute(&short);
+        assert!(matches!(
+            inventory_reparse_point(16, &[parsed], NtfsInventoryLimits::default()),
+            Err(NtfsInventoryError::InvalidReparsePoint {
+                record_number: 16,
+                actual: 7
+            })
+        ));
+
+        let mut mismatched = payload;
+        mismatched[4..6].copy_from_slice(&0_u16.to_le_bytes());
+        let encoded = resident_attribute(REPARSE_POINT, 8, &mismatched);
+        let parsed = parse_test_attribute(&encoded);
+        assert!(matches!(
+            inventory_reparse_point(16, &[parsed], NtfsInventoryLimits::default()),
+            Err(NtfsInventoryError::InvalidReparsePoint {
+                record_number: 16,
+                actual: 16
+            })
+        ));
+
+        let mut nonresident = nonresident_attribute(8, 0, 0, 0, 4096, 16, 16, 0, &[0x11, 1, 8]);
+        nonresident[0..4].copy_from_slice(&REPARSE_POINT.to_le_bytes());
+        let parsed = parse_test_attribute(&nonresident);
+        let (present, captured) =
+            inventory_reparse_point(16, &[parsed], NtfsInventoryLimits::default()).unwrap();
+        assert!(present);
+        assert_eq!(captured, None);
+    }
+
+    /// Twelve-record MFT (three clusters at LCN 4) so `$Extend` (record 11) is inside the scan.
+    const REPARSE_FIXTURE_RECORDS: u64 = 12;
+
+    fn reparse_fixture_bootstrap() -> MftBootstrap {
+        let clusters = REPARSE_FIXTURE_RECORDS * 1024 / 4096;
+        MftBootstrap {
+            runlist: NtfsRunlist {
+                extents: vec![NtfsExtent {
+                    vcn: 0,
+                    length: clusters,
+                    location: ExtentLocation::Physical { lcn: 4 },
+                }],
+                next_vcn: clusters,
+                encoded_runs: 1,
+                bytes_consumed: 4,
+                decoded_clusters: clusters,
+                physical_clusters: clusters,
+                sparse_clusters: 0,
+            },
+            allocated_bytes: clusters * 4096,
+            data_bytes: REPARSE_FIXTURE_RECORDS * 1024,
+            initialized_bytes: REPARSE_FIXTURE_RECORDS * 1024,
+            mapping_complete: true,
+            record_zero_sequence_number: 1,
+        }
+    }
+
+    /// Resident `$INDEX_ROOT:$R` value listing `keys` (in any order).
+    fn reparse_root_value(keys: &[(u32, u64)]) -> Vec<u8> {
+        use crate::fs::ntfs_reparse_index::{
+            NtfsReparseIndexGeometry, NtfsReparseIndexLimits, serialize_ntfs_reparse_index,
+        };
+        let keys: Vec<_> = keys
+            .iter()
+            .map(|(reparse_tag, file_reference)| ReparseIndexKey {
+                reparse_tag: *reparse_tag,
+                file_reference: *file_reference,
+            })
+            .collect();
+        serialize_ntfs_reparse_index(
+            &keys,
+            NtfsReparseIndexGeometry {
+                cluster_bytes: 4096,
+                index_block_bytes: 4096,
+                resident_root_bytes: 1024,
+            },
+            NtfsReparseIndexLimits::default(),
+        )
+        .unwrap()
+        .index_root
+    }
+
+    /// The `$Extend\$Reparse` metafile record with a resident `$R` root listing `keys`.
+    fn reparse_metafile_record(record_number: u32, keys: &[(u32, u64)]) -> Vec<u8> {
+        let name: Vec<u16> = "$Reparse".encode_utf16().collect();
+        record_with_attributes(
+            record_number,
+            1,
+            None,
+            &[
+                resident_attribute(
+                    FILE_NAME,
+                    2,
+                    &file_name_value(NTFS_EXTEND_RECORD, 1, &name, 3),
+                ),
+                named_resident_attribute(
+                    INDEX_ROOT,
+                    3,
+                    &[u16::from(b'$'), u16::from(b'R')],
+                    &reparse_root_value(keys),
+                ),
+            ],
+        )
+    }
+
+    /// Image whose MFT holds `records` (all others unused) using the reparse fixture geometry.
+    fn reparse_fixture_image(records: &[(u32, Vec<u8>)]) -> Vec<u8> {
+        let mut bytes = vec![0_u8; 128 * 512];
+        let mft = 4 * 4096;
+        for record_number in 0..u32::try_from(REPARSE_FIXTURE_RECORDS).unwrap() {
+            let record = records
+                .iter()
+                .find(|(number, _)| *number == record_number)
+                .map_or_else(|| empty_record(record_number, false), |(_, r)| r.clone());
+            let offset = mft + usize::try_from(record_number).unwrap() * 1024;
+            bytes[offset..offset + 1024].copy_from_slice(&record);
+        }
+        bytes
+    }
+
+    fn inventory_reparse_fixture(
+        records: &[(u32, Vec<u8>)],
+        limits: NtfsInventoryLimits,
+    ) -> Result<NtfsInventory, NtfsInventoryError> {
+        let temp = TempImage::create(&reparse_fixture_image(records));
+        let image = ImageFile::open(&temp.0).unwrap();
+        inventory_ntfs(&image, &boot(), &reparse_fixture_bootstrap(), limits)
+    }
+
+    const SYMLINK_TAG: u32 = 0xa000_000c;
+    const MOUNT_POINT_TAG: u32 = 0xa000_0003;
+
+    fn reparse_file_record(record_number: u32, sequence: u16) -> Vec<u8> {
+        record_with_attributes(
+            record_number,
+            sequence,
+            None,
+            &[resident_attribute(
+                REPARSE_POINT,
+                8,
+                &symlink_reparse_payload(),
+            )],
+        )
+    }
+
+    #[test]
+    fn inventories_resident_reparse_point_payload_in_the_bounded_census() {
+        let payload = symlink_reparse_payload();
+        let inventory = inventory_reparse_fixture(
+            &[
+                (0, reparse_file_record(0, 1)),
+                (1, reparse_metafile_record(1, &[(SYMLINK_TAG, 1 << 48)])),
+            ],
+            NtfsInventoryLimits::default(),
+        )
+        .unwrap();
+        assert!(inventory.objects[0].has_reparse_point);
+        assert_eq!(
+            inventory.objects[0].reparse_point.as_deref(),
+            Some(payload.as_slice())
+        );
+        assert!(
+            inventory.objects[0]
+                .attribute_census
+                .iter()
+                .any(|attribute| attribute.attribute_type == REPARSE_POINT
+                    && attribute.resident
+                    && attribute.name.is_none())
+        );
+        assert!(inventory.is_complete());
+        assert_eq!(
+            inventory.reparse_index,
+            NtfsReparseIndexEvidence::Reconciled {
+                keys: 1,
+                spilled: false,
+                index_blocks: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn reparse_index_is_absent_without_reparse_points_or_a_reparse_metafile() {
+        let inventory = inventory_reparse_fixture(
+            &[(0, record_with_attributes(0, 1, None, &[]))],
+            NtfsInventoryLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(inventory.reparse_index, NtfsReparseIndexEvidence::Absent);
+
+        // An empty `$R` over a volume without reparse points reconciles to zero keys.
+        let inventory = inventory_reparse_fixture(
+            &[(1, reparse_metafile_record(1, &[]))],
+            NtfsInventoryLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            inventory.reparse_index,
+            NtfsReparseIndexEvidence::Reconciled {
+                keys: 0,
+                spilled: false,
+                index_blocks: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn reparse_index_disagreements_fail_closed() {
+        // Reparse point but no `$Extend\$Reparse` at all.
+        assert!(matches!(
+            inventory_reparse_fixture(
+                &[(0, reparse_file_record(0, 1))],
+                NtfsInventoryLimits::default()
+            ),
+            Err(NtfsInventoryError::ReparseIndexMissing { record_number: 0 })
+        ));
+        // `$R` exists but does not list the record.
+        assert!(matches!(
+            inventory_reparse_fixture(
+                &[
+                    (0, reparse_file_record(0, 1)),
+                    (1, reparse_metafile_record(1, &[])),
+                ],
+                NtfsInventoryLimits::default()
+            ),
+            Err(NtfsInventoryError::ReparseIndexNotListed {
+                record_number: 0,
+                reparse_tag: Some(SYMLINK_TAG),
+            })
+        ));
+        // `$R` carries the wrong tag for the record.
+        assert!(matches!(
+            inventory_reparse_fixture(
+                &[
+                    (0, reparse_file_record(0, 1)),
+                    (1, reparse_metafile_record(1, &[(MOUNT_POINT_TAG, 1 << 48)])),
+                ],
+                NtfsInventoryLimits::default()
+            ),
+            Err(NtfsInventoryError::ReparseIndexTagMismatch {
+                record_number: 0,
+                index_tag: MOUNT_POINT_TAG,
+                attribute_tag: SYMLINK_TAG,
+            })
+        ));
+        // `$R` names a stale sequence number for the record.
+        assert!(matches!(
+            inventory_reparse_fixture(
+                &[
+                    (0, reparse_file_record(0, 1)),
+                    (1, reparse_metafile_record(1, &[(SYMLINK_TAG, 2 << 48)])),
+                ],
+                NtfsInventoryLimits::default()
+            ),
+            Err(NtfsInventoryError::ReparseIndexStaleKey {
+                reparse_tag: SYMLINK_TAG,
+                file_reference,
+            }) if file_reference == 2 << 48
+        ));
+        // `$R` additionally names an unused record.
+        assert!(matches!(
+            inventory_reparse_fixture(
+                &[
+                    (0, reparse_file_record(0, 1)),
+                    (
+                        1,
+                        reparse_metafile_record(
+                            1,
+                            &[(SYMLINK_TAG, 1 << 48), (SYMLINK_TAG, (1 << 48) | 7)]
+                        )
+                    ),
+                ],
+                NtfsInventoryLimits::default()
+            ),
+            Err(NtfsInventoryError::ReparseIndexStaleKey {
+                reparse_tag: SYMLINK_TAG,
+                file_reference,
+            }) if file_reference == (1 << 48) | 7
+        ));
+        // Two `$Extend\$Reparse` metafiles.
+        assert!(matches!(
+            inventory_reparse_fixture(
+                &[
+                    (0, reparse_file_record(0, 1)),
+                    (1, reparse_metafile_record(1, &[(SYMLINK_TAG, 1 << 48)])),
+                    (2, reparse_metafile_record(2, &[(SYMLINK_TAG, 1 << 48)])),
+                ],
+                NtfsInventoryLimits::default()
+            ),
+            Err(NtfsInventoryError::DuplicateReparseRecord { record_number: 2 })
+        ));
+        // A `$Reparse` metafile whose `$R` root is not the reparse profile.
+        let mut wrong_collation = reparse_metafile_record(1, &[(SYMLINK_TAG, 1 << 48)]);
+        let first_attribute = 56_usize;
+        let root_attribute = first_attribute
+            + usize::try_from(le_u32(&wrong_collation, first_attribute + 4)).unwrap();
+        let root_value = root_attribute
+            + usize::from(u16::from_le_bytes([
+                wrong_collation[root_attribute + 20],
+                wrong_collation[root_attribute + 21],
+            ]));
+        assert_eq!(le_u32(&wrong_collation, root_value + 4), 19);
+        wrong_collation[root_value + 4..root_value + 8].copy_from_slice(&1_u32.to_le_bytes());
+        assert!(matches!(
+            inventory_reparse_fixture(
+                &[(0, reparse_file_record(0, 1)), (1, wrong_collation)],
+                NtfsInventoryLimits::default()
+            ),
+            Err(NtfsInventoryError::ReparseIndexMalformed {
+                record_number: 1,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn reparse_index_is_unavailable_when_the_census_is_bounded() {
+        // A record cap that stops before `$Extend` cannot claim reconciliation either way.
+        let inventory = inventory_reparse_fixture(
+            &[
+                (0, reparse_file_record(0, 1)),
+                (1, reparse_metafile_record(1, &[(SYMLINK_TAG, 1 << 48)])),
+            ],
+            NtfsInventoryLimits {
+                max_records: 2,
+                ..NtfsInventoryLimits::default()
+            },
+        )
+        .unwrap();
+        assert!(!inventory.is_complete());
+        assert_eq!(
+            inventory.reparse_index,
+            NtfsReparseIndexEvidence::Unavailable
         );
     }
 
@@ -3069,9 +4178,15 @@ mod tests {
             attribute_limits(&boot(), NtfsInventoryLimits::default()),
         )
         .unwrap();
-        let stream =
-            inventory_data_stream(4, &[&attribute], &boot(), NtfsInventoryLimits::default())
-                .unwrap();
+        let stream = inventory_data_stream(
+            4,
+            &[&attribute],
+            &boot(),
+            NtfsInventoryLimits::default(),
+            None,
+            &mut 0,
+        )
+        .unwrap();
         let NtfsStreamStorage::NonResident {
             mapping_complete,
             extents,

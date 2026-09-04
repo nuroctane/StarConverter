@@ -15,12 +15,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use sha2::{Digest, Sha256};
 
 use crate::conversion::{OpaqueWriteSets, ReservedWrite};
-use crate::geometry::{Relocation, SealedRelocationPlan};
+use crate::extent::{ExtentKind, Placement};
+use crate::fs::lznt1::{Lznt1Error, materialize_ntfs_compressed_stream};
+use crate::geometry::{Materialization, Relocation, SealedRelocationPlan};
 use crate::image::{
     BoundedImageReader, ImageError, ImageFile, ImageIdentity, reject_device_like_path,
 };
 use crate::inspect::{InspectionError, inspect_open_image};
-use crate::object::ObjectGraph;
+use crate::object::{ObjectGraph, StreamStorage};
 use crate::overlay::OverlayWrite;
 use crate::phase::PhaseWritePreview;
 use crate::preservation::{
@@ -34,7 +36,8 @@ use crate::{FileSystem, GuaranteeMode};
 
 const BOUND_ESCROW_MAGIC: [u8; 8] = *b"STARXESC";
 const BOUND_ESCROW_VERSION: u16 = 1;
-const BOUND_ESCROW_FIXED_BYTES: usize = 8 + 2 + 1 + 1 + 8 + (32 * 3) + 32;
+/// Fixed envelope overhead of a bound escrow file beyond its preservation payload.
+pub const BOUND_ESCROW_FIXED_BYTES: usize = 8 + 2 + 1 + 1 + 8 + (32 * 3) + 32;
 static NEXT_PARTIAL: AtomicU64 = AtomicU64::new(0);
 
 /// Explicit work and output limits for one copy-based candidate export.
@@ -87,6 +90,14 @@ pub struct SourceImageSnapshot {
     container_token: [u8; 32],
     image_bytes: u64,
     sha256: [u8; 32],
+}
+
+impl SourceImageSnapshot {
+    /// Whole-image SHA-256 captured before planning.
+    #[must_use]
+    pub const fn sha256(&self) -> [u8; 32] {
+        self.sha256
+    }
 }
 
 /// Hashes the read-only source before planning and binds the result to its stable container.
@@ -315,6 +326,7 @@ pub enum CandidateExportError {
     },
     RelocationShape(&'static str),
     ArithmeticOverflow(&'static str),
+    NtfsCompression(Lznt1Error),
     Io {
         operation: &'static str,
         source: io::Error,
@@ -451,6 +463,9 @@ impl fmt::Display for CandidateExportError {
             Self::ArithmeticOverflow(calculation) => {
                 write!(formatter, "overflow while calculating {calculation}")
             }
+            Self::NtfsCompression(source) => {
+                write!(formatter, "NTFS compression materialization failed: {source}")
+            }
             Self::Io { operation, source } => write!(formatter, "{operation}: {source}"),
             Self::Image(source) => write!(formatter, "source image access failed: {source}"),
             Self::Preservation(source) => write!(formatter, "escrow validation failed: {source}"),
@@ -567,8 +582,15 @@ impl std::error::Error for CandidateExportError {
             Self::Preservation(source) => Some(source),
             Self::Inspection(source) => Some(source),
             Self::Verification(source) => Some(source),
+            Self::NtfsCompression(source) => Some(source),
             _ => None,
         }
+    }
+}
+
+impl From<Lznt1Error> for CandidateExportError {
+    fn from(value: Lznt1Error) -> Self {
+        Self::NtfsCompression(value)
     }
 }
 
@@ -1115,12 +1137,24 @@ where
         Some(relocation) => validate_relocations(source, relocation, preview.writes(), limits)?,
         None => (0, 0, Vec::new()),
     };
-    let applied_write_count = write_count.checked_add(relocation_count).ok_or(
-        CandidateExportError::ArithmeticOverflow("candidate operation count"),
-    )?;
-    let replacement_bytes = write_bytes.checked_add(relocation_bytes).ok_or(
-        CandidateExportError::ArithmeticOverflow("candidate replacement byte total"),
-    )?;
+    let (materialization_count, materialization_bytes, sorted_materializations) = match relocation {
+        Some(relocation) => {
+            validate_materializations(source, relocation, preview.writes(), limits)?
+        }
+        None => (0, 0, Vec::new()),
+    };
+    let applied_write_count = write_count
+        .checked_add(relocation_count)
+        .and_then(|count| count.checked_add(materialization_count))
+        .ok_or(CandidateExportError::ArithmeticOverflow(
+            "candidate operation count",
+        ))?;
+    let replacement_bytes = write_bytes
+        .checked_add(relocation_bytes)
+        .and_then(|bytes| bytes.checked_add(materialization_bytes))
+        .ok_or(CandidateExportError::ArithmeticOverflow(
+            "candidate replacement byte total",
+        ))?;
     if applied_write_count > limits.max_writes {
         return Err(CandidateExportError::WriteLimitExceeded {
             actual: applied_write_count,
@@ -1143,6 +1177,8 @@ where
         let relocated_source = RelocatedSourceView {
             source,
             relocations: &sorted_relocations,
+            materializations: &sorted_materializations,
+            source_graph: relocation.map(SealedRelocationPlan::source_graph),
         };
         build_manifest_with_reader(&relocated_source, target_graph, limits.verification)?
     } else {
@@ -1170,13 +1206,26 @@ where
         limits.copy_chunk_bytes,
         &mut observer,
     )?;
-    if relocation.is_some() {
+    if let Some(authority) = relocation {
+        let payload_bytes = relocation_bytes.checked_add(materialization_bytes).ok_or(
+            CandidateExportError::ArithmeticOverflow("payload progress total"),
+        )?;
         apply_relocations_with_progress(
             source,
             output_guard.file_mut(),
             &sorted_relocations,
             limits.copy_chunk_bytes,
+            payload_bytes,
+            &mut observer,
+        )?;
+        apply_materializations_with_progress(
+            source,
+            output_guard.file_mut(),
+            authority.source_graph(),
+            &sorted_materializations,
+            limits.copy_chunk_bytes,
             relocation_bytes,
+            payload_bytes,
             &mut observer,
         )?;
     }
@@ -1446,6 +1495,8 @@ struct RelocatedSourceView<'a> {
     source: &'a ImageFile,
     /// Sorted by destination offset and independently validated as disjoint.
     relocations: &'a [Relocation],
+    materializations: &'a [Materialization],
+    source_graph: Option<&'a ObjectGraph>,
 }
 
 impl BoundedImageReader for RelocatedSourceView<'_> {
@@ -1468,6 +1519,16 @@ impl BoundedImageReader for RelocatedSourceView<'_> {
                 offset,
                 length: length_u64,
             })?;
+        if let (Some(graph), Some(materialization)) = (
+            self.source_graph,
+            covering_materialization(self.materializations, offset, end),
+        ) {
+            return read_materialized_logical(self.source, graph, materialization, offset, length)
+                .map_err(|_| ImageError::RangeOverflow {
+                    offset,
+                    length: length_u64,
+                });
+        }
         let position = self
             .relocations
             .partition_point(|relocation| relocation.destination.offset <= offset);
@@ -1497,6 +1558,23 @@ impl BoundedImageReader for RelocatedSourceView<'_> {
         }
         self.source.read_exact_at(offset, length)
     }
+}
+
+fn covering_materialization(
+    materializations: &[Materialization],
+    offset: u64,
+    end: u64,
+) -> Option<&Materialization> {
+    let position = materializations.partition_point(|item| item.destination.offset <= offset);
+    position
+        .checked_sub(1)
+        .and_then(|index| materializations.get(index))
+        .filter(|item| {
+            item.destination
+                .offset
+                .checked_add(item.destination.length)
+                .is_some_and(|destination_end| end <= destination_end)
+        })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1638,6 +1716,306 @@ fn validate_relocations(
         }
     }
     Ok((relocations.len(), relocated_bytes, relocations))
+}
+
+#[allow(clippy::too_many_lines)]
+fn validate_materializations(
+    source: &ImageFile,
+    authority: &SealedRelocationPlan,
+    writes: &OpaqueWriteSets,
+    limits: CandidateExportLimits,
+) -> Result<(usize, u64, Vec<Materialization>), CandidateExportError> {
+    let source_graph = authority.source_graph();
+    let target_graph = authority.target_graph();
+    let mut materializations = authority.layout().materializations.clone();
+    if materializations.len() > limits.max_writes {
+        return Err(CandidateExportError::WriteLimitExceeded {
+            actual: materializations.len(),
+            maximum: limits.max_writes,
+        });
+    }
+    let mut materialized_bytes = 0_u64;
+    for materialization in &materializations {
+        if materialization.destination.length == 0 {
+            return Err(CandidateExportError::RelocationShape(
+                "materialization destination length must be nonzero",
+            ));
+        }
+        let destination_end = materialization
+            .destination
+            .offset
+            .checked_add(materialization.destination.length)
+            .ok_or(CandidateExportError::RelocationShape(
+                "materialization destination overflows",
+            ))?;
+        if destination_end > source.len() {
+            return Err(CandidateExportError::RelocationShape(
+                "materialization destination is outside the image",
+            ));
+        }
+        let stream = source_graph
+            .objects()
+            .iter()
+            .find_map(|object| {
+                object
+                    .streams
+                    .iter()
+                    .find(|candidate| candidate.id == materialization.stream)
+            })
+            .ok_or(CandidateExportError::RelocationShape(
+                "source graph does not authorize a materialization read",
+            ))?;
+        if materialization.destination.length < stream.logical_bytes {
+            return Err(CandidateExportError::RelocationShape(
+                "materialization destination is smaller than logical stream bytes",
+            ));
+        }
+        let committed = target_graph.extents().extents().iter().any(|extent| {
+            extent.kind == ExtentKind::FileData
+                && extent.stream == materialization.stream
+                && extent.logical_offset == 0
+                && extent.length == materialization.destination.length
+                && extent.placement
+                    == Placement::Physical {
+                        byte_offset: materialization.destination.offset,
+                    }
+        });
+        if !committed {
+            return Err(CandidateExportError::RelocationShape(
+                "target graph does not commit a materialization destination",
+            ));
+        }
+        materialized_bytes = materialized_bytes
+            .checked_add(materialization.destination.length)
+            .ok_or(CandidateExportError::ArithmeticOverflow(
+                "materialization byte total",
+            ))?;
+    }
+    if materialized_bytes != authority.layout().materialized_bytes {
+        return Err(CandidateExportError::RelocationShape(
+            "materialized byte total disagrees with the layout",
+        ));
+    }
+    materializations.sort_unstable_by_key(|item| item.destination.offset);
+    if materializations.windows(2).any(|pair| {
+        pair[0]
+            .destination
+            .offset
+            .checked_add(pair[0].destination.length)
+            .is_none_or(|end| end > pair[1].destination.offset)
+    }) {
+        return Err(CandidateExportError::RelocationShape(
+            "materialization destinations overlap",
+        ));
+    }
+    for materialization in &materializations {
+        let destination_end =
+            materialization.destination.offset + materialization.destination.length;
+        for relocation in &authority.layout().relocations {
+            let relocation_end = relocation.destination.offset + relocation.destination.length;
+            if materialization.destination.offset < relocation_end
+                && relocation.destination.offset < destination_end
+            {
+                return Err(CandidateExportError::RelocationShape(
+                    "materialization destination overlaps a relocation",
+                ));
+            }
+        }
+        for write in writes
+            .target_staging
+            .iter()
+            .chain(&writes.backup_boot)
+            .chain(&writes.activation)
+        {
+            let write_end = write
+                .write
+                .offset
+                .checked_add(u64::try_from(write.write.bytes.len()).map_err(|_| {
+                    CandidateExportError::ArithmeticOverflow("candidate write length")
+                })?)
+                .ok_or(CandidateExportError::ArithmeticOverflow(
+                    "candidate write end",
+                ))?;
+            if materialization.destination.offset < write_end
+                && write.write.offset < destination_end
+            {
+                return Err(CandidateExportError::RelocationShape(
+                    "materialization destination overlaps candidate metadata",
+                ));
+            }
+        }
+    }
+    Ok((materializations.len(), materialized_bytes, materializations))
+}
+
+fn read_materialized_logical(
+    source: &ImageFile,
+    graph: &ObjectGraph,
+    materialization: &Materialization,
+    offset: u64,
+    length: usize,
+) -> Result<Vec<u8>, CandidateExportError> {
+    let logical_offset = offset
+        .checked_sub(materialization.destination.offset)
+        .ok_or(CandidateExportError::RelocationShape(
+            "materialization read is before its destination",
+        ))?;
+    let payload = reconstruct_stream_destination(source, graph, materialization)?;
+    let start = usize::try_from(logical_offset)
+        .map_err(|_| CandidateExportError::ArithmeticOverflow("materialization read offset"))?;
+    let end = start
+        .checked_add(length)
+        .ok_or(CandidateExportError::ArithmeticOverflow(
+            "materialization read end",
+        ))?;
+    if end > payload.len() {
+        return Err(CandidateExportError::RelocationShape(
+            "materialization read exceeds destination",
+        ));
+    }
+    Ok(payload[start..end].to_vec())
+}
+
+fn reconstruct_stream_destination(
+    source: &ImageFile,
+    graph: &ObjectGraph,
+    materialization: &Materialization,
+) -> Result<Vec<u8>, CandidateExportError> {
+    let stream = graph
+        .objects()
+        .iter()
+        .find_map(|object| {
+            object
+                .streams
+                .iter()
+                .find(|candidate| candidate.id == materialization.stream)
+        })
+        .ok_or(CandidateExportError::RelocationShape(
+            "source graph does not authorize a materialization read",
+        ))?;
+    let dest_len = usize::try_from(materialization.destination.length).map_err(|_| {
+        CandidateExportError::ArithmeticOverflow("materialization destination length")
+    })?;
+    let mut destination = vec![0_u8; dest_len];
+    let initialized = usize::try_from(stream.initialized_bytes.min(stream.logical_bytes))
+        .map_err(|_| CandidateExportError::ArithmeticOverflow("initialized stream bytes"))?;
+    match &stream.storage {
+        StreamStorage::Resident(bytes) => {
+            let copy = initialized.min(bytes.len()).min(dest_len);
+            destination[..copy].copy_from_slice(&bytes[..copy]);
+        }
+        StreamStorage::Extents if stream.flags.compression_block_bytes != 0 => {
+            return materialize_ntfs_compressed_stream(
+                graph.extents().extents(),
+                stream.id,
+                stream.flags.compression_block_bytes,
+                stream.initialized_bytes.min(stream.logical_bytes),
+                dest_len,
+                |offset, length| {
+                    source
+                        .read_exact_at(offset, length)
+                        .map_err(CandidateExportError::from)
+                },
+            );
+        }
+        StreamStorage::Extents => {
+            for extent in
+                graph.extents().extents().iter().filter(|extent| {
+                    extent.stream == stream.id && extent.kind == ExtentKind::FileData
+                })
+            {
+                if extent.logical_offset >= stream.initialized_bytes {
+                    continue;
+                }
+                let take = extent
+                    .length
+                    .min(stream.initialized_bytes - extent.logical_offset);
+                let dest_start = usize::try_from(extent.logical_offset).map_err(|_| {
+                    CandidateExportError::ArithmeticOverflow("extent logical offset")
+                })?;
+                let take_usize = usize::try_from(take)
+                    .map_err(|_| CandidateExportError::ArithmeticOverflow("extent copy length"))?;
+                if dest_start >= dest_len {
+                    continue;
+                }
+                let copy = take_usize.min(dest_len - dest_start);
+                match extent.placement {
+                    Placement::Physical { byte_offset } => {
+                        let bytes = source.read_exact_at(byte_offset, copy)?;
+                        destination[dest_start..dest_start + copy].copy_from_slice(&bytes);
+                    }
+                    Placement::Sparse => {}
+                }
+            }
+        }
+    }
+    Ok(destination)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_materializations_with_progress<F>(
+    source: &ImageFile,
+    output: &mut File,
+    source_graph: &ObjectGraph,
+    materializations: &[Materialization],
+    chunk_bytes: usize,
+    completed_bytes: u64,
+    payload_bytes: u64,
+    observer: &mut F,
+) -> Result<(), CandidateExportError>
+where
+    F: FnMut(CandidateWorkProgress) -> CandidateWorkControl,
+{
+    if materializations.is_empty() {
+        return Ok(());
+    }
+    let mut completed = completed_bytes;
+    observe_cancellable(
+        observer,
+        CandidateWorkPhase::RelocatePayload,
+        completed,
+        Some(payload_bytes),
+    )?;
+    for materialization in materializations {
+        let payload = reconstruct_stream_destination(source, source_graph, materialization)?;
+        let mut copied = 0_usize;
+        while copied < payload.len() {
+            let remaining = payload.len() - copied;
+            let length = remaining.min(chunk_bytes);
+            let destination_offset = materialization
+                .destination
+                .offset
+                .checked_add(u64::try_from(copied).map_err(|_| {
+                    CandidateExportError::ArithmeticOverflow("materialization write offset")
+                })?)
+                .ok_or(CandidateExportError::ArithmeticOverflow(
+                    "materialization write offset",
+                ))?;
+            output
+                .seek(SeekFrom::Start(destination_offset))
+                .map_err(|source| {
+                    CandidateExportError::io("seek materialization destination", source)
+                })?;
+            output
+                .write_all(&payload[copied..copied + length])
+                .map_err(|source| CandidateExportError::io("write materialized payload", source))?;
+            copied += length;
+            completed = completed
+                .checked_add(u64::try_from(length).map_err(|_| {
+                    CandidateExportError::ArithmeticOverflow("materialization progress")
+                })?)
+                .ok_or(CandidateExportError::ArithmeticOverflow(
+                    "materialization total progress",
+                ))?;
+            observe_cancellable(
+                observer,
+                CandidateWorkPhase::RelocatePayload,
+                completed,
+                Some(payload_bytes),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn validate_before_image(
@@ -1818,18 +2196,21 @@ fn apply_relocations_with_progress<F>(
     output: &mut File,
     relocations: &[Relocation],
     chunk_bytes: usize,
-    relocation_bytes: u64,
+    payload_bytes: u64,
     observer: &mut F,
 ) -> Result<(), CandidateExportError>
 where
     F: FnMut(CandidateWorkProgress) -> CandidateWorkControl,
 {
+    if relocations.is_empty() {
+        return Ok(());
+    }
     let mut completed = 0_u64;
     observe_cancellable(
         observer,
         CandidateWorkPhase::RelocatePayload,
         0,
-        Some(relocation_bytes),
+        Some(payload_bytes),
     )?;
     for relocation in relocations {
         let mut copied = 0_u64;
@@ -1868,7 +2249,7 @@ where
                 observer,
                 CandidateWorkPhase::RelocatePayload,
                 completed,
-                Some(relocation_bytes),
+                Some(payload_bytes),
             )?;
         }
     }
@@ -2294,14 +2675,14 @@ mod tests {
         RECOMMENDED_EXFAT_UPCASE_CHECKSUM, RecommendedExfatUpcaseLimits,
         generate_recommended_exfat_upcase,
     };
-    use crate::fs::ntfs_inventory::NtfsObjectReference;
+    use crate::fs::ntfs_inventory::{NtfsInventoryLimits, NtfsObjectReference};
     use crate::fs::ntfs_normalize::{
         NormalizedNtfs, NtfsPreservationSidecar, NtfsSecurityDescriptorEvidence,
     };
     use crate::fs::ntfs_serialize::{
-        NtfsDestinationInputs, NtfsSerializeLimits, plan_ntfs_destination,
+        NtfsDestinationInputs, NtfsObjectTimestamps, NtfsSerializeLimits, plan_ntfs_destination,
     };
-    use crate::geometry::{LayoutLimits, ReservationKind};
+    use crate::geometry::{ByteRange, LayoutLimits, ReservationKind};
     use crate::inspect::inspect_image;
     use crate::object::{
         NamespaceEntry, ObjectGraphLimits, ObjectId, ObjectKind, ObjectRecord, ObjectSemantics,
@@ -2396,6 +2777,101 @@ mod tests {
 
     fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
         bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn lznt1_abcabc_cluster() -> Vec<u8> {
+        let payload = [0x08_u8, b'A', b'B', b'C', 0x00, 0x20];
+        let header = 0xb000 | u16::try_from(payload.len() - 1).unwrap();
+        let mut encoded = header.to_le_bytes().to_vec();
+        encoded.extend_from_slice(&payload);
+        encoded.extend_from_slice(&[0, 0]);
+        encoded.resize(4096, 0);
+        encoded
+    }
+
+    #[test]
+    fn reconstruct_decompresses_ntfs_lznt1_into_dest_native_bytes() {
+        let cluster = lznt1_abcabc_cluster();
+        let source_file = TempFile::create(&cluster);
+        let source = ImageFile::open(&source_file.path).unwrap();
+        let graph = ObjectGraph::build(
+            ObjectId(1),
+            vec![
+                ObjectRecord {
+                    id: ObjectId(1),
+                    kind: ObjectKind::Directory,
+                    link_count: 0,
+                    semantics: ObjectSemantics::default(),
+                    streams: Vec::new(),
+                },
+                ObjectRecord {
+                    id: ObjectId(2),
+                    kind: ObjectKind::File,
+                    link_count: 1,
+                    semantics: ObjectSemantics::default(),
+                    streams: vec![ObjectStream {
+                        id: StreamId(2),
+                        name: None,
+                        logical_bytes: 6,
+                        initialized_bytes: 6,
+                        mapped_bytes: 8192,
+                        allocated_bytes: 4096,
+                        flags: StreamFlags {
+                            compression_block_bytes: 8192,
+                            ..StreamFlags::default()
+                        },
+                        storage: StreamStorage::Extents,
+                    }],
+                },
+            ],
+            vec![NamespaceEntry {
+                parent: ObjectId(1),
+                target: ObjectId(2),
+                name: "packed.bin".encode_utf16().collect(),
+            }],
+            ExtentGraph::build(
+                vec![
+                    Extent {
+                        stream: StreamId(2),
+                        logical_offset: 0,
+                        length: 4096,
+                        placement: Placement::Physical { byte_offset: 0 },
+                        kind: ExtentKind::FileData,
+                    },
+                    Extent {
+                        stream: StreamId(2),
+                        logical_offset: 4096,
+                        length: 4096,
+                        placement: Placement::Sparse,
+                        kind: ExtentKind::FileData,
+                    },
+                ],
+                8192,
+                2,
+            )
+            .unwrap(),
+            ObjectGraphLimits {
+                max_objects: 4,
+                max_entries: 4,
+                max_streams: 4,
+                max_name_code_units: 255,
+            },
+        )
+        .unwrap();
+        let payload = reconstruct_stream_destination(
+            &source,
+            &graph,
+            &Materialization {
+                stream: StreamId(2),
+                destination: ByteRange {
+                    offset: 4096,
+                    length: 4096,
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(&payload[..6], b"ABCABC");
+        assert!(payload[6..].iter().all(|byte| *byte == 0));
     }
 
     fn minimal_exfat_image() -> Vec<u8> {
@@ -2502,6 +2978,7 @@ mod tests {
             upcase_checksum: RECOMMENDED_EXFAT_UPCASE_CHECKSUM,
             source_preservation: ExfatPreservationEvidence::default(),
             allocated_bad_clusters: 0,
+            bad_cluster_ranges: &[],
         };
         let options = ExfatSerializeOptions {
             bytes_per_cluster: CLUSTER_BYTES,
@@ -2587,6 +3064,277 @@ mod tests {
         let mut image = vec![0_u8; usize::try_from(VOLUME_BYTES).unwrap()];
         let payload_start = usize::try_from(payload_offset).unwrap();
         image[payload_start..payload_start + payload.len()].copy_from_slice(&payload);
+        for write in plan.overlay.writes() {
+            let start = usize::try_from(write.offset).unwrap();
+            image[start..start + write.bytes.len()].copy_from_slice(&write.bytes);
+        }
+        (image, payload)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn exfat_image_with_aligned_uninitialized_payload() -> (Vec<u8>, Vec<u8>) {
+        const VOLUME_BYTES: u64 = 16 * 1024 * 1024;
+        const CLUSTER_BYTES: u32 = 4096;
+        const INITIALIZED: usize = 1000;
+        let root = ObjectId(1);
+        let root_record = ObjectRecord {
+            id: root,
+            kind: ObjectKind::Directory,
+            link_count: 0,
+            semantics: ObjectSemantics::default(),
+            streams: Vec::new(),
+        };
+        let graph_limits = ObjectGraphLimits {
+            max_objects: 4,
+            max_entries: 4,
+            max_streams: 4,
+            max_name_code_units: 255,
+        };
+        let empty_graph = ObjectGraph::build(
+            root,
+            vec![root_record.clone()],
+            Vec::new(),
+            ExtentGraph::build(Vec::new(), VOLUME_BYTES, 4).unwrap(),
+            graph_limits,
+        )
+        .unwrap();
+        let upcase =
+            generate_recommended_exfat_upcase(RecommendedExfatUpcaseLimits::default()).unwrap();
+        let volume = ExfatVolumeProfile {
+            volume_label: None,
+            encoded_upcase_table: upcase.encoded_bytes(),
+            upcase_checksum: RECOMMENDED_EXFAT_UPCASE_CHECKSUM,
+            source_preservation: ExfatPreservationEvidence::default(),
+            allocated_bad_clusters: 0,
+            bad_cluster_ranges: &[],
+        };
+        let options = ExfatSerializeOptions {
+            bytes_per_cluster: CLUSTER_BYTES,
+            volume_serial_number: 0x1234_abcd,
+            ..ExfatSerializeOptions::default()
+        };
+        let bootstrap = serialize_exfat_destination(
+            &empty_graph,
+            &[],
+            volume,
+            options,
+            ExfatSerializeLimits::default(),
+        )
+        .unwrap();
+        let payload_offset = u64::from(bootstrap.geometry.cluster_heap_offset_sectors) * 512;
+        let mut allocated = (0..usize::try_from(CLUSTER_BYTES).unwrap())
+            .map(|index| u8::try_from(index % 251).unwrap())
+            .collect::<Vec<_>>();
+        for byte in allocated.iter_mut().skip(INITIALIZED) {
+            *byte = 0xaa;
+        }
+        let initialized = allocated[..INITIALIZED].to_vec();
+        let file = ObjectRecord {
+            id: ObjectId(2),
+            kind: ObjectKind::File,
+            link_count: 1,
+            semantics: ObjectSemantics::default(),
+            streams: vec![ObjectStream {
+                id: StreamId(20),
+                name: None,
+                logical_bytes: u64::from(CLUSTER_BYTES),
+                initialized_bytes: u64::try_from(INITIALIZED).unwrap(),
+                mapped_bytes: u64::from(CLUSTER_BYTES),
+                allocated_bytes: u64::from(CLUSTER_BYTES),
+                flags: StreamFlags::default(),
+                storage: StreamStorage::Extents,
+            }],
+        };
+        let graph = ObjectGraph::build(
+            root,
+            vec![root_record, file],
+            vec![NamespaceEntry {
+                parent: root,
+                target: ObjectId(2),
+                name: "payload.bin".encode_utf16().collect(),
+            }],
+            ExtentGraph::build(
+                vec![Extent {
+                    stream: StreamId(20),
+                    logical_offset: 0,
+                    length: u64::from(CLUSTER_BYTES),
+                    placement: Placement::Physical {
+                        byte_offset: payload_offset,
+                    },
+                    kind: ExtentKind::FileData,
+                }],
+                VOLUME_BYTES,
+                4,
+            )
+            .unwrap(),
+            graph_limits,
+        )
+        .unwrap();
+        let timestamp = ((2024_u32 - 1980) << 25) | (1 << 21) | (1 << 16);
+        let plan = serialize_exfat_destination(
+            &graph,
+            &[ExfatObjectMetadata {
+                object: ObjectId(2),
+                file_attributes: 0x20,
+                timestamps: ExfatTimestamps {
+                    create: timestamp,
+                    modified: timestamp,
+                    accessed: timestamp,
+                    create_centiseconds: 0,
+                    modified_centiseconds: 0,
+                    create_utc_offset: 0x80,
+                    modified_utc_offset: 0x80,
+                    accessed_utc_offset: 0x80,
+                },
+            }],
+            volume,
+            options,
+            ExfatSerializeLimits::default(),
+        )
+        .unwrap();
+        let mut image = vec![0_u8; usize::try_from(VOLUME_BYTES).unwrap()];
+        let payload_start = usize::try_from(payload_offset).unwrap();
+        image[payload_start..payload_start + allocated.len()].copy_from_slice(&allocated);
+        for write in plan.overlay.writes() {
+            let start = usize::try_from(write.offset).unwrap();
+            image[start..start + write.bytes.len()].copy_from_slice(&write.bytes);
+        }
+        (image, initialized)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn exfat_image_with_two_4k_fragments() -> (Vec<u8>, Vec<u8>) {
+        const VOLUME_BYTES: u64 = 16 * 1024 * 1024;
+        const CLUSTER_BYTES: u32 = 4096;
+        let root = ObjectId(1);
+        let root_record = ObjectRecord {
+            id: root,
+            kind: ObjectKind::Directory,
+            link_count: 0,
+            semantics: ObjectSemantics::default(),
+            streams: Vec::new(),
+        };
+        let graph_limits = ObjectGraphLimits {
+            max_objects: 4,
+            max_entries: 4,
+            max_streams: 4,
+            max_name_code_units: 255,
+        };
+        let empty_graph = ObjectGraph::build(
+            root,
+            vec![root_record.clone()],
+            Vec::new(),
+            ExtentGraph::build(Vec::new(), VOLUME_BYTES, 4).unwrap(),
+            graph_limits,
+        )
+        .unwrap();
+        let upcase =
+            generate_recommended_exfat_upcase(RecommendedExfatUpcaseLimits::default()).unwrap();
+        let volume = ExfatVolumeProfile {
+            volume_label: None,
+            encoded_upcase_table: upcase.encoded_bytes(),
+            upcase_checksum: RECOMMENDED_EXFAT_UPCASE_CHECKSUM,
+            source_preservation: ExfatPreservationEvidence::default(),
+            allocated_bad_clusters: 0,
+            bad_cluster_ranges: &[],
+        };
+        let options = ExfatSerializeOptions {
+            bytes_per_cluster: CLUSTER_BYTES,
+            volume_serial_number: 0x1234_abcd,
+            ..ExfatSerializeOptions::default()
+        };
+        let bootstrap = serialize_exfat_destination(
+            &empty_graph,
+            &[],
+            volume,
+            options,
+            ExfatSerializeLimits::default(),
+        )
+        .unwrap();
+        let heap = u64::from(bootstrap.geometry.cluster_heap_offset_sectors) * 512;
+        let cluster = u64::from(CLUSTER_BYTES);
+        let first = heap + 100 * cluster;
+        let second = heap + 120 * cluster;
+        let payload = (0..8192)
+            .map(|index| u8::try_from((index * 13) % 251).unwrap())
+            .collect::<Vec<_>>();
+        let file = ObjectRecord {
+            id: ObjectId(2),
+            kind: ObjectKind::File,
+            link_count: 1,
+            semantics: ObjectSemantics::default(),
+            streams: vec![ObjectStream {
+                id: StreamId(20),
+                name: None,
+                logical_bytes: 8192,
+                initialized_bytes: 8192,
+                mapped_bytes: 8192,
+                allocated_bytes: 8192,
+                flags: StreamFlags::default(),
+                storage: StreamStorage::Extents,
+            }],
+        };
+        let graph = ObjectGraph::build(
+            root,
+            vec![root_record, file],
+            vec![NamespaceEntry {
+                parent: root,
+                target: ObjectId(2),
+                name: "split.bin".encode_utf16().collect(),
+            }],
+            ExtentGraph::build(
+                vec![
+                    Extent {
+                        stream: StreamId(20),
+                        logical_offset: 0,
+                        length: cluster,
+                        placement: Placement::Physical { byte_offset: first },
+                        kind: ExtentKind::FileData,
+                    },
+                    Extent {
+                        stream: StreamId(20),
+                        logical_offset: cluster,
+                        length: cluster,
+                        placement: Placement::Physical {
+                            byte_offset: second,
+                        },
+                        kind: ExtentKind::FileData,
+                    },
+                ],
+                VOLUME_BYTES,
+                4,
+            )
+            .unwrap(),
+            graph_limits,
+        )
+        .unwrap();
+        let timestamp = ((2024_u32 - 1980) << 25) | (1 << 21) | (1 << 16);
+        let plan = serialize_exfat_destination(
+            &graph,
+            &[ExfatObjectMetadata {
+                object: ObjectId(2),
+                file_attributes: 0x20,
+                timestamps: ExfatTimestamps {
+                    create: timestamp,
+                    modified: timestamp,
+                    accessed: timestamp,
+                    create_centiseconds: 0,
+                    modified_centiseconds: 0,
+                    create_utc_offset: 0x80,
+                    modified_utc_offset: 0x80,
+                    accessed_utc_offset: 0x80,
+                },
+            }],
+            volume,
+            options,
+            ExfatSerializeLimits::default(),
+        )
+        .unwrap();
+        let mut image = vec![0_u8; usize::try_from(VOLUME_BYTES).unwrap()];
+        let first_start = usize::try_from(first).unwrap();
+        let second_start = usize::try_from(second).unwrap();
+        image[first_start..first_start + 4096].copy_from_slice(&payload[..4096]);
+        image[second_start..second_start + 4096].copy_from_slice(&payload[4096..]);
         for write in plan.overlay.writes() {
             let start = usize::try_from(write.offset).unwrap();
             image[start..start + write.bytes.len()].copy_from_slice(&write.bytes);
@@ -2929,6 +3677,72 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_during_materialization_cleans_partial_and_preserves_source() {
+        let (source_bytes, _) = ntfs_image_with_resident_payload();
+        let source_file = TempFile::create(&source_bytes);
+        let source = ImageFile::open(&source_file.path).unwrap();
+        let source_snapshot =
+            capture_source_image_snapshot(&source, CandidateExportLimits::default()).unwrap();
+        let inspection = inspect_open_image(&source).unwrap();
+        let normalized = inspection.normalized_ntfs.as_deref().unwrap();
+        let draft = draft_lossless_ntfs_to_exfat(
+            normalized,
+            GuaranteeMode::Escrow,
+            NtfsToExfatOptions {
+                bytes_per_cluster: 8192,
+                ..NtfsToExfatOptions::default()
+            },
+            NtfsToExfatLimits::default(),
+        )
+        .unwrap();
+        let solved = solve_lossless_ntfs_to_exfat(draft, LayoutLimits::default()).unwrap();
+        assert!(solved.layout().relocations.is_empty());
+        assert_eq!(solved.layout().materializations.len(), 1);
+        let preview =
+            preview_exfat_phase_writes(&source, &solved.destination, PreimageLimits::default())
+                .unwrap();
+        let parent = temp_path("cancelled-during-materialize-dir");
+        fs::create_dir(&parent).unwrap();
+        let destination = parent.join("candidate.img");
+        let escrow = parent.join("candidate.escrow");
+
+        let error = export_relocated_candidate_image_with_progress(
+            &source,
+            &destination,
+            Some(&escrow),
+            &preview,
+            &source_snapshot,
+            solved.relocation(),
+            &solved.preservation,
+            CandidateExportLimits {
+                copy_chunk_bytes: 512,
+                ..CandidateExportLimits::default()
+            },
+            |progress| {
+                if progress.phase == CandidateWorkPhase::RelocatePayload
+                    && progress.completed_bytes >= 512
+                {
+                    CandidateWorkControl::Cancel
+                } else {
+                    CandidateWorkControl::Continue
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            CandidateExportError::Cancelled {
+                phase: CandidateWorkPhase::RelocatePayload
+            }
+        ));
+        assert_eq!(fs::read_dir(&parent).unwrap().count(), 0);
+        assert!(!destination.exists());
+        assert!(!escrow.exists());
+        assert_eq!(fs::read(&source_file.path).unwrap(), source_bytes);
+        fs::remove_dir(parent).unwrap();
+    }
+
+    #[test]
     fn misaligned_ntfs_payload_is_copied_relocated_and_verified_in_new_exfat_image() {
         let (source_bytes, payload, source_offset) =
             ntfs_image_with_payload_misaligned_for_8k_exfat();
@@ -3000,6 +3814,2993 @@ mod tests {
         )
         .unwrap();
         assert_eq!(verification.target_filesystem, FileSystem::ExFat);
+        assert_eq!(fs::read(&source_file.path).unwrap(), source_bytes);
+        fs::remove_file(destination).unwrap();
+        fs::remove_file(escrow).unwrap();
+    }
+
+    fn ntfs_image_with_resident_payload() -> (Vec<u8>, Vec<u8>) {
+        const VOLUME_BYTES: u64 = 64 * 1024 * 1024;
+        let payload = b"xyz".to_vec();
+        let graph = ObjectGraph::build(
+            ObjectId(1),
+            vec![
+                ObjectRecord {
+                    id: ObjectId(1),
+                    kind: ObjectKind::Directory,
+                    link_count: 0,
+                    semantics: ObjectSemantics::default(),
+                    streams: Vec::new(),
+                },
+                ObjectRecord {
+                    id: ObjectId(2),
+                    kind: ObjectKind::File,
+                    link_count: 1,
+                    semantics: ObjectSemantics::default(),
+                    streams: vec![ObjectStream {
+                        id: StreamId(2),
+                        name: None,
+                        logical_bytes: u64::try_from(payload.len()).unwrap(),
+                        initialized_bytes: u64::try_from(payload.len()).unwrap(),
+                        mapped_bytes: u64::try_from(payload.len()).unwrap(),
+                        allocated_bytes: 0,
+                        flags: StreamFlags::default(),
+                        storage: StreamStorage::Resident(payload.clone()),
+                    }],
+                },
+            ],
+            vec![NamespaceEntry {
+                parent: ObjectId(1),
+                target: ObjectId(2),
+                name: "tiny.txt".encode_utf16().collect(),
+            }],
+            ExtentGraph::build(Vec::new(), VOLUME_BYTES, 1).unwrap(),
+            ObjectGraphLimits {
+                max_objects: 4,
+                max_entries: 4,
+                max_streams: 4,
+                max_name_code_units: 255,
+            },
+        )
+        .unwrap();
+        let plan = plan_ntfs_destination(
+            &graph,
+            NtfsDestinationInputs {
+                image_bytes: VOLUME_BYTES,
+                partition_offset_sectors: 0,
+                cluster_bytes: 4096,
+                volume_serial_number: 0x1122_3344_5566_7788,
+                timestamp: 0x01dc_0000_0000_0000,
+            },
+            NtfsSerializeLimits::default(),
+        )
+        .unwrap();
+        let mut image = vec![0_u8; usize::try_from(VOLUME_BYTES).unwrap()];
+        for write in plan
+            .staging_writes
+            .iter()
+            .chain(std::iter::once(&plan.backup_boot_write))
+            .chain(std::iter::once(&plan.primary_boot_write))
+        {
+            let start = usize::try_from(write.offset).unwrap();
+            image[start..start + write.bytes.len()].copy_from_slice(&write.bytes);
+        }
+        (image, payload)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn ntfs_image_with_sparse_payload() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        const VOLUME_BYTES: u64 = 16 * 1024 * 1024;
+        const FIRST: u64 = 8 * 1024 * 1024;
+        const SECOND: u64 = FIRST + 8192;
+        let first = vec![0xa5_u8; 4096];
+        let second = vec![0x5a_u8; 4096];
+        let graph = ObjectGraph::build(
+            ObjectId(1),
+            vec![
+                ObjectRecord {
+                    id: ObjectId(1),
+                    kind: ObjectKind::Directory,
+                    link_count: 0,
+                    semantics: ObjectSemantics::default(),
+                    streams: Vec::new(),
+                },
+                ObjectRecord {
+                    id: ObjectId(2),
+                    kind: ObjectKind::File,
+                    link_count: 1,
+                    semantics: ObjectSemantics::default(),
+                    streams: vec![ObjectStream {
+                        id: StreamId(2),
+                        name: None,
+                        logical_bytes: 3 * 4096,
+                        initialized_bytes: 3 * 4096,
+                        mapped_bytes: 3 * 4096,
+                        allocated_bytes: 2 * 4096,
+                        flags: StreamFlags {
+                            sparse: true,
+                            compressed: false,
+                            encrypted: false,
+                            compression_block_bytes: 0,
+                        },
+                        storage: StreamStorage::Extents,
+                    }],
+                },
+            ],
+            vec![NamespaceEntry {
+                parent: ObjectId(1),
+                target: ObjectId(2),
+                name: "sparse.bin".encode_utf16().collect(),
+            }],
+            ExtentGraph::build(
+                vec![
+                    Extent {
+                        stream: StreamId(2),
+                        logical_offset: 0,
+                        length: 4096,
+                        placement: Placement::Physical { byte_offset: FIRST },
+                        kind: ExtentKind::FileData,
+                    },
+                    Extent {
+                        stream: StreamId(2),
+                        logical_offset: 4096,
+                        length: 4096,
+                        placement: Placement::Sparse,
+                        kind: ExtentKind::FileData,
+                    },
+                    Extent {
+                        stream: StreamId(2),
+                        logical_offset: 8192,
+                        length: 4096,
+                        placement: Placement::Physical {
+                            byte_offset: SECOND,
+                        },
+                        kind: ExtentKind::FileData,
+                    },
+                ],
+                VOLUME_BYTES,
+                4,
+            )
+            .unwrap(),
+            ObjectGraphLimits {
+                max_objects: 4,
+                max_entries: 4,
+                max_streams: 4,
+                max_name_code_units: 255,
+            },
+        )
+        .unwrap();
+        let plan = plan_ntfs_destination(
+            &graph,
+            NtfsDestinationInputs {
+                image_bytes: VOLUME_BYTES,
+                partition_offset_sectors: 0,
+                cluster_bytes: 4096,
+                volume_serial_number: 0x1122_3344_5566_7788,
+                timestamp: 0x01dc_0000_0000_0000,
+            },
+            NtfsSerializeLimits::default(),
+        )
+        .unwrap();
+        let mut image = vec![0_u8; usize::try_from(VOLUME_BYTES).unwrap()];
+        let first_start = usize::try_from(FIRST).unwrap();
+        let second_start = usize::try_from(SECOND).unwrap();
+        image[first_start..first_start + 4096].copy_from_slice(&first);
+        image[second_start..second_start + 4096].copy_from_slice(&second);
+        for write in plan
+            .staging_writes
+            .iter()
+            .chain(std::iter::once(&plan.backup_boot_write))
+            .chain(std::iter::once(&plan.primary_boot_write))
+        {
+            let start = usize::try_from(write.offset).unwrap();
+            image[start..start + write.bytes.len()].copy_from_slice(&write.bytes);
+        }
+        (image, first, second)
+    }
+
+    fn unprotect_file_record(record: &mut [u8]) {
+        let sequence_array = usize::from(u16::from_le_bytes(record[4..6].try_into().unwrap()));
+        let count = usize::from(u16::from_le_bytes(record[6..8].try_into().unwrap()));
+        for sector in 0..count.saturating_sub(1) {
+            let trailer = (sector + 1) * 512 - 2;
+            let original = sequence_array + (sector + 1) * 2;
+            record.copy_within(original..original + 2, trailer);
+        }
+    }
+
+    fn protect_file_record(record: &mut [u8]) {
+        let sequence_array = usize::from(u16::from_le_bytes(record[4..6].try_into().unwrap()));
+        let count = usize::from(u16::from_le_bytes(record[6..8].try_into().unwrap()));
+        let sequence_number = record[sequence_array..sequence_array + 2].to_vec();
+        for sector in 0..count.saturating_sub(1) {
+            let trailer = (sector + 1) * 512 - 2;
+            let original = sequence_array + (sector + 1) * 2;
+            record.copy_within(trailer..trailer + 2, original);
+            record[trailer..trailer + 2].copy_from_slice(&sequence_number);
+        }
+    }
+
+    fn patch_unnamed_sparse_data_to_lznt1(record: &mut [u8]) -> bool {
+        let mut cursor = usize::from(u16::from_le_bytes(record[20..22].try_into().unwrap()));
+        while cursor + 16 <= record.len() {
+            let attribute_type = u32::from_le_bytes(record[cursor..cursor + 4].try_into().unwrap());
+            if attribute_type == u32::MAX {
+                return false;
+            }
+            let length = usize::try_from(u32::from_le_bytes(
+                record[cursor + 4..cursor + 8].try_into().unwrap(),
+            ))
+            .unwrap();
+            if length < 16 || cursor + length > record.len() {
+                return false;
+            }
+            let non_resident = record[cursor + 8] == 1;
+            let name_length = record[cursor + 9];
+            let flags = u16::from_le_bytes(record[cursor + 12..cursor + 14].try_into().unwrap());
+            if attribute_type == 0x80 && non_resident && name_length == 0 && flags == 0x8000 {
+                record[cursor + 12..cursor + 14].copy_from_slice(&1_u16.to_le_bytes());
+                record[cursor + 34] = 1;
+                return true;
+            }
+            cursor += length;
+        }
+        false
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn ntfs_image_with_compressed_payload() -> (Vec<u8>, Vec<u8>) {
+        const VOLUME_BYTES: u64 = 16 * 1024 * 1024;
+        const PAYLOAD: u64 = 8 * 1024 * 1024;
+        let encoded = lznt1_abcabc_cluster();
+        let graph = ObjectGraph::build(
+            ObjectId(1),
+            vec![
+                ObjectRecord {
+                    id: ObjectId(1),
+                    kind: ObjectKind::Directory,
+                    link_count: 0,
+                    semantics: ObjectSemantics::default(),
+                    streams: Vec::new(),
+                },
+                ObjectRecord {
+                    id: ObjectId(2),
+                    kind: ObjectKind::File,
+                    link_count: 1,
+                    semantics: ObjectSemantics::default(),
+                    streams: vec![ObjectStream {
+                        id: StreamId(2),
+                        name: None,
+                        logical_bytes: 6,
+                        initialized_bytes: 6,
+                        mapped_bytes: 8192,
+                        allocated_bytes: 4096,
+                        flags: StreamFlags {
+                            sparse: true,
+                            compressed: false,
+                            encrypted: false,
+                            compression_block_bytes: 0,
+                        },
+                        storage: StreamStorage::Extents,
+                    }],
+                },
+            ],
+            vec![NamespaceEntry {
+                parent: ObjectId(1),
+                target: ObjectId(2),
+                name: "packed.bin".encode_utf16().collect(),
+            }],
+            ExtentGraph::build(
+                vec![
+                    Extent {
+                        stream: StreamId(2),
+                        logical_offset: 0,
+                        length: 4096,
+                        placement: Placement::Physical {
+                            byte_offset: PAYLOAD,
+                        },
+                        kind: ExtentKind::FileData,
+                    },
+                    Extent {
+                        stream: StreamId(2),
+                        logical_offset: 4096,
+                        length: 4096,
+                        placement: Placement::Sparse,
+                        kind: ExtentKind::FileData,
+                    },
+                ],
+                VOLUME_BYTES,
+                4,
+            )
+            .unwrap(),
+            ObjectGraphLimits {
+                max_objects: 4,
+                max_entries: 4,
+                max_streams: 4,
+                max_name_code_units: 255,
+            },
+        )
+        .unwrap();
+        let plan = plan_ntfs_destination(
+            &graph,
+            NtfsDestinationInputs {
+                image_bytes: VOLUME_BYTES,
+                partition_offset_sectors: 0,
+                cluster_bytes: 4096,
+                volume_serial_number: 0x1122_3344_5566_7788,
+                timestamp: 0x01dc_0000_0000_0000,
+            },
+            NtfsSerializeLimits::default(),
+        )
+        .unwrap();
+        let mut image = vec![0_u8; usize::try_from(VOLUME_BYTES).unwrap()];
+        let payload_start = usize::try_from(PAYLOAD).unwrap();
+        image[payload_start..payload_start + 4096].copy_from_slice(&encoded);
+        for write in plan
+            .staging_writes
+            .iter()
+            .chain(std::iter::once(&plan.backup_boot_write))
+            .chain(std::iter::once(&plan.primary_boot_write))
+        {
+            let start = usize::try_from(write.offset).unwrap();
+            image[start..start + write.bytes.len()].copy_from_slice(&write.bytes);
+        }
+        let mut patched = false;
+        let mut offset = 0;
+        while offset + 1024 <= image.len() {
+            if &image[offset..offset + 4] != b"FILE" {
+                offset += 1024;
+                continue;
+            }
+            unprotect_file_record(&mut image[offset..offset + 1024]);
+            let found = patch_unnamed_sparse_data_to_lznt1(&mut image[offset..offset + 1024]);
+            protect_file_record(&mut image[offset..offset + 1024]);
+            if found {
+                patched = true;
+            }
+            offset += 1024;
+        }
+        assert!(
+            patched,
+            "serialized NTFS image must contain unnamed sparse $DATA"
+        );
+        (image, b"ABCABC".to_vec())
+    }
+
+    fn first_ntfs_distinct_exfat_colliding_units() -> (u16, u16) {
+        use crate::fs::ntfs_upcase_serialize::{
+            NtfsUpcaseLimits, generate_ntfs3g_windows61_upcase,
+        };
+        use crate::preservation::is_legal_exfat_name;
+        let ntfs = generate_ntfs3g_windows61_upcase(NtfsUpcaseLimits::default()).unwrap();
+        let exfat =
+            generate_recommended_exfat_upcase(RecommendedExfatUpcaseLimits::default()).unwrap();
+        let mut buckets: std::collections::BTreeMap<u16, Vec<u16>> =
+            std::collections::BTreeMap::new();
+        for unit in 0_u16..=u16::MAX {
+            if (0xd800..=0xdfff).contains(&unit)
+                || matches!(unit, 32 | 46)
+                || !is_legal_exfat_name(&[unit])
+            {
+                continue;
+            }
+            buckets.entry(exfat.map(unit)).or_default().push(unit);
+        }
+        for members in buckets.values() {
+            for (index, left) in members.iter().enumerate() {
+                for right in &members[index + 1..] {
+                    if ntfs.lookup(*left) != ntfs.lookup(*right) {
+                        return (*left, *right);
+                    }
+                }
+            }
+        }
+        panic!("expected an NTFS-distinct exFAT-colliding legal name pair");
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn ntfs_image_with_exfat_case_colliding_names() -> (Vec<u8>, Vec<u16>, Vec<u16>) {
+        const VOLUME_BYTES: u64 = 16 * 1024 * 1024;
+        let (left_unit, right_unit) = first_ntfs_distinct_exfat_colliding_units();
+        let left_name = vec![left_unit];
+        let right_name = vec![right_unit];
+        let left_payload = b"left".to_vec();
+        let right_payload = b"right".to_vec();
+        let graph = ObjectGraph::build(
+            ObjectId(1),
+            vec![
+                ObjectRecord {
+                    id: ObjectId(1),
+                    kind: ObjectKind::Directory,
+                    link_count: 0,
+                    semantics: ObjectSemantics::default(),
+                    streams: Vec::new(),
+                },
+                ObjectRecord {
+                    id: ObjectId(2),
+                    kind: ObjectKind::File,
+                    link_count: 1,
+                    semantics: ObjectSemantics::default(),
+                    streams: vec![ObjectStream {
+                        id: StreamId(2),
+                        name: None,
+                        logical_bytes: u64::try_from(left_payload.len()).unwrap(),
+                        initialized_bytes: u64::try_from(left_payload.len()).unwrap(),
+                        mapped_bytes: u64::try_from(left_payload.len()).unwrap(),
+                        allocated_bytes: 0,
+                        flags: StreamFlags::default(),
+                        storage: StreamStorage::Resident(left_payload),
+                    }],
+                },
+                ObjectRecord {
+                    id: ObjectId(3),
+                    kind: ObjectKind::File,
+                    link_count: 1,
+                    semantics: ObjectSemantics::default(),
+                    streams: vec![ObjectStream {
+                        id: StreamId(3),
+                        name: None,
+                        logical_bytes: u64::try_from(right_payload.len()).unwrap(),
+                        initialized_bytes: u64::try_from(right_payload.len()).unwrap(),
+                        mapped_bytes: u64::try_from(right_payload.len()).unwrap(),
+                        allocated_bytes: 0,
+                        flags: StreamFlags::default(),
+                        storage: StreamStorage::Resident(right_payload),
+                    }],
+                },
+            ],
+            vec![
+                NamespaceEntry {
+                    parent: ObjectId(1),
+                    target: ObjectId(2),
+                    name: left_name.clone(),
+                },
+                NamespaceEntry {
+                    parent: ObjectId(1),
+                    target: ObjectId(3),
+                    name: right_name.clone(),
+                },
+            ],
+            ExtentGraph::build(Vec::new(), VOLUME_BYTES, 1).unwrap(),
+            ObjectGraphLimits {
+                max_objects: 8,
+                max_entries: 8,
+                max_streams: 8,
+                max_name_code_units: 255,
+            },
+        )
+        .unwrap();
+        let plan = plan_ntfs_destination(
+            &graph,
+            NtfsDestinationInputs {
+                image_bytes: VOLUME_BYTES,
+                partition_offset_sectors: 0,
+                cluster_bytes: 4096,
+                volume_serial_number: 0x1122_3344_5566_7788,
+                timestamp: 0x01dc_0000_0000_0000,
+            },
+            NtfsSerializeLimits::default(),
+        )
+        .unwrap();
+        let mut image = vec![0_u8; usize::try_from(VOLUME_BYTES).unwrap()];
+        for write in plan
+            .staging_writes
+            .iter()
+            .chain(std::iter::once(&plan.backup_boot_write))
+            .chain(std::iter::once(&plan.primary_boot_write))
+        {
+            let start = usize::try_from(write.offset).unwrap();
+            image[start..start + write.bytes.len()].copy_from_slice(&write.bytes);
+        }
+        (image, left_name, right_name)
+    }
+
+    fn ntfs_image_with_hard_links_and_named_stream() -> (Vec<u8>, Vec<u8>) {
+        const VOLUME_BYTES: u64 = 64 * 1024 * 1024;
+        let payload = b"abc".to_vec();
+        let graph = ObjectGraph::build(
+            ObjectId(1),
+            vec![
+                ObjectRecord {
+                    id: ObjectId(1),
+                    kind: ObjectKind::Directory,
+                    link_count: 0,
+                    semantics: ObjectSemantics::default(),
+                    streams: Vec::new(),
+                },
+                ObjectRecord {
+                    id: ObjectId(2),
+                    kind: ObjectKind::File,
+                    link_count: 2,
+                    semantics: ObjectSemantics::default(),
+                    streams: vec![
+                        ObjectStream {
+                            id: StreamId(2),
+                            name: None,
+                            logical_bytes: u64::try_from(payload.len()).unwrap(),
+                            initialized_bytes: u64::try_from(payload.len()).unwrap(),
+                            mapped_bytes: u64::try_from(payload.len()).unwrap(),
+                            allocated_bytes: 0,
+                            flags: StreamFlags::default(),
+                            storage: StreamStorage::Resident(payload.clone()),
+                        },
+                        ObjectStream {
+                            id: StreamId(3),
+                            name: Some("fork".encode_utf16().collect()),
+                            logical_bytes: 1,
+                            initialized_bytes: 1,
+                            mapped_bytes: 1,
+                            allocated_bytes: 0,
+                            flags: StreamFlags::default(),
+                            storage: StreamStorage::Resident(b"x".to_vec()),
+                        },
+                    ],
+                },
+            ],
+            vec![
+                NamespaceEntry {
+                    parent: ObjectId(1),
+                    target: ObjectId(2),
+                    name: "beta.txt".encode_utf16().collect(),
+                },
+                NamespaceEntry {
+                    parent: ObjectId(1),
+                    target: ObjectId(2),
+                    name: "alpha.txt".encode_utf16().collect(),
+                },
+            ],
+            ExtentGraph::build(Vec::new(), VOLUME_BYTES, 1).unwrap(),
+            ObjectGraphLimits {
+                max_objects: 4,
+                max_entries: 4,
+                max_streams: 4,
+                max_name_code_units: 255,
+            },
+        )
+        .unwrap();
+        let plan = plan_ntfs_destination(
+            &graph,
+            NtfsDestinationInputs {
+                image_bytes: VOLUME_BYTES,
+                partition_offset_sectors: 0,
+                cluster_bytes: 4096,
+                volume_serial_number: 0x1122_3344_5566_7788,
+                timestamp: 0x01dc_0000_0000_0000,
+            },
+            NtfsSerializeLimits::default(),
+        )
+        .unwrap();
+        let mut image = vec![0_u8; usize::try_from(VOLUME_BYTES).unwrap()];
+        for write in plan
+            .staging_writes
+            .iter()
+            .chain(std::iter::once(&plan.backup_boot_write))
+            .chain(std::iter::once(&plan.primary_boot_write))
+        {
+            let start = usize::try_from(write.offset).unwrap();
+            image[start..start + write.bytes.len()].copy_from_slice(&write.bytes);
+        }
+        (image, payload)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn ntfs_image_with_directory_hard_links_and_nonresident_ads() -> (Vec<u8>, Vec<u8>) {
+        const VOLUME_BYTES: u64 = 64 * 1024 * 1024;
+        let payload = b"abc".to_vec();
+        let ads = (0..4096)
+            .map(|index| u8::try_from(index % 251).unwrap())
+            .collect::<Vec<_>>();
+        let limits = ObjectGraphLimits {
+            max_objects: 8,
+            max_entries: 8,
+            max_streams: 8,
+            max_name_code_units: 255,
+        };
+        let objects = vec![
+            ObjectRecord {
+                id: ObjectId(1),
+                kind: ObjectKind::Directory,
+                link_count: 0,
+                semantics: ObjectSemantics::default(),
+                streams: Vec::new(),
+            },
+            ObjectRecord {
+                id: ObjectId(2),
+                kind: ObjectKind::Directory,
+                link_count: 2,
+                semantics: ObjectSemantics::default(),
+                streams: Vec::new(),
+            },
+            ObjectRecord {
+                id: ObjectId(3),
+                kind: ObjectKind::Directory,
+                link_count: 1,
+                semantics: ObjectSemantics::default(),
+                streams: Vec::new(),
+            },
+            ObjectRecord {
+                id: ObjectId(4),
+                kind: ObjectKind::File,
+                link_count: 2,
+                semantics: ObjectSemantics::default(),
+                streams: vec![
+                    ObjectStream {
+                        id: StreamId(2),
+                        name: None,
+                        logical_bytes: u64::try_from(payload.len()).unwrap(),
+                        initialized_bytes: u64::try_from(payload.len()).unwrap(),
+                        mapped_bytes: u64::try_from(payload.len()).unwrap(),
+                        allocated_bytes: 0,
+                        flags: StreamFlags::default(),
+                        storage: StreamStorage::Resident(payload.clone()),
+                    },
+                    ObjectStream {
+                        id: StreamId(3),
+                        name: Some("fork".encode_utf16().collect()),
+                        logical_bytes: 4096,
+                        initialized_bytes: 4096,
+                        mapped_bytes: 4096,
+                        allocated_bytes: 4096,
+                        flags: StreamFlags::default(),
+                        storage: StreamStorage::Extents,
+                    },
+                ],
+            },
+        ];
+        let entries = vec![
+            NamespaceEntry {
+                parent: ObjectId(1),
+                target: ObjectId(2),
+                name: "right".encode_utf16().collect(),
+            },
+            NamespaceEntry {
+                parent: ObjectId(1),
+                target: ObjectId(2),
+                name: "left".encode_utf16().collect(),
+            },
+            NamespaceEntry {
+                parent: ObjectId(1),
+                target: ObjectId(3),
+                name: "other".encode_utf16().collect(),
+            },
+            NamespaceEntry {
+                parent: ObjectId(2),
+                target: ObjectId(4),
+                name: "shared.bin".encode_utf16().collect(),
+            },
+            NamespaceEntry {
+                parent: ObjectId(3),
+                target: ObjectId(4),
+                name: "alias.bin".encode_utf16().collect(),
+            },
+        ];
+        for offset in (8 * 1024 * 1024..40 * 1024 * 1024).step_by(8192) {
+            let graph = ObjectGraph::build(
+                ObjectId(1),
+                objects.clone(),
+                entries.clone(),
+                ExtentGraph::build(
+                    vec![Extent {
+                        stream: StreamId(3),
+                        logical_offset: 0,
+                        length: 4096,
+                        placement: Placement::Physical {
+                            byte_offset: offset,
+                        },
+                        kind: ExtentKind::FileData,
+                    }],
+                    VOLUME_BYTES,
+                    4,
+                )
+                .unwrap(),
+                limits,
+            )
+            .unwrap();
+            let Ok(plan) = plan_ntfs_destination(
+                &graph,
+                NtfsDestinationInputs {
+                    image_bytes: VOLUME_BYTES,
+                    partition_offset_sectors: 0,
+                    cluster_bytes: 4096,
+                    volume_serial_number: 0x1122_3344_5566_7788,
+                    timestamp: 0x01dc_0000_0000_0000,
+                },
+                NtfsSerializeLimits::default(),
+            ) else {
+                continue;
+            };
+            let mut image = vec![0_u8; usize::try_from(VOLUME_BYTES).unwrap()];
+            let start = usize::try_from(offset).unwrap();
+            image[start..start + ads.len()].copy_from_slice(&ads);
+            for write in plan
+                .staging_writes
+                .iter()
+                .chain(std::iter::once(&plan.backup_boot_write))
+                .chain(std::iter::once(&plan.primary_boot_write))
+            {
+                let write_start = usize::try_from(write.offset).unwrap();
+                image[write_start..write_start + write.bytes.len()].copy_from_slice(&write.bytes);
+            }
+            return (image, payload);
+        }
+        panic!("could not place a non-resident named stream outside NTFS metadata");
+    }
+
+    fn ntfs_image_with_two_4k_fragments() -> (Vec<u8>, Vec<u8>) {
+        const VOLUME_BYTES: u64 = 64 * 1024 * 1024;
+        let payload = (0..8192)
+            .map(|index| u8::try_from((index * 11) % 251).unwrap())
+            .collect::<Vec<_>>();
+        let root = ObjectRecord {
+            id: ObjectId(1),
+            kind: ObjectKind::Directory,
+            link_count: 0,
+            semantics: ObjectSemantics::default(),
+            streams: Vec::new(),
+        };
+        let file = ObjectRecord {
+            id: ObjectId(2),
+            kind: ObjectKind::File,
+            link_count: 1,
+            semantics: ObjectSemantics::default(),
+            streams: vec![ObjectStream {
+                id: StreamId(2),
+                name: None,
+                logical_bytes: 8192,
+                initialized_bytes: 8192,
+                mapped_bytes: 8192,
+                allocated_bytes: 8192,
+                flags: StreamFlags::default(),
+                storage: StreamStorage::Extents,
+            }],
+        };
+        let limits = ObjectGraphLimits {
+            max_objects: 4,
+            max_entries: 4,
+            max_streams: 4,
+            max_name_code_units: 255,
+        };
+        for first in (8 * 1024 * 1024..40 * 1024 * 1024).step_by(8192) {
+            let second = first + 16 * 1024;
+            let graph = ObjectGraph::build(
+                ObjectId(1),
+                vec![root.clone(), file.clone()],
+                vec![NamespaceEntry {
+                    parent: ObjectId(1),
+                    target: ObjectId(2),
+                    name: "split.bin".encode_utf16().collect(),
+                }],
+                ExtentGraph::build(
+                    vec![
+                        Extent {
+                            stream: StreamId(2),
+                            logical_offset: 0,
+                            length: 4096,
+                            placement: Placement::Physical { byte_offset: first },
+                            kind: ExtentKind::FileData,
+                        },
+                        Extent {
+                            stream: StreamId(2),
+                            logical_offset: 4096,
+                            length: 4096,
+                            placement: Placement::Physical {
+                                byte_offset: second,
+                            },
+                            kind: ExtentKind::FileData,
+                        },
+                    ],
+                    VOLUME_BYTES,
+                    4,
+                )
+                .unwrap(),
+                limits,
+            )
+            .unwrap();
+            let Ok(plan) = plan_ntfs_destination(
+                &graph,
+                NtfsDestinationInputs {
+                    image_bytes: VOLUME_BYTES,
+                    partition_offset_sectors: 0,
+                    cluster_bytes: 4096,
+                    volume_serial_number: 0x1122_3344_5566_7788,
+                    timestamp: 0x01dc_0000_0000_0000,
+                },
+                NtfsSerializeLimits::default(),
+            ) else {
+                continue;
+            };
+            let mut image = vec![0_u8; usize::try_from(VOLUME_BYTES).unwrap()];
+            let first_start = usize::try_from(first).unwrap();
+            let second_start = usize::try_from(second).unwrap();
+            image[first_start..first_start + 4096].copy_from_slice(&payload[..4096]);
+            image[second_start..second_start + 4096].copy_from_slice(&payload[4096..]);
+            for write in plan
+                .staging_writes
+                .iter()
+                .chain(std::iter::once(&plan.backup_boot_write))
+                .chain(std::iter::once(&plan.primary_boot_write))
+            {
+                let start = usize::try_from(write.offset).unwrap();
+                image[start..start + write.bytes.len()].copy_from_slice(&write.bytes);
+            }
+            return (image, payload);
+        }
+        panic!("could not place a fragmented NTFS payload outside metadata");
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn ntfs_image_with_partially_initialized_fragments() -> (Vec<u8>, Vec<u8>) {
+        const VOLUME_BYTES: u64 = 64 * 1024 * 1024;
+        const INITIALIZED: usize = 5000;
+        let mut allocated = (0..8192)
+            .map(|index| u8::try_from((index * 11) % 251).unwrap())
+            .collect::<Vec<_>>();
+        for byte in allocated.iter_mut().skip(INITIALIZED) {
+            *byte = 0xaa;
+        }
+        let initialized = allocated[..INITIALIZED].to_vec();
+        let root = ObjectRecord {
+            id: ObjectId(1),
+            kind: ObjectKind::Directory,
+            link_count: 0,
+            semantics: ObjectSemantics::default(),
+            streams: Vec::new(),
+        };
+        let file = ObjectRecord {
+            id: ObjectId(2),
+            kind: ObjectKind::File,
+            link_count: 1,
+            semantics: ObjectSemantics::default(),
+            streams: vec![ObjectStream {
+                id: StreamId(2),
+                name: None,
+                logical_bytes: 8192,
+                initialized_bytes: u64::try_from(INITIALIZED).unwrap(),
+                mapped_bytes: 8192,
+                allocated_bytes: 8192,
+                flags: StreamFlags::default(),
+                storage: StreamStorage::Extents,
+            }],
+        };
+        let limits = ObjectGraphLimits {
+            max_objects: 4,
+            max_entries: 4,
+            max_streams: 4,
+            max_name_code_units: 255,
+        };
+        for first in (8 * 1024 * 1024..40 * 1024 * 1024).step_by(8192) {
+            let second = first + 16 * 1024;
+            let graph = ObjectGraph::build(
+                ObjectId(1),
+                vec![root.clone(), file.clone()],
+                vec![NamespaceEntry {
+                    parent: ObjectId(1),
+                    target: ObjectId(2),
+                    name: "partial.bin".encode_utf16().collect(),
+                }],
+                ExtentGraph::build(
+                    vec![
+                        Extent {
+                            stream: StreamId(2),
+                            logical_offset: 0,
+                            length: 4096,
+                            placement: Placement::Physical { byte_offset: first },
+                            kind: ExtentKind::FileData,
+                        },
+                        Extent {
+                            stream: StreamId(2),
+                            logical_offset: 4096,
+                            length: 4096,
+                            placement: Placement::Physical {
+                                byte_offset: second,
+                            },
+                            kind: ExtentKind::FileData,
+                        },
+                    ],
+                    VOLUME_BYTES,
+                    4,
+                )
+                .unwrap(),
+                limits,
+            )
+            .unwrap();
+            let Ok(plan) = plan_ntfs_destination(
+                &graph,
+                NtfsDestinationInputs {
+                    image_bytes: VOLUME_BYTES,
+                    partition_offset_sectors: 0,
+                    cluster_bytes: 4096,
+                    volume_serial_number: 0x1122_3344_5566_7788,
+                    timestamp: 0x01dc_0000_0000_0000,
+                },
+                NtfsSerializeLimits::default(),
+            ) else {
+                continue;
+            };
+            let mut image = vec![0_u8; usize::try_from(VOLUME_BYTES).unwrap()];
+            let first_start = usize::try_from(first).unwrap();
+            let second_start = usize::try_from(second).unwrap();
+            image[first_start..first_start + 4096].copy_from_slice(&allocated[..4096]);
+            image[second_start..second_start + 4096].copy_from_slice(&allocated[4096..]);
+            for write in plan
+                .staging_writes
+                .iter()
+                .chain(std::iter::once(&plan.backup_boot_write))
+                .chain(std::iter::once(&plan.primary_boot_write))
+            {
+                let start = usize::try_from(write.offset).unwrap();
+                image[start..start + write.bytes.len()].copy_from_slice(&write.bytes);
+            }
+            return (image, initialized);
+        }
+        panic!("could not place a partially initialized NTFS payload outside metadata");
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn ntfs_image_with_aligned_uninitialized_payload() -> (Vec<u8>, Vec<u8>, u64) {
+        const VOLUME_BYTES: u64 = 64 * 1024 * 1024;
+        const INITIALIZED: usize = 5000;
+        let mut allocated = (0..8192)
+            .map(|index| u8::try_from((index * 11) % 251).unwrap())
+            .collect::<Vec<_>>();
+        for byte in allocated.iter_mut().skip(INITIALIZED) {
+            *byte = 0xaa;
+        }
+        let initialized = allocated[..INITIALIZED].to_vec();
+        let root = ObjectRecord {
+            id: ObjectId(1),
+            kind: ObjectKind::Directory,
+            link_count: 0,
+            semantics: ObjectSemantics::default(),
+            streams: Vec::new(),
+        };
+        let file = ObjectRecord {
+            id: ObjectId(2),
+            kind: ObjectKind::File,
+            link_count: 1,
+            semantics: ObjectSemantics::default(),
+            streams: vec![ObjectStream {
+                id: StreamId(2),
+                name: None,
+                logical_bytes: 8192,
+                initialized_bytes: u64::try_from(INITIALIZED).unwrap(),
+                mapped_bytes: 8192,
+                allocated_bytes: 8192,
+                flags: StreamFlags::default(),
+                storage: StreamStorage::Extents,
+            }],
+        };
+        let limits = ObjectGraphLimits {
+            max_objects: 4,
+            max_entries: 4,
+            max_streams: 4,
+            max_name_code_units: 255,
+        };
+        for offset in (8 * 1024 * 1024..40 * 1024 * 1024).step_by(8192) {
+            let graph = ObjectGraph::build(
+                ObjectId(1),
+                vec![root.clone(), file.clone()],
+                vec![NamespaceEntry {
+                    parent: ObjectId(1),
+                    target: ObjectId(2),
+                    name: "partial.bin".encode_utf16().collect(),
+                }],
+                ExtentGraph::build(
+                    vec![Extent {
+                        stream: StreamId(2),
+                        logical_offset: 0,
+                        length: 8192,
+                        placement: Placement::Physical {
+                            byte_offset: offset,
+                        },
+                        kind: ExtentKind::FileData,
+                    }],
+                    VOLUME_BYTES,
+                    4,
+                )
+                .unwrap(),
+                limits,
+            )
+            .unwrap();
+            let Ok(plan) = plan_ntfs_destination(
+                &graph,
+                NtfsDestinationInputs {
+                    image_bytes: VOLUME_BYTES,
+                    partition_offset_sectors: 0,
+                    cluster_bytes: 4096,
+                    volume_serial_number: 0x1122_3344_5566_7788,
+                    timestamp: 0x01dc_0000_0000_0000,
+                },
+                NtfsSerializeLimits::default(),
+            ) else {
+                continue;
+            };
+            let mut image = vec![0_u8; usize::try_from(VOLUME_BYTES).unwrap()];
+            let start = usize::try_from(offset).unwrap();
+            image[start..start + allocated.len()].copy_from_slice(&allocated);
+            for write in plan
+                .staging_writes
+                .iter()
+                .chain(std::iter::once(&plan.backup_boot_write))
+                .chain(std::iter::once(&plan.primary_boot_write))
+            {
+                let write_start = usize::try_from(write.offset).unwrap();
+                image[write_start..write_start + write.bytes.len()].copy_from_slice(&write.bytes);
+            }
+            return (image, initialized, offset);
+        }
+        panic!("could not place an aligned uninitialized NTFS payload outside metadata");
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn ntfs_image_with_misaligned_and_resident_payloads() -> (Vec<u8>, Vec<u8>, Vec<u8>, u64) {
+        const VOLUME_BYTES: u64 = 64 * 1024 * 1024;
+        const PAYLOAD_BYTES: u64 = 8192;
+        let relocated = (0..usize::try_from(PAYLOAD_BYTES).unwrap())
+            .map(|index| u8::try_from((index * 7) % 251).unwrap())
+            .collect::<Vec<_>>();
+        let resident = b"xyz".to_vec();
+        let root = ObjectRecord {
+            id: ObjectId(1),
+            kind: ObjectKind::Directory,
+            link_count: 0,
+            semantics: ObjectSemantics::default(),
+            streams: Vec::new(),
+        };
+        let extent_file = ObjectRecord {
+            id: ObjectId(2),
+            kind: ObjectKind::File,
+            link_count: 1,
+            semantics: ObjectSemantics::default(),
+            streams: vec![ObjectStream {
+                id: StreamId(2),
+                name: None,
+                logical_bytes: PAYLOAD_BYTES,
+                initialized_bytes: PAYLOAD_BYTES,
+                mapped_bytes: PAYLOAD_BYTES,
+                allocated_bytes: PAYLOAD_BYTES,
+                flags: StreamFlags::default(),
+                storage: StreamStorage::Extents,
+            }],
+        };
+        let resident_file = ObjectRecord {
+            id: ObjectId(3),
+            kind: ObjectKind::File,
+            link_count: 1,
+            semantics: ObjectSemantics::default(),
+            streams: vec![ObjectStream {
+                id: StreamId(3),
+                name: None,
+                logical_bytes: u64::try_from(resident.len()).unwrap(),
+                initialized_bytes: u64::try_from(resident.len()).unwrap(),
+                mapped_bytes: u64::try_from(resident.len()).unwrap(),
+                allocated_bytes: 0,
+                flags: StreamFlags::default(),
+                storage: StreamStorage::Resident(resident.clone()),
+            }],
+        };
+        let limits = ObjectGraphLimits {
+            max_objects: 4,
+            max_entries: 4,
+            max_streams: 4,
+            max_name_code_units: 255,
+        };
+        for offset in (4 * 1024 * 1024 + 4096..48 * 1024 * 1024).step_by(8192) {
+            let graph = ObjectGraph::build(
+                ObjectId(1),
+                vec![root.clone(), extent_file.clone(), resident_file.clone()],
+                vec![
+                    NamespaceEntry {
+                        parent: ObjectId(1),
+                        target: ObjectId(2),
+                        name: "payload.bin".encode_utf16().collect(),
+                    },
+                    NamespaceEntry {
+                        parent: ObjectId(1),
+                        target: ObjectId(3),
+                        name: "tiny.txt".encode_utf16().collect(),
+                    },
+                ],
+                ExtentGraph::build(
+                    vec![Extent {
+                        stream: StreamId(2),
+                        logical_offset: 0,
+                        length: PAYLOAD_BYTES,
+                        placement: Placement::Physical {
+                            byte_offset: offset,
+                        },
+                        kind: ExtentKind::FileData,
+                    }],
+                    VOLUME_BYTES,
+                    4,
+                )
+                .unwrap(),
+                limits,
+            )
+            .unwrap();
+            let Ok(plan) = plan_ntfs_destination(
+                &graph,
+                NtfsDestinationInputs {
+                    image_bytes: VOLUME_BYTES,
+                    partition_offset_sectors: 0,
+                    cluster_bytes: 4096,
+                    volume_serial_number: 0x1122_3344_5566_7788,
+                    timestamp: 0x01dc_0000_0000_0000,
+                },
+                NtfsSerializeLimits::default(),
+            ) else {
+                continue;
+            };
+            let mut image = vec![0_u8; usize::try_from(VOLUME_BYTES).unwrap()];
+            let start = usize::try_from(offset).unwrap();
+            image[start..start + relocated.len()].copy_from_slice(&relocated);
+            for write in plan
+                .staging_writes
+                .iter()
+                .chain(std::iter::once(&plan.backup_boot_write))
+                .chain(std::iter::once(&plan.primary_boot_write))
+            {
+                let write_start = usize::try_from(write.offset).unwrap();
+                image[write_start..write_start + write.bytes.len()].copy_from_slice(&write.bytes);
+            }
+            return (image, relocated, resident, offset);
+        }
+        panic!("could not place a mixed NTFS payload outside metadata");
+    }
+
+    #[test]
+    fn resident_ntfs_payload_is_materialized_into_new_exfat_image() {
+        let (source_bytes, payload) = ntfs_image_with_resident_payload();
+        let source_file = TempFile::create(&source_bytes);
+        let source = ImageFile::open(&source_file.path).unwrap();
+        let source_snapshot =
+            capture_source_image_snapshot(&source, CandidateExportLimits::default()).unwrap();
+        let inspection = inspect_open_image(&source).unwrap();
+        let normalized = inspection.normalized_ntfs.as_deref().unwrap();
+        let draft = draft_lossless_ntfs_to_exfat(
+            normalized,
+            GuaranteeMode::Escrow,
+            NtfsToExfatOptions {
+                bytes_per_cluster: 8192,
+                ..NtfsToExfatOptions::default()
+            },
+            NtfsToExfatLimits::default(),
+        )
+        .unwrap();
+        let solved = solve_lossless_ntfs_to_exfat(draft, LayoutLimits::default()).unwrap();
+        assert!(solved.layout().relocations.is_empty());
+        assert_eq!(solved.layout().materializations.len(), 1);
+        let destination_range = solved.layout().materializations[0].destination;
+        assert_eq!(destination_range.length, 8192);
+        assert_eq!(destination_range.offset % 8192, 0);
+        let preview =
+            preview_exfat_phase_writes(&source, &solved.destination, PreimageLimits::default())
+                .unwrap();
+        let destination = temp_path("resident-candidate.exfat.img");
+        let escrow = temp_path("resident-candidate.escrow");
+        let evidence = export_relocated_candidate_image(
+            &source,
+            &destination,
+            Some(&escrow),
+            &preview,
+            &source_snapshot,
+            solved.relocation(),
+            &solved.preservation,
+            CandidateExportLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(evidence.target_filesystem, FileSystem::ExFat);
+        let candidate_bytes = fs::read(&destination).unwrap();
+        let start = usize::try_from(destination_range.offset).unwrap();
+        assert_eq!(&candidate_bytes[start..start + payload.len()], payload);
+        assert!(
+            candidate_bytes[start + payload.len()..start + 8192]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        let candidate = inspect_image(&destination).unwrap();
+        assert_eq!(candidate.profile.filesystem, FileSystem::ExFat);
+        assert!(candidate.profile.inventory_complete);
+        verify_bound_export(
+            &destination,
+            &escrow,
+            Some(&source_file.path),
+            CandidateVerificationLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(fs::read(&source_file.path).unwrap(), source_bytes);
+        fs::remove_file(destination).unwrap();
+        fs::remove_file(escrow).unwrap();
+    }
+
+    #[test]
+    fn sparse_ntfs_payload_is_materialized_into_new_exfat_image() {
+        let (source_bytes, first, second) = ntfs_image_with_sparse_payload();
+        let source_file = TempFile::create(&source_bytes);
+        let source = ImageFile::open(&source_file.path).unwrap();
+        let source_snapshot =
+            capture_source_image_snapshot(&source, CandidateExportLimits::default()).unwrap();
+        let inspection = inspect_open_image(&source).unwrap();
+        let normalized = inspection.normalized_ntfs.as_deref().unwrap();
+        assert!(
+            normalized
+                .graph
+                .objects()
+                .iter()
+                .flat_map(|object| &object.streams)
+                .any(|stream| stream.flags.sparse)
+        );
+        let draft = draft_lossless_ntfs_to_exfat(
+            normalized,
+            GuaranteeMode::Escrow,
+            NtfsToExfatOptions::default(),
+            NtfsToExfatLimits::default(),
+        )
+        .unwrap();
+        let solved = solve_lossless_ntfs_to_exfat(draft, LayoutLimits::default()).unwrap();
+        assert!(solved.layout().relocations.is_empty());
+        assert_eq!(solved.layout().materializations.len(), 1);
+        let destination_range = solved.layout().materializations[0].destination;
+        assert_eq!(destination_range.length, 3 * 4096);
+        let preview =
+            preview_exfat_phase_writes(&source, &solved.destination, PreimageLimits::default())
+                .unwrap();
+        let destination = temp_path("sparse-candidate.exfat.img");
+        let escrow = temp_path("sparse-candidate.escrow");
+        export_relocated_candidate_image(
+            &source,
+            &destination,
+            Some(&escrow),
+            &preview,
+            &source_snapshot,
+            solved.relocation(),
+            &solved.preservation,
+            CandidateExportLimits::default(),
+        )
+        .unwrap();
+        let candidate_bytes = fs::read(&destination).unwrap();
+        let start = usize::try_from(destination_range.offset).unwrap();
+        assert_eq!(&candidate_bytes[start..start + 4096], first.as_slice());
+        assert!(
+            candidate_bytes[start + 4096..start + 8192]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        assert_eq!(
+            &candidate_bytes[start + 8192..start + 3 * 4096],
+            second.as_slice()
+        );
+        verify_bound_export(
+            &destination,
+            &escrow,
+            Some(&source_file.path),
+            CandidateVerificationLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(fs::read(&source_file.path).unwrap(), source_bytes);
+        fs::remove_file(destination).unwrap();
+        fs::remove_file(escrow).unwrap();
+    }
+
+    #[test]
+    fn compressed_ntfs_payload_is_decompressed_into_new_exfat_image() {
+        let (source_bytes, plaintext) = ntfs_image_with_compressed_payload();
+        let source_file = TempFile::create(&source_bytes);
+        let source = ImageFile::open(&source_file.path).unwrap();
+        let source_snapshot =
+            capture_source_image_snapshot(&source, CandidateExportLimits::default()).unwrap();
+        let inspection = inspect_open_image(&source).unwrap();
+        let normalized = inspection.normalized_ntfs.as_deref().unwrap();
+        assert!(
+            normalized
+                .graph
+                .objects()
+                .iter()
+                .flat_map(|object| &object.streams)
+                .any(|stream| stream.flags.compressed
+                    && stream.flags.compression_block_bytes == 8192)
+        );
+        let draft = draft_lossless_ntfs_to_exfat(
+            normalized,
+            GuaranteeMode::Escrow,
+            NtfsToExfatOptions::default(),
+            NtfsToExfatLimits::default(),
+        )
+        .unwrap();
+        assert!(
+            draft
+                .target_graph()
+                .objects()
+                .iter()
+                .flat_map(|object| &object.streams)
+                .any(|stream| !stream.flags.compressed
+                    && stream.flags.compression_block_bytes == 8192)
+        );
+        let solved = solve_lossless_ntfs_to_exfat(draft, LayoutLimits::default()).unwrap();
+        assert!(solved.layout().relocations.is_empty());
+        assert_eq!(solved.layout().materializations.len(), 1);
+        let destination_range = solved.layout().materializations[0].destination;
+        assert_eq!(destination_range.length, 4096);
+        assert!(
+            solved
+                .target_graph()
+                .objects()
+                .iter()
+                .flat_map(|object| &object.streams)
+                .all(|stream| stream.flags.compression_block_bytes == 0 && !stream.flags.compressed)
+        );
+        let preview =
+            preview_exfat_phase_writes(&source, &solved.destination, PreimageLimits::default())
+                .unwrap();
+        let destination = temp_path("compressed-candidate.exfat.img");
+        let escrow = temp_path("compressed-candidate.escrow");
+        export_relocated_candidate_image(
+            &source,
+            &destination,
+            Some(&escrow),
+            &preview,
+            &source_snapshot,
+            solved.relocation(),
+            &solved.preservation,
+            CandidateExportLimits::default(),
+        )
+        .unwrap();
+        let candidate_bytes = fs::read(&destination).unwrap();
+        let start = usize::try_from(destination_range.offset).unwrap();
+        assert_eq!(&candidate_bytes[start..start + plaintext.len()], plaintext);
+        assert!(
+            candidate_bytes[start + plaintext.len()..start + 4096]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        verify_bound_export(
+            &destination,
+            &escrow,
+            Some(&source_file.path),
+            CandidateVerificationLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(fs::read(&source_file.path).unwrap(), source_bytes);
+        fs::remove_file(destination).unwrap();
+        fs::remove_file(escrow).unwrap();
+    }
+
+    #[test]
+    fn escrow_ntfs_exfat_case_collisions_export_dest_native_names() {
+        let (source_bytes, left_name, right_name) = ntfs_image_with_exfat_case_colliding_names();
+        let source_file = TempFile::create(&source_bytes);
+        let source = ImageFile::open(&source_file.path).unwrap();
+        let source_snapshot =
+            capture_source_image_snapshot(&source, CandidateExportLimits::default()).unwrap();
+        let inspection = inspect_open_image(&source).unwrap();
+        let normalized = inspection.normalized_ntfs.as_deref().unwrap();
+        let mut source_names: Vec<Vec<u16>> = normalized
+            .graph
+            .entries()
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect();
+        source_names.sort();
+        let mut expected_source = vec![left_name.clone(), right_name.clone()];
+        expected_source.sort();
+        assert_eq!(source_names, expected_source);
+        let draft = draft_lossless_ntfs_to_exfat(
+            normalized,
+            GuaranteeMode::Escrow,
+            NtfsToExfatOptions::default(),
+            NtfsToExfatLimits::default(),
+        )
+        .unwrap();
+        let solved = solve_lossless_ntfs_to_exfat(draft, LayoutLimits::default()).unwrap();
+        let dest_names: std::collections::BTreeSet<Vec<u16>> = solved
+            .target_graph()
+            .entries()
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect();
+        assert_eq!(dest_names.len(), 2);
+        assert!(dest_names.contains(&left_name));
+        let mut renamed = right_name;
+        renamed.extend("~2".encode_utf16());
+        assert!(dest_names.contains(&renamed));
+        let preview =
+            preview_exfat_phase_writes(&source, &solved.destination, PreimageLimits::default())
+                .unwrap();
+        let destination = temp_path("case-collision-candidate.exfat.img");
+        let escrow = temp_path("case-collision-candidate.escrow");
+        export_relocated_candidate_image(
+            &source,
+            &destination,
+            Some(&escrow),
+            &preview,
+            &source_snapshot,
+            solved.relocation(),
+            &solved.preservation,
+            CandidateExportLimits::default(),
+        )
+        .unwrap();
+        verify_bound_export(
+            &destination,
+            &escrow,
+            Some(&source_file.path),
+            CandidateVerificationLimits::default(),
+        )
+        .unwrap();
+        let candidate = inspect_image(&destination).unwrap();
+        assert_eq!(candidate.profile.filesystem, FileSystem::ExFat);
+        assert!(candidate.profile.inventory_complete);
+        assert_eq!(fs::read(&source_file.path).unwrap(), source_bytes);
+        fs::remove_file(destination).unwrap();
+        fs::remove_file(escrow).unwrap();
+    }
+
+    #[test]
+    fn escrow_ntfs_hard_links_and_ads_export_dest_native_exfat() {
+        let (source_bytes, payload) = ntfs_image_with_hard_links_and_named_stream();
+        let source_file = TempFile::create(&source_bytes);
+        let source = ImageFile::open(&source_file.path).unwrap();
+        let source_snapshot =
+            capture_source_image_snapshot(&source, CandidateExportLimits::default()).unwrap();
+        let inspection = inspect_open_image(&source).unwrap();
+        let normalized = inspection.normalized_ntfs.as_deref().unwrap();
+        assert_eq!(normalized.graph.entries().len(), 2);
+        assert_eq!(
+            normalized
+                .graph
+                .objects()
+                .iter()
+                .find(|object| object.kind == ObjectKind::File)
+                .unwrap()
+                .streams
+                .len(),
+            2
+        );
+        assert!(
+            !evaluate_ntfs(
+                normalized,
+                FileSystem::ExFat,
+                GuaranteeMode::Strict,
+                crate::preservation::PreservationLimits::default(),
+            )
+            .unwrap()
+            .permitted
+        );
+        let draft = draft_lossless_ntfs_to_exfat(
+            normalized,
+            GuaranteeMode::Escrow,
+            NtfsToExfatOptions {
+                bytes_per_cluster: 8192,
+                ..NtfsToExfatOptions::default()
+            },
+            NtfsToExfatLimits::default(),
+        )
+        .unwrap();
+        let solved = solve_lossless_ntfs_to_exfat(draft, LayoutLimits::default()).unwrap();
+        let dest_entries: Vec<Vec<u16>> = solved
+            .target_graph()
+            .entries()
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect();
+        assert_eq!(
+            dest_entries,
+            vec!["alpha.txt".encode_utf16().collect::<Vec<_>>()]
+        );
+        let dest_file = solved
+            .target_graph()
+            .objects()
+            .iter()
+            .find(|object| object.kind == ObjectKind::File)
+            .unwrap();
+        assert_eq!(dest_file.link_count, 1);
+        assert_eq!(dest_file.streams.len(), 1);
+        assert!(dest_file.streams[0].name.is_none());
+        let destination_range = solved.layout().materializations[0].destination;
+        let preview =
+            preview_exfat_phase_writes(&source, &solved.destination, PreimageLimits::default())
+                .unwrap();
+        let destination = temp_path("hardlink-ads-candidate.exfat.img");
+        let escrow = temp_path("hardlink-ads-candidate.escrow");
+        export_relocated_candidate_image(
+            &source,
+            &destination,
+            Some(&escrow),
+            &preview,
+            &source_snapshot,
+            solved.relocation(),
+            &solved.preservation,
+            CandidateExportLimits::default(),
+        )
+        .unwrap();
+        let candidate_bytes = fs::read(&destination).unwrap();
+        let start = usize::try_from(destination_range.offset).unwrap();
+        assert_eq!(&candidate_bytes[start..start + payload.len()], payload);
+        verify_bound_export(
+            &destination,
+            &escrow,
+            Some(&source_file.path),
+            CandidateVerificationLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(fs::read(&source_file.path).unwrap(), source_bytes);
+        fs::remove_file(destination).unwrap();
+        fs::remove_file(escrow).unwrap();
+    }
+
+    /// Exact per-object NTFS evidence for the escrow round-trip source volume.
+    struct RoundTripSource {
+        image: Vec<u8>,
+        serial: u64,
+        label: Vec<u16>,
+        /// (dest-native path, timestamps, low-word DOS attributes without the directory bit)
+        objects: Vec<(Vec<&'static str>, NtfsObjectTimestamps, u32)>,
+        junction_payload: Vec<u8>,
+        symlink_payload: Vec<u8>,
+    }
+
+    fn reparse_payload(tag: u32, data: &[u8]) -> Vec<u8> {
+        let mut payload = tag.to_le_bytes().to_vec();
+        payload.extend_from_slice(&u16::try_from(data.len()).unwrap().to_le_bytes());
+        payload.extend_from_slice(&[0, 0]);
+        payload.extend_from_slice(data);
+        payload
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn ntfs_round_trip_source() -> RoundTripSource {
+        use crate::fs::ntfs_serialize::{
+            NTFS3G_SECURITY_ID_READ_WRITE, NtfsObjectMetadata, NtfsVolumeProfile,
+            plan_ntfs_destination_with_metadata_and_volume,
+        };
+
+        const VOLUME_BYTES: u64 = 64 * 1024 * 1024;
+        // 2025-era FILETIME base with sub-10 ms tick offsets that exFAT cannot represent.
+        const BASE: u64 = 0x01dc_0000_0000_0000;
+        let stamps = |offset: u64| NtfsObjectTimestamps {
+            creation_time: BASE + offset + 1_234_567,
+            modification_time: BASE + offset + 2_345_671,
+            mft_change_time: BASE + offset + 3_456_713,
+            access_time: BASE + offset + 4_567_131,
+        };
+        let root_stamps = stamps(0);
+        let file_stamps = stamps(600_000_000);
+        let junction_stamps = stamps(1_200_000_000);
+        let symlink_stamps = stamps(1_800_000_000);
+        let junction_payload = reparse_payload(0xa000_0003, b"\\??\\C:\\target\0");
+        let symlink_payload = reparse_payload(0xa000_000c, b"relative\0");
+        let resident = |id: u64, name: Option<&str>, bytes: &[u8]| ObjectStream {
+            id: StreamId(id),
+            name: name.map(|name| name.encode_utf16().collect()),
+            logical_bytes: u64::try_from(bytes.len()).unwrap(),
+            initialized_bytes: u64::try_from(bytes.len()).unwrap(),
+            mapped_bytes: u64::try_from(bytes.len()).unwrap(),
+            allocated_bytes: 0,
+            flags: StreamFlags::default(),
+            storage: StreamStorage::Resident(bytes.to_vec()),
+        };
+        let reparse_semantics = ObjectSemantics {
+            is_reparse_point: true,
+            ..ObjectSemantics::default()
+        };
+        let graph = ObjectGraph::build(
+            ObjectId(1),
+            vec![
+                ObjectRecord {
+                    id: ObjectId(1),
+                    kind: ObjectKind::Directory,
+                    link_count: 0,
+                    semantics: ObjectSemantics::default(),
+                    streams: Vec::new(),
+                },
+                ObjectRecord {
+                    id: ObjectId(2),
+                    kind: ObjectKind::File,
+                    link_count: 2,
+                    semantics: ObjectSemantics::default(),
+                    streams: vec![resident(2, None, b"abc"), resident(3, Some("fork"), b"xyz")],
+                },
+                ObjectRecord {
+                    id: ObjectId(3),
+                    kind: ObjectKind::Directory,
+                    link_count: 1,
+                    semantics: reparse_semantics,
+                    streams: Vec::new(),
+                },
+                ObjectRecord {
+                    id: ObjectId(4),
+                    kind: ObjectKind::File,
+                    link_count: 1,
+                    semantics: reparse_semantics,
+                    streams: vec![resident(4, None, b"")],
+                },
+            ],
+            vec![
+                NamespaceEntry {
+                    parent: ObjectId(1),
+                    target: ObjectId(2),
+                    name: "beta.txt".encode_utf16().collect(),
+                },
+                NamespaceEntry {
+                    parent: ObjectId(1),
+                    target: ObjectId(2),
+                    name: "alpha.txt".encode_utf16().collect(),
+                },
+                NamespaceEntry {
+                    parent: ObjectId(1),
+                    target: ObjectId(3),
+                    name: "junction".encode_utf16().collect(),
+                },
+                NamespaceEntry {
+                    parent: ObjectId(1),
+                    target: ObjectId(4),
+                    name: "link.lnk".encode_utf16().collect(),
+                },
+            ],
+            ExtentGraph::build(Vec::new(), VOLUME_BYTES, 1).unwrap(),
+            ObjectGraphLimits {
+                max_objects: 8,
+                max_entries: 8,
+                max_streams: 8,
+                max_name_code_units: 255,
+            },
+        )
+        .unwrap();
+        let metadata =
+            |object: u64, kind: ObjectKind, timestamps, attributes: u32| NtfsObjectMetadata {
+                object: ObjectId(object),
+                object_kind: kind,
+                timestamps,
+                dos_file_attributes: attributes,
+                security_id: NTFS3G_SECURITY_ID_READ_WRITE,
+            };
+        let object_metadata = vec![
+            metadata(1, ObjectKind::Directory, root_stamps, 0x16),
+            metadata(2, ObjectKind::File, file_stamps, 0x21),
+            metadata(3, ObjectKind::Directory, junction_stamps, 0x10),
+            metadata(4, ObjectKind::File, symlink_stamps, 0x20),
+        ];
+        let label: Vec<u16> = "Round Trip Volume 2025".encode_utf16().collect();
+        let serial = 0x1122_3344_5566_7788;
+        let plan = plan_ntfs_destination_with_metadata_and_volume(
+            &graph,
+            NtfsDestinationInputs {
+                image_bytes: VOLUME_BYTES,
+                partition_offset_sectors: 0,
+                cluster_bytes: 4096,
+                volume_serial_number: serial,
+                timestamp: BASE,
+            },
+            &object_metadata,
+            NtfsVolumeProfile {
+                volume_label: Some(&label),
+                bad_cluster_ranges: &[],
+                reparse_points: &[
+                    (ObjectId(3), junction_payload.as_slice()),
+                    (ObjectId(4), symlink_payload.as_slice()),
+                ],
+            },
+            NtfsSerializeLimits::default(),
+        )
+        .unwrap();
+        let mut image = vec![0_u8; usize::try_from(VOLUME_BYTES).unwrap()];
+        for write in plan
+            .staging_writes
+            .iter()
+            .chain(std::iter::once(&plan.backup_boot_write))
+            .chain(std::iter::once(&plan.primary_boot_write))
+        {
+            let start = usize::try_from(write.offset).unwrap();
+            image[start..start + write.bytes.len()].copy_from_slice(&write.bytes);
+        }
+        RoundTripSource {
+            image,
+            serial,
+            label,
+            objects: vec![
+                (vec![], root_stamps, 0x06),
+                (vec!["alpha.txt"], file_stamps, 0x21),
+                (vec!["junction"], junction_stamps, 0x00),
+                (vec!["link.lnk"], symlink_stamps, 0x20),
+            ],
+            junction_payload,
+            symlink_payload,
+        }
+    }
+
+    fn ntfs_path_of(normalized: &NormalizedNtfs, object: ObjectId) -> Vec<String> {
+        let mut path = Vec::new();
+        let mut current = object;
+        while current != normalized.graph.root() {
+            let entry = normalized
+                .graph
+                .entries()
+                .iter()
+                .find(|entry| entry.target == current)
+                .unwrap();
+            path.push(String::from_utf16(&entry.name).unwrap());
+            current = entry.parent;
+        }
+        path.reverse();
+        path
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
+    fn escrow_round_trip_restores_ntfs_identities_metadata_and_reparse_index() {
+        use crate::cross_format::draft_escrow_restored_exfat_to_ntfs;
+        use crate::escrow_restore::{NtfsRestoreError, decode_restore_sidecar};
+        use crate::fs::ntfs_extend::parse_reparse_r_index_entries;
+        use crate::preservation::PreservationLimits;
+
+        let source = ntfs_round_trip_source();
+        let source_file = TempFile::create(&source.image);
+        let source_image = ImageFile::open(&source_file.path).unwrap();
+        let source_snapshot =
+            capture_source_image_snapshot(&source_image, CandidateExportLimits::default()).unwrap();
+        let inspection = inspect_open_image(&source_image).unwrap();
+        let normalized = inspection.normalized_ntfs.as_deref().unwrap();
+        assert_eq!(normalized.graph.objects().len(), 4);
+
+        // Forward: NTFS -> exFAT with escrow.
+        let draft = draft_lossless_ntfs_to_exfat(
+            normalized,
+            GuaranteeMode::Escrow,
+            NtfsToExfatOptions::default(),
+            NtfsToExfatLimits::default(),
+        )
+        .unwrap();
+        let solved = solve_lossless_ntfs_to_exfat(draft, LayoutLimits::default()).unwrap();
+        let preview = preview_exfat_phase_writes(
+            &source_image,
+            &solved.destination,
+            PreimageLimits::default(),
+        )
+        .unwrap();
+        let exfat_path = temp_path("round-trip.exfat.img");
+        let exfat_escrow_path = temp_path("round-trip.exfat.escrow");
+        export_relocated_candidate_image(
+            &source_image,
+            &exfat_path,
+            Some(&exfat_escrow_path),
+            &preview,
+            &source_snapshot,
+            solved.relocation(),
+            &solved.preservation,
+            CandidateExportLimits::default(),
+        )
+        .unwrap();
+
+        // Backward: the exFAT candidate plus its bound escrow become a new NTFS image.
+        let exfat_image = ImageFile::open(&exfat_path).unwrap();
+        let exfat_snapshot =
+            capture_source_image_snapshot(&exfat_image, CandidateExportLimits::default()).unwrap();
+        let exfat_inspection = inspect_open_image(&exfat_image).unwrap();
+        let normalized_exfat = exfat_inspection.normalized_exfat.as_deref().unwrap();
+        assert_eq!(normalized_exfat.graph.entries().len(), 3);
+        let escrow_bytes = fs::read(&exfat_escrow_path).unwrap();
+        let sidecar = decode_restore_sidecar(
+            &escrow_bytes,
+            exfat_snapshot.sha256(),
+            CandidateExportLimits::default().max_escrow_bytes,
+            PreservationLimits::default(),
+        )
+        .unwrap();
+        let restored_draft = draft_escrow_restored_exfat_to_ntfs(
+            normalized_exfat,
+            &sidecar,
+            GuaranteeMode::Escrow,
+            ExfatToNtfsOptions::default(),
+            ExfatToNtfsLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(restored_draft.target_graph().entries().len(), 4);
+        let restored_solved =
+            solve_lossless_exfat_to_ntfs(restored_draft, LayoutLimits::default()).unwrap();
+        let restored_preview = preview_ntfs_phase_writes(
+            &exfat_image,
+            &restored_solved.destination,
+            PreimageLimits::default(),
+        )
+        .unwrap();
+        let ntfs_path = temp_path("round-trip.restored.ntfs.img");
+        let ntfs_escrow_path = temp_path("round-trip.restored.ntfs.escrow");
+        export_relocated_candidate_image(
+            &exfat_image,
+            &ntfs_path,
+            Some(&ntfs_escrow_path),
+            &restored_preview,
+            &exfat_snapshot,
+            restored_solved.relocation(),
+            &restored_solved.preservation,
+            CandidateExportLimits::default(),
+        )
+        .unwrap();
+        verify_bound_export(
+            &ntfs_path,
+            &ntfs_escrow_path,
+            Some(&exfat_path),
+            CandidateVerificationLimits::default(),
+        )
+        .unwrap();
+
+        // The restored NTFS volume carries the original identities and exact metadata.
+        let restored_inspection = inspect_image(&ntfs_path).unwrap();
+        let restored = restored_inspection.normalized_ntfs.as_deref().unwrap();
+        assert_eq!(restored.preservation.volume_serial_number, source.serial);
+        assert_eq!(
+            restored.preservation.volume_label.as_deref(),
+            Some(source.label.as_slice())
+        );
+        assert_eq!(restored.graph.objects().len(), 4);
+        let mut names: Vec<String> = restored
+            .graph
+            .entries()
+            .iter()
+            .map(|entry| String::from_utf16(&entry.name).unwrap())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, ["alpha.txt", "beta.txt", "junction", "link.lnk"]);
+        let file = restored
+            .graph
+            .objects()
+            .iter()
+            .find(|object| object.streams.len() == 2)
+            .unwrap();
+        assert_eq!(file.link_count, 2);
+        let restored_bytes = fs::read(&ntfs_path).unwrap();
+        let stream_bytes = |stream: &crate::object::ObjectStream| -> Vec<u8> {
+            match &stream.storage {
+                StreamStorage::Resident(bytes) => bytes.clone(),
+                StreamStorage::Extents => {
+                    let mut bytes = Vec::new();
+                    for extent in restored.graph.extents().extents() {
+                        if extent.stream != stream.id {
+                            continue;
+                        }
+                        let Placement::Physical { byte_offset } = extent.placement else {
+                            panic!("physical placement");
+                        };
+                        let start = usize::try_from(byte_offset).unwrap();
+                        let end = start + usize::try_from(extent.length).unwrap();
+                        bytes.extend_from_slice(&restored_bytes[start..end]);
+                    }
+                    bytes.truncate(usize::try_from(stream.logical_bytes).unwrap());
+                    bytes
+                }
+            }
+        };
+        let fork_name: Vec<u16> = "fork".encode_utf16().collect();
+        let fork = file
+            .streams
+            .iter()
+            .find(|stream| stream.name.as_deref() == Some(fork_name.as_slice()))
+            .expect("restored named stream");
+        assert_eq!(stream_bytes(fork), b"xyz");
+        let unnamed = file
+            .streams
+            .iter()
+            .find(|stream| stream.name.is_none())
+            .expect("restored unnamed stream");
+        assert_eq!(stream_bytes(unnamed), b"abc");
+        let mut listed_reparse = Vec::new();
+        let mut checked_objects = 0usize;
+        for preserved in &restored.preservation.objects {
+            let object = &preserved.source;
+            let is_user_visible = preserved.object == restored.graph.root()
+                || restored
+                    .graph
+                    .entries()
+                    .iter()
+                    .any(|entry| entry.target == preserved.object);
+            if !is_user_visible {
+                // System records ($MFT, $Extend and its children, ...) are not part of the
+                // user-visible graph and carry no escrowed metadata.
+                continue;
+            }
+            checked_objects += 1;
+            let path = ntfs_path_of(restored, preserved.object);
+            let expected = source
+                .objects
+                .iter()
+                .find(|(expected_path, _, _)| {
+                    expected_path.len() == path.len()
+                        && expected_path
+                            .iter()
+                            .zip(path.iter())
+                            .all(|(left, right)| *left == right)
+                })
+                .unwrap_or_else(|| panic!("unexpected restored path {path:?}"));
+            let standard = object.standard_information.unwrap();
+            assert_eq!(
+                (
+                    standard.creation_time,
+                    standard.modification_time,
+                    standard.mft_change_time,
+                    standard.access_time
+                ),
+                (
+                    expected.1.creation_time,
+                    expected.1.modification_time,
+                    expected.1.mft_change_time,
+                    expected.1.access_time
+                ),
+                "timestamps for {path:?}"
+            );
+            assert_eq!(
+                standard.file_attributes & 0xffff & !0x0410,
+                expected.2,
+                "attributes for {path:?}"
+            );
+            match path.first().map(String::as_str) {
+                Some("junction") => {
+                    assert!(object.is_directory);
+                    assert_eq!(
+                        object.reparse_point.as_deref(),
+                        Some(source.junction_payload.as_slice())
+                    );
+                    listed_reparse.push(object.reference);
+                }
+                Some("link.lnk") => {
+                    assert!(!object.is_directory);
+                    assert_eq!(
+                        object.reparse_point.as_deref(),
+                        Some(source.symlink_payload.as_slice())
+                    );
+                    listed_reparse.push(object.reference);
+                }
+                _ => assert!(object.reparse_point.is_none()),
+            }
+        }
+        assert_eq!(listed_reparse.len(), 2);
+        assert_eq!(checked_objects, source.objects.len());
+
+        // `$Extend\$Reparse:$R` lists exactly those two reparse points.
+        let cluster = u64::from(restored_solved.destination.cluster_bytes);
+        let record_offset =
+            usize::try_from(restored_solved.destination.mft_lcn * cluster + 26 * 1024).unwrap();
+        let record = crate::fs::ntfs_record::parse_file_record(
+            &restored_bytes[record_offset..record_offset + 1024],
+        )
+        .unwrap();
+        let attributes = crate::fs::ntfs_attribute::parse_attribute_list(
+            record.repaired_bytes(),
+            usize::from(record.attributes_offset),
+            usize::try_from(record.bytes_in_use).unwrap(),
+            crate::fs::ntfs_attribute::AttributeLimits {
+                cluster_size_bytes: cluster,
+                max_attribute_bytes: 1024,
+                max_name_code_units: 255,
+                max_attributes: 32,
+            },
+        )
+        .unwrap();
+        let r_name: Vec<u16> = "$R".encode_utf16().collect();
+        let root = attributes
+            .attributes
+            .iter()
+            .find(|attribute| {
+                attribute.attribute_type == 0x90
+                    && attribute
+                        .name
+                        .as_ref()
+                        .is_some_and(|name| name.code_units == r_name)
+            })
+            .unwrap();
+        let crate::fs::ntfs_attribute::AttributeBody::Resident(root) = &root.body else {
+            panic!("resident $Reparse:$R");
+        };
+        let keys = parse_reparse_r_index_entries(&root.value[32..]).unwrap();
+        let mut expected_keys: Vec<(u32, u64, u16)> = listed_reparse
+            .iter()
+            .map(|reference| {
+                let object = restored
+                    .preservation
+                    .objects
+                    .iter()
+                    .find(|preserved| preserved.source.reference == *reference)
+                    .unwrap();
+                let tag = u32::from_le_bytes(
+                    object.source.reparse_point.as_ref().unwrap()[..4]
+                        .try_into()
+                        .unwrap(),
+                );
+                (tag, reference.record_number, reference.sequence_number)
+            })
+            .collect();
+        expected_keys.sort_unstable();
+        let mut actual_keys: Vec<(u32, u64, u16)> = keys
+            .iter()
+            .map(|key| {
+                (
+                    key.reparse_tag,
+                    key.file_reference & 0xffff_ffff_ffff,
+                    u16::try_from(key.file_reference >> 48).unwrap(),
+                )
+            })
+            .collect();
+        actual_keys.sort_unstable();
+        assert_eq!(actual_keys, expected_keys);
+
+        // Binding: an edited exFAT image or a wrong-direction escrow is refused before restore.
+        let mut edited = fs::read(&exfat_path).unwrap();
+        let last = edited.len() - 1;
+        edited[last] ^= 0x01;
+        let edited_sha: [u8; 32] = Sha256::digest(&edited).into();
+        assert!(matches!(
+            decode_restore_sidecar(
+                &escrow_bytes,
+                edited_sha,
+                CandidateExportLimits::default().max_escrow_bytes,
+                PreservationLimits::default(),
+            ),
+            Err(NtfsRestoreError::CandidateBindingMismatch { .. })
+        ));
+        let restored_sha: [u8; 32] = Sha256::digest(&restored_bytes).into();
+        assert!(matches!(
+            decode_restore_sidecar(
+                &fs::read(&ntfs_escrow_path).unwrap(),
+                restored_sha,
+                CandidateExportLimits::default().max_escrow_bytes,
+                PreservationLimits::default(),
+            ),
+            Err(NtfsRestoreError::EscrowDirectionMismatch { .. })
+        ));
+
+        assert_eq!(fs::read(&source_file.path).unwrap(), source.image);
+        for path in [exfat_path, exfat_escrow_path, ntfs_path, ntfs_escrow_path] {
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    /// Source NTFS image whose `data.bin` carries a `:big` stream one cluster above the inventory
+    /// capture cap, so the escrow sidecar cannot hold its bytes.
+    #[allow(clippy::too_many_lines)]
+    fn ntfs_image_with_uncaptured_named_stream() -> (Vec<u8>, Vec<u8>) {
+        const VOLUME_BYTES: u64 = 64 * 1024 * 1024;
+        let ads_len = NtfsInventoryLimits::default().max_resident_data_bytes + 4096;
+        let ads: Vec<u8> = (0..ads_len)
+            .map(|index| u8::try_from((index * 7 + index / 4093) % 251).unwrap())
+            .collect();
+        let ads_bytes = u64::try_from(ads.len()).unwrap();
+        let objects = vec![
+            ObjectRecord {
+                id: ObjectId(1),
+                kind: ObjectKind::Directory,
+                link_count: 0,
+                semantics: ObjectSemantics::default(),
+                streams: Vec::new(),
+            },
+            ObjectRecord {
+                id: ObjectId(2),
+                kind: ObjectKind::File,
+                link_count: 1,
+                semantics: ObjectSemantics::default(),
+                streams: vec![
+                    ObjectStream {
+                        id: StreamId(2),
+                        name: None,
+                        logical_bytes: 3,
+                        initialized_bytes: 3,
+                        mapped_bytes: 3,
+                        allocated_bytes: 0,
+                        flags: StreamFlags::default(),
+                        storage: StreamStorage::Resident(b"abc".to_vec()),
+                    },
+                    ObjectStream {
+                        id: StreamId(3),
+                        name: Some("big".encode_utf16().collect()),
+                        logical_bytes: ads_bytes,
+                        initialized_bytes: ads_bytes,
+                        mapped_bytes: ads_bytes,
+                        allocated_bytes: ads_bytes,
+                        flags: StreamFlags::default(),
+                        storage: StreamStorage::Extents,
+                    },
+                ],
+            },
+        ];
+        let entries = vec![NamespaceEntry {
+            parent: ObjectId(1),
+            target: ObjectId(2),
+            name: "data.bin".encode_utf16().collect(),
+        }];
+        for offset in (8 * 1024 * 1024..32 * 1024 * 1024).step_by(1024 * 1024) {
+            let graph = ObjectGraph::build(
+                ObjectId(1),
+                objects.clone(),
+                entries.clone(),
+                ExtentGraph::build(
+                    vec![Extent {
+                        stream: StreamId(3),
+                        logical_offset: 0,
+                        length: ads_bytes,
+                        placement: Placement::Physical {
+                            byte_offset: offset,
+                        },
+                        kind: ExtentKind::FileData,
+                    }],
+                    VOLUME_BYTES,
+                    4,
+                )
+                .unwrap(),
+                ObjectGraphLimits {
+                    max_objects: 4,
+                    max_entries: 4,
+                    max_streams: 4,
+                    max_name_code_units: 255,
+                },
+            )
+            .unwrap();
+            let Ok(plan) = plan_ntfs_destination(
+                &graph,
+                NtfsDestinationInputs {
+                    image_bytes: VOLUME_BYTES,
+                    partition_offset_sectors: 0,
+                    cluster_bytes: 4096,
+                    volume_serial_number: 0x0bad_c0de_1234_5678,
+                    timestamp: 0x01dc_0000_0000_0000,
+                },
+                NtfsSerializeLimits::default(),
+            ) else {
+                continue;
+            };
+            let mut image = vec![0_u8; usize::try_from(VOLUME_BYTES).unwrap()];
+            let start = usize::try_from(offset).unwrap();
+            image[start..start + ads.len()].copy_from_slice(&ads);
+            for write in plan
+                .staging_writes
+                .iter()
+                .chain(std::iter::once(&plan.backup_boot_write))
+                .chain(std::iter::once(&plan.primary_boot_write))
+            {
+                let write_start = usize::try_from(write.offset).unwrap();
+                image[write_start..write_start + write.bytes.len()].copy_from_slice(&write.bytes);
+            }
+            return (image, ads);
+        }
+        panic!("could not place the oversized named stream outside NTFS metadata");
+    }
+
+    fn graph_stream_bytes(
+        graph: &ObjectGraph,
+        image: &[u8],
+        stream: &crate::object::ObjectStream,
+    ) -> Vec<u8> {
+        match &stream.storage {
+            StreamStorage::Resident(bytes) => bytes.clone(),
+            StreamStorage::Extents => {
+                let mut extents: Vec<&Extent> = graph
+                    .extents()
+                    .extents()
+                    .iter()
+                    .filter(|extent| extent.stream == stream.id)
+                    .collect();
+                extents.sort_by_key(|extent| extent.logical_offset);
+                let mut bytes = Vec::new();
+                for extent in extents {
+                    match extent.placement {
+                        Placement::Physical { byte_offset } => {
+                            let start = usize::try_from(byte_offset).unwrap();
+                            let end = start + usize::try_from(extent.length).unwrap();
+                            bytes.extend_from_slice(&image[start..end]);
+                        }
+                        Placement::Sparse => {
+                            bytes.resize(bytes.len() + usize::try_from(extent.length).unwrap(), 0);
+                        }
+                    }
+                }
+                bytes.truncate(usize::try_from(stream.logical_bytes).unwrap());
+                bytes
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn escrow_round_trip_carries_uncaptured_named_stream_as_dest_native_file() {
+        use crate::cross_format::draft_escrow_restored_exfat_to_ntfs;
+        use crate::escrow_carrier::{carrier_directory_name, carrier_file_name};
+        use crate::escrow_restore::decode_restore_sidecar;
+        use crate::fs::ntfs_inventory::NtfsStreamStorage;
+        use crate::preservation::PreservationLimits;
+
+        let (source_bytes, ads) = ntfs_image_with_uncaptured_named_stream();
+        let source_file = TempFile::create(&source_bytes);
+        let source_image = ImageFile::open(&source_file.path).unwrap();
+        let source_snapshot =
+            capture_source_image_snapshot(&source_image, CandidateExportLimits::default()).unwrap();
+        let inspection = inspect_open_image(&source_image).unwrap();
+        let normalized = inspection.normalized_ntfs.as_deref().unwrap();
+        let big_name: Vec<u16> = "big".encode_utf16().collect();
+        let source_object = normalized
+            .preservation
+            .objects
+            .iter()
+            .find(|preserved| {
+                preserved.source.data_streams.iter().any(|stream| {
+                    stream.name.as_ref().map(|name| &name.code_units) == Some(&big_name)
+                })
+            })
+            .expect("source file with :big");
+        let big_stream = source_object
+            .source
+            .data_streams
+            .iter()
+            .find(|stream| stream.name.as_ref().map(|name| &name.code_units) == Some(&big_name))
+            .unwrap();
+        let NtfsStreamStorage::NonResident {
+            captured_payload: None,
+            data_bytes,
+            ..
+        } = &big_stream.storage
+        else {
+            panic!("the oversized named stream must be non-resident and uncaptured");
+        };
+        assert_eq!(*data_bytes, u64::try_from(ads.len()).unwrap());
+        let expected_carrier_path = vec![
+            carrier_directory_name(),
+            carrier_file_name(source_object.object.0, big_stream.attribute_id),
+        ];
+
+        // Forward: NTFS -> exFAT with escrow; the ADS becomes a hidden+system carrier file.
+        let draft = draft_lossless_ntfs_to_exfat(
+            normalized,
+            GuaranteeMode::Escrow,
+            NtfsToExfatOptions::default(),
+            NtfsToExfatLimits::default(),
+        )
+        .unwrap();
+        let solved = solve_lossless_ntfs_to_exfat(draft, LayoutLimits::default()).unwrap();
+        let preview = preview_exfat_phase_writes(
+            &source_image,
+            &solved.destination,
+            PreimageLimits::default(),
+        )
+        .unwrap();
+        let exfat_path = temp_path("carrier-round-trip.exfat.img");
+        let exfat_escrow_path = temp_path("carrier-round-trip.exfat.escrow");
+        export_relocated_candidate_image(
+            &source_image,
+            &exfat_path,
+            Some(&exfat_escrow_path),
+            &preview,
+            &source_snapshot,
+            solved.relocation(),
+            &solved.preservation,
+            CandidateExportLimits::default(),
+        )
+        .unwrap();
+        verify_bound_export(
+            &exfat_path,
+            &exfat_escrow_path,
+            Some(&source_file.path),
+            CandidateVerificationLimits::default(),
+        )
+        .unwrap();
+
+        let exfat_image = ImageFile::open(&exfat_path).unwrap();
+        let exfat_snapshot =
+            capture_source_image_snapshot(&exfat_image, CandidateExportLimits::default()).unwrap();
+        let exfat_inspection = inspect_open_image(&exfat_image).unwrap();
+        assert!(exfat_inspection.profile.inventory_complete);
+        let normalized_exfat = exfat_inspection.normalized_exfat.as_deref().unwrap();
+        let carrier = normalized_exfat
+            .preservation
+            .objects
+            .iter()
+            .find(|object| object.path == expected_carrier_path)
+            .expect("dest-native carrier file");
+        assert_eq!(
+            carrier.file_attributes & 0x06,
+            0x06,
+            "carrier is hidden+system"
+        );
+        let directory = normalized_exfat
+            .preservation
+            .objects
+            .iter()
+            .find(|object| object.path == vec![carrier_directory_name()])
+            .expect("escrow carrier directory");
+        assert_eq!(directory.file_attributes & 0x16, 0x16);
+        let exfat_bytes = fs::read(&exfat_path).unwrap();
+        let carrier_object = normalized_exfat
+            .graph
+            .objects()
+            .iter()
+            .find(|object| object.id == carrier.object)
+            .unwrap();
+        assert_eq!(carrier_object.streams.len(), 1);
+        assert_eq!(
+            graph_stream_bytes(
+                &normalized_exfat.graph,
+                &exfat_bytes,
+                &carrier_object.streams[0]
+            ),
+            ads,
+            "carrier bytes equal the source named stream"
+        );
+        // The visible user namespace is unchanged apart from the reserved escrow directory.
+        let mut root_names: Vec<String> = normalized_exfat
+            .graph
+            .entries()
+            .iter()
+            .filter(|entry| entry.parent == normalized_exfat.graph.root())
+            .map(|entry| String::from_utf16(&entry.name).unwrap())
+            .collect();
+        root_names.sort_unstable();
+        assert_eq!(root_names, [".starconverter-escrow", "data.bin"]);
+
+        // Backward: the carrier folds back into `data.bin:big` and disappears from the namespace.
+        let escrow_bytes = fs::read(&exfat_escrow_path).unwrap();
+        let sidecar = decode_restore_sidecar(
+            &escrow_bytes,
+            exfat_snapshot.sha256(),
+            CandidateExportLimits::default().max_escrow_bytes,
+            PreservationLimits::default(),
+        )
+        .unwrap();
+        let restored_draft = draft_escrow_restored_exfat_to_ntfs(
+            normalized_exfat,
+            &sidecar,
+            GuaranteeMode::Escrow,
+            ExfatToNtfsOptions::default(),
+            ExfatToNtfsLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(restored_draft.target_graph().entries().len(), 1);
+        assert_eq!(restored_draft.target_graph().objects().len(), 2);
+        let restored_solved =
+            solve_lossless_exfat_to_ntfs(restored_draft, LayoutLimits::default()).unwrap();
+        let restored_preview = preview_ntfs_phase_writes(
+            &exfat_image,
+            &restored_solved.destination,
+            PreimageLimits::default(),
+        )
+        .unwrap();
+        let ntfs_path = temp_path("carrier-round-trip.restored.ntfs.img");
+        let ntfs_escrow_path = temp_path("carrier-round-trip.restored.ntfs.escrow");
+        export_relocated_candidate_image(
+            &exfat_image,
+            &ntfs_path,
+            Some(&ntfs_escrow_path),
+            &restored_preview,
+            &exfat_snapshot,
+            restored_solved.relocation(),
+            &restored_solved.preservation,
+            CandidateExportLimits::default(),
+        )
+        .unwrap();
+        verify_bound_export(
+            &ntfs_path,
+            &ntfs_escrow_path,
+            Some(&exfat_path),
+            CandidateVerificationLimits::default(),
+        )
+        .unwrap();
+
+        let restored_inspection = inspect_image(&ntfs_path).unwrap();
+        assert!(restored_inspection.profile.inventory_complete);
+        let restored = restored_inspection.normalized_ntfs.as_deref().unwrap();
+        let names: Vec<String> = restored
+            .graph
+            .entries()
+            .iter()
+            .map(|entry| String::from_utf16(&entry.name).unwrap())
+            .collect();
+        assert_eq!(names, ["data.bin"]);
+        let file = restored
+            .graph
+            .objects()
+            .iter()
+            .find(|object| object.kind == ObjectKind::File)
+            .unwrap();
+        assert_eq!(file.streams.len(), 2);
+        let restored_bytes = fs::read(&ntfs_path).unwrap();
+        let unnamed = file
+            .streams
+            .iter()
+            .find(|stream| stream.name.is_none())
+            .unwrap();
+        assert_eq!(
+            graph_stream_bytes(&restored.graph, &restored_bytes, unnamed),
+            b"abc"
+        );
+        let big = file
+            .streams
+            .iter()
+            .find(|stream| stream.name.as_deref() == Some(big_name.as_slice()))
+            .expect("restored :big stream");
+        assert_eq!(big.logical_bytes, u64::try_from(ads.len()).unwrap());
+        assert_eq!(big.storage, StreamStorage::Extents);
+        assert_eq!(
+            graph_stream_bytes(&restored.graph, &restored_bytes, big),
+            ads,
+            "restored named stream bytes equal the source"
+        );
+
+        assert_eq!(fs::read(&source_file.path).unwrap(), source_bytes);
+        for path in [exfat_path, exfat_escrow_path, ntfs_path, ntfs_escrow_path] {
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn escrow_ntfs_directory_hard_links_and_nonresident_ads_export_dest_native_exfat() {
+        let (source_bytes, payload) = ntfs_image_with_directory_hard_links_and_nonresident_ads();
+        let source_file = TempFile::create(&source_bytes);
+        let source = ImageFile::open(&source_file.path).unwrap();
+        let source_snapshot =
+            capture_source_image_snapshot(&source, CandidateExportLimits::default()).unwrap();
+        let inspection = inspect_open_image(&source).unwrap();
+        let normalized = inspection.normalized_ntfs.as_deref().unwrap();
+        assert!(
+            normalized
+                .graph
+                .objects()
+                .iter()
+                .any(|object| object.kind == ObjectKind::Directory && object.link_count == 2)
+        );
+        let file = normalized
+            .graph
+            .objects()
+            .iter()
+            .find(|object| object.kind == ObjectKind::File)
+            .unwrap();
+        assert_eq!(file.link_count, 2);
+        assert_eq!(file.streams.len(), 2);
+        assert!(file.streams.iter().any(
+            |stream| stream.name.is_some() && matches!(stream.storage, StreamStorage::Extents)
+        ));
+        assert!(
+            !evaluate_ntfs(
+                normalized,
+                FileSystem::ExFat,
+                GuaranteeMode::Strict,
+                crate::preservation::PreservationLimits::default(),
+            )
+            .unwrap()
+            .permitted
+        );
+        let draft = draft_lossless_ntfs_to_exfat(
+            normalized,
+            GuaranteeMode::Escrow,
+            NtfsToExfatOptions {
+                bytes_per_cluster: 8192,
+                ..NtfsToExfatOptions::default()
+            },
+            NtfsToExfatLimits::default(),
+        )
+        .unwrap();
+        let solved = solve_lossless_ntfs_to_exfat(draft, LayoutLimits::default()).unwrap();
+        let dest_entries: Vec<(u64, Vec<u16>)> = solved
+            .target_graph()
+            .entries()
+            .iter()
+            .map(|entry| (entry.parent.0, entry.name.clone()))
+            .collect();
+        assert_eq!(
+            dest_entries,
+            vec![
+                (5, "left".encode_utf16().collect()),
+                (5, "other".encode_utf16().collect()),
+                (27, "shared.bin".encode_utf16().collect()),
+            ]
+        );
+        let dest_file = solved
+            .target_graph()
+            .objects()
+            .iter()
+            .find(|object| object.kind == ObjectKind::File)
+            .unwrap();
+        assert_eq!(dest_file.link_count, 1);
+        assert_eq!(dest_file.streams.len(), 1);
+        assert!(dest_file.streams[0].name.is_none());
+        assert!(
+            solved
+                .target_graph()
+                .objects()
+                .iter()
+                .filter(|object| object.kind == ObjectKind::Directory && object.id.0 != 5)
+                .all(|object| object.link_count == 1)
+        );
+        let destination_range = solved.layout().materializations[0].destination;
+        let preview =
+            preview_exfat_phase_writes(&source, &solved.destination, PreimageLimits::default())
+                .unwrap();
+        let destination = temp_path("dir-hardlink-ads-candidate.exfat.img");
+        let escrow = temp_path("dir-hardlink-ads-candidate.escrow");
+        export_relocated_candidate_image(
+            &source,
+            &destination,
+            Some(&escrow),
+            &preview,
+            &source_snapshot,
+            solved.relocation(),
+            &solved.preservation,
+            CandidateExportLimits::default(),
+        )
+        .unwrap();
+        let candidate_bytes = fs::read(&destination).unwrap();
+        let start = usize::try_from(destination_range.offset).unwrap();
+        assert_eq!(&candidate_bytes[start..start + payload.len()], payload);
+        verify_bound_export(
+            &destination,
+            &escrow,
+            Some(&source_file.path),
+            CandidateVerificationLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(fs::read(&source_file.path).unwrap(), source_bytes);
+        fs::remove_file(destination).unwrap();
+        fs::remove_file(escrow).unwrap();
+    }
+
+    #[test]
+    fn fragmented_ntfs_runs_are_repacked_into_exfat_clusters() {
+        let (source_bytes, payload) = ntfs_image_with_two_4k_fragments();
+        let source_file = TempFile::create(&source_bytes);
+        let source = ImageFile::open(&source_file.path).unwrap();
+        let source_snapshot =
+            capture_source_image_snapshot(&source, CandidateExportLimits::default()).unwrap();
+        let inspection = inspect_open_image(&source).unwrap();
+        let normalized = inspection.normalized_ntfs.as_deref().unwrap();
+        let draft = draft_lossless_ntfs_to_exfat(
+            normalized,
+            GuaranteeMode::Escrow,
+            NtfsToExfatOptions {
+                bytes_per_cluster: 8192,
+                ..NtfsToExfatOptions::default()
+            },
+            NtfsToExfatLimits::default(),
+        )
+        .unwrap();
+        let solved = solve_lossless_ntfs_to_exfat(draft, LayoutLimits::default()).unwrap();
+        assert!(solved.layout().relocations.is_empty());
+        assert_eq!(solved.layout().materializations.len(), 1);
+        let destination_range = solved.layout().materializations[0].destination;
+        assert_eq!(destination_range.length, 8192);
+        let preview =
+            preview_exfat_phase_writes(&source, &solved.destination, PreimageLimits::default())
+                .unwrap();
+        let destination = temp_path("repacked-candidate.exfat.img");
+        let escrow = temp_path("repacked-candidate.escrow");
+        export_relocated_candidate_image(
+            &source,
+            &destination,
+            Some(&escrow),
+            &preview,
+            &source_snapshot,
+            solved.relocation(),
+            &solved.preservation,
+            CandidateExportLimits::default(),
+        )
+        .unwrap();
+        let candidate_bytes = fs::read(&destination).unwrap();
+        let start = usize::try_from(destination_range.offset).unwrap();
+        assert_eq!(&candidate_bytes[start..start + payload.len()], payload);
+        let candidate = inspect_image(&destination).unwrap();
+        assert!(candidate.profile.inventory_complete);
+        verify_bound_export(
+            &destination,
+            &escrow,
+            Some(&source_file.path),
+            CandidateVerificationLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(fs::read(&source_file.path).unwrap(), source_bytes);
+        fs::remove_file(destination).unwrap();
+        fs::remove_file(escrow).unwrap();
+    }
+
+    #[test]
+    fn uninitialized_ntfs_fragment_tail_is_zeroed_when_materialized() {
+        let (source_bytes, initialized) = ntfs_image_with_partially_initialized_fragments();
+        let source_file = TempFile::create(&source_bytes);
+        let source = ImageFile::open(&source_file.path).unwrap();
+        let source_snapshot =
+            capture_source_image_snapshot(&source, CandidateExportLimits::default()).unwrap();
+        let inspection = inspect_open_image(&source).unwrap();
+        let normalized = inspection.normalized_ntfs.as_deref().unwrap();
+        let stream = normalized
+            .graph
+            .objects()
+            .iter()
+            .find(|object| object.kind == ObjectKind::File)
+            .unwrap()
+            .streams
+            .first()
+            .unwrap();
+        assert_eq!(stream.initialized_bytes, 5000);
+        assert_eq!(stream.logical_bytes, 8192);
+        let draft = draft_lossless_ntfs_to_exfat(
+            normalized,
+            GuaranteeMode::Escrow,
+            NtfsToExfatOptions {
+                bytes_per_cluster: 8192,
+                ..NtfsToExfatOptions::default()
+            },
+            NtfsToExfatLimits::default(),
+        )
+        .unwrap();
+        let solved = solve_lossless_ntfs_to_exfat(draft, LayoutLimits::default()).unwrap();
+        assert!(solved.layout().relocations.is_empty());
+        assert_eq!(solved.layout().materializations.len(), 1);
+        let destination_range = solved.layout().materializations[0].destination;
+        let preview =
+            preview_exfat_phase_writes(&source, &solved.destination, PreimageLimits::default())
+                .unwrap();
+        let destination = temp_path("partial-init-candidate.exfat.img");
+        let escrow = temp_path("partial-init-candidate.escrow");
+        export_relocated_candidate_image(
+            &source,
+            &destination,
+            Some(&escrow),
+            &preview,
+            &source_snapshot,
+            solved.relocation(),
+            &solved.preservation,
+            CandidateExportLimits::default(),
+        )
+        .unwrap();
+        let candidate_bytes = fs::read(&destination).unwrap();
+        let start = usize::try_from(destination_range.offset).unwrap();
+        assert_eq!(
+            &candidate_bytes[start..start + initialized.len()],
+            initialized.as_slice()
+        );
+        assert!(
+            candidate_bytes[start + initialized.len()..start + 8192]
+                .iter()
+                .all(|byte| *byte == 0),
+            "uninitialized source slack must not be copied into the destination"
+        );
+        let candidate = inspect_image(&destination).unwrap();
+        let dest_stream = candidate
+            .normalized_exfat
+            .as_deref()
+            .unwrap()
+            .graph
+            .objects()
+            .iter()
+            .find(|object| object.kind == ObjectKind::File)
+            .unwrap()
+            .streams
+            .first()
+            .unwrap();
+        assert_eq!(dest_stream.initialized_bytes, 5000);
+        assert_eq!(dest_stream.logical_bytes, 8192);
+        verify_bound_export(
+            &destination,
+            &escrow,
+            Some(&source_file.path),
+            CandidateVerificationLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(fs::read(&source_file.path).unwrap(), source_bytes);
+        fs::remove_file(destination).unwrap();
+        fs::remove_file(escrow).unwrap();
+    }
+
+    #[test]
+    fn dest_aligned_uninitialized_ntfs_payload_is_materialized_and_zeroed() {
+        let (source_bytes, initialized, source_offset) =
+            ntfs_image_with_aligned_uninitialized_payload();
+        assert_eq!(source_offset % 8192, 0);
+        let source_file = TempFile::create(&source_bytes);
+        let source = ImageFile::open(&source_file.path).unwrap();
+        let source_snapshot =
+            capture_source_image_snapshot(&source, CandidateExportLimits::default()).unwrap();
+        let inspection = inspect_open_image(&source).unwrap();
+        let normalized = inspection.normalized_ntfs.as_deref().unwrap();
+        let file_data: Vec<_> = normalized
+            .graph
+            .extents()
+            .extents()
+            .iter()
+            .filter(|extent| extent.kind == ExtentKind::FileData)
+            .collect();
+        assert_eq!(file_data.len(), 1);
+        assert_eq!(file_data[0].length, 8192);
+        assert_eq!(
+            file_data[0].placement,
+            Placement::Physical {
+                byte_offset: source_offset
+            }
+        );
+        let stream = normalized
+            .graph
+            .objects()
+            .iter()
+            .find(|object| object.kind == ObjectKind::File)
+            .unwrap()
+            .streams
+            .first()
+            .unwrap();
+        assert_eq!(stream.initialized_bytes, 5000);
+        assert_eq!(stream.logical_bytes, 8192);
+        let draft = draft_lossless_ntfs_to_exfat(
+            normalized,
+            GuaranteeMode::Escrow,
+            NtfsToExfatOptions {
+                bytes_per_cluster: 8192,
+                ..NtfsToExfatOptions::default()
+            },
+            NtfsToExfatLimits::default(),
+        )
+        .unwrap();
+        let solved = solve_lossless_ntfs_to_exfat(draft, LayoutLimits::default()).unwrap();
+        assert!(solved.layout().relocations.is_empty());
+        assert_eq!(solved.layout().materializations.len(), 1);
+        let destination_range = solved.layout().materializations[0].destination;
+        assert_eq!(destination_range.length, 8192);
+        assert_eq!(destination_range.offset % 8192, 0);
+        let preview =
+            preview_exfat_phase_writes(&source, &solved.destination, PreimageLimits::default())
+                .unwrap();
+        let destination = temp_path("aligned-partial-init-candidate.exfat.img");
+        let escrow = temp_path("aligned-partial-init-candidate.escrow");
+        export_relocated_candidate_image(
+            &source,
+            &destination,
+            Some(&escrow),
+            &preview,
+            &source_snapshot,
+            solved.relocation(),
+            &solved.preservation,
+            CandidateExportLimits::default(),
+        )
+        .unwrap();
+        let candidate_bytes = fs::read(&destination).unwrap();
+        let start = usize::try_from(destination_range.offset).unwrap();
+        assert_eq!(
+            &candidate_bytes[start..start + initialized.len()],
+            initialized.as_slice()
+        );
+        assert!(
+            candidate_bytes[start + initialized.len()..start + 8192]
+                .iter()
+                .all(|byte| *byte == 0),
+            "uninitialized source slack must not be copied into a dest-aligned cluster"
+        );
+        verify_bound_export(
+            &destination,
+            &escrow,
+            Some(&source_file.path),
+            CandidateVerificationLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(fs::read(&source_file.path).unwrap(), source_bytes);
+        fs::remove_file(destination).unwrap();
+        fs::remove_file(escrow).unwrap();
+    }
+
+    #[test]
+    fn mixed_relocation_and_resident_materialization_export_to_exfat() {
+        let (source_bytes, relocated_payload, resident_payload, source_offset) =
+            ntfs_image_with_misaligned_and_resident_payloads();
+        let source_file = TempFile::create(&source_bytes);
+        let source = ImageFile::open(&source_file.path).unwrap();
+        let source_snapshot =
+            capture_source_image_snapshot(&source, CandidateExportLimits::default()).unwrap();
+        let inspection = inspect_open_image(&source).unwrap();
+        let normalized = inspection.normalized_ntfs.as_deref().unwrap();
+        let draft = draft_lossless_ntfs_to_exfat(
+            normalized,
+            GuaranteeMode::Escrow,
+            NtfsToExfatOptions {
+                bytes_per_cluster: 8192,
+                ..NtfsToExfatOptions::default()
+            },
+            NtfsToExfatLimits::default(),
+        )
+        .unwrap();
+        let solved = solve_lossless_ntfs_to_exfat(draft, LayoutLimits::default()).unwrap();
+        assert_eq!(solved.layout().relocations.len(), 1);
+        assert_eq!(solved.layout().materializations.len(), 1);
+        let relocation = solved.layout().relocations[0];
+        let materialization = solved.layout().materializations[0];
+        assert_eq!(relocation.source.offset, source_offset);
+        assert_eq!(relocation.destination.offset % 8192, 0);
+        assert_eq!(materialization.destination.length, 8192);
+        let payload_total = solved.layout().relocated_bytes + solved.layout().materialized_bytes;
+        let preview =
+            preview_exfat_phase_writes(&source, &solved.destination, PreimageLimits::default())
+                .unwrap();
+        let destination = temp_path("mixed-candidate.exfat.img");
+        let escrow = temp_path("mixed-candidate.escrow");
+        let mut last_payload_progress = None;
+        export_relocated_candidate_image_with_progress(
+            &source,
+            &destination,
+            Some(&escrow),
+            &preview,
+            &source_snapshot,
+            solved.relocation(),
+            &solved.preservation,
+            CandidateExportLimits::default(),
+            |progress| {
+                if progress.phase == CandidateWorkPhase::RelocatePayload {
+                    if let Some((completed, total)) = last_payload_progress {
+                        assert!(progress.completed_bytes >= completed);
+                        assert_eq!(progress.total_bytes, total);
+                    }
+                    last_payload_progress = Some((progress.completed_bytes, progress.total_bytes));
+                }
+                CandidateWorkControl::Continue
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            last_payload_progress,
+            Some((payload_total, Some(payload_total)))
+        );
+        let candidate_bytes = fs::read(&destination).unwrap();
+        let relocated_start = usize::try_from(relocation.destination.offset).unwrap();
+        assert_eq!(
+            &candidate_bytes[relocated_start..relocated_start + relocated_payload.len()],
+            relocated_payload.as_slice()
+        );
+        let materialized_start = usize::try_from(materialization.destination.offset).unwrap();
+        assert_eq!(
+            &candidate_bytes[materialized_start..materialized_start + resident_payload.len()],
+            resident_payload.as_slice()
+        );
+        assert!(
+            candidate_bytes[materialized_start + resident_payload.len()..materialized_start + 8192]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        verify_bound_export(
+            &destination,
+            &escrow,
+            Some(&source_file.path),
+            CandidateVerificationLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(fs::read(&source_file.path).unwrap(), source_bytes);
+        fs::remove_file(destination).unwrap();
+        fs::remove_file(escrow).unwrap();
+    }
+
+    #[test]
+    fn fragmented_exfat_runs_are_repacked_into_ntfs_clusters() {
+        let (source_bytes, payload) = exfat_image_with_two_4k_fragments();
+        let source_file = TempFile::create(&source_bytes);
+        let source = ImageFile::open(&source_file.path).unwrap();
+        let source_snapshot =
+            capture_source_image_snapshot(&source, CandidateExportLimits::default()).unwrap();
+        let inspection = inspect_open_image(&source).unwrap();
+        let normalized = inspection.normalized_exfat.as_deref().unwrap();
+        let draft = draft_lossless_exfat_to_ntfs(
+            normalized,
+            GuaranteeMode::Escrow,
+            ExfatToNtfsOptions {
+                cluster_bytes: 8192,
+                ..ExfatToNtfsOptions::default()
+            },
+            ExfatToNtfsLimits::default(),
+        )
+        .unwrap();
+        let solved = solve_lossless_exfat_to_ntfs(draft, LayoutLimits::default()).unwrap();
+        assert!(solved.layout().relocations.is_empty());
+        assert_eq!(solved.layout().materializations.len(), 1);
+        let destination_range = solved.layout().materializations[0].destination;
+        assert_eq!(destination_range.length, 8192);
+        assert_eq!(destination_range.offset % 8192, 0);
+        let preview =
+            preview_ntfs_phase_writes(&source, &solved.destination, PreimageLimits::default())
+                .unwrap();
+        let destination = temp_path("repacked-candidate.ntfs.img");
+        let escrow = temp_path("repacked-ntfs-candidate.escrow");
+        export_relocated_candidate_image(
+            &source,
+            &destination,
+            Some(&escrow),
+            &preview,
+            &source_snapshot,
+            solved.relocation(),
+            &solved.preservation,
+            CandidateExportLimits::default(),
+        )
+        .unwrap();
+        let candidate_bytes = fs::read(&destination).unwrap();
+        let start = usize::try_from(destination_range.offset).unwrap();
+        assert_eq!(&candidate_bytes[start..start + payload.len()], payload);
+        let candidate = inspect_image(&destination).unwrap();
+        assert_eq!(candidate.profile.filesystem, FileSystem::Ntfs);
+        assert!(candidate.profile.inventory_complete);
+        verify_bound_export(
+            &destination,
+            &escrow,
+            Some(&source_file.path),
+            CandidateVerificationLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(fs::read(&source_file.path).unwrap(), source_bytes);
+        fs::remove_file(destination).unwrap();
+        fs::remove_file(escrow).unwrap();
+    }
+
+    #[test]
+    fn dest_aligned_uninitialized_exfat_payload_is_materialized_and_zeroed() {
+        let (source_bytes, initialized) = exfat_image_with_aligned_uninitialized_payload();
+        let source_file = TempFile::create(&source_bytes);
+        let source = ImageFile::open(&source_file.path).unwrap();
+        let source_snapshot =
+            capture_source_image_snapshot(&source, CandidateExportLimits::default()).unwrap();
+        let inspection = inspect_open_image(&source).unwrap();
+        let normalized = inspection.normalized_exfat.as_deref().unwrap();
+        let file_data: Vec<_> = normalized
+            .graph
+            .extents()
+            .extents()
+            .iter()
+            .filter(|extent| extent.kind == ExtentKind::FileData)
+            .collect();
+        assert_eq!(file_data.len(), 1);
+        assert_eq!(file_data[0].length, 4096);
+        let stream = normalized
+            .graph
+            .objects()
+            .iter()
+            .find(|object| object.kind == ObjectKind::File)
+            .unwrap()
+            .streams
+            .first()
+            .unwrap();
+        assert_eq!(stream.initialized_bytes, 1000);
+        assert_eq!(stream.logical_bytes, 4096);
+        let draft = draft_lossless_exfat_to_ntfs(
+            normalized,
+            GuaranteeMode::Escrow,
+            ExfatToNtfsOptions {
+                cluster_bytes: 4096,
+                ..ExfatToNtfsOptions::default()
+            },
+            ExfatToNtfsLimits::default(),
+        )
+        .unwrap();
+        let solved = solve_lossless_exfat_to_ntfs(draft, LayoutLimits::default()).unwrap();
+        assert!(solved.layout().relocations.is_empty());
+        assert_eq!(solved.layout().materializations.len(), 1);
+        let destination_range = solved.layout().materializations[0].destination;
+        assert_eq!(destination_range.length, 4096);
+        let preview =
+            preview_ntfs_phase_writes(&source, &solved.destination, PreimageLimits::default())
+                .unwrap();
+        let destination = temp_path("aligned-partial-init-candidate.ntfs.img");
+        let escrow = temp_path("aligned-partial-init-candidate.ntfs.escrow");
+        export_relocated_candidate_image(
+            &source,
+            &destination,
+            Some(&escrow),
+            &preview,
+            &source_snapshot,
+            solved.relocation(),
+            &solved.preservation,
+            CandidateExportLimits::default(),
+        )
+        .unwrap();
+        let candidate_bytes = fs::read(&destination).unwrap();
+        let start = usize::try_from(destination_range.offset).unwrap();
+        assert_eq!(
+            &candidate_bytes[start..start + initialized.len()],
+            initialized.as_slice()
+        );
+        assert!(
+            candidate_bytes[start + initialized.len()..start + 4096]
+                .iter()
+                .all(|byte| *byte == 0),
+            "uninitialized exFAT slack must not be copied into dest-aligned NTFS clusters"
+        );
+        verify_bound_export(
+            &destination,
+            &escrow,
+            Some(&source_file.path),
+            CandidateVerificationLimits::default(),
+        )
+        .unwrap();
         assert_eq!(fs::read(&source_file.path).unwrap(), source_bytes);
         fs::remove_file(destination).unwrap();
         fs::remove_file(escrow).unwrap();

@@ -15,12 +15,19 @@
 
 #![allow(clippy::module_name_repetitions)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::FileSystem;
 use crate::GuaranteeMode;
-use crate::extent::{ExtentKind, Placement, StreamId};
+use crate::escrow_carrier::{
+    ESCROW_CARRIER_DIRECTORY, carrier_directory_name, collides_with_carrier_directory,
+    sidecar_carriers,
+};
+use crate::escrow_restore::{
+    NtfsRestoreError, RestoredNtfsIdentities, restore_ntfs_identities_with_evidence,
+};
+use crate::extent::{Extent, ExtentGraph, ExtentGraphError, ExtentKind, Placement, StreamId};
 use crate::fs::exfat_inventory::{ExfatPreservationEvidence, ExfatTimestamps};
 use crate::fs::exfat_normalize::NormalizedExfat;
 use crate::fs::exfat_serialize::{
@@ -28,12 +35,15 @@ use crate::fs::exfat_serialize::{
     ExfatSerializeLimits, ExfatSerializeOptions, ExfatVolumeProfile, draft_exfat_destination,
     finalize_exfat_destination, serialize_exfat_destination,
 };
+use crate::fs::exfat_upcase::MAX_FILE_NAME_CODE_UNITS;
 use crate::fs::exfat_upcase_serialize::{
-    RECOMMENDED_EXFAT_UPCASE_CHECKSUM, RecommendedExfatUpcaseError, RecommendedExfatUpcaseLimits,
-    generate_recommended_exfat_upcase,
+    RECOMMENDED_EXFAT_UPCASE_CHECKSUM, RecommendedExfatUpcase, RecommendedExfatUpcaseError,
+    RecommendedExfatUpcaseLimits, generate_recommended_exfat_upcase,
 };
-use crate::fs::ntfs_inventory::NtfsExtentPlacement;
-use crate::fs::ntfs_normalize::NormalizedNtfs;
+use crate::fs::ntfs_essential::BADCLUS_STREAM_NAME;
+use crate::fs::ntfs_index::FileNameNamespace;
+use crate::fs::ntfs_inventory::{NtfsExtentPlacement, NtfsStreamStorage};
+use crate::fs::ntfs_normalize::{NormalizedNtfs, NtfsPreservationSidecar};
 use crate::fs::ntfs_serialize::{
     NTFS3G_SECURITY_ID_READ_WRITE, NtfsDestinationDraft, NtfsDestinationInputs,
     NtfsDestinationPlan, NtfsObjectMetadata, NtfsObjectTimestamps, NtfsSerializeError,
@@ -41,14 +51,18 @@ use crate::fs::ntfs_serialize::{
     finalize_ntfs_destination, plan_ntfs_destination_with_metadata_and_volume,
 };
 use crate::geometry::{
-    ByteRange, LayoutError, LayoutLimits, LayoutPlan, RelocatedGraphError, SealedRelocationPlan,
-    SourceAllocation, solve_layout_with_destination_domain_and_alignments,
+    ByteRange, LayoutError, LayoutLimits, LayoutPlan, MaterializationRequest, RelocatedGraphError,
+    SealedRelocationPlan, SourceAllocation, materialization_length_for_stream,
+    solve_layout_with_destination_domain_alignments_and_materializations,
     solve_layout_with_staging_exclusions_and_io_alignment,
 };
-use crate::object::{ObjectGraph, ObjectGraphError, ObjectGraphLimits, ObjectId, ObjectKind};
+use crate::object::{
+    NamespaceEntry, ObjectGraph, ObjectGraphError, ObjectGraphLimits, ObjectId, ObjectKind,
+    ObjectRecord, ObjectSemantics,
+};
 use crate::preservation::{
     PreservationError, PreservationField, PreservationLimits, PreservationReport, evaluate_exfat,
-    evaluate_ntfs,
+    evaluate_ntfs, is_legal_exfat_name,
 };
 
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
@@ -260,10 +274,9 @@ impl NtfsToExfatSolvedPlan {
 #[derive(Debug)]
 pub enum ExfatToNtfsError {
     ContentOnlyIsNotLossless,
-    /// The current NTFS serializer does not yet project exFAT bad-cluster allocation into both
-    /// `$BadClus:$Bad` and `$Bitmap`. Escrow alone is insufficient because the converted
-    /// filesystem could otherwise allocate known-bad media.
-    AllocatedBadClustersNotRepresented {
+    /// Source bad-cluster count and exact extent evidence disagree, so the destination cannot
+    /// mark the same unusable media in `$BadClus:$Bad` and `$Bitmap`.
+    InconsistentBadClusterEvidence {
         allocated_clusters: u64,
         bad_cluster_extents: usize,
     },
@@ -285,6 +298,14 @@ pub enum ExfatToNtfsError {
     Layout(LayoutError),
     RelocatedGraph(RelocatedGraphError),
     Serialization(NtfsSerializeError),
+    /// The NTFS→exFAT escrow could not be reattached onto this exFAT candidate.
+    EscrowRestore(NtfsRestoreError),
+    /// A sidecar object identified by dest-native path lacks `$STANDARD_INFORMATION`, so exact
+    /// NTFS timestamps and attributes cannot be restored for it.
+    MissingEscrowStandardInformation {
+        dest: ObjectId,
+        source_record: u64,
+    },
 }
 
 impl fmt::Display for ExfatToNtfsError {
@@ -293,12 +314,12 @@ impl fmt::Display for ExfatToNtfsError {
             Self::ContentOnlyIsNotLossless => formatter.write_str(
                 "content-only mode cannot produce a lossless exFAT-to-NTFS conversion plan",
             ),
-            Self::AllocatedBadClustersNotRepresented {
+            Self::InconsistentBadClusterEvidence {
                 allocated_clusters,
                 bad_cluster_extents,
             } => write!(
                 formatter,
-                "exFAT reports {allocated_clusters} allocated bad clusters with {bad_cluster_extents} bad-cluster extents, but the NTFS serializer does not yet represent them in both `$BadClus:$Bad` and `$Bitmap`"
+                "exFAT reports {allocated_clusters} allocated bad clusters but {bad_cluster_extents} bad-cluster extents"
             ),
             Self::Preservation(error) => write!(formatter, "preservation policy failed: {error}"),
             Self::PreservationRefused { blockers } => write!(
@@ -343,6 +364,17 @@ impl fmt::Display for ExfatToNtfsError {
                 write!(formatter, "target graph relocation failed: {error}")
             }
             Self::Serialization(error) => write!(formatter, "NTFS serialization failed: {error}"),
+            Self::EscrowRestore(error) => {
+                write!(formatter, "NTFS escrow identity restore failed: {error}")
+            }
+            Self::MissingEscrowStandardInformation {
+                dest,
+                source_record,
+            } => write!(
+                formatter,
+                "escrow record {source_record} for dest object {} has no $STANDARD_INFORMATION",
+                dest.0
+            ),
         }
     }
 }
@@ -355,6 +387,7 @@ impl std::error::Error for ExfatToNtfsError {
             Self::GraphProjection(error) => Some(error),
             Self::Layout(error) => Some(error),
             Self::RelocatedGraph(error) => Some(error),
+            Self::EscrowRestore(error) => Some(error),
             _ => None,
         }
     }
@@ -390,16 +423,35 @@ impl From<RelocatedGraphError> for ExfatToNtfsError {
 pub enum NtfsToExfatError {
     ContentOnlyIsNotLossless,
     Preservation(PreservationError),
-    PreservationRefused { blockers: Vec<PreservationField> },
+    PreservationRefused {
+        blockers: Vec<PreservationField>,
+    },
     MissingObjectEvidence(ObjectId),
     DuplicateObjectEvidence(ObjectId),
     UnknownObjectEvidence(ObjectId),
     MissingStandardInformation(ObjectId),
     TimestampOutsideExfatRange(ObjectId),
     AttributesOutsideExfatRange(ObjectId),
+    NameDisambiguationFailed {
+        parent: ObjectId,
+    },
     AllocationFailed,
-    SourceMetadataLimitExceeded { actual: usize, maximum: usize },
+    SourceMetadataLimitExceeded {
+        actual: usize,
+        maximum: usize,
+    },
+    /// The sidecar implies a carrier for a named stream, but the neutral graph has no such
+    /// object or stream.
+    EscrowCarrierStreamMissing {
+        owner: ObjectId,
+        attribute_id: u16,
+    },
+    /// A source root entry folds onto the reserved escrow carrier directory name.
+    EscrowCarrierNameCollision,
+    /// No free [`ObjectId`] remained for a dest-native carrier object.
+    ObjectIdOverflow,
     GraphProjection(ObjectGraphError),
+    ExtentProjection(ExtentGraphError),
     Upcase(RecommendedExfatUpcaseError),
     Layout(LayoutError),
     RelocatedGraph(RelocatedGraphError),
@@ -447,6 +499,11 @@ impl fmt::Display for NtfsToExfatError {
                 "object {} has DOS attributes which cannot be represented by exFAT",
                 object.0
             ),
+            Self::NameDisambiguationFailed { parent } => write!(
+                formatter,
+                "directory {} has names that collide under exFAT up-case and could not be disambiguated",
+                parent.0
+            ),
             Self::AllocationFailed => {
                 formatter.write_str("could not allocate bounded cross-format metadata")
             }
@@ -454,7 +511,25 @@ impl fmt::Display for NtfsToExfatError {
                 formatter,
                 "source metadata requires {actual} allocations, exceeding {maximum}"
             ),
+            Self::EscrowCarrierStreamMissing {
+                owner,
+                attribute_id,
+            } => write!(
+                formatter,
+                "escrow names an uncaptured named stream (record {}, attribute {attribute_id}) that the neutral graph does not carry",
+                owner.0
+            ),
+            Self::EscrowCarrierNameCollision => write!(
+                formatter,
+                "a source root entry collides with the reserved `{ESCROW_CARRIER_DIRECTORY}` escrow carrier directory"
+            ),
+            Self::ObjectIdOverflow => {
+                formatter.write_str("no free object identifier remained for an escrow carrier")
+            }
             Self::GraphProjection(error) => write!(formatter, "graph projection failed: {error}"),
+            Self::ExtentProjection(error) => {
+                write!(formatter, "extent projection failed: {error}")
+            }
             Self::Upcase(error) => {
                 write!(
                     formatter,
@@ -477,6 +552,7 @@ impl std::error::Error for NtfsToExfatError {
             Self::Upcase(error) => Some(error),
             Self::Serialization(error) => Some(error),
             Self::GraphProjection(error) => Some(error),
+            Self::ExtentProjection(error) => Some(error),
             Self::Layout(error) => Some(error),
             Self::RelocatedGraph(error) => Some(error),
             _ => None,
@@ -518,9 +594,10 @@ impl From<RelocatedGraphError> for NtfsToExfatError {
 ///
 /// # Errors
 ///
-/// Refuses content-only mode, allocated bad clusters until the NTFS serializer represents them in
-/// `$BadClus:$Bad` and `$Bitmap`, any preservation blocker, incomplete/inconsistent sidecar
-/// evidence, invalid timestamps, cap exhaustion, and every refusal exposed by the NTFS serializer.
+/// Refuses content-only mode, inconsistent bad-cluster count/extent evidence, any preservation
+/// blocker, incomplete/inconsistent sidecar evidence, invalid timestamps, cap exhaustion, and
+/// every refusal exposed by the NTFS serializer. Consistent bad-cluster extents are projected
+/// into `$BadClus:$Bad` and `$Bitmap`.
 pub fn plan_lossless_exfat_to_ntfs(
     normalized: &NormalizedExfat,
     mode: GuaranteeMode,
@@ -530,18 +607,7 @@ pub fn plan_lossless_exfat_to_ntfs(
     if mode == GuaranteeMode::ContentOnly {
         return Err(ExfatToNtfsError::ContentOnlyIsNotLossless);
     }
-    let bad_cluster_extents = normalized
-        .preservation
-        .filesystem_extents
-        .iter()
-        .filter(|extent| extent.kind == ExtentKind::BadCluster)
-        .count();
-    if normalized.preservation.allocated_bad_clusters != 0 || bad_cluster_extents != 0 {
-        return Err(ExfatToNtfsError::AllocatedBadClustersNotRepresented {
-            allocated_clusters: normalized.preservation.allocated_bad_clusters,
-            bad_cluster_extents,
-        });
-    }
+    let bad_cluster_ranges = exfat_bad_cluster_ranges(normalized)?;
     let preservation = evaluate_exfat(normalized, FileSystem::Ntfs, mode, limits.preservation)?;
     if !preservation.permitted {
         let blockers = preservation.blockers;
@@ -567,6 +633,8 @@ pub fn plan_lossless_exfat_to_ntfs(
         &object_metadata,
         NtfsVolumeProfile {
             volume_label: volume_label.as_deref(),
+            bad_cluster_ranges: &bad_cluster_ranges,
+            reparse_points: &[],
         },
         limits.serializer,
     )?;
@@ -604,18 +672,7 @@ pub fn draft_lossless_exfat_to_ntfs(
     if mode == GuaranteeMode::ContentOnly {
         return Err(ExfatToNtfsError::ContentOnlyIsNotLossless);
     }
-    let bad_cluster_extents = normalized
-        .preservation
-        .filesystem_extents
-        .iter()
-        .filter(|extent| extent.kind == ExtentKind::BadCluster)
-        .count();
-    if normalized.preservation.allocated_bad_clusters != 0 || bad_cluster_extents != 0 {
-        return Err(ExfatToNtfsError::AllocatedBadClustersNotRepresented {
-            allocated_clusters: normalized.preservation.allocated_bad_clusters,
-            bad_cluster_extents,
-        });
-    }
+    let bad_cluster_ranges = exfat_bad_cluster_ranges(normalized)?;
     let preservation = evaluate_exfat(normalized, FileSystem::Ntfs, mode, limits.preservation)?;
     if !preservation.permitted {
         return Err(ExfatToNtfsError::PreservationRefused {
@@ -642,6 +699,8 @@ pub fn draft_lossless_exfat_to_ntfs(
         &object_metadata,
         NtfsVolumeProfile {
             volume_label: volume_label.as_deref(),
+            bad_cluster_ranges: &bad_cluster_ranges,
+            reparse_points: &[],
         },
         limits.serializer,
     )?;
@@ -659,6 +718,155 @@ pub fn draft_lossless_exfat_to_ntfs(
     })
 }
 
+/// Drafts an exFAT→NTFS destination that reattaches the NTFS identities an earlier NTFS→exFAT
+/// escrow recorded for this exact exFAT candidate.
+///
+/// The caller must already have proven that `sidecar` was decoded from an envelope bound to this
+/// exFAT image (see [`crate::escrow_restore::decode_restore_sidecar`]). On top of the ordinary
+/// dest-native projection this restores, per object matched by dest-native path: extra non-DOS
+/// `$FILE_NAME` hard links, resident, captured, or carrier-backed named `$DATA` streams (carrier
+/// files under the root `.starconverter-escrow` directory are folded back into their owners and
+/// removed), resident `$REPARSE_POINT` payloads (listed in `$Extend:$R`), and exact
+/// `$STANDARD_INFORMATION` timestamps and DOS attributes. The volume keeps the original 64-bit
+/// NTFS serial and full-length label. Objects the escrow does not know (added on the exFAT side)
+/// keep exFAT-derived metadata. Security descriptors remain the pinned ordinary profile, and exact
+/// source MFT numbers and runlists are not rematerialized.
+///
+/// # Errors
+///
+/// Returns every refusal of [`draft_lossless_exfat_to_ntfs`] plus
+/// [`ExfatToNtfsError::EscrowRestore`] when the escrow cannot be reattached (missing dest path,
+/// kind mismatch, unrestorable stream, incomplete reparse payload) and
+/// [`ExfatToNtfsError::MissingEscrowStandardInformation`] for an identified object without exact
+/// NTFS metadata.
+pub fn draft_escrow_restored_exfat_to_ntfs(
+    normalized: &NormalizedExfat,
+    sidecar: &NtfsPreservationSidecar,
+    mode: GuaranteeMode,
+    options: ExfatToNtfsOptions,
+    limits: ExfatToNtfsLimits,
+) -> Result<ExfatToNtfsRelocationDraft, ExfatToNtfsError> {
+    if mode == GuaranteeMode::ContentOnly {
+        return Err(ExfatToNtfsError::ContentOnlyIsNotLossless);
+    }
+    let bad_cluster_ranges = exfat_bad_cluster_ranges(normalized)?;
+    let preservation = evaluate_exfat(normalized, FileSystem::Ntfs, mode, limits.preservation)?;
+    if !preservation.permitted {
+        return Err(ExfatToNtfsError::PreservationRefused {
+            blockers: preservation.blockers,
+        });
+    }
+
+    let dest_native = project_exfat_graph_for_ntfs(normalized)?;
+    let restored = restore_ntfs_identities_with_evidence(&dest_native, sidecar)
+        .map_err(ExfatToNtfsError::EscrowRestore)?;
+    let mut exfat_metadata = map_exfat_object_metadata(normalized, options.system_timestamp)?;
+    // Escrow carriers were folded back into their owners' named streams and no longer exist on
+    // the restored graph, so they must not be described to the NTFS serializer.
+    exfat_metadata.retain(|entry| !restored.removed_objects.contains(&entry.object));
+    let object_metadata = restore_ntfs_object_metadata(&restored, sidecar, exfat_metadata)?;
+    let volume_label = sidecar.volume_label.clone();
+    let inputs = NtfsDestinationInputs {
+        image_bytes: normalized.graph.extents().volume_bytes(),
+        partition_offset_sectors: options.partition_offset_sectors,
+        cluster_bytes: options.cluster_bytes,
+        volume_serial_number: sidecar.volume_serial_number,
+        timestamp: options.system_timestamp,
+    };
+    let reparse_points: Vec<(ObjectId, &[u8])> = restored
+        .reparse_points
+        .iter()
+        .map(|(object, payload)| (*object, payload.as_slice()))
+        .collect();
+    let mut destination = draft_ntfs_destination_with_metadata_and_volume(
+        &restored.graph,
+        inputs,
+        &object_metadata,
+        NtfsVolumeProfile {
+            volume_label: volume_label.as_deref(),
+            bad_cluster_ranges: &bad_cluster_ranges,
+            reparse_points: &reparse_points,
+        },
+        limits.serializer,
+    )?;
+    retain_exfat_source_metadata(
+        &mut destination.source_allocations,
+        normalized,
+        limits.serializer.max_extents,
+    )?;
+    Ok(ExfatToNtfsRelocationDraft {
+        preservation,
+        target_graph: restored.graph,
+        object_metadata,
+        volume_label,
+        destination,
+    })
+}
+
+/// Overrides exFAT-derived NTFS metadata with the exact `$STANDARD_INFORMATION` the escrow
+/// recorded for every dest object it identified by path.
+///
+/// `FILE_ATTRIBUTE_DIRECTORY` is re-derived from the dest object kind because the destination
+/// serializer requires it on directories, and `FILE_ATTRIBUTE_REPARSE_POINT` is re-derived from the
+/// restored payload. `COMPRESSED` and `ENCRYPTED` are cleared because dest streams are never
+/// compressed or encrypted; `SPARSE` survives only when a restored stream is sparse.
+fn restore_ntfs_object_metadata(
+    restored: &RestoredNtfsIdentities,
+    sidecar: &NtfsPreservationSidecar,
+    mut metadata: Vec<NtfsObjectMetadata>,
+) -> Result<Vec<NtfsObjectMetadata>, ExfatToNtfsError> {
+    const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x200;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    const FILE_ATTRIBUTE_COMPRESSED: u32 = 0x800;
+    const FILE_ATTRIBUTE_ENCRYPTED: u32 = 0x4000;
+
+    let sidecar_by_id: BTreeMap<ObjectId, _> = sidecar
+        .objects
+        .iter()
+        .map(|preserved| (preserved.object, &preserved.source))
+        .collect();
+    for entry in &mut metadata {
+        let Some(source_id) = restored.source_by_dest.get(&entry.object) else {
+            continue;
+        };
+        let Some(source) = sidecar_by_id.get(source_id) else {
+            continue;
+        };
+        let standard = source.standard_information.ok_or(
+            ExfatToNtfsError::MissingEscrowStandardInformation {
+                dest: entry.object,
+                source_record: source.reference.record_number,
+            },
+        )?;
+        let dest_object = restored
+            .graph
+            .objects()
+            .iter()
+            .find(|object| object.id == entry.object);
+        let sparse = dest_object
+            .is_some_and(|object| object.streams.iter().any(|stream| stream.flags.sparse));
+        let mut attributes = standard.file_attributes
+            & !(FILE_ATTRIBUTE_DIRECTORY
+                | FILE_ATTRIBUTE_REPARSE_POINT
+                | FILE_ATTRIBUTE_COMPRESSED
+                | FILE_ATTRIBUTE_ENCRYPTED);
+        if !sparse {
+            attributes &= !FILE_ATTRIBUTE_SPARSE_FILE;
+        }
+        if entry.object_kind == ObjectKind::Directory {
+            attributes |= FILE_ATTRIBUTE_DIRECTORY;
+        }
+        entry.timestamps = NtfsObjectTimestamps {
+            creation_time: standard.creation_time,
+            modification_time: standard.modification_time,
+            mft_change_time: standard.mft_change_time,
+            access_time: standard.access_time,
+        };
+        entry.dos_file_attributes = attributes;
+    }
+    Ok(metadata)
+}
+
 /// Solves a pinned exFAT-to-NTFS draft and regenerates every placement-dependent NTFS structure.
 ///
 /// Source filesystem metadata which is not part of the neutral graph remains excluded from staging
@@ -674,39 +882,39 @@ pub fn solve_lossless_exfat_to_ntfs(
     draft: ExfatToNtfsRelocationDraft,
     limits: LayoutLimits,
 ) -> Result<ExfatToNtfsSolvedPlan, ExfatToNtfsError> {
-    let mut live_allocations = Vec::new();
-    let mut staging_exclusions = Vec::new();
-    live_allocations
-        .try_reserve(draft.destination.source_allocations.len())
-        .map_err(|_| ExfatToNtfsError::AllocationFailed)?;
-    staging_exclusions
-        .try_reserve(draft.destination.source_allocations.len())
-        .map_err(|_| ExfatToNtfsError::AllocationFailed)?;
-    for allocation in &draft.destination.source_allocations {
-        let graph_backed = draft.target_graph.extents().extents().iter().any(|extent| {
-            extent.stream == allocation.stream
-                && extent.logical_offset == allocation.logical_offset
-                && extent.length == allocation.range.length
-                && extent.placement
-                    == Placement::Physical {
-                        byte_offset: allocation.range.offset,
-                    }
-        });
-        if graph_backed {
-            live_allocations.push(*allocation);
-        } else {
-            staging_exclusions.push(allocation.range);
-        }
-    }
-    let layout = solve_layout_with_staging_exclusions_and_io_alignment(
-        draft.destination.image_bytes,
-        u64::from(draft.destination.cluster_bytes),
-        512,
-        live_allocations,
-        draft.destination.reservations.clone(),
-        staging_exclusions,
-        limits,
+    let destination_alignment = u64::from(draft.destination.cluster_bytes);
+    let (live_allocations, staging_exclusions, materializations) = partition_payload_work(
+        draft.destination.source_allocations.iter().copied(),
+        &draft.target_graph,
+        destination_alignment,
     )?;
+    let layout = if materializations.is_empty() {
+        solve_layout_with_staging_exclusions_and_io_alignment(
+            draft.destination.image_bytes,
+            destination_alignment,
+            512,
+            live_allocations,
+            draft.destination.reservations.clone(),
+            staging_exclusions,
+            limits,
+        )?
+    } else {
+        solve_layout_with_destination_domain_alignments_and_materializations(
+            draft.destination.image_bytes,
+            512,
+            destination_alignment,
+            512,
+            ByteRange {
+                offset: 0,
+                length: draft.destination.image_bytes,
+            },
+            live_allocations,
+            draft.destination.reservations.clone(),
+            staging_exclusions,
+            &materializations,
+            limits,
+        )?
+    };
     let relocation = SealedRelocationPlan::seal(draft.target_graph, layout)?;
     let destination = finalize_ntfs_destination(&draft.destination, relocation.target_graph())?;
     Ok(ExfatToNtfsSolvedPlan {
@@ -716,6 +924,75 @@ pub fn solve_lossless_exfat_to_ntfs(
         destination,
         relocation,
     })
+}
+
+fn ntfs_bad_cluster_ranges(normalized: &NormalizedNtfs) -> Vec<ByteRange> {
+    const BADCLUS_RECORD: u64 = 8;
+    let Some(object) = normalized
+        .preservation
+        .objects
+        .iter()
+        .find(|object| object.source.reference.record_number == BADCLUS_RECORD)
+    else {
+        return Vec::new();
+    };
+    let Some(stream) = object.source.data_streams.iter().find(|stream| {
+        stream
+            .name
+            .as_ref()
+            .is_some_and(|name| name.code_units == BADCLUS_STREAM_NAME)
+    }) else {
+        return Vec::new();
+    };
+    match &stream.storage {
+        NtfsStreamStorage::Resident { .. } => Vec::new(),
+        NtfsStreamStorage::NonResident { extents, .. } => extents
+            .iter()
+            .filter_map(|extent| match extent.placement {
+                NtfsExtentPlacement::Physical { byte_offset } => Some(ByteRange {
+                    offset: byte_offset,
+                    length: extent.length,
+                }),
+                NtfsExtentPlacement::Sparse => None,
+            })
+            .collect(),
+    }
+}
+
+fn exfat_bad_cluster_ranges(
+    normalized: &NormalizedExfat,
+) -> Result<Vec<ByteRange>, ExfatToNtfsError> {
+    let extents: Vec<_> = normalized
+        .preservation
+        .filesystem_extents
+        .iter()
+        .filter(|extent| extent.kind == ExtentKind::BadCluster)
+        .copied()
+        .collect();
+    let allocated = normalized.preservation.allocated_bad_clusters;
+    if allocated != u64::try_from(extents.len()).map_err(|_| ExfatToNtfsError::AllocationFailed)? {
+        return Err(ExfatToNtfsError::InconsistentBadClusterEvidence {
+            allocated_clusters: allocated,
+            bad_cluster_extents: extents.len(),
+        });
+    }
+    let mut ranges = Vec::new();
+    ranges
+        .try_reserve(extents.len())
+        .map_err(|_| ExfatToNtfsError::AllocationFailed)?;
+    for extent in extents {
+        let Placement::Physical { byte_offset } = extent.placement else {
+            return Err(ExfatToNtfsError::InconsistentBadClusterEvidence {
+                allocated_clusters: allocated,
+                bad_cluster_extents: ranges.len() + 1,
+            });
+        };
+        ranges.push(ByteRange {
+            offset: byte_offset,
+            length: extent.length,
+        });
+    }
+    Ok(ranges)
 }
 
 fn project_exfat_graph_for_ntfs(
@@ -777,7 +1054,8 @@ pub fn plan_lossless_ntfs_to_exfat(
         let blockers = preservation.blockers;
         return Err(NtfsToExfatError::PreservationRefused { blockers });
     }
-    let object_metadata = map_ntfs_object_metadata(normalized)?;
+    let projection = project_ntfs_graph_for_exfat(normalized)?;
+    let object_metadata = map_ntfs_object_metadata(normalized, &projection)?;
     let destination_volume_label = normalized
         .preservation
         .volume_label
@@ -786,7 +1064,8 @@ pub fn plan_lossless_ntfs_to_exfat(
         .cloned();
     let serial = fold_ntfs_volume_serial(normalized.preservation.volume_serial_number);
     let upcase = generate_recommended_exfat_upcase(limits.upcase)?;
-    let target_graph = project_ntfs_graph_for_exfat(normalized)?;
+    let target_graph = projection.graph;
+    let bad_cluster_ranges = ntfs_bad_cluster_ranges(normalized);
     let mut destination = serialize_exfat_destination(
         &target_graph,
         &object_metadata,
@@ -795,7 +1074,8 @@ pub fn plan_lossless_ntfs_to_exfat(
             encoded_upcase_table: upcase.encoded_bytes(),
             upcase_checksum: RECOMMENDED_EXFAT_UPCASE_CHECKSUM,
             source_preservation: ExfatPreservationEvidence::default(),
-            allocated_bad_clusters: 0,
+            allocated_bad_clusters: u64::try_from(bad_cluster_ranges.len()).unwrap_or(u64::MAX),
+            bad_cluster_ranges: &bad_cluster_ranges,
         },
         ExfatSerializeOptions {
             bytes_per_sector: options.bytes_per_sector,
@@ -847,7 +1127,8 @@ pub fn draft_lossless_ntfs_to_exfat(
             blockers: preservation.blockers,
         });
     }
-    let object_metadata = map_ntfs_object_metadata(normalized)?;
+    let projection = project_ntfs_graph_for_exfat(normalized)?;
+    let object_metadata = map_ntfs_object_metadata(normalized, &projection)?;
     let destination_volume_label = normalized
         .preservation
         .volume_label
@@ -856,7 +1137,8 @@ pub fn draft_lossless_ntfs_to_exfat(
         .cloned();
     let serial = fold_ntfs_volume_serial(normalized.preservation.volume_serial_number);
     let upcase = generate_recommended_exfat_upcase(limits.upcase)?;
-    let target_graph = project_ntfs_graph_for_exfat(normalized)?;
+    let target_graph = projection.graph;
+    let bad_cluster_ranges = ntfs_bad_cluster_ranges(normalized);
     let mut destination = draft_exfat_destination(
         &target_graph,
         &object_metadata,
@@ -865,7 +1147,8 @@ pub fn draft_lossless_ntfs_to_exfat(
             encoded_upcase_table: upcase.encoded_bytes(),
             upcase_checksum: RECOMMENDED_EXFAT_UPCASE_CHECKSUM,
             source_preservation: ExfatPreservationEvidence::default(),
-            allocated_bad_clusters: 0,
+            allocated_bad_clusters: u64::try_from(bad_cluster_ranges.len()).unwrap_or(u64::MAX),
+            bad_cluster_ranges: &bad_cluster_ranges,
         },
         ExfatSerializeOptions {
             bytes_per_sector: options.bytes_per_sector,
@@ -901,41 +1184,22 @@ pub fn solve_lossless_ntfs_to_exfat(
     draft: NtfsToExfatRelocationDraft,
     limits: LayoutLimits,
 ) -> Result<NtfsToExfatSolvedPlan, NtfsToExfatError> {
-    let mut live_allocations = Vec::new();
-    let mut staging_exclusions = Vec::new();
-    live_allocations
-        .try_reserve(draft.destination.source_allocations().len())
-        .map_err(|_| NtfsToExfatError::AllocationFailed)?;
-    staging_exclusions
-        .try_reserve(draft.destination.source_allocations().len())
-        .map_err(|_| NtfsToExfatError::AllocationFailed)?;
-    for allocation in draft.destination.source_allocations() {
-        let graph_backed_file_data = allocation.movable
-            && draft.target_graph.extents().extents().iter().any(|extent| {
-                extent.kind == ExtentKind::FileData
-                    && extent.stream == allocation.stream
-                    && extent.logical_offset == allocation.logical_offset
-                    && extent.length == allocation.range.length
-                    && extent.placement
-                        == Placement::Physical {
-                            byte_offset: allocation.range.offset,
-                        }
-            });
-        if graph_backed_file_data {
-            live_allocations.push(*allocation);
-        } else {
-            staging_exclusions.push(allocation.range);
-        }
-    }
-    let layout = solve_layout_with_destination_domain_and_alignments(
+    let destination_alignment = u64::from(draft.destination.geometry().bytes_per_cluster);
+    let (live_allocations, staging_exclusions, materializations) = partition_payload_work(
+        draft.destination.source_allocations().iter().copied(),
+        &draft.target_graph,
+        destination_alignment,
+    )?;
+    let layout = solve_layout_with_destination_domain_alignments_and_materializations(
         draft.destination.geometry().volume_bytes,
         512,
-        u64::from(draft.destination.geometry().bytes_per_cluster),
+        destination_alignment,
         512,
         draft.destination.cluster_heap_range(),
         live_allocations,
         draft.destination.reservations().to_vec(),
         staging_exclusions,
+        &materializations,
         limits,
     )?;
     let relocation = SealedRelocationPlan::seal(draft.target_graph, layout)?;
@@ -950,17 +1214,221 @@ pub fn solve_lossless_ntfs_to_exfat(
     })
 }
 
-fn project_ntfs_graph_for_exfat(
+/// One escrow carrier file placed on the dest-native exFAT graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProjectedCarrier {
+    /// Dest-native carrier file object.
+    pub object: ObjectId,
+    /// Source object (sidecar record) whose named stream the carrier holds.
+    pub owner: ObjectId,
+}
+
+/// Dest-native exFAT projection of an NTFS graph plus the escrow carriers it introduced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NtfsExfatProjection {
+    pub graph: ObjectGraph,
+    /// Root-level escrow carrier directory, present only when at least one carrier exists.
+    pub escrow_directory: Option<ObjectId>,
+    pub carriers: Vec<ProjectedCarrier>,
+}
+
+fn projected_stream_id(record: u64, attribute_id: u16) -> Option<StreamId> {
+    record
+        .checked_shl(16)
+        .and_then(|value| value.checked_add(u64::from(attribute_id)))
+        .map(StreamId)
+}
+
+/// Moves every sidecar-implied carrier stream out of its owner into a dest-native carrier file.
+///
+/// Carrier objects and the escrow directory receive fresh [`ObjectId`]s above every source id;
+/// the moved stream keeps its [`StreamId`] so the graph's extents stay attached to the payload.
+/// Carrier objects/entries introduced by [`project_escrow_carriers`].
+#[derive(Debug, Default)]
+struct CarrierProjection {
+    escrow_directory: Option<ObjectId>,
+    carriers: Vec<ProjectedCarrier>,
+    entries: Vec<NamespaceEntry>,
+}
+
+fn project_escrow_carriers(
     normalized: &NormalizedNtfs,
-) -> Result<ObjectGraph, NtfsToExfatError> {
-    let mut objects = normalized.graph.objects().to_vec();
-    for object in &mut objects {
-        // exFAT cannot enforce per-object ACLs. The preservation policy has already required and
-        // produced exact escrow before this projection is reached, so only the destination view
-        // loses the enforcement marker; source identities and descriptor bytes stay in evidence.
-        object.semantics.has_security_descriptor = false;
+    objects: &mut Vec<ObjectRecord>,
+    kept_streams: &mut BTreeSet<StreamId>,
+) -> Result<CarrierProjection, NtfsToExfatError> {
+    let carriers = sidecar_carriers(&normalized.preservation);
+    if carriers.is_empty() {
+        return Ok(CarrierProjection::default());
     }
-    let entries = normalized.graph.entries().to_vec();
+    let mut next_id = objects.iter().map(|object| object.id.0).max().unwrap_or(0);
+    let allocate = |next_id: &mut u64| -> Result<ObjectId, NtfsToExfatError> {
+        *next_id = next_id
+            .checked_add(1)
+            .ok_or(NtfsToExfatError::ObjectIdOverflow)?;
+        Ok(ObjectId(*next_id))
+    };
+    let escrow_directory = allocate(&mut next_id)?;
+    let mut projected = Vec::new();
+    let mut carrier_objects = Vec::new();
+    let mut carrier_entries = Vec::new();
+    projected
+        .try_reserve_exact(carriers.len())
+        .map_err(|_| NtfsToExfatError::AllocationFailed)?;
+    carrier_objects
+        .try_reserve_exact(carriers.len().saturating_add(1))
+        .map_err(|_| NtfsToExfatError::AllocationFailed)?;
+    carrier_entries
+        .try_reserve_exact(carriers.len().saturating_add(1))
+        .map_err(|_| NtfsToExfatError::AllocationFailed)?;
+    for carrier in &carriers {
+        let missing = || NtfsToExfatError::EscrowCarrierStreamMissing {
+            owner: carrier.owner,
+            attribute_id: carrier.attribute_id,
+        };
+        let stream_id =
+            projected_stream_id(carrier.owner.0, carrier.attribute_id).ok_or_else(missing)?;
+        let owner = objects
+            .iter_mut()
+            .find(|object| object.id == carrier.owner)
+            .ok_or_else(missing)?;
+        let position = owner
+            .streams
+            .iter()
+            .position(|stream| {
+                stream.id == stream_id
+                    && stream.name.as_deref() == Some(carrier.stream_name.as_slice())
+                    && stream.logical_bytes == carrier.data_bytes
+            })
+            .ok_or_else(missing)?;
+        let mut stream = owner.streams.remove(position);
+        stream.name = None;
+        // Same dest-view policy as unnamed payloads: exFAT has no sparse or compressed streams,
+        // so the carrier materializes holes as zeros and decompresses LZNT1 units, while the
+        // compression-unit size stays on the projected stream so reconstruction never copies
+        // compressed clusters as plaintext.
+        stream.flags.sparse = false;
+        stream.flags.compressed = false;
+        kept_streams.insert(stream.id);
+        let object = allocate(&mut next_id)?;
+        carrier_objects.push(ObjectRecord {
+            id: object,
+            kind: ObjectKind::File,
+            link_count: 1,
+            semantics: ObjectSemantics::default(),
+            streams: vec![stream],
+        });
+        carrier_entries.push(NamespaceEntry {
+            parent: escrow_directory,
+            target: object,
+            name: carrier.file_name(),
+        });
+        projected.push(ProjectedCarrier {
+            object,
+            owner: carrier.owner,
+        });
+    }
+    carrier_objects.push(ObjectRecord {
+        id: escrow_directory,
+        kind: ObjectKind::Directory,
+        link_count: 1,
+        semantics: ObjectSemantics::default(),
+        streams: Vec::new(),
+    });
+    carrier_entries.push(NamespaceEntry {
+        parent: normalized.graph.root(),
+        target: escrow_directory,
+        name: carrier_directory_name(),
+    });
+    objects
+        .try_reserve(carrier_objects.len())
+        .map_err(|_| NtfsToExfatError::AllocationFailed)?;
+    objects.extend(carrier_objects);
+    Ok(CarrierProjection {
+        escrow_directory: Some(escrow_directory),
+        carriers: projected,
+        entries: carrier_entries,
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+pub(crate) fn project_ntfs_graph_for_exfat(
+    normalized: &NormalizedNtfs,
+) -> Result<NtfsExfatProjection, NtfsToExfatError> {
+    let mut kept_streams = BTreeSet::new();
+    let mut objects = normalized.graph.objects().to_vec();
+    // Named streams the sidecar could not capture byte-for-byte become dest-native carrier files
+    // before the remaining named streams are dropped from the destination view.
+    let CarrierProjection {
+        escrow_directory,
+        carriers,
+        entries: carrier_entries,
+    } = project_escrow_carriers(normalized, &mut objects, &mut kept_streams)?;
+    for object in &mut objects {
+        // exFAT cannot enforce per-object ACLs or reparse semantics. The preservation policy has
+        // already required and produced exact escrow before this projection is reached, so only
+        // the destination view loses the enforcement markers; source identities, descriptor bytes,
+        // and $REPARSE_POINT payloads stay in evidence.
+        object.semantics.has_security_descriptor = false;
+        object.semantics.is_reparse_point = false;
+        if object.id != normalized.graph.root() {
+            object.link_count = 1;
+        }
+        object.streams.retain(|stream| stream.name.is_none());
+        for stream in &mut object.streams {
+            stream.flags.sparse = false;
+            stream.flags.compressed = false;
+            kept_streams.insert(stream.id);
+        }
+    }
+    let mut by_target: BTreeMap<ObjectId, Vec<&NamespaceEntry>> = BTreeMap::new();
+    for entry in normalized.graph.entries() {
+        by_target.entry(entry.target).or_default().push(entry);
+    }
+    let mut entries = Vec::new();
+    entries
+        .try_reserve(objects.len().saturating_sub(1))
+        .map_err(|_| NtfsToExfatError::AllocationFailed)?;
+    for object in normalized.graph.objects() {
+        if object.id == normalized.graph.root() {
+            continue;
+        }
+        let Some(choices) = by_target.get(&object.id) else {
+            continue;
+        };
+        entries.push(select_dest_native_namespace_entry(
+            object.id,
+            choices,
+            &normalized.preservation,
+        ));
+    }
+    if escrow_directory.is_some()
+        && entries.iter().any(|entry| {
+            entry.parent == normalized.graph.root() && collides_with_carrier_directory(&entry.name)
+        })
+    {
+        return Err(NtfsToExfatError::EscrowCarrierNameCollision);
+    }
+    // Hard-link collapse already picked one dest-native name per object. Remaining siblings
+    // that fold together under the recommended exFAT up-case table keep the lowest ObjectId
+    // name unchanged and receive a dest-legal `~N` suffix so the exFAT writer can serialize.
+    disambiguate_exfat_case_collisions(&mut entries)?;
+    // Carrier names are reserved and collision-free by construction, so they join after
+    // disambiguation exactly as the restore side reconstructs them.
+    entries.extend(carrier_entries);
+    let filtered_extents: Vec<Extent> = normalized
+        .graph
+        .extents()
+        .extents()
+        .iter()
+        .copied()
+        .filter(|extent| kept_streams.contains(&extent.stream))
+        .collect();
+    let extent_graph = ExtentGraph::build(
+        filtered_extents,
+        normalized.graph.extents().volume_bytes(),
+        normalized.graph.extents().extents().len().max(1),
+    )
+    .map_err(NtfsToExfatError::ExtentProjection)?;
     let maximum_name_units = entries
         .iter()
         .map(|entry| entry.name.len())
@@ -970,19 +1438,172 @@ fn project_ntfs_graph_for_exfat(
         .iter()
         .map(|object| object.streams.len())
         .sum::<usize>();
-    ObjectGraph::build(
+    let object_count = objects.len();
+    let entry_count = entries.len();
+    let graph = ObjectGraph::build(
         normalized.graph.root(),
         objects,
         entries,
-        normalized.graph.extents().clone(),
+        extent_graph,
         ObjectGraphLimits {
-            max_objects: normalized.graph.objects().len().max(1),
-            max_entries: normalized.graph.entries().len().max(1),
+            max_objects: object_count.max(1),
+            max_entries: entry_count.max(1),
             max_streams: stream_count.max(1),
             max_name_code_units: maximum_name_units,
         },
     )
-    .map_err(NtfsToExfatError::GraphProjection)
+    .map_err(NtfsToExfatError::GraphProjection)?;
+    Ok(NtfsExfatProjection {
+        graph,
+        escrow_directory,
+        carriers,
+    })
+}
+
+pub(crate) fn select_dest_native_namespace_entry(
+    object: ObjectId,
+    choices: &[&NamespaceEntry],
+    sidecar: &crate::fs::ntfs_normalize::NtfsPreservationSidecar,
+) -> NamespaceEntry {
+    choices
+        .iter()
+        .min_by_key(|entry| {
+            (
+                dest_native_name_rank(object, entry, sidecar),
+                entry.parent.0,
+                entry.name.as_slice(),
+            )
+        })
+        .copied()
+        .expect("namespace projection is only called with a non-empty name set")
+        .clone()
+}
+
+pub(crate) fn dest_native_name_rank(
+    object: ObjectId,
+    entry: &NamespaceEntry,
+    sidecar: &crate::fs::ntfs_normalize::NtfsPreservationSidecar,
+) -> u8 {
+    let Some(preserved) = sidecar
+        .objects
+        .iter()
+        .find(|candidate| candidate.object == object)
+    else {
+        return 4;
+    };
+    preserved
+        .source
+        .file_names
+        .iter()
+        .find_map(|name| {
+            (name.parent.record_number == entry.parent.0 && name.name.code_units == entry.name)
+                .then_some(match name.namespace {
+                    FileNameNamespace::Win32AndDos => 0,
+                    FileNameNamespace::Win32 => 1,
+                    FileNameNamespace::Posix => 2,
+                    FileNameNamespace::Dos => 3,
+                })
+        })
+        .unwrap_or(4)
+}
+
+pub(crate) fn disambiguate_exfat_case_collisions(
+    entries: &mut [NamespaceEntry],
+) -> Result<(), NtfsToExfatError> {
+    if entries.len() < 2 {
+        return Ok(());
+    }
+    let table = generate_recommended_exfat_upcase(RecommendedExfatUpcaseLimits::default())?;
+    let mut used = BTreeSet::new();
+    let mut groups: BTreeMap<(ObjectId, Vec<u16>), Vec<usize>> = BTreeMap::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let folded = fold_exfat_name(&entry.name, &table)?;
+        groups
+            .entry((entry.parent, folded.clone()))
+            .or_default()
+            .push(index);
+        used.insert((entry.parent, folded));
+    }
+    for ((parent, _), mut members) in groups {
+        if members.len() < 2 {
+            continue;
+        }
+        members.sort_by(|left, right| {
+            entries[*left]
+                .target
+                .cmp(&entries[*right].target)
+                .then_with(|| entries[*left].name.cmp(&entries[*right].name))
+        });
+        for index in members.into_iter().skip(1) {
+            let replacement =
+                unique_exfat_sibling_name(&entries[index].name, parent, &table, &mut used)?;
+            entries[index].name = replacement;
+        }
+    }
+    Ok(())
+}
+
+fn fold_exfat_name(
+    name: &[u16],
+    table: &RecommendedExfatUpcase,
+) -> Result<Vec<u16>, NtfsToExfatError> {
+    let mut folded = Vec::new();
+    folded
+        .try_reserve_exact(name.len())
+        .map_err(|_| NtfsToExfatError::AllocationFailed)?;
+    folded.extend(name.iter().map(|unit| table.map(*unit)));
+    Ok(folded)
+}
+
+fn split_exfat_stem_ext(name: &[u16]) -> (&[u16], &[u16]) {
+    name.iter()
+        .rposition(|unit| *unit == u16::from(b'.'))
+        .filter(|position| *position > 0)
+        .map_or((name, &[]), |position| {
+            (&name[..position], &name[position..])
+        })
+}
+
+fn exfat_disambiguated_name(stem: &[u16], ext: &[u16], n: u32) -> Option<Vec<u16>> {
+    let suffix: Vec<u16> = format!("~{n}").encode_utf16().collect();
+    let needed = suffix.len().checked_add(ext.len())?;
+    if needed >= MAX_FILE_NAME_CODE_UNITS || stem.is_empty() {
+        return None;
+    }
+    let max_stem = MAX_FILE_NAME_CODE_UNITS - needed;
+    let stem = &stem[..stem.len().min(max_stem)];
+    if stem.is_empty() {
+        return None;
+    }
+    let mut name = Vec::new();
+    name.try_reserve_exact(stem.len() + suffix.len() + ext.len())
+        .ok()?;
+    name.extend_from_slice(stem);
+    name.extend_from_slice(&suffix);
+    name.extend_from_slice(ext);
+    Some(name)
+}
+
+fn unique_exfat_sibling_name(
+    original: &[u16],
+    parent: ObjectId,
+    table: &RecommendedExfatUpcase,
+    used: &mut BTreeSet<(ObjectId, Vec<u16>)>,
+) -> Result<Vec<u16>, NtfsToExfatError> {
+    let (stem, ext) = split_exfat_stem_ext(original);
+    for n in 2_u32..=1_000_000 {
+        let Some(candidate) = exfat_disambiguated_name(stem, ext, n) else {
+            continue;
+        };
+        if !is_legal_exfat_name(&candidate) {
+            continue;
+        }
+        let folded = fold_exfat_name(&candidate, table)?;
+        if used.insert((parent, folded)) {
+            return Ok(candidate);
+        }
+    }
+    Err(NtfsToExfatError::NameDisambiguationFailed { parent })
 }
 
 fn map_exfat_object_metadata(
@@ -1143,7 +1764,132 @@ fn retain_ntfs_source_metadata(
     Ok(())
 }
 
+type PartitionedPayloadWork = (
+    Vec<SourceAllocation>,
+    Vec<ByteRange>,
+    Vec<MaterializationRequest>,
+);
+
+fn partition_payload_work<I>(
+    allocations: I,
+    graph: &ObjectGraph,
+    destination_alignment: u64,
+) -> Result<PartitionedPayloadWork, LayoutError>
+where
+    I: IntoIterator<Item = SourceAllocation>,
+{
+    let allocations: Vec<_> = allocations.into_iter().collect();
+    let mut materializing = std::collections::BTreeSet::new();
+    for object in graph.objects() {
+        if object.kind != ObjectKind::File {
+            continue;
+        }
+        for stream in &object.streams {
+            if let Some(destination_length) =
+                materialization_length_for_stream(graph, stream.id, destination_alignment)
+            {
+                materializing.insert((stream.id, destination_length));
+            }
+        }
+    }
+    let mut live_allocations = Vec::new();
+    let mut staging_exclusions = Vec::new();
+    live_allocations
+        .try_reserve(allocations.len())
+        .map_err(|_| LayoutError::AllocationFailed)?;
+    staging_exclusions
+        .try_reserve(allocations.len())
+        .map_err(|_| LayoutError::AllocationFailed)?;
+    for allocation in allocations {
+        let graph_backed_file_data = allocation.movable
+            && graph.extents().extents().iter().any(|extent| {
+                extent.kind == ExtentKind::FileData
+                    && extent.stream == allocation.stream
+                    && extent.logical_offset == allocation.logical_offset
+                    && extent.length == allocation.range.length
+                    && extent.placement
+                        == Placement::Physical {
+                            byte_offset: allocation.range.offset,
+                        }
+            });
+        let stream_materializes = materializing
+            .iter()
+            .any(|(stream, _)| *stream == allocation.stream);
+        if graph_backed_file_data && !stream_materializes {
+            live_allocations.push(allocation);
+        } else {
+            staging_exclusions.push(allocation.range);
+        }
+    }
+    let mut materializations = Vec::new();
+    materializations
+        .try_reserve(materializing.len())
+        .map_err(|_| LayoutError::AllocationFailed)?;
+    for (stream, destination_length) in materializing {
+        materializations.push(MaterializationRequest {
+            stream,
+            destination_length,
+        });
+    }
+    Ok((live_allocations, staging_exclusions, materializations))
+}
+
+/// exFAT `FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM`, applied to every escrow carrier so the
+/// dest volume never presents carrier payloads as ordinary user files.
+const ESCROW_CARRIER_ATTRIBUTES: u16 = 0x06;
+const EXFAT_ATTRIBUTE_DIRECTORY: u16 = 0x10;
+const EXFAT_ATTRIBUTE_ARCHIVE: u16 = 0x20;
+
 fn map_ntfs_object_metadata(
+    normalized: &NormalizedNtfs,
+    projection: &NtfsExfatProjection,
+) -> Result<Vec<ExfatObjectMetadata>, NtfsToExfatError> {
+    let mut metadata = map_ntfs_source_object_metadata(normalized)?;
+    let Some(escrow_directory) = projection.escrow_directory else {
+        return Ok(metadata);
+    };
+    metadata
+        .try_reserve(projection.carriers.len().saturating_add(1))
+        .map_err(|_| NtfsToExfatError::AllocationFailed)?;
+    let standard_for = |object: ObjectId| {
+        normalized
+            .preservation
+            .objects
+            .iter()
+            .find(|evidence| evidence.object == object)
+            .and_then(|evidence| evidence.source.standard_information)
+            .ok_or(NtfsToExfatError::MissingStandardInformation(object))
+    };
+    let root = standard_for(normalized.graph.root())?;
+    metadata.push(ExfatObjectMetadata {
+        object: escrow_directory,
+        file_attributes: ESCROW_CARRIER_ATTRIBUTES | EXFAT_ATTRIBUTE_DIRECTORY,
+        timestamps: map_ntfs_timestamps(
+            root.creation_time,
+            root.modification_time,
+            root.access_time,
+        )
+        .ok_or(NtfsToExfatError::TimestampOutsideExfatRange(
+            escrow_directory,
+        ))?,
+    });
+    for carrier in &projection.carriers {
+        let owner = standard_for(carrier.owner)?;
+        metadata.push(ExfatObjectMetadata {
+            object: carrier.object,
+            file_attributes: ESCROW_CARRIER_ATTRIBUTES | EXFAT_ATTRIBUTE_ARCHIVE,
+            timestamps: map_ntfs_timestamps(
+                owner.creation_time,
+                owner.modification_time,
+                owner.access_time,
+            )
+            .ok_or(NtfsToExfatError::TimestampOutsideExfatRange(carrier.owner))?,
+        });
+    }
+    Ok(metadata)
+}
+
+fn map_ntfs_source_object_metadata(
     normalized: &NormalizedNtfs,
 ) -> Result<Vec<ExfatObjectMetadata>, NtfsToExfatError> {
     let mut by_object = BTreeMap::new();
@@ -1406,6 +2152,7 @@ mod tests {
         NamespaceEntry, ObjectGraph, ObjectGraphLimits, ObjectRecord, ObjectSemantics,
         ObjectStream, StreamFlags, StreamStorage,
     };
+    use crate::preservation::FieldDisposition;
 
     const fn packed_timestamp(
         year: u32,
@@ -1602,6 +2349,7 @@ mod tests {
             }],
             directory_entries: Vec::new(),
             has_reparse_point: false,
+            reparse_point: None,
             has_attribute_list: false,
             directory_index_complete: true,
         }
@@ -1619,6 +2367,7 @@ mod tests {
             compressed: false,
             encrypted: false,
             sparse: false,
+            compression_block_bytes: 0,
             storage: NtfsStreamStorage::NonResident {
                 allocated_bytes: 64 * 1024 * 1024,
                 data_bytes: 64 * 1024 * 1024,
@@ -1631,6 +2380,7 @@ mod tests {
                     length: 64 * 1024 * 1024,
                     placement: NtfsExtentPlacement::Sparse,
                 }],
+                captured_payload: None,
             },
         });
         badclus.attribute_census.push(NtfsAttributeEvidence {
@@ -1790,6 +2540,7 @@ mod tests {
             compressed: false,
             encrypted: false,
             sparse: false,
+            compression_block_bytes: 0,
             storage: NtfsStreamStorage::NonResident {
                 allocated_bytes: 4096,
                 data_bytes: 4096,
@@ -1797,6 +2548,7 @@ mod tests {
                 compressed_bytes: None,
                 mapping_complete: true,
                 extents: vec![source_extent],
+                captured_payload: None,
             },
         });
         source.attribute_census.push(NtfsAttributeEvidence {
@@ -1809,6 +2561,530 @@ mod tests {
         });
         normalized.preservation.source_extents.push(source_extent);
         normalized
+    }
+
+    fn normalized_ntfs_with_compressed_payload() -> NormalizedNtfs {
+        let byte_offset = 8 * 1024 * 1024;
+        let mut normalized = normalized_ntfs_with_payload(byte_offset);
+        let stream_id = StreamId((27_u64 << 16) | 2);
+        let mut objects = normalized.graph.objects().to_vec();
+        let stream = &mut objects
+            .iter_mut()
+            .find(|object| object.id == ObjectId(27))
+            .unwrap()
+            .streams[0];
+        stream.logical_bytes = 6;
+        stream.initialized_bytes = 6;
+        stream.mapped_bytes = 8192;
+        stream.allocated_bytes = 4096;
+        stream.flags.compressed = true;
+        stream.flags.compression_block_bytes = 8192;
+        let physical = NtfsInventoryExtent {
+            stream_id: stream_id.0,
+            logical_offset: 0,
+            length: 4096,
+            placement: NtfsExtentPlacement::Physical { byte_offset },
+        };
+        let hole = NtfsInventoryExtent {
+            stream_id: stream_id.0,
+            logical_offset: 4096,
+            length: 4096,
+            placement: NtfsExtentPlacement::Sparse,
+        };
+        normalized.graph = ObjectGraph::build(
+            normalized.graph.root(),
+            objects,
+            normalized.graph.entries().to_vec(),
+            ExtentGraph::build(
+                vec![
+                    crate::extent::Extent {
+                        stream: stream_id,
+                        logical_offset: 0,
+                        length: 4096,
+                        placement: Placement::Physical { byte_offset },
+                        kind: ExtentKind::FileData,
+                    },
+                    crate::extent::Extent {
+                        stream: stream_id,
+                        logical_offset: 4096,
+                        length: 4096,
+                        placement: Placement::Sparse,
+                        kind: ExtentKind::FileData,
+                    },
+                ],
+                normalized.graph.extents().volume_bytes(),
+                8,
+            )
+            .unwrap(),
+            ObjectGraphLimits {
+                max_objects: 4,
+                max_entries: 4,
+                max_streams: 4,
+                max_name_code_units: 255,
+            },
+        )
+        .unwrap();
+        let source = &mut normalized
+            .preservation
+            .objects
+            .iter_mut()
+            .find(|object| object.object == ObjectId(27))
+            .unwrap()
+            .source;
+        let stream = source
+            .data_streams
+            .iter_mut()
+            .find(|stream| stream.attribute_id == 2)
+            .unwrap();
+        stream.compressed = true;
+        stream.compression_block_bytes = 8192;
+        stream.storage = NtfsStreamStorage::NonResident {
+            allocated_bytes: 4096,
+            data_bytes: 6,
+            initialized_bytes: 6,
+            compressed_bytes: Some(4096),
+            mapping_complete: true,
+            extents: vec![physical, hole],
+            captured_payload: None,
+        };
+        if let Some(attribute) = source
+            .attribute_census
+            .iter_mut()
+            .find(|attribute| attribute.attribute_id == 2)
+        {
+            attribute.flags_raw = 0x0001;
+        }
+        normalized
+            .preservation
+            .source_extents
+            .retain(|extent| extent.stream_id != stream_id.0);
+        normalized
+            .preservation
+            .source_extents
+            .extend([physical, hole]);
+        normalized
+    }
+
+    /// `legal.txt` gains a 4 KiB non-resident `:fork` stream the inventory did not capture.
+    #[allow(clippy::too_many_lines)]
+    fn normalized_ntfs_with_uncaptured_named_stream(byte_offset: u64) -> NormalizedNtfs {
+        let mut normalized = normalized_ntfs_with_payload(4 * 1024 * 1024);
+        let stream_id = StreamId((27_u64 << 16) | 3);
+        let fork_name: Vec<u16> = "fork".encode_utf16().collect();
+        let mut objects = normalized.graph.objects().to_vec();
+        objects
+            .iter_mut()
+            .find(|object| object.id == ObjectId(27))
+            .unwrap()
+            .streams
+            .push(ObjectStream {
+                id: stream_id,
+                name: Some(fork_name.clone()),
+                logical_bytes: 4096,
+                initialized_bytes: 4096,
+                mapped_bytes: 4096,
+                allocated_bytes: 4096,
+                flags: StreamFlags::default(),
+                storage: StreamStorage::Extents,
+            });
+        let source_extent = NtfsInventoryExtent {
+            stream_id: stream_id.0,
+            logical_offset: 0,
+            length: 4096,
+            placement: NtfsExtentPlacement::Physical { byte_offset },
+        };
+        let mut extents = normalized.graph.extents().extents().to_vec();
+        extents.push(crate::extent::Extent {
+            stream: stream_id,
+            logical_offset: 0,
+            length: 4096,
+            placement: Placement::Physical { byte_offset },
+            kind: ExtentKind::FileData,
+        });
+        normalized.graph = ObjectGraph::build(
+            normalized.graph.root(),
+            objects,
+            normalized.graph.entries().to_vec(),
+            ExtentGraph::build(extents, normalized.graph.extents().volume_bytes(), 8).unwrap(),
+            ObjectGraphLimits {
+                max_objects: 4,
+                max_entries: 4,
+                max_streams: 4,
+                max_name_code_units: 255,
+            },
+        )
+        .unwrap();
+        let source = &mut normalized
+            .preservation
+            .objects
+            .iter_mut()
+            .find(|object| object.object == ObjectId(27))
+            .unwrap()
+            .source;
+        // Escrow restore matches dest objects by the dest-native path reconstructed from the
+        // sidecar's `$FILE_NAME`s, so the fixture needs the source name evidence too.
+        source
+            .file_names
+            .push(crate::fs::ntfs_inventory::NtfsFileName {
+                parent: NtfsObjectReference {
+                    record_number: 5,
+                    sequence_number: 1,
+                },
+                namespace: FileNameNamespace::Win32AndDos,
+                name: NtfsName {
+                    code_units: "legal.txt".encode_utf16().collect(),
+                    is_well_formed: true,
+                },
+                allocated_size: 4096,
+                data_size: 4096,
+                file_attributes: 0x20,
+                reparse_tag_or_ea_size: 0,
+            });
+        source.data_streams.push(NtfsDataStream {
+            attribute_id: 3,
+            name: Some(NtfsName {
+                code_units: fork_name,
+                is_well_formed: true,
+            }),
+            compressed: false,
+            encrypted: false,
+            sparse: false,
+            compression_block_bytes: 0,
+            storage: NtfsStreamStorage::NonResident {
+                allocated_bytes: 4096,
+                data_bytes: 4096,
+                initialized_bytes: 4096,
+                compressed_bytes: None,
+                mapping_complete: true,
+                extents: vec![source_extent],
+                captured_payload: None,
+            },
+        });
+        source.attribute_census.push(NtfsAttributeEvidence {
+            attribute_type: 0x80,
+            name: Some(NtfsName {
+                code_units: "fork".encode_utf16().collect(),
+                is_well_formed: true,
+            }),
+            flags_raw: 0,
+            flags_unknown_bits: 0,
+            attribute_id: 3,
+            resident: false,
+        });
+        normalized.preservation.source_extents.push(source_extent);
+        normalized
+    }
+
+    #[test]
+    fn uncaptured_named_stream_is_projected_as_a_hidden_escrow_carrier_file() {
+        use crate::escrow_carrier::{carrier_directory_name, carrier_file_name};
+
+        let normalized = normalized_ntfs_with_uncaptured_named_stream(8 * 1024 * 1024);
+        let projection = project_ntfs_graph_for_exfat(&normalized).unwrap();
+        let graph = &projection.graph;
+        let directory = projection.escrow_directory.expect("escrow directory");
+        assert_eq!(projection.carriers.len(), 1);
+        let carrier = projection.carriers[0];
+        assert_eq!(carrier.owner, ObjectId(27));
+        assert_eq!(graph.objects().len(), 4);
+
+        let owner = graph
+            .objects()
+            .iter()
+            .find(|object| object.id == ObjectId(27))
+            .unwrap();
+        assert_eq!(owner.streams.len(), 1);
+        assert!(owner.streams[0].name.is_none());
+
+        let carrier_object = graph
+            .objects()
+            .iter()
+            .find(|object| object.id == carrier.object)
+            .unwrap();
+        assert_eq!(carrier_object.kind, ObjectKind::File);
+        assert_eq!(carrier_object.streams.len(), 1);
+        assert_eq!(carrier_object.streams[0].id, StreamId((27_u64 << 16) | 3));
+        assert!(carrier_object.streams[0].name.is_none());
+        assert_eq!(carrier_object.streams[0].storage, StreamStorage::Extents);
+        assert!(graph.extents().extents().iter().any(|extent| {
+            extent.stream == StreamId((27_u64 << 16) | 3)
+                && extent.placement
+                    == Placement::Physical {
+                        byte_offset: 8 * 1024 * 1024,
+                    }
+        }));
+
+        let directory_entry = graph
+            .entries()
+            .iter()
+            .find(|entry| entry.target == directory)
+            .unwrap();
+        assert_eq!(directory_entry.parent, graph.root());
+        assert_eq!(directory_entry.name, carrier_directory_name());
+        let carrier_entry = graph
+            .entries()
+            .iter()
+            .find(|entry| entry.target == carrier.object)
+            .unwrap();
+        assert_eq!(carrier_entry.parent, directory);
+        assert_eq!(carrier_entry.name, carrier_file_name(27, 3));
+
+        let metadata = map_ntfs_object_metadata(&normalized, &projection).unwrap();
+        assert_eq!(metadata.len(), 3);
+        let directory_metadata = metadata
+            .iter()
+            .find(|entry| entry.object == directory)
+            .unwrap();
+        assert_eq!(directory_metadata.file_attributes, 0x16);
+        let carrier_metadata = metadata
+            .iter()
+            .find(|entry| entry.object == carrier.object)
+            .unwrap();
+        assert_eq!(carrier_metadata.file_attributes, 0x26);
+        let owner_metadata = metadata
+            .iter()
+            .find(|entry| entry.object == ObjectId(27))
+            .unwrap();
+        assert_eq!(carrier_metadata.timestamps, owner_metadata.timestamps);
+
+        // The carrier payload is relocated into the exFAT heap like any unnamed payload.
+        let draft = draft_lossless_ntfs_to_exfat(
+            &normalized,
+            GuaranteeMode::Escrow,
+            NtfsToExfatOptions::default(),
+            NtfsToExfatLimits::default(),
+        )
+        .unwrap();
+        assert!(draft.destination.source_allocations().iter().any(|item| {
+            item.stream == StreamId((27_u64 << 16) | 3)
+                && item.range.offset == 8 * 1024 * 1024
+                && item.movable
+        }));
+        let solved = solve_lossless_ntfs_to_exfat(draft, LayoutLimits::default()).unwrap();
+        assert!(
+            solved
+                .relocation()
+                .target_graph()
+                .objects()
+                .iter()
+                .any(|object| object.id == carrier.object)
+        );
+    }
+
+    #[test]
+    fn source_root_entry_colliding_with_the_escrow_directory_is_refused() {
+        let mut normalized = normalized_ntfs_with_uncaptured_named_stream(8 * 1024 * 1024);
+        let mut entries = normalized.graph.entries().to_vec();
+        entries[0].name = ".StarConverter-Escrow".encode_utf16().collect();
+        normalized.graph = ObjectGraph::build(
+            normalized.graph.root(),
+            normalized.graph.objects().to_vec(),
+            entries,
+            normalized.graph.extents().clone(),
+            ObjectGraphLimits {
+                max_objects: 4,
+                max_entries: 4,
+                max_streams: 4,
+                max_name_code_units: 255,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            project_ntfs_graph_for_exfat(&normalized),
+            Err(NtfsToExfatError::EscrowCarrierNameCollision)
+        ));
+
+        // Without any carrier the same name is an ordinary user entry.
+        let plain = normalized_ntfs();
+        let mut entries = plain.graph.entries().to_vec();
+        entries[0].name = ".starconverter-escrow".encode_utf16().collect();
+        let plain = NormalizedNtfs {
+            graph: ObjectGraph::build(
+                plain.graph.root(),
+                plain.graph.objects().to_vec(),
+                entries,
+                plain.graph.extents().clone(),
+                ObjectGraphLimits {
+                    max_objects: 4,
+                    max_entries: 4,
+                    max_streams: 4,
+                    max_name_code_units: 255,
+                },
+            )
+            .unwrap(),
+            preservation: plain.preservation,
+        };
+        let projection = project_ntfs_graph_for_exfat(&plain).unwrap();
+        assert!(projection.escrow_directory.is_none());
+        assert_eq!(projection.graph.objects().len(), 2);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn escrow_restore_folds_carrier_back_into_the_named_stream() {
+        use crate::escrow_restore::restore_ntfs_identities_with_evidence;
+
+        let normalized = normalized_ntfs_with_uncaptured_named_stream(8 * 1024 * 1024);
+        let projection = project_ntfs_graph_for_exfat(&normalized).unwrap();
+        let carrier = projection.carriers[0];
+        let directory = projection.escrow_directory.unwrap();
+
+        let restored =
+            restore_ntfs_identities_with_evidence(&projection.graph, &normalized.preservation)
+                .unwrap();
+        assert_eq!(
+            restored.removed_objects,
+            BTreeSet::from([carrier.object, directory])
+        );
+        assert_eq!(restored.graph.objects().len(), 2);
+        assert_eq!(restored.graph.entries().len(), 1);
+        let file = restored
+            .graph
+            .objects()
+            .iter()
+            .find(|object| object.id == ObjectId(27))
+            .unwrap();
+        assert_eq!(file.streams.len(), 2);
+        let fork_name: Vec<u16> = "fork".encode_utf16().collect();
+        let fork = file
+            .streams
+            .iter()
+            .find(|stream| stream.name.as_deref() == Some(fork_name.as_slice()))
+            .expect("restored named stream");
+        assert_eq!(fork.id, StreamId((27_u64 << 16) | 3));
+        assert_eq!(fork.logical_bytes, 4096);
+        assert_eq!(fork.storage, StreamStorage::Extents);
+        assert_eq!(fork.flags, StreamFlags::default());
+        assert!(
+            restored
+                .graph
+                .extents()
+                .extents()
+                .iter()
+                .any(|extent| extent.stream == fork.id)
+        );
+
+        // A carrier the sidecar expects but the candidate lacks fails closed.
+        let without_carrier = ObjectGraph::build(
+            projection.graph.root(),
+            projection
+                .graph
+                .objects()
+                .iter()
+                .filter(|object| object.id != carrier.object)
+                .cloned()
+                .collect(),
+            projection
+                .graph
+                .entries()
+                .iter()
+                .filter(|entry| entry.target != carrier.object)
+                .cloned()
+                .collect(),
+            ExtentGraph::build(
+                projection
+                    .graph
+                    .extents()
+                    .extents()
+                    .iter()
+                    .filter(|extent| extent.stream != StreamId((27_u64 << 16) | 3))
+                    .copied()
+                    .collect(),
+                projection.graph.extents().volume_bytes(),
+                8,
+            )
+            .unwrap(),
+            ObjectGraphLimits {
+                max_objects: 4,
+                max_entries: 4,
+                max_streams: 4,
+                max_name_code_units: 255,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            restore_ntfs_identities_with_evidence(&without_carrier, &normalized.preservation),
+            Err(NtfsRestoreError::UnrestorableNamedStream {
+                object: ObjectId(27),
+                data_bytes: 4096,
+                ..
+            })
+        ));
+
+        // A carrier of the wrong length is not silently accepted.
+        let mut wrong_length = projection.graph.objects().to_vec();
+        let shortened = &mut wrong_length
+            .iter_mut()
+            .find(|object| object.id == carrier.object)
+            .unwrap()
+            .streams[0];
+        shortened.logical_bytes = 4095;
+        shortened.initialized_bytes = 4095;
+        let wrong_length = ObjectGraph::build(
+            projection.graph.root(),
+            wrong_length,
+            projection.graph.entries().to_vec(),
+            projection.graph.extents().clone(),
+            ObjectGraphLimits {
+                max_objects: 4,
+                max_entries: 4,
+                max_streams: 4,
+                max_name_code_units: 255,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            restore_ntfs_identities_with_evidence(&wrong_length, &normalized.preservation),
+            Err(NtfsRestoreError::EscrowCarrierMismatch {
+                owner: ObjectId(27),
+                data_bytes: 4096,
+                ..
+            })
+        ));
+
+        // Foreign entries inside the escrow directory keep it from being deleted.
+        let mut with_foreign_objects = projection.graph.objects().to_vec();
+        with_foreign_objects.push(ObjectRecord {
+            id: ObjectId(900),
+            kind: ObjectKind::File,
+            link_count: 1,
+            semantics: ObjectSemantics::default(),
+            streams: vec![ObjectStream {
+                id: StreamId(900),
+                name: None,
+                logical_bytes: 0,
+                initialized_bytes: 0,
+                mapped_bytes: 0,
+                allocated_bytes: 0,
+                flags: StreamFlags::default(),
+                storage: StreamStorage::Resident(Vec::new()),
+            }],
+        });
+        let mut with_foreign_entries = projection.graph.entries().to_vec();
+        with_foreign_entries.push(NamespaceEntry {
+            parent: directory,
+            target: ObjectId(900),
+            name: "notes.txt".encode_utf16().collect(),
+        });
+        let with_foreign = ObjectGraph::build(
+            projection.graph.root(),
+            with_foreign_objects,
+            with_foreign_entries,
+            projection.graph.extents().clone(),
+            ObjectGraphLimits {
+                max_objects: 5,
+                max_entries: 5,
+                max_streams: 5,
+                max_name_code_units: 255,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            restore_ntfs_identities_with_evidence(&with_foreign, &normalized.preservation)
+                .err()
+                .unwrap(),
+            NtfsRestoreError::EscrowDirectoryNotEmpty(directory)
+        );
     }
 
     #[test]
@@ -2043,7 +3319,50 @@ mod tests {
     }
 
     #[test]
-    fn exfat_bad_clusters_refuse_until_ntfs_badclus_and_bitmap_are_serialized() {
+    fn escrow_ntfs_lznt1_is_materialized_as_dest_native_exfat() {
+        let normalized = normalized_ntfs_with_compressed_payload();
+        assert!(matches!(
+            plan_lossless_ntfs_to_exfat(
+                &normalized,
+                GuaranteeMode::Strict,
+                NtfsToExfatOptions::default(),
+                NtfsToExfatLimits::default(),
+            ),
+            Err(NtfsToExfatError::PreservationRefused { blockers })
+                if blockers.contains(&PreservationField::Compression)
+        ));
+
+        let draft = draft_lossless_ntfs_to_exfat(
+            &normalized,
+            GuaranteeMode::Escrow,
+            NtfsToExfatOptions::default(),
+            NtfsToExfatLimits::default(),
+        )
+        .unwrap();
+        assert!(
+            draft
+                .target_graph()
+                .objects()
+                .iter()
+                .flat_map(|object| &object.streams)
+                .any(|stream| !stream.flags.compressed
+                    && stream.flags.compression_block_bytes == 8192)
+        );
+
+        let solved = solve_lossless_ntfs_to_exfat(draft, LayoutLimits::default()).unwrap();
+        assert!(solved.layout().relocations.is_empty());
+        assert_eq!(solved.layout().materializations.len(), 1);
+        assert_eq!(solved.layout().materializations[0].destination.length, 4096);
+        assert!(solved
+            .target_graph()
+            .objects()
+            .iter()
+            .flat_map(|object| &object.streams)
+            .all(|stream| stream.flags.compression_block_bytes == 0 && !stream.flags.compressed));
+    }
+
+    #[test]
+    fn exfat_bad_clusters_are_reserved_on_the_ntfs_destination() {
         let mut normalized = normalized_exfat();
         normalized
             .preservation
@@ -2066,25 +3385,21 @@ mod tests {
                 PreservationLimits::default(),
             )
             .expect("consistent exact bad-cluster evidence")
-            .permitted,
-            "escrow policy alone permits exact source evidence, so the target-native guard is required"
+            .permitted
         );
 
-        let error = plan_lossless_exfat_to_ntfs(
+        let plan = plan_lossless_exfat_to_ntfs(
             &normalized,
             GuaranteeMode::Escrow,
             ExfatToNtfsOptions::default(),
             ExfatToNtfsLimits::default(),
         )
-        .expect_err("escrow cannot replace target-native bad-cluster allocation state");
-
-        assert!(matches!(
-            error,
-            ExfatToNtfsError::AllocatedBadClustersNotRepresented {
-                allocated_clusters: 1,
-                bad_cluster_extents: 1,
-            }
-        ));
+        .expect("consistent bad-cluster extents become dest-native $BadClus and $Bitmap marks");
+        assert!(plan.destination.reservations.iter().any(|reservation| {
+            reservation.kind == crate::geometry::ReservationKind::Other
+                && reservation.range.offset == 30 * 1024 * 1024
+                && reservation.range.length == 4096
+        }));
     }
 
     #[test]
@@ -2110,7 +3425,7 @@ mod tests {
                 ExfatToNtfsOptions::default(),
                 ExfatToNtfsLimits::default(),
             ),
-            Err(ExfatToNtfsError::AllocatedBadClustersNotRepresented {
+            Err(ExfatToNtfsError::InconsistentBadClusterEvidence {
                 allocated_clusters: 0,
                 bad_cluster_extents: 1,
             })
@@ -2168,6 +3483,258 @@ mod tests {
                         && allocation.range.offset == 31 * 1024 * 1024
                         && !allocation.movable
                 })
+        );
+    }
+
+    fn empty_file(id: ObjectId, stream: StreamId) -> ObjectRecord {
+        ObjectRecord {
+            id,
+            kind: ObjectKind::File,
+            link_count: 1,
+            semantics: ObjectSemantics::default(),
+            streams: vec![ObjectStream {
+                id: stream,
+                name: None,
+                logical_bytes: 0,
+                initialized_bytes: 0,
+                mapped_bytes: 0,
+                allocated_bytes: 0,
+                flags: StreamFlags::default(),
+                storage: StreamStorage::Resident(Vec::new()),
+            }],
+        }
+    }
+
+    fn normalized_ntfs_with_case_colliding_files() -> NormalizedNtfs {
+        let mut normalized = normalized_ntfs();
+        let root = normalized.graph.root();
+        let winner = ObjectId(27);
+        let loser = ObjectId(28);
+        let occupied = ObjectId(29);
+        let timestamp = normalized.preservation.objects[1]
+            .source
+            .standard_information
+            .unwrap()
+            .creation_time;
+        let objects = vec![
+            normalized.graph.objects()[0].clone(),
+            empty_file(winner, StreamId(27)),
+            empty_file(loser, StreamId(28)),
+            empty_file(occupied, StreamId(29)),
+        ];
+        normalized.graph = ObjectGraph::build(
+            root,
+            objects,
+            vec![
+                NamespaceEntry {
+                    parent: root,
+                    target: winner,
+                    name: "ReadMe.txt".encode_utf16().collect(),
+                },
+                NamespaceEntry {
+                    parent: root,
+                    target: loser,
+                    name: "README.TXT".encode_utf16().collect(),
+                },
+                NamespaceEntry {
+                    parent: root,
+                    target: occupied,
+                    name: "README~2.TXT".encode_utf16().collect(),
+                },
+            ],
+            normalized.graph.extents().clone(),
+            ObjectGraphLimits {
+                max_objects: 8,
+                max_entries: 8,
+                max_streams: 8,
+                max_name_code_units: 255,
+            },
+        )
+        .unwrap();
+        normalized
+            .preservation
+            .objects
+            .push(NtfsObjectPreservation {
+                object: loser,
+                source: ntfs_source_object(28, false, 0x21, timestamp),
+            });
+        normalized
+            .preservation
+            .objects
+            .push(NtfsObjectPreservation {
+                object: occupied,
+                source: ntfs_source_object(29, false, 0x21, timestamp),
+            });
+        normalized
+    }
+
+    #[test]
+    fn escrow_ntfs_case_collisions_are_disambiguated_without_clobbering_siblings() {
+        let normalized = normalized_ntfs_with_case_colliding_files();
+        let strict = plan_lossless_ntfs_to_exfat(
+            &normalized,
+            GuaranteeMode::Strict,
+            NtfsToExfatOptions::default(),
+            NtfsToExfatLimits::default(),
+        );
+        assert!(matches!(
+            strict,
+            Err(NtfsToExfatError::PreservationRefused { blockers })
+                if blockers.contains(&PreservationField::NamesAndCase)
+        ));
+        let plan = plan_lossless_ntfs_to_exfat(
+            &normalized,
+            GuaranteeMode::Escrow,
+            NtfsToExfatOptions::default(),
+            NtfsToExfatLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.preservation
+                .assessments
+                .iter()
+                .find(|assessment| assessment.field == PreservationField::NamesAndCase)
+                .map(|assessment| assessment.disposition),
+            Some(FieldDisposition::EscrowRequired)
+        );
+        let mut names: Vec<Vec<u16>> = plan
+            .target_graph
+            .entries()
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "README~2.TXT".encode_utf16().collect::<Vec<u16>>(),
+                "README~3.TXT".encode_utf16().collect::<Vec<u16>>(),
+                "ReadMe.txt".encode_utf16().collect::<Vec<u16>>(),
+            ]
+        );
+        let table =
+            generate_recommended_exfat_upcase(RecommendedExfatUpcaseLimits::default()).unwrap();
+        let folded: BTreeSet<Vec<u16>> = plan
+            .target_graph
+            .entries()
+            .iter()
+            .map(|entry| {
+                entry
+                    .name
+                    .iter()
+                    .map(|unit| table.map(*unit))
+                    .collect::<Vec<u16>>()
+            })
+            .collect();
+        assert_eq!(folded.len(), 3);
+        assert_eq!(plan.object_metadata.len(), 3);
+    }
+
+    fn symlink_reparse_payload() -> Vec<u8> {
+        let mut payload = vec![0_u8; 16];
+        payload[..4].copy_from_slice(&0xa000_000c_u32.to_le_bytes());
+        payload[4..6].copy_from_slice(&8_u16.to_le_bytes());
+        payload
+    }
+
+    fn normalized_ntfs_with_reparse_point() -> (NormalizedNtfs, Vec<u8>) {
+        let mut normalized = normalized_ntfs();
+        let file = ObjectId(27);
+        let mut objects = normalized.graph.objects().to_vec();
+        for object in &mut objects {
+            if object.id == file {
+                object.semantics.is_reparse_point = true;
+            }
+        }
+        normalized.graph = ObjectGraph::build(
+            normalized.graph.root(),
+            objects,
+            normalized.graph.entries().to_vec(),
+            normalized.graph.extents().clone(),
+            ObjectGraphLimits {
+                max_objects: 4,
+                max_entries: 4,
+                max_streams: 4,
+                max_name_code_units: 255,
+            },
+        )
+        .unwrap();
+        let payload = symlink_reparse_payload();
+        let preserved = normalized
+            .preservation
+            .objects
+            .iter_mut()
+            .find(|object| object.object == file)
+            .unwrap();
+        preserved.source.has_reparse_point = true;
+        preserved.source.reparse_point = Some(payload.clone());
+        preserved
+            .source
+            .standard_information
+            .as_mut()
+            .unwrap()
+            .file_attributes |= 0x400;
+        preserved
+            .source
+            .attribute_census
+            .push(NtfsAttributeEvidence {
+                attribute_type: 0xc0,
+                name: None,
+                flags_raw: 0,
+                flags_unknown_bits: 0,
+                attribute_id: 8,
+                resident: true,
+            });
+        (normalized, payload)
+    }
+
+    #[test]
+    fn escrow_ntfs_reparse_points_project_without_dest_semantics() {
+        let (normalized, payload) = normalized_ntfs_with_reparse_point();
+        let strict = plan_lossless_ntfs_to_exfat(
+            &normalized,
+            GuaranteeMode::Strict,
+            NtfsToExfatOptions::default(),
+            NtfsToExfatLimits::default(),
+        );
+        assert!(matches!(
+            strict,
+            Err(NtfsToExfatError::PreservationRefused { blockers })
+                if blockers.contains(&PreservationField::ReparsePoints)
+        ));
+        let plan = plan_lossless_ntfs_to_exfat(
+            &normalized,
+            GuaranteeMode::Escrow,
+            NtfsToExfatOptions::default(),
+            NtfsToExfatLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.preservation
+                .assessments
+                .iter()
+                .find(|assessment| assessment.field == PreservationField::ReparsePoints)
+                .map(|assessment| assessment.disposition),
+            Some(FieldDisposition::EscrowRequired)
+        );
+        assert!(
+            plan.target_graph
+                .objects()
+                .iter()
+                .all(|object| !object.semantics.is_reparse_point)
+        );
+        assert_eq!(
+            plan.object_metadata
+                .iter()
+                .find(|item| item.object == ObjectId(27))
+                .map(|item| item.file_attributes),
+            Some(0x21)
+        );
+        let escrow = plan.preservation.escrow.as_ref().expect("escrow");
+        assert!(
+            escrow
+                .windows(payload.len())
+                .any(|window| window == payload)
         );
     }
 }

@@ -2,8 +2,9 @@
 //!
 //! This module is pure: it accepts owned metadata views and returns bytes. It performs no file,
 //! image, volume, or device I/O. Small indexes remain entirely in a resident `INDEX_ROOT` value.
-//! Larger indexes use a single internal resident root over MST-protected leaf `INDX` records and
-//! a canonical allocation bitmap. A topology needing internal `INDX` nodes is refused.
+//! Larger indexes use a resident root over MST-protected `INDX` records and a canonical allocation
+//! bitmap. When leaf separators do not fit in the resident root, additional internal `INDX` levels
+//! are emitted. A root that cannot hold even one child pointer is refused.
 //!
 //! The structure and split rules are pinned to ntfs-3g commit
 //! `d327833ec1d5eb1358b6f2c37139f10a3460944d`: `layout.h` defines the structures,
@@ -140,7 +141,7 @@ pub struct ValidatedNtfsDirectoryIndex {
 pub enum NtfsDirectoryIndexError {
     /// The supplied `$UpCase` table was not complete.
     IncompleteUpcaseTable { actual: usize },
-    /// The geometry is not the supported cluster-aligned, single-level profile.
+    /// The geometry is not the supported cluster-aligned index-block profile.
     UnsupportedGeometry { reason: &'static str },
     /// A configured cap is internally invalid.
     InvalidLimit { field: &'static str },
@@ -166,7 +167,7 @@ pub enum NtfsDirectoryIndexError {
     },
     /// The single-level topology cannot represent this index without empty leaves.
     UnsupportedSingleLevelPartition { remaining_entries: usize },
-    /// Root separators do not fit the resident budget; another tree level would be needed.
+    /// Root separators do not fit the resident budget and another tree level cannot be formed.
     MultiLevelTreeRequired { root_bytes: usize, maximum: usize },
     /// The requested allocation exceeds a resource cap.
     AllocationLimitExceeded { actual: usize, maximum: usize },
@@ -238,7 +239,7 @@ impl fmt::Display for NtfsDirectoryIndexError {
                 maximum,
             } => write!(
                 formatter,
-                "separator root needs {root_bytes} bytes but resident budget is {maximum}; an internal INDX level is required"
+                "separator root needs {root_bytes} bytes but resident budget is {maximum}; no further INDX level can be formed"
             ),
             Self::AllocationLimitExceeded { actual, maximum } => write!(
                 formatter,
@@ -270,14 +271,16 @@ struct CheckedGeometry {
     root_budget: usize,
 }
 
-/// Serialize a deterministic resident or single-level spilled `$I30` directory index.
+/// Serialize a deterministic resident or spilled `$I30` directory index.
 ///
 /// `upcase` must be the exact 65,536-entry table selected for the destination NTFS volume.
-/// Input order is irrelevant. Equal filename collation keys are refused.
+/// Input order is irrelevant. Equal filename collation keys are refused. Spilled indexes use a
+/// resident root over leaf `INDX` records and add internal `INDX` levels when the root cannot hold
+/// every leaf separator.
 ///
 /// # Errors
 /// Returns an error for invalid geometry, invalid input, cap violations, filename collisions, or
-/// an index that would require more than one allocation level.
+/// an index whose resident root cannot hold a child pointer after every allocation level.
 pub fn serialize_ntfs_directory_index(
     entries: &[NtfsDirectoryIndexEntry],
     upcase: &[u16],
@@ -299,7 +302,7 @@ pub fn serialize_ntfs_directory_index(
     let resident_bytes = root_size(&sorted, false)?;
     if resident_bytes <= checked.root_budget {
         return Ok(SerializedNtfsDirectoryIndex {
-            index_root: build_root(&sorted, &[], checked, false)?,
+            index_root: build_root(&sorted, &[], &[], checked, false)?,
             index_allocation: Vec::new(),
             bitmap: Vec::new(),
             block_vcns: Vec::new(),
@@ -319,23 +322,91 @@ pub fn serialize_ntfs_directory_index(
         }
     }
 
-    let (leaf_ranges, separators) = partition_leaves(&sorted, checked)?;
-    let root_bytes = root_size_for_separators(&sorted, &separators)?;
-    if root_bytes > checked.root_budget {
-        return Err(NtfsDirectoryIndexError::MultiLevelTreeRequired {
-            root_bytes,
-            maximum: checked.root_budget,
-        });
+    spill_directory_index(&sorted, checked, limits)
+}
+
+const MAX_INDEX_DEPTH: usize = 8;
+
+enum PlannedIndexNode {
+    Leaf {
+        range: Range<usize>,
+    },
+    Internal {
+        children: Vec<usize>,
+        separators: Vec<usize>,
+    },
+}
+
+fn spill_directory_index(
+    sorted: &[(usize, &NtfsDirectoryIndexEntry)],
+    checked: CheckedGeometry,
+    limits: NtfsDirectoryIndexLimits,
+) -> Result<SerializedNtfsDirectoryIndex, NtfsDirectoryIndexError> {
+    let (leaf_ranges, mut separators) = partition_leaves(sorted, checked)?;
+    let mut nodes: Vec<PlannedIndexNode> = leaf_ranges
+        .into_iter()
+        .map(|range| PlannedIndexNode::Leaf { range })
+        .collect();
+    let mut level: Vec<usize> = (0..nodes.len()).collect();
+    for _ in 0..MAX_INDEX_DEPTH {
+        let root_bytes = root_size_for_separators(sorted, &separators)?;
+        if root_bytes <= checked.root_budget {
+            return emit_spilled_index(sorted, &nodes, &level, &separators, checked, limits);
+        }
+        let previous = level.len();
+        let (groups, promoted) = partition_index_nodes(sorted, &separators, previous, checked)?;
+        let mut child_cursor = 0_usize;
+        let mut next_level = Vec::new();
+        next_level
+            .try_reserve_exact(groups.len())
+            .map_err(|_| NtfsDirectoryIndexError::AllocationFailed)?;
+        for (group_separators, child_count) in groups {
+            let end = child_cursor
+                .checked_add(child_count)
+                .ok_or(NtfsDirectoryIndexError::ArithmeticOverflow)?;
+            if end > level.len() {
+                return Err(NtfsDirectoryIndexError::ArithmeticOverflow);
+            }
+            let id = nodes.len();
+            nodes.push(PlannedIndexNode::Internal {
+                children: level[child_cursor..end].to_vec(),
+                separators: group_separators,
+            });
+            next_level.push(id);
+            child_cursor = end;
+        }
+        if next_level.is_empty() || next_level.len() >= previous {
+            return Err(NtfsDirectoryIndexError::MultiLevelTreeRequired {
+                root_bytes,
+                maximum: checked.root_budget,
+            });
+        }
+        level = next_level;
+        separators = promoted;
     }
-    if leaf_ranges.len() > limits.max_blocks {
+    Err(NtfsDirectoryIndexError::MultiLevelTreeRequired {
+        root_bytes: root_size_for_separators(sorted, &separators)?,
+        maximum: checked.root_budget,
+    })
+}
+
+fn emit_spilled_index(
+    sorted: &[(usize, &NtfsDirectoryIndexEntry)],
+    nodes: &[PlannedIndexNode],
+    root_children: &[usize],
+    separators: &[usize],
+    checked: CheckedGeometry,
+    limits: NtfsDirectoryIndexLimits,
+) -> Result<SerializedNtfsDirectoryIndex, NtfsDirectoryIndexError> {
+    if nodes.len() > limits.max_blocks {
         return Err(NtfsDirectoryIndexError::BlockLimitExceeded {
-            actual: leaf_ranges.len(),
+            actual: nodes.len(),
             maximum: limits.max_blocks,
         });
     }
     let allocation_bytes = checked
         .block_bytes
-        .checked_mul(leaf_ranges.len())
+        .checked_mul(nodes.len())
         .ok_or(NtfsDirectoryIndexError::ArithmeticOverflow)?;
     if allocation_bytes > limits.max_allocation_bytes {
         return Err(NtfsDirectoryIndexError::AllocationLimitExceeded {
@@ -343,28 +414,83 @@ pub fn serialize_ntfs_directory_index(
             maximum: limits.max_allocation_bytes,
         });
     }
-
-    let block_vcns = block_vcns(leaf_ranges.len(), checked.vcn_units_per_block)?;
+    let block_vcns = block_vcns(nodes.len(), checked.vcn_units_per_block)?;
     let mut index_allocation = Vec::new();
     index_allocation
         .try_reserve_exact(allocation_bytes)
         .map_err(|_| NtfsDirectoryIndexError::AllocationFailed)?;
-    for (block_number, range) in leaf_ranges.iter().enumerate() {
-        index_allocation.extend_from_slice(&build_leaf_block(
-            &sorted[range.clone()],
+    for (block_number, node) in nodes.iter().enumerate() {
+        index_allocation.extend_from_slice(&build_planned_block(
+            sorted,
+            node,
+            &block_vcns,
             block_vcns[block_number],
             block_number,
             checked,
         )?);
     }
-    let bitmap = build_bitmap(leaf_ranges.len())?;
-    let index_root = build_root(&sorted, &separators, checked, true)?;
+    let root_child_vcns: Result<Vec<u64>, _> = root_children
+        .iter()
+        .map(|id| {
+            block_vcns
+                .get(*id)
+                .copied()
+                .ok_or(NtfsDirectoryIndexError::ArithmeticOverflow)
+        })
+        .collect();
     Ok(SerializedNtfsDirectoryIndex {
-        index_root,
+        index_root: build_root(sorted, separators, &root_child_vcns?, checked, true)?,
         index_allocation,
-        bitmap,
+        bitmap: build_bitmap(nodes.len())?,
         block_vcns,
     })
+}
+
+fn build_planned_block(
+    sorted: &[(usize, &NtfsDirectoryIndexEntry)],
+    node: &PlannedIndexNode,
+    block_vcns: &[u64],
+    vcn: u64,
+    block_number: usize,
+    checked: CheckedGeometry,
+) -> Result<Vec<u8>, NtfsDirectoryIndexError> {
+    match node {
+        PlannedIndexNode::Leaf { range } => build_index_block(
+            &sorted[range.clone()],
+            &[],
+            false,
+            vcn,
+            block_number,
+            checked,
+        ),
+        PlannedIndexNode::Internal {
+            children,
+            separators,
+        } => {
+            if children.len() != separators.len() + 1 {
+                return Err(NtfsDirectoryIndexError::ArithmeticOverflow);
+            }
+            let mut entries = Vec::new();
+            entries
+                .try_reserve_exact(separators.len())
+                .map_err(|_| NtfsDirectoryIndexError::AllocationFailed)?;
+            let mut child_vcns = Vec::new();
+            child_vcns
+                .try_reserve_exact(children.len())
+                .map_err(|_| NtfsDirectoryIndexError::AllocationFailed)?;
+            for (index, child) in children.iter().enumerate() {
+                let child_vcn = block_vcns
+                    .get(*child)
+                    .copied()
+                    .ok_or(NtfsDirectoryIndexError::ArithmeticOverflow)?;
+                child_vcns.push(child_vcn);
+                if let Some(&separator) = separators.get(index) {
+                    entries.push(sorted[separator]);
+                }
+            }
+            build_index_block(&entries, &child_vcns, true, vcn, block_number, checked)
+        }
+    }
 }
 
 /// Independently validate a complete serialized `$I30` stream set.
@@ -472,60 +598,20 @@ fn validate_spilled(
         return malformed("BITMAP", "noncanonical allocation bits or padding");
     }
 
-    let root_entries: Vec<_> = root.entries().collect();
-    if root_entries.len() != block_count {
-        return malformed(
-            "INDEX_ROOT",
-            "child count does not match allocated leaf count",
-        );
-    }
     let mut ordered_names = Vec::new();
-    for block_number in 0..block_count {
-        let root_entry = root_entries[block_number];
-        if root_entry.child_vcn != Some(expected_vcns[block_number]) {
-            return malformed("INDEX_ROOT", "child VCN is not in canonical stream order");
-        }
-        let start = block_number
-            .checked_mul(checked.block_bytes)
-            .ok_or(NtfsDirectoryIndexError::ArithmeticOverflow)?;
-        let end = start
-            .checked_add(checked.block_bytes)
-            .ok_or(NtfsDirectoryIndexError::ArithmeticOverflow)?;
-        let block = parse_index_block(
-            &serialized.index_allocation[start..end],
-            Some(expected_vcns[block_number]),
-            parser_limits,
-        )
-        .map_err(|error| malformed_error("INDEX_ALLOCATION", error.to_string()))?;
-        if block.header.has_children
-            || block.log_file_sequence_number != 0
-            || usize::from(block.update_sequence_offset) != UPDATE_SEQUENCE_OFFSET
-            || usize::try_from(block.header.entries_offset).unwrap_or(usize::MAX)
-                != checked.entries_offset - INDEX_BLOCK_HEADER_BYTES
-            || usize::try_from(block.header.allocated_size).unwrap_or(usize::MAX)
-                != checked.block_bytes - INDEX_BLOCK_HEADER_BYTES
-        {
-            return malformed("INDEX_ALLOCATION", "noncanonical leaf header");
-        }
-        if read_u16(
-            &serialized.index_allocation[start..end],
-            UPDATE_SEQUENCE_OFFSET,
-        )? != update_sequence_number(block_number)?
-        {
-            return malformed("INDEX_ALLOCATION", "noncanonical update-sequence number");
-        }
-        ordered_names.extend(collect_leaf_names(block.entries(), "INDEX_ALLOCATION")?);
-        if !root_entry.is_end {
-            let key = root_entry.file_name.ok_or_else(|| {
-                malformed_error("INDEX_ROOT", "separator has no filename key".to_owned())
-            })?;
-            ordered_names.push(key.name.code_units().collect());
-        } else if block_number + 1 != block_count {
-            return malformed("INDEX_ROOT", "terminal child precedes another child");
-        }
-    }
-    if !root_entries.last().is_some_and(|entry| entry.is_end) {
-        return malformed("INDEX_ROOT", "final child is not the terminal entry");
+    let mut seen = vec![false; block_count];
+    walk_index_node(
+        root.entries(),
+        "INDEX_ROOT",
+        serialized,
+        &expected_vcns,
+        &mut seen,
+        &mut ordered_names,
+        checked,
+        parser_limits,
+    )?;
+    if seen.iter().any(|visited| !visited) {
+        return malformed("INDEX_ALLOCATION", "allocated index block is unreachable");
     }
     validate_name_order(&ordered_names, upcase)?;
     if ordered_names.len() > limits.max_entries {
@@ -539,6 +625,97 @@ fn validate_spilled(
         block_count,
         spilled: true,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_index_node<'a>(
+    entries: impl Iterator<Item = super::ntfs_index::NtfsIndexEntry<'a>>,
+    component: &'static str,
+    serialized: &SerializedNtfsDirectoryIndex,
+    expected_vcns: &[u64],
+    seen: &mut [bool],
+    ordered_names: &mut Vec<Vec<u16>>,
+    checked: CheckedGeometry,
+    parser_limits: NtfsIndexLimits,
+) -> Result<(), NtfsDirectoryIndexError> {
+    let entries: Vec<_> = entries.collect();
+    if !entries.last().is_some_and(|entry| entry.is_end) {
+        return malformed(component, "final child is not the terminal entry");
+    }
+    for (index, entry) in entries.iter().enumerate() {
+        if entry.is_end && index + 1 != entries.len() {
+            return malformed(component, "terminal child precedes another child");
+        }
+        if let Some(child_vcn) = entry.child_vcn {
+            let block_number = expected_vcns
+                .iter()
+                .position(|vcn| *vcn == child_vcn)
+                .ok_or_else(|| {
+                    malformed_error(
+                        component,
+                        "child VCN is not in the allocation stream".to_owned(),
+                    )
+                })?;
+            if seen[block_number] {
+                return malformed(component, "child VCN is reachable more than once");
+            }
+            seen[block_number] = true;
+            let start = block_number
+                .checked_mul(checked.block_bytes)
+                .ok_or(NtfsDirectoryIndexError::ArithmeticOverflow)?;
+            let end = start
+                .checked_add(checked.block_bytes)
+                .ok_or(NtfsDirectoryIndexError::ArithmeticOverflow)?;
+            let block_bytes = &serialized.index_allocation[start..end];
+            let block = parse_index_block(block_bytes, Some(child_vcn), parser_limits)
+                .map_err(|error| malformed_error("INDEX_ALLOCATION", error.to_string()))?;
+            validate_index_block_header(&block, block_bytes, block_number, checked)?;
+            if block.header.has_children {
+                walk_index_node(
+                    block.entries(),
+                    "INDEX_ALLOCATION",
+                    serialized,
+                    expected_vcns,
+                    seen,
+                    ordered_names,
+                    checked,
+                    parser_limits,
+                )?;
+            } else {
+                ordered_names.extend(collect_leaf_names(block.entries(), "INDEX_ALLOCATION")?);
+            }
+        } else if component == "INDEX_ROOT" {
+            return malformed(component, "spilled root entry is missing a child VCN");
+        }
+        if !entry.is_end {
+            let key = entry.file_name.ok_or_else(|| {
+                malformed_error(component, "separator has no filename key".to_owned())
+            })?;
+            ordered_names.push(key.name.code_units().collect());
+        }
+    }
+    Ok(())
+}
+
+fn validate_index_block_header(
+    block: &super::ntfs_index::NtfsIndexBlock<'_>,
+    bytes: &[u8],
+    block_number: usize,
+    checked: CheckedGeometry,
+) -> Result<(), NtfsDirectoryIndexError> {
+    if block.log_file_sequence_number != 0
+        || usize::from(block.update_sequence_offset) != UPDATE_SEQUENCE_OFFSET
+        || usize::try_from(block.header.entries_offset).unwrap_or(usize::MAX)
+            != checked.entries_offset - INDEX_BLOCK_HEADER_BYTES
+        || usize::try_from(block.header.allocated_size).unwrap_or(usize::MAX)
+            != checked.block_bytes - INDEX_BLOCK_HEADER_BYTES
+    {
+        return malformed("INDEX_ALLOCATION", "noncanonical index-block header");
+    }
+    if read_u16(bytes, UPDATE_SEQUENCE_OFFSET)? != update_sequence_number(block_number)? {
+        return malformed("INDEX_ALLOCATION", "noncanonical update-sequence number");
+    }
+    Ok(())
 }
 
 fn check_inputs(
@@ -735,6 +912,90 @@ fn partition_leaves(
     Ok((ranges, separators))
 }
 
+type IndexNodeGroup = (Vec<usize>, usize);
+
+fn partition_index_nodes(
+    sorted: &[(usize, &NtfsDirectoryIndexEntry)],
+    keys: &[usize],
+    child_count: usize,
+    checked: CheckedGeometry,
+) -> Result<(Vec<IndexNodeGroup>, Vec<usize>), NtfsDirectoryIndexError> {
+    if child_count == 0 || keys.len().checked_add(1) != Some(child_count) {
+        return Err(NtfsDirectoryIndexError::ArithmeticOverflow);
+    }
+    let payload_capacity = checked
+        .leaf_entry_bytes
+        .checked_sub(serialized_terminal_len(true))
+        .ok_or(NtfsDirectoryIndexError::ArithmeticOverflow)?;
+    for &key in keys {
+        let required = serialized_entry_len(sorted[key].1.name.len(), true)?;
+        if required > payload_capacity {
+            return Err(NtfsDirectoryIndexError::EntryCannotFitLeaf {
+                entry: sorted[key].0,
+                required,
+                available: payload_capacity,
+            });
+        }
+    }
+    let mut groups = Vec::new();
+    let mut promoted = Vec::new();
+    let mut child_cursor = 0;
+    let mut key_cursor = 0;
+    while child_cursor < child_count {
+        let remaining_children = child_count - child_cursor;
+        let remaining_keys = keys.len() - key_cursor;
+        let mut packed_keys = 0;
+        let mut used = 0_usize;
+        while key_cursor + packed_keys < keys.len() {
+            let size =
+                serialized_entry_len(sorted[keys[key_cursor + packed_keys]].1.name.len(), true)?;
+            if used
+                .checked_add(size)
+                .is_none_or(|next| next > payload_capacity)
+            {
+                break;
+            }
+            used += size;
+            packed_keys += 1;
+        }
+        let mut take = packed_keys
+            .checked_add(1)
+            .ok_or(NtfsDirectoryIndexError::ArithmeticOverflow)?
+            .min(remaining_children);
+        if child_cursor + take < child_count {
+            take = take.min(remaining_children.saturating_sub(1));
+            if take == 0 || remaining_keys < take {
+                return Err(NtfsDirectoryIndexError::UnsupportedSingleLevelPartition {
+                    remaining_entries: remaining_children,
+                });
+            }
+            let group_key_count = take - 1;
+            groups.push((
+                keys[key_cursor..key_cursor + group_key_count].to_vec(),
+                take,
+            ));
+            promoted.push(keys[key_cursor + group_key_count]);
+            key_cursor += take;
+            child_cursor += take;
+        } else {
+            let group_keys = keys[key_cursor..].to_vec();
+            if group_keys.len() + 1 != take {
+                return Err(NtfsDirectoryIndexError::UnsupportedSingleLevelPartition {
+                    remaining_entries: remaining_children,
+                });
+            }
+            groups.push((group_keys, take));
+            break;
+        }
+    }
+    if groups.len() != promoted.len() + 1 || groups.iter().any(|(_, count)| *count == 0) {
+        return Err(NtfsDirectoryIndexError::UnsupportedSingleLevelPartition {
+            remaining_entries: child_count.saturating_sub(child_cursor),
+        });
+    }
+    Ok((groups, promoted))
+}
+
 fn root_size(
     entries: &[(usize, &NtfsDirectoryIndexEntry)],
     children: bool,
@@ -764,6 +1025,7 @@ fn root_size_for_separators(
 fn build_root(
     sorted: &[(usize, &NtfsDirectoryIndexEntry)],
     separators: &[usize],
+    child_vcns: &[u64],
     checked: CheckedGeometry,
     children: bool,
 ) -> Result<Vec<u8>, NtfsDirectoryIndexError> {
@@ -775,6 +1037,9 @@ fn build_root(
     } else {
         sorted.to_vec()
     };
+    if children && child_vcns.len() != selected.len() + 1 {
+        return Err(NtfsDirectoryIndexError::ArithmeticOverflow);
+    }
     let size = root_size(&selected, children)?;
     let mut bytes = Vec::new();
     bytes
@@ -791,15 +1056,14 @@ fn build_root(
     )?;
     bytes[12] = checked.vcn_units_per_block;
     for (child_number, (_, entry)) in selected.iter().enumerate() {
-        let child_vcn = children
-            .then(|| child_vcn(child_number, checked.vcn_units_per_block))
-            .transpose()?;
-        append_entry(&mut bytes, entry, child_vcn, false)?;
+        append_entry(
+            &mut bytes,
+            entry,
+            children.then(|| child_vcns[child_number]),
+            false,
+        )?;
     }
-    let terminal_vcn = children
-        .then(|| child_vcn(selected.len(), checked.vcn_units_per_block))
-        .transpose()?;
-    append_terminal(&mut bytes, terminal_vcn)?;
+    append_terminal(&mut bytes, children.then(|| child_vcns[selected.len()]))?;
     let used = bytes
         .len()
         .checked_sub(INDEX_ROOT_PREFIX_BYTES)
@@ -819,12 +1083,20 @@ fn build_root(
     Ok(bytes)
 }
 
-fn build_leaf_block(
+fn build_index_block(
     entries: &[(usize, &NtfsDirectoryIndexEntry)],
+    child_vcns: &[u64],
+    has_children: bool,
     vcn: u64,
     block_number: usize,
     checked: CheckedGeometry,
 ) -> Result<Vec<u8>, NtfsDirectoryIndexError> {
+    if has_children && child_vcns.len() != entries.len() + 1 {
+        return Err(NtfsDirectoryIndexError::ArithmeticOverflow);
+    }
+    if !has_children && !child_vcns.is_empty() {
+        return Err(NtfsDirectoryIndexError::ArithmeticOverflow);
+    }
     let sector_count = checked.block_bytes / UPDATE_SEQUENCE_STRIDE;
     let usa_count = sector_count
         .checked_add(1)
@@ -845,16 +1117,24 @@ fn build_leaf_block(
     put_u64(&mut bytes, 16, vcn)?;
 
     let mut encoded_entries = Vec::new();
-    for (_, entry) in entries {
-        append_entry(&mut encoded_entries, entry, None, false)?;
+    for (index, (_, entry)) in entries.iter().enumerate() {
+        append_entry(
+            &mut encoded_entries,
+            entry,
+            has_children.then(|| child_vcns[index]),
+            false,
+        )?;
     }
-    append_terminal(&mut encoded_entries, None)?;
+    append_terminal(
+        &mut encoded_entries,
+        has_children.then(|| child_vcns[entries.len()]),
+    )?;
     let used_end = checked
         .entries_offset
         .checked_add(encoded_entries.len())
         .ok_or(NtfsDirectoryIndexError::ArithmeticOverflow)?;
     if used_end > checked.block_bytes {
-        return malformed("INDEX_ALLOCATION", "leaf entries exceed their block");
+        return malformed("INDEX_ALLOCATION", "index entries exceed their block");
     }
     bytes[checked.entries_offset..used_end].copy_from_slice(&encoded_entries);
     put_u32(
@@ -875,6 +1155,7 @@ fn build_leaf_block(
         u32::try_from(checked.block_bytes - INDEX_BLOCK_HEADER_BYTES)
             .map_err(|_| NtfsDirectoryIndexError::ArithmeticOverflow)?,
     )?;
+    bytes[INDEX_BLOCK_HEADER_BYTES + 12] = u8::from(has_children);
 
     let usn = update_sequence_number(block_number)?;
     put_u16(&mut bytes, UPDATE_SEQUENCE_OFFSET, usn)?;
@@ -1472,12 +1753,57 @@ mod tests {
     }
 
     #[test]
-    fn multi_level_requirement_is_explicitly_refused() {
+    fn multi_level_tree_round_trips_through_independent_validation() {
+        let table = upcase();
+        let input = entries(12);
+        let serialized = serialize_ntfs_directory_index(
+            &input,
+            &table,
+            geometry(64),
+            NtfsDirectoryIndexLimits::default(),
+        )
+        .unwrap();
+        assert!(serialized.is_spilled());
+        assert!(serialized.block_vcns.len() > 1);
+        let parser_limits = NtfsIndexLimits::default();
+        let root = parse_index_root(&serialized.index_root, parser_limits).unwrap();
+        assert!(root.header.has_children);
+        let internals = serialized
+            .block_vcns
+            .iter()
+            .enumerate()
+            .filter(|(index, vcn)| {
+                let start = index * 512;
+                parse_index_block(
+                    &serialized.index_allocation[start..start + 512],
+                    Some(**vcn),
+                    parser_limits,
+                )
+                .unwrap()
+                .header
+                .has_children
+            })
+            .count();
+        assert!(internals >= 1);
+        let validated = validate_serialized_ntfs_directory_index(
+            &serialized,
+            &table,
+            geometry(64),
+            NtfsDirectoryIndexLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(validated.entry_count, 12);
+        assert_eq!(validated.block_count, serialized.block_vcns.len());
+        assert!(validated.spilled);
+    }
+
+    #[test]
+    fn spilled_root_without_room_for_a_child_pointer_is_refused() {
         let table = upcase();
         let error = serialize_ntfs_directory_index(
             &entries(12),
             &table,
-            geometry(64),
+            geometry(48),
             NtfsDirectoryIndexLimits::default(),
         )
         .unwrap_err();

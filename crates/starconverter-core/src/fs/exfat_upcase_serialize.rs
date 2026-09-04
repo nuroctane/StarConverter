@@ -629,4 +629,40 @@ mod tests {
             Err(RecommendedExfatUpcaseError::Name(NameError::Empty))
         ));
     }
+
+    #[test]
+    fn recommended_exfat_folds_a_windows61_ntfs_distinct_legal_name_pair() {
+        use crate::fs::ntfs_upcase_serialize::{
+            NtfsUpcaseLimits, generate_ntfs3g_windows61_upcase,
+        };
+        use crate::preservation::is_legal_exfat_name;
+        let ntfs = generate_ntfs3g_windows61_upcase(NtfsUpcaseLimits::default()).unwrap();
+        let exfat = table();
+        let mut buckets: std::collections::BTreeMap<u16, Vec<u16>> =
+            std::collections::BTreeMap::new();
+        for unit in 0_u16..=u16::MAX {
+            if (0xd800..=0xdfff).contains(&unit)
+                || matches!(unit, 32 | 46)
+                || !is_legal_exfat_name(&[unit])
+            {
+                continue;
+            }
+            buckets.entry(exfat.map(unit)).or_default().push(unit);
+        }
+        let mut pair = None;
+        'search: for members in buckets.values() {
+            for (index, left) in members.iter().enumerate() {
+                for right in &members[index + 1..] {
+                    if ntfs.lookup(*left) != ntfs.lookup(*right) {
+                        pair = Some((*left, *right));
+                        break 'search;
+                    }
+                }
+            }
+        }
+        assert!(
+            pair.is_some(),
+            "expected at least one NTFS-distinct exFAT-colliding legal BMP pair"
+        );
+    }
 }

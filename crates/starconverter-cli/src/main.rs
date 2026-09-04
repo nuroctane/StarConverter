@@ -8,14 +8,17 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use starconverter_core::candidate_export::{
-    CandidateExportEvidence, CandidateExportLimits, CandidateVerificationLimits,
-    capture_source_image_snapshot, export_relocated_candidate_image, verify_bound_export,
+    BOUND_ESCROW_FIXED_BYTES, CandidateExportEvidence, CandidateExportLimits,
+    CandidateVerificationLimits, capture_source_image_snapshot, export_relocated_candidate_image,
+    verify_bound_export,
 };
 use starconverter_core::cross_format::{
     ExfatToNtfsLimits, ExfatToNtfsOptions, NtfsToExfatLimits, NtfsToExfatOptions,
-    draft_lossless_exfat_to_ntfs, draft_lossless_ntfs_to_exfat, solve_lossless_exfat_to_ntfs,
-    solve_lossless_ntfs_to_exfat,
+    draft_escrow_restored_exfat_to_ntfs, draft_lossless_exfat_to_ntfs,
+    draft_lossless_ntfs_to_exfat, solve_lossless_exfat_to_ntfs, solve_lossless_ntfs_to_exfat,
 };
+use starconverter_core::escrow_carrier::{ESCROW_CARRIER_DIRECTORY, sidecar_carriers};
+use starconverter_core::escrow_restore::decode_restore_sidecar;
 use starconverter_core::fs::exfat_normalize::NormalizedExfat;
 use starconverter_core::fs::exfat_region::ExfatBootRegionComparison;
 use starconverter_core::fs::ntfs_normalize::NormalizedNtfs;
@@ -231,9 +234,13 @@ fn convert_image_command(args: &[String]) -> Result<(), String> {
         FileSystem::Ntfs => FileSystem::ExFat,
         FileSystem::Unknown => return Err("recognized image has unknown filesystem".into()),
     };
-    let mut mode = GuaranteeMode::Escrow;
-    let mut escrow_override = None;
-    parse_convert_options(&args[2..], &mut target, &mut mode, &mut escrow_override)?;
+    let mut options = ConvertOptions::default();
+    parse_convert_options(&args[2..], &mut target, &mut options)?;
+    let ConvertOptions {
+        mode,
+        escrow_override,
+        restore_escrow,
+    } = options;
     if mode == GuaranteeMode::ContentOnly {
         return Err(
             "convert-image supports only strict or escrow losslessness; content-only is preview-only"
@@ -242,6 +249,12 @@ fn convert_image_command(args: &[String]) -> Result<(), String> {
     }
     if target == inspection.profile.filesystem {
         return Err("convert-image target must differ from the source filesystem".into());
+    }
+    if restore_escrow.is_some() && target != FileSystem::Ntfs {
+        return Err(
+            "--restore-escrow applies only to exFAT -> NTFS conversion of an escrow-exported candidate"
+                .into(),
+        );
     }
 
     let output_path = PathBuf::from(output);
@@ -256,6 +269,7 @@ fn convert_image_command(args: &[String]) -> Result<(), String> {
             &output_path,
             mode,
             escrow_override.as_deref(),
+            restore_escrow.as_deref(),
         )?,
         (None, Some(normalized), FileSystem::ExFat) => export_ntfs_source(
             &source_image,
@@ -274,7 +288,11 @@ fn convert_image_command(args: &[String]) -> Result<(), String> {
             return Err("inspection contains evidence for two filesystems".into());
         }
     };
+    print_convert_evidence(&evidence, restore_escrow.as_deref());
+    Ok(())
+}
 
+fn print_convert_evidence(evidence: &CandidateExportEvidence, restore_escrow: Option<&Path>) {
     println!("{BANNER}");
     println!(
         "[COMPLETE] copy-based {} candidate exported",
@@ -283,6 +301,13 @@ fn convert_image_command(args: &[String]) -> Result<(), String> {
     println!("[OUTPUT]   {}", evidence.output_path.display());
     if let Some(path) = &evidence.escrow_path {
         println!("[ESCROW]   {}", path.display());
+    }
+    if let Some(path) = restore_escrow {
+        println!(
+            "[RESTORED] NTFS identities (hard links, named streams, reparse points, exact \
+             timestamps, serial, label) rematerialized from {}",
+            path.display()
+        );
     }
     println!(
         "[VERIFIED] {} writes / {} replaced / manifest {}",
@@ -310,7 +335,6 @@ fn convert_image_command(args: &[String]) -> Result<(), String> {
         "[SAFE] Output paths were create-new; no existing file or device was opened for write."
     );
     println!("[QUALIFICATION] In-place activation remains locked behind serializer/Windows gates.");
-    Ok(())
 }
 
 fn export_exfat_source(
@@ -319,17 +343,38 @@ fn export_exfat_source(
     output: &Path,
     mode: GuaranteeMode,
     requested_escrow: Option<&Path>,
+    restore_escrow: Option<&Path>,
 ) -> Result<CandidateExportEvidence, String> {
     let export_limits = CandidateExportLimits::default();
     let source_snapshot = capture_source_image_snapshot(source, export_limits)
         .map_err(|error| format!("source snapshot failed: {error}"))?;
-    let draft = draft_lossless_exfat_to_ntfs(
-        normalized,
-        mode,
-        ExfatToNtfsOptions::default(),
-        ExfatToNtfsLimits::default(),
-    )
-    .map_err(|error| format!("cross-format plan refused: {error}"))?;
+    let draft = match restore_escrow {
+        Some(escrow_path) => {
+            let escrow_bytes = read_bounded_escrow(escrow_path, export_limits.max_escrow_bytes)?;
+            let sidecar = decode_restore_sidecar(
+                &escrow_bytes,
+                source_snapshot.sha256(),
+                export_limits.max_escrow_bytes,
+                PreservationLimits::default(),
+            )
+            .map_err(|error| format!("escrow restore refused: {error}"))?;
+            draft_escrow_restored_exfat_to_ntfs(
+                normalized,
+                &sidecar,
+                mode,
+                ExfatToNtfsOptions::default(),
+                ExfatToNtfsLimits::default(),
+            )
+            .map_err(|error| format!("escrow-restored plan refused: {error}"))?
+        }
+        None => draft_lossless_exfat_to_ntfs(
+            normalized,
+            mode,
+            ExfatToNtfsOptions::default(),
+            ExfatToNtfsLimits::default(),
+        )
+        .map_err(|error| format!("cross-format plan refused: {error}"))?,
+    };
     let plan = solve_lossless_exfat_to_ntfs(draft, LayoutLimits::default())
         .map_err(|error| format!("payload layout refused: {error}"))?;
     let preview = preview_ntfs_phase_writes(source, &plan.destination, PreimageLimits::default())
@@ -367,6 +412,13 @@ fn export_ntfs_source(
     .map_err(|error| format!("cross-format plan refused: {error}"))?;
     let plan = solve_lossless_ntfs_to_exfat(draft, LayoutLimits::default())
         .map_err(|error| format!("payload layout refused: {error}"))?;
+    let carriers = sidecar_carriers(&normalized.preservation);
+    if !carriers.is_empty() {
+        println!(
+            "[ESCROW]   {} named stream(s) too large for the sidecar travel as hidden+system carrier file(s) under \\{ESCROW_CARRIER_DIRECTORY}; keep that directory intact for --restore-escrow",
+            carriers.len()
+        );
+    }
     let preview = preview_exfat_phase_writes(source, &plan.destination, PreimageLimits::default())
         .map_err(|error| format!("phase preview failed: {error}"))?;
     let escrow_path = select_escrow_path(output, &plan.preservation, requested_escrow)?;
@@ -383,11 +435,31 @@ fn export_ntfs_source(
     .map_err(|error| format!("candidate export failed: {error}"))
 }
 
+/// Parsed `convert-image` options beyond the target filesystem.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConvertOptions {
+    mode: GuaranteeMode,
+    /// Where to write the sidecar produced by this conversion.
+    escrow_override: Option<PathBuf>,
+    /// An earlier NTFS -> exFAT sidecar bound to the source candidate whose NTFS identities
+    /// should be rematerialized on the exFAT -> NTFS return trip.
+    restore_escrow: Option<PathBuf>,
+}
+
+impl Default for ConvertOptions {
+    fn default() -> Self {
+        Self {
+            mode: GuaranteeMode::Escrow,
+            escrow_override: None,
+            restore_escrow: None,
+        }
+    }
+}
+
 fn parse_convert_options(
     args: &[String],
     target: &mut FileSystem,
-    mode: &mut GuaranteeMode,
-    escrow_path: &mut Option<PathBuf>,
+    options: &mut ConvertOptions,
 ) -> Result<(), String> {
     let mut index = 0;
     while index < args.len() {
@@ -397,13 +469,36 @@ fn parse_convert_options(
             .ok_or_else(|| format!("missing value after `{flag}`"))?;
         match flag {
             "--to" => *target = value.parse().map_err(|error| format!("{error}"))?,
-            "--mode" => *mode = value.parse().map_err(|error| format!("{error}"))?,
-            "--escrow" => *escrow_path = Some(PathBuf::from(value)),
+            "--mode" => options.mode = value.parse().map_err(|error| format!("{error}"))?,
+            "--escrow" => options.escrow_override = Some(PathBuf::from(value)),
+            "--restore-escrow" => options.restore_escrow = Some(PathBuf::from(value)),
             _ => return Err(format!("unknown convert-image option `{flag}`")),
         }
         index += 2;
     }
     Ok(())
+}
+
+/// Reads an escrow sidecar read-only through the pinned image opener with a hard byte bound so a
+/// hostile or mistaken path cannot make the CLI buffer an arbitrary file.
+fn read_bounded_escrow(path: &Path, max_payload_bytes: usize) -> Result<Vec<u8>, String> {
+    let max_envelope_bytes = BOUND_ESCROW_FIXED_BYTES
+        .checked_add(max_payload_bytes)
+        .ok_or_else(|| "escrow limit overflow".to_owned())?;
+    let escrow = ImageFile::open_with_limit(path, max_envelope_bytes)
+        .map_err(|error| format!("restore escrow `{}` unreadable: {error}", path.display()))?;
+    let length = usize::try_from(escrow.len())
+        .ok()
+        .filter(|length| *length <= max_envelope_bytes)
+        .ok_or_else(|| {
+            format!(
+                "restore escrow `{}` exceeds the {max_envelope_bytes}-byte envelope limit",
+                path.display()
+            )
+        })?;
+    escrow
+        .read_exact_at(0, length)
+        .map_err(|error| format!("restore escrow `{}` unreadable: {error}", path.display()))
 }
 
 fn select_escrow_path(
@@ -624,7 +719,28 @@ fn relocation_preview_lines(layout: &LayoutPlan) -> Vec<String> {
             layout.relocations.len() - MAX_PLACEMENTS
         ));
     }
-    if layout.relocations.is_empty() {
+    let remaining = MAX_PLACEMENTS.saturating_sub(lines.len());
+    lines.extend(
+        layout
+            .materializations
+            .iter()
+            .take(remaining)
+            .map(|materialization| {
+                format!(
+                    "[CREATE-NEW MATERIALIZE] stream={} destination={} bytes={}",
+                    materialization.stream.0,
+                    materialization.destination.offset,
+                    materialization.destination.length
+                )
+            }),
+    );
+    if layout.materializations.len() > remaining {
+        lines.push(format!(
+            "[CREATE-NEW MATERIALIZE] ... {} additional streams",
+            layout.materializations.len() - remaining
+        ));
+    }
+    if layout.relocations.is_empty() && layout.materializations.is_empty() {
         lines.push("[CREATE-NEW RELOCATION] none required".to_owned());
     }
     lines
@@ -940,6 +1056,35 @@ fn print_inspection(inspection: &ImageInspection) {
                 inventory.incomplete_reasons.len()
             );
         }
+        {
+            use starconverter_core::fs::ntfs_inventory::NtfsReparseIndexEvidence;
+            match &inventory.reparse_index {
+                NtfsReparseIndexEvidence::Unavailable => {
+                    println!("| $Reparse:$R : not reconciled (bounded census)");
+                }
+                NtfsReparseIndexEvidence::Absent => {
+                    println!("| $Reparse:$R : absent; no reparse points");
+                }
+                NtfsReparseIndexEvidence::Reconciled {
+                    keys,
+                    spilled: false,
+                    ..
+                } => {
+                    println!(
+                        "| $Reparse:$R : {keys} key(s) reconciled with $REPARSE_POINT (resident)"
+                    );
+                }
+                NtfsReparseIndexEvidence::Reconciled {
+                    keys,
+                    spilled: true,
+                    index_blocks,
+                } => {
+                    println!(
+                        "| $Reparse:$R : {keys} key(s) reconciled with $REPARSE_POINT ({index_blocks} INDX block(s))"
+                    );
+                }
+            }
+        }
         if let Some(secure) = inventory
             .objects
             .iter()
@@ -1183,6 +1328,7 @@ fn print_help() {
     println!(
         "  starconverter convert-image <SOURCE> <NEW-OUTPUT> [--to exfat|ntfs] [--mode MODE] [--escrow PATH]"
     );
+    println!("                              [--restore-escrow PATH]");
     println!("  starconverter verify-export <CANDIDATE> <ESCROW> [--source SOURCE]");
     println!("  starconverter verify-windows-report <REPORT.json>");
     println!("  starconverter plan [OPTIONS]\n");
@@ -1206,7 +1352,13 @@ fn print_help() {
     println!(
         "  Escrow mode writes <NEW-OUTPUT>.starconverter-escrow unless --escrow selects another new path.\n"
     );
-    println!("  Conversion accepts strict or escrow mode; content-only remains preview-only.\n");
+    println!("  Conversion accepts strict or escrow mode; content-only remains preview-only.");
+    println!(
+        "  exFAT -> NTFS with --restore-escrow consumes the NTFS -> exFAT sidecar bound to <SOURCE>:"
+    );
+    println!(
+        "  hard links, named streams, reparse points, exact timestamps, serial, and label return.\n"
+    );
     println!("VERIFY-EXPORT");
     println!(
         "  Opens regular files read-only and validates the escrow envelope, candidate SHA-256, filesystem, and logical manifest."
@@ -1562,12 +1714,14 @@ mod tests {
     #[test]
     fn relocation_preview_is_explicit_for_zero_and_nonzero_layouts() {
         use starconverter_core::extent::StreamId;
-        use starconverter_core::geometry::{ByteRange, Relocation};
+        use starconverter_core::geometry::{ByteRange, Materialization, Relocation};
 
         let empty = LayoutPlan {
             relocations: Vec::new(),
+            materializations: Vec::new(),
             free_after_staging: Vec::new(),
             relocated_bytes: 0,
+            materialized_bytes: 0,
             largest_free_range: 0,
         };
         assert_eq!(
@@ -1588,8 +1742,10 @@ mod tests {
                     length: 8192,
                 },
             }],
+            materializations: Vec::new(),
             free_after_staging: Vec::new(),
             relocated_bytes: 8192,
+            materialized_bytes: 0,
             largest_free_range: 0,
         };
         let lines = relocation_preview_lines(&relocated);
@@ -1598,6 +1754,27 @@ mod tests {
         assert!(lines[0].contains("source=12288"));
         assert!(lines[0].contains("destination=32768"));
         assert!(lines[0].contains("bytes=8192"));
+
+        let materialized = LayoutPlan {
+            relocations: Vec::new(),
+            materializations: vec![Materialization {
+                stream: StreamId(3),
+                destination: ByteRange {
+                    offset: 16_384,
+                    length: 4096,
+                },
+            }],
+            free_after_staging: Vec::new(),
+            relocated_bytes: 0,
+            materialized_bytes: 4096,
+            largest_free_range: 0,
+        };
+        let materialize_lines = relocation_preview_lines(&materialized);
+        assert_eq!(materialize_lines.len(), 1);
+        assert!(materialize_lines[0].contains("[CREATE-NEW MATERIALIZE]"));
+        assert!(materialize_lines[0].contains("stream=3"));
+        assert!(materialize_lines[0].contains("destination=16384"));
+        assert!(materialize_lines[0].contains("bytes=4096"));
     }
 
     #[test]
@@ -1625,6 +1802,95 @@ mod tests {
         assert_eq!(
             run(&["convert-image".to_owned(), "source.img".to_owned()]),
             Err("convert-image requires a new output image path".to_owned())
+        );
+    }
+
+    #[test]
+    fn convert_option_parser_accepts_restore_escrow_and_stays_fail_closed() {
+        let mut target = FileSystem::Ntfs;
+        let mut options = ConvertOptions::default();
+        parse_convert_options(
+            &[
+                "--mode".into(),
+                "strict".into(),
+                "--escrow".into(),
+                "out.escrow".into(),
+                "--restore-escrow".into(),
+                "in.escrow".into(),
+            ],
+            &mut target,
+            &mut options,
+        )
+        .unwrap();
+        assert_eq!(
+            options,
+            ConvertOptions {
+                mode: GuaranteeMode::Strict,
+                escrow_override: Some(PathBuf::from("out.escrow")),
+                restore_escrow: Some(PathBuf::from("in.escrow")),
+            }
+        );
+        assert_eq!(
+            parse_convert_options(
+                &["--restore-escrow".into()],
+                &mut target,
+                &mut ConvertOptions::default()
+            ),
+            Err("missing value after `--restore-escrow`".into())
+        );
+        assert_eq!(
+            parse_convert_options(
+                &["--restore".into(), "x".into()],
+                &mut target,
+                &mut ConvertOptions::default()
+            ),
+            Err("unknown convert-image option `--restore`".into())
+        );
+    }
+
+    #[test]
+    fn restore_escrow_is_refused_for_ntfs_sources() {
+        let image = TempImage::write("restore-direction", &ntfs_image());
+        let output = std::env::temp_dir().join(format!(
+            "starconverter-cli-restore-direction-{}-never-created.img",
+            std::process::id()
+        ));
+        let result = run(&[
+            "convert-image".to_owned(),
+            image.path().to_string_lossy().into_owned(),
+            output.to_string_lossy().into_owned(),
+            "--restore-escrow".to_owned(),
+            "unused.escrow".to_owned(),
+        ]);
+        assert_eq!(
+            result,
+            Err(
+                "--restore-escrow applies only to exFAT -> NTFS conversion of an escrow-exported candidate"
+                    .to_owned()
+            )
+        );
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn bounded_escrow_reader_refuses_oversized_and_missing_files() {
+        let escrow = TempImage::write("restore-escrow", &[0_u8; 512]);
+        let bytes = read_bounded_escrow(escrow.path(), 1024).unwrap();
+        assert_eq!(bytes.len(), 512);
+        let oversized = read_bounded_escrow(escrow.path(), 16).unwrap_err();
+        assert!(
+            oversized.contains("restore escrow") && oversized.contains("unreadable")
+                || oversized.contains("envelope limit"),
+            "{oversized}"
+        );
+        let missing = std::env::temp_dir().join(format!(
+            "starconverter-cli-missing-escrow-{}.starconverter-escrow",
+            std::process::id()
+        ));
+        assert!(
+            read_bounded_escrow(&missing, 1024)
+                .unwrap_err()
+                .contains("unreadable")
         );
     }
 

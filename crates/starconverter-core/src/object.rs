@@ -33,6 +33,8 @@ pub struct StreamFlags {
     pub sparse: bool,
     pub compressed: bool,
     pub encrypted: bool,
+    /// NTFS compression-unit size in bytes. Zero when the stream is not NTFS-compressed.
+    pub compression_block_bytes: u64,
 }
 
 /// Where a stream's bytes are represented.

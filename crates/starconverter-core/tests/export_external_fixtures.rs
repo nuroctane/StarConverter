@@ -555,6 +555,7 @@ fn exfat_image(
             upcase_checksum: RECOMMENDED_EXFAT_UPCASE_PROFILE.table_checksum,
             source_preservation: ExfatPreservationEvidence::default(),
             allocated_bad_clusters: 0,
+            bad_cluster_ranges: &[],
         },
         ExfatSerializeOptions {
             partition_offset_sectors,

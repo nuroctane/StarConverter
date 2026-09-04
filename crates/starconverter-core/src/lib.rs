@@ -10,6 +10,8 @@ mod capsule_fault;
 pub mod capsule_store;
 pub mod conversion;
 pub mod cross_format;
+pub mod escrow_carrier;
+pub mod escrow_restore;
 pub mod executor;
 pub mod extent;
 pub mod fs;

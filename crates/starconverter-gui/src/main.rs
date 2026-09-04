@@ -14,16 +14,19 @@ use eframe::egui::{
     WidgetInfo, WidgetType,
 };
 use starconverter_core::candidate_export::{
-    CandidateExportError, CandidateExportEvidence, CandidateExportLimits,
+    BOUND_ESCROW_FIXED_BYTES, CandidateExportError, CandidateExportEvidence, CandidateExportLimits,
     CandidateVerificationEvidence, CandidateVerificationLimits, CandidateWorkControl,
     CandidateWorkPhase, CandidateWorkProgress, SourceImageSnapshot, capture_source_image_snapshot,
     export_relocated_candidate_image_with_progress, verify_bound_export_with_progress,
 };
 use starconverter_core::cross_format::{
-    ExfatToNtfsLimits, ExfatToNtfsOptions, NtfsToExfatLimits, NtfsToExfatOptions,
-    draft_lossless_exfat_to_ntfs, draft_lossless_ntfs_to_exfat, solve_lossless_exfat_to_ntfs,
-    solve_lossless_ntfs_to_exfat,
+    ExfatToNtfsLimits, ExfatToNtfsOptions, ExfatToNtfsRelocationDraft, NtfsToExfatLimits,
+    NtfsToExfatOptions, draft_escrow_restored_exfat_to_ntfs, draft_lossless_exfat_to_ntfs,
+    draft_lossless_ntfs_to_exfat, solve_lossless_exfat_to_ntfs, solve_lossless_ntfs_to_exfat,
 };
+use starconverter_core::escrow_carrier::{ESCROW_CARRIER_DIRECTORY, sidecar_carriers};
+use starconverter_core::escrow_restore::decode_restore_sidecar;
+use starconverter_core::fs::exfat_normalize::NormalizedExfat;
 use starconverter_core::geometry::{
     DestinationReservation, LayoutLimits, LayoutPlan, SourceAllocation,
 };
@@ -33,7 +36,7 @@ use starconverter_core::phase::{
     PhaseWritePreview, preview_exfat_phase_writes, preview_ntfs_phase_writes,
 };
 use starconverter_core::preimage::PreimageLimits;
-use starconverter_core::preservation::PreservationReport;
+use starconverter_core::preservation::{PreservationLimits, PreservationReport};
 use starconverter_core::{
     ConversionPlan, FileSystem, GuaranteeMode, HealthState, Planner, SemanticFeature, Severity,
     VolumeProfile,
@@ -449,6 +452,8 @@ struct ExportJobSuccess {
     profile: VolumeProfile,
     target: FileSystem,
     source_path: String,
+    /// The bound NTFS -> exFAT sidecar whose identities were rematerialized, when one was used.
+    restored_from_escrow: Option<PathBuf>,
     evidence: CandidateExportEvidence,
 }
 
@@ -685,6 +690,10 @@ struct StarConverterApp {
     plan: ConversionPlan,
     plan_currency: PlanCurrency,
     image_path: String,
+    /// Optional NTFS -> exFAT escrow sidecar bound to the exFAT source; when set, the exFAT ->
+    /// NTFS preview and export rematerialize the escrowed NTFS identities instead of deriving
+    /// them from exFAT alone.
+    restore_escrow_path: String,
     real_source: bool,
     inspection_status: String,
     exact_preview: Option<String>,
@@ -757,6 +766,7 @@ impl StarConverterApp {
             plan,
             plan_currency: PlanCurrency::Current,
             image_path,
+            restore_escrow_path: String::new(),
             real_source: false,
             inspection_status: if recovered_image_path {
                 "Recovered image path; read-only analysis has not started.".into()
@@ -1006,6 +1016,12 @@ impl StarConverterApp {
                     evidence.target_filesystem,
                     evidence.output_path.display()
                 ));
+                if let Some(escrow) = success.restored_from_escrow {
+                    self.activity.push(format!(
+                        "00:00:00  [RESTORED] NTFS identities rematerialized from {}",
+                        escrow.display()
+                    ));
+                }
                 self.replan();
             }
             JobOutcome::Verification(evidence) => {
@@ -1194,6 +1210,7 @@ impl StarConverterApp {
             return;
         }
         let mode = self.mode;
+        let restore_escrow = self.restore_escrow_input();
         self.invalidate_conversion_evidence(
             "Exact preview is running; prior evidence is no longer accepted.",
         );
@@ -1203,7 +1220,7 @@ impl StarConverterApp {
                 JobKind::Preview,
                 CandidateWorkPhase::BuildExpectedManifest,
                 &control,
-                || match build_exact_preview(&source_path, mode) {
+                || match build_exact_preview(&source_path, mode, restore_escrow.as_deref()) {
                     Ok(success) => JobOutcome::Preview(success),
                     Err(message) => JobOutcome::Failed {
                         kind: JobKind::Preview,
@@ -1238,11 +1255,17 @@ impl StarConverterApp {
         };
 
         let mode = self.mode;
+        let restore_escrow = self.restore_escrow_input();
         self.inspection_status = "Create-new candidate export is running in the background.".into();
         self.start_background_job(
             JobKind::Export,
-            move |control| match build_candidate_export(&source_path, &output_path, mode, &control)
-            {
+            move |control| match build_candidate_export(
+                &source_path,
+                &output_path,
+                mode,
+                restore_escrow.as_deref(),
+                &control,
+            ) {
                 Ok(success) => JobOutcome::Export(success),
                 Err(ControlledJobError::Cancelled(phase)) => JobOutcome::Cancelled {
                     kind: JobKind::Export,
@@ -1254,6 +1277,24 @@ impl StarConverterApp {
                 },
             },
         );
+    }
+
+    /// The trimmed optional restore-escrow path, or `None` when the field is blank.
+    fn restore_escrow_input(&self) -> Option<PathBuf> {
+        let trimmed = self.restore_escrow_path.trim();
+        (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+    }
+
+    fn choose_restore_escrow(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .set_title("Select the NTFS -> exFAT escrow sidecar bound to this exFAT source")
+            .pick_file()
+        {
+            self.restore_escrow_path = path.display().to_string();
+            self.invalidate_conversion_evidence(
+                "Restore escrow changed; preview this source again before export.",
+            );
+        }
     }
 
     fn choose_verification_candidate(&mut self) {
@@ -1339,9 +1380,71 @@ const fn opposite_filesystem(filesystem: FileSystem) -> FileSystem {
     }
 }
 
+/// Drafts the exFAT -> NTFS relocation, rematerializing escrowed NTFS identities when a bound
+/// NTFS -> exFAT sidecar for this exact exFAT image is supplied.
+fn draft_exfat_to_ntfs_with_optional_restore(
+    image: &ImageFile,
+    normalized: &NormalizedExfat,
+    mode: GuaranteeMode,
+    restore_escrow: Option<&Path>,
+) -> Result<ExfatToNtfsRelocationDraft, String> {
+    let Some(escrow_path) = restore_escrow else {
+        return draft_lossless_exfat_to_ntfs(
+            normalized,
+            mode,
+            ExfatToNtfsOptions::default(),
+            ExfatToNtfsLimits::default(),
+        )
+        .map_err(|error| format!("cross-format plan refused: {error}"));
+    };
+    let export_limits = CandidateExportLimits::default();
+    let snapshot = capture_source_image_snapshot(image, export_limits)
+        .map_err(|error| format!("source snapshot failed: {error}"))?;
+    let max_envelope_bytes = BOUND_ESCROW_FIXED_BYTES
+        .checked_add(export_limits.max_escrow_bytes)
+        .ok_or_else(|| "escrow limit overflow".to_owned())?;
+    let escrow = ImageFile::open_with_limit(escrow_path, max_envelope_bytes).map_err(|error| {
+        format!(
+            "restore escrow `{}` unreadable: {error}",
+            escrow_path.display()
+        )
+    })?;
+    let length = usize::try_from(escrow.len())
+        .ok()
+        .filter(|length| *length <= max_envelope_bytes)
+        .ok_or_else(|| {
+            format!(
+                "restore escrow `{}` exceeds the {max_envelope_bytes}-byte envelope limit",
+                escrow_path.display()
+            )
+        })?;
+    let escrow_bytes = escrow.read_exact_at(0, length).map_err(|error| {
+        format!(
+            "restore escrow `{}` unreadable: {error}",
+            escrow_path.display()
+        )
+    })?;
+    let sidecar = decode_restore_sidecar(
+        &escrow_bytes,
+        snapshot.sha256(),
+        export_limits.max_escrow_bytes,
+        PreservationLimits::default(),
+    )
+    .map_err(|error| format!("escrow restore refused: {error}"))?;
+    draft_escrow_restored_exfat_to_ntfs(
+        normalized,
+        &sidecar,
+        mode,
+        ExfatToNtfsOptions::default(),
+        ExfatToNtfsLimits::default(),
+    )
+    .map_err(|error| format!("escrow-restored plan refused: {error}"))
+}
+
 fn build_exact_preview(
     source_path: &str,
     mode: GuaranteeMode,
+    restore_escrow: Option<&Path>,
 ) -> Result<PreviewJobSuccess, String> {
     let image = ImageFile::open(source_path).map_err(|error| error.to_string())?;
     let inspection = inspect_open_image(&image).map_err(|error| error.to_string())?;
@@ -1349,19 +1452,24 @@ fn build_exact_preview(
     if target == FileSystem::Unknown {
         return Err("recognized image has unknown filesystem".into());
     }
+    if restore_escrow.is_some() && target != FileSystem::Ntfs {
+        return Err(
+            "a restore escrow applies only to exFAT -> NTFS conversion of an escrow-exported candidate"
+                .into(),
+        );
+    }
     let report = match (
         inspection.normalized_exfat.as_deref(),
         inspection.normalized_ntfs.as_deref(),
         target,
     ) {
         (Some(normalized), None, FileSystem::Ntfs) => {
-            let draft = draft_lossless_exfat_to_ntfs(
+            let draft = draft_exfat_to_ntfs_with_optional_restore(
+                &image,
                 normalized,
                 mode,
-                ExfatToNtfsOptions::default(),
-                ExfatToNtfsLimits::default(),
-            )
-            .map_err(|error| format!("cross-format plan refused: {error}"))?;
+                restore_escrow,
+            )?;
             let plan = solve_lossless_exfat_to_ntfs(draft, LayoutLimits::default())
                 .map_err(|error| format!("payload layout refused: {error}"))?;
             let preview =
@@ -1388,13 +1496,22 @@ fn build_exact_preview(
             let preview =
                 preview_exfat_phase_writes(&image, &plan.destination, PreimageLimits::default())
                     .map_err(|error| format!("phase preview failed: {error}"))?;
-            exact_preview_report(
+            let mut report = exact_preview_report(
                 &preview,
                 &plan.destination.reservations,
                 &plan.destination.source_allocations,
                 plan.layout(),
                 &plan.preservation,
-            )
+            );
+            let carriers = sidecar_carriers(&normalized.preservation);
+            if !carriers.is_empty() {
+                let _ = writeln!(
+                    report,
+                    "[ESCROW] {} named stream(s) too large for the sidecar travel as hidden+system carrier file(s) under \\{ESCROW_CARRIER_DIRECTORY}; keep that directory intact for the escrow-restored return trip",
+                    carriers.len()
+                );
+            }
+            report
         }
         (Some(_), None, _) | (None, Some(_), _) => {
             return Err("preview direction does not match the inspected source".into());
@@ -1426,6 +1543,7 @@ fn build_candidate_export(
     source_path: &str,
     output_path: &Path,
     mode: GuaranteeMode,
+    restore_escrow: Option<&Path>,
     control: &JobControl,
 ) -> Result<ExportJobSuccess, ControlledJobError> {
     control
@@ -1448,21 +1566,21 @@ fn build_candidate_export(
             "recognized image has unknown filesystem".into(),
         ));
     }
+    if restore_escrow.is_some() && target != FileSystem::Ntfs {
+        return Err(ControlledJobError::Failed(
+            "a restore escrow applies only to exFAT -> NTFS conversion of an escrow-exported candidate"
+                .into(),
+        ));
+    }
     let evidence = match (
         inspection.normalized_exfat.as_deref(),
         inspection.normalized_ntfs.as_deref(),
         target,
     ) {
         (Some(normalized), None, FileSystem::Ntfs) => {
-            let draft = draft_lossless_exfat_to_ntfs(
-                normalized,
-                mode,
-                ExfatToNtfsOptions::default(),
-                ExfatToNtfsLimits::default(),
-            )
-            .map_err(|error| {
-                ControlledJobError::Failed(format!("cross-format plan refused: {error}"))
-            })?;
+            let draft =
+                draft_exfat_to_ntfs_with_optional_restore(&image, normalized, mode, restore_escrow)
+                    .map_err(ControlledJobError::Failed)?;
             let plan =
                 solve_lossless_exfat_to_ntfs(draft, LayoutLimits::default()).map_err(|error| {
                     ControlledJobError::Failed(format!("payload layout refused: {error}"))
@@ -1531,6 +1649,7 @@ fn build_candidate_export(
         profile: inspection.profile,
         target,
         source_path: source_path.to_owned(),
+        restored_from_escrow: restore_escrow.map(Path::to_path_buf),
         evidence,
     })
 }
@@ -1866,6 +1985,40 @@ impl StarConverterApp {
                 .clicked()
             {
                 self.choose_image();
+            }
+        });
+        ui.add_space(6.0);
+        let restore_label = ui.label(
+            RichText::new("RESTORE ESCROW (OPTIONAL, EXFAT -> NTFS)")
+                .monospace()
+                .size(10.0)
+                .color(MUTED),
+        );
+        ui.horizontal(|ui| {
+            let browse_width = 78.0;
+            let path_width = (ui.available_width() - browse_width - 8.0).max(80.0);
+            let response = ui.add_sized(
+                [path_width, 44.0],
+                egui::TextEdit::singleline(&mut self.restore_escrow_path)
+                    .id_source("restore_escrow_path")
+                    .hint_text("C:\\path\\candidate.img.starconverter-escrow"),
+            );
+            let changed = response.changed();
+            response.labelled_by(restore_label.id).on_hover_text(
+                "NTFS -> exFAT sidecar bound to this exact exFAT image. Restores hard links, \
+                 named streams, reparse points, exact timestamps, serial, and label on the way \
+                 back to NTFS. A mismatched or wrong-direction sidecar is refused.",
+            );
+            if changed {
+                self.invalidate_conversion_evidence(
+                    "Restore escrow changed; preview this source again before export.",
+                );
+            }
+            if ui
+                .add_sized([browse_width, 44.0], Button::new("Browse"))
+                .clicked()
+            {
+                self.choose_restore_escrow();
             }
         });
     }
@@ -2890,11 +3043,13 @@ fn exact_preview_report(
 fn relocation_preview_report(layout: &LayoutPlan) -> String {
     const MAX_PLACEMENTS: usize = 4;
     let mut report = format!(
-        "relocation={} spans / {}\n",
+        "relocation={} spans / {} materialize={} streams / {}\n",
         layout.relocations.len(),
-        format_byte_count(usize::try_from(layout.relocated_bytes).unwrap_or(usize::MAX))
+        format_byte_count(usize::try_from(layout.relocated_bytes).unwrap_or(usize::MAX)),
+        layout.materializations.len(),
+        format_byte_count(usize::try_from(layout.materialized_bytes).unwrap_or(usize::MAX))
     );
-    if layout.relocations.is_empty() {
+    if layout.relocations.is_empty() && layout.materializations.is_empty() {
         report.push_str("[CREATE-NEW RELOCATION] none required\n");
         return report;
     }
@@ -2914,6 +3069,23 @@ fn relocation_preview_report(layout: &LayoutPlan) -> String {
             report,
             "[CREATE-NEW RELOCATION] ... {} additional placements",
             layout.relocations.len() - MAX_PLACEMENTS
+        );
+    }
+    let remaining = MAX_PLACEMENTS.saturating_sub(layout.relocations.len().min(MAX_PLACEMENTS));
+    for materialization in layout.materializations.iter().take(remaining) {
+        let _ = writeln!(
+            report,
+            "[CREATE-NEW MATERIALIZE] stream={} destination={} bytes={}",
+            materialization.stream.0,
+            materialization.destination.offset,
+            materialization.destination.length
+        );
+    }
+    if layout.materializations.len() > remaining {
+        let _ = writeln!(
+            report,
+            "[CREATE-NEW MATERIALIZE] ... {} additional streams",
+            layout.materializations.len() - remaining
         );
     }
     report
@@ -3184,6 +3356,7 @@ mod tests {
             target,
             mode,
             image_path: "C:\\images\\accepted.img".into(),
+            restore_escrow_path: String::new(),
             real_source: true,
             inspection_status: "accepted".into(),
             exact_preview: Some("accepted exact preview".into()),
@@ -3253,12 +3426,15 @@ mod tests {
 
         let empty = LayoutPlan {
             relocations: Vec::new(),
+            materializations: Vec::new(),
             free_after_staging: Vec::new(),
             relocated_bytes: 0,
+            materialized_bytes: 0,
             largest_free_range: 0,
         };
         let empty_report = relocation_preview_report(&empty);
         assert!(empty_report.contains("relocation=0 spans"));
+        assert!(empty_report.contains("materialize=0 streams"));
         assert!(empty_report.contains("none required"));
 
         let relocated = LayoutPlan {
@@ -3274,8 +3450,10 @@ mod tests {
                     length: 8192,
                 },
             }],
+            materializations: Vec::new(),
             free_after_staging: Vec::new(),
             relocated_bytes: 8192,
+            materialized_bytes: 0,
             largest_free_range: 0,
         };
         let report = relocation_preview_report(&relocated);

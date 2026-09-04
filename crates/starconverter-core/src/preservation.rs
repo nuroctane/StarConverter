@@ -21,14 +21,15 @@ use crate::fs::exfat_upcase_serialize::{
 };
 use crate::fs::ntfs_index::FileNameNamespace;
 use crate::fs::ntfs_inventory::{
-    NtfsAttributeEvidence, NtfsDataStream, NtfsExtentPlacement, NtfsFileName, NtfsInventoryExtent,
-    NtfsName, NtfsObject, NtfsObjectReference, NtfsStandardInformation, NtfsStreamStorage,
+    NtfsAttributeEvidence, NtfsDataStream, NtfsDirectoryEntry, NtfsExtentPlacement, NtfsFileName,
+    NtfsInventoryExtent, NtfsName, NtfsObject, NtfsObjectReference, NtfsStandardInformation,
+    NtfsStreamStorage,
 };
 use crate::fs::ntfs_normalize::{
-    NormalizedNtfs, NtfsPreservationSidecar, NtfsSecurityDescriptorEvidence,
+    NormalizedNtfs, NtfsObjectPreservation, NtfsPreservationSidecar, NtfsSecurityDescriptorEvidence,
 };
 use crate::fs::ntfs_secure::{NtfsSecureLimits, NtfsSecureProfile, generate_ntfs_secure_metadata};
-use crate::object::ObjectGraph;
+use crate::object::{ObjectGraph, ObjectId};
 use crate::{FileSystem, GuaranteeMode};
 
 const ESCROW_MAGIC: [u8; 8] = *b"SCESCROW";
@@ -626,18 +627,7 @@ fn ntfs_assessments(
         );
     }
     classify_stream_flags(graph, &mut result);
-    if graph
-        .objects()
-        .iter()
-        .any(|object| object.semantics.is_reparse_point)
-    {
-        set(
-            &mut result,
-            PreservationField::ReparsePoints,
-            FieldDisposition::Refusal,
-            "reparse presence is known but the reparse attribute payload is absent",
-        );
-    }
+    classify_ntfs_reparse_points(graph, sidecar, &mut result);
     set(
         &mut result,
         PreservationField::Timestamps,
@@ -664,19 +654,23 @@ fn ntfs_assessments(
             "the shared DOS attribute subset maps reversibly"
         },
     );
-    let names_compatible = ntfs_namespace_is_exfat_compatible(graph)?;
+    let names = classify_ntfs_names_for_exfat(graph)?;
     set(
         &mut result,
         PreservationField::NamesAndCase,
-        if names_compatible {
-            FieldDisposition::CanonicalTransform
-        } else {
-            FieldDisposition::Refusal
+        match names {
+            NtfsExfatNameClass::Compatible => FieldDisposition::CanonicalTransform,
+            NtfsExfatNameClass::CaseCollision => FieldDisposition::EscrowRequired,
+            NtfsExfatNameClass::Illegal => FieldDisposition::Refusal,
         },
-        if names_compatible {
-            "all names are legal and collision-free under the recommended exFAT up-case table"
-        } else {
-            "a name is illegal or collides under the recommended exFAT up-case table"
+        match names {
+            NtfsExfatNameClass::Compatible => {
+                "all names are legal and collision-free under the recommended exFAT up-case table"
+            }
+            NtfsExfatNameClass::CaseCollision => {
+                "sibling names collide under the recommended exFAT up-case table and must be dest-native disambiguated"
+            }
+            NtfsExfatNameClass::Illegal => "a name is illegal under exFAT",
         },
     );
     if sidecar
@@ -728,17 +722,17 @@ fn ntfs_assessments(
         &mut result,
         PreservationField::BadClusters,
         match bad_clusters {
-            NtfsBadClusterEvidence::EntirelySparse => FieldDisposition::EscrowRequired,
-            NtfsBadClusterEvidence::Physical | NtfsBadClusterEvidence::Incomplete => {
-                FieldDisposition::Refusal
+            NtfsBadClusterEvidence::EntirelySparse | NtfsBadClusterEvidence::Physical => {
+                FieldDisposition::EscrowRequired
             }
+            NtfsBadClusterEvidence::Incomplete => FieldDisposition::Refusal,
         },
         match bad_clusters {
             NtfsBadClusterEvidence::EntirelySparse => {
                 "$BadClus:$Bad is completely mapped and entirely sparse; its exact mapping remains in escrow"
             }
             NtfsBadClusterEvidence::Physical => {
-                "$BadClus:$Bad contains physical bad-cluster extents and is outside the activation common subset"
+                "$BadClus:$Bad physical runs mark dest-native unusable clusters; the exact NTFS runlist remains in escrow"
             }
             NtfsBadClusterEvidence::Incomplete => {
                 "complete unambiguous $BadClus:$Bad mapping evidence is unavailable"
@@ -778,6 +772,7 @@ const NTFS_DATA: u32 = 0x80;
 const NTFS_INDEX_ROOT: u32 = 0x90;
 const NTFS_INDEX_ALLOCATION: u32 = 0xa0;
 const NTFS_BITMAP: u32 = 0xb0;
+const NTFS_REPARSE_POINT: u32 = 0xc0;
 
 fn ntfs_attribute_supported(attribute: &NtfsAttributeEvidence) -> bool {
     if attribute.flags_unknown_bits != 0
@@ -793,13 +788,53 @@ fn ntfs_attribute_supported(attribute: &NtfsAttributeEvidence) -> bool {
         NTFS_STANDARD_INFORMATION | NTFS_FILE_NAME | NTFS_VOLUME_NAME | NTFS_VOLUME_INFORMATION => {
             unnamed && attribute.resident && attribute.flags_raw == 0
         }
-        NTFS_ATTRIBUTE_LIST => unnamed && attribute.flags_raw == 0,
+        NTFS_ATTRIBUTE_LIST | NTFS_REPARSE_POINT => unnamed && attribute.flags_raw == 0,
         NTFS_DATA => true,
         NTFS_INDEX_ROOT => attribute.resident && attribute.flags_raw == 0,
         NTFS_INDEX_ALLOCATION => !attribute.resident && attribute.flags_raw == 0,
         NTFS_BITMAP => attribute.flags_raw == 0,
         _ => false,
     }
+}
+
+fn classify_ntfs_reparse_points(
+    graph: &ObjectGraph,
+    sidecar: &NtfsPreservationSidecar,
+    result: &mut [FieldAssessment],
+) {
+    if !graph
+        .objects()
+        .iter()
+        .any(|object| object.semantics.is_reparse_point)
+    {
+        return;
+    }
+    let complete = graph
+        .objects()
+        .iter()
+        .filter(|object| object.semantics.is_reparse_point)
+        .all(|object| {
+            sidecar
+                .objects
+                .iter()
+                .find(|preserved| preserved.object == object.id)
+                .and_then(|preserved| preserved.source.reparse_point.as_ref())
+                .is_some_and(|payload| payload.len() >= 8)
+        });
+    set(
+        result,
+        PreservationField::ReparsePoints,
+        if complete {
+            FieldDisposition::EscrowRequired
+        } else {
+            FieldDisposition::Refusal
+        },
+        if complete {
+            "exact $REPARSE_POINT bytes are retained in escrow; dest-native exFAT cannot enforce reparse semantics"
+        } else {
+            "reparse presence is known but the reparse attribute payload is absent"
+        },
+    );
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -873,13 +908,22 @@ fn is_canonical_exfat_volume_label(units: &[u16]) -> bool {
         })
 }
 
-fn ntfs_namespace_is_exfat_compatible(graph: &ObjectGraph) -> Result<bool, PreservationError> {
+enum NtfsExfatNameClass {
+    Compatible,
+    CaseCollision,
+    Illegal,
+}
+
+fn classify_ntfs_names_for_exfat(
+    graph: &ObjectGraph,
+) -> Result<NtfsExfatNameClass, PreservationError> {
     let table = generate_recommended_exfat_upcase(RecommendedExfatUpcaseLimits::default())
         .map_err(|_| PreservationError::AllocationFailed)?;
     let mut folded = BTreeSet::new();
+    let mut collision = false;
     for entry in graph.entries() {
         if !is_legal_exfat_name(&entry.name) {
-            return Ok(false);
+            return Ok(NtfsExfatNameClass::Illegal);
         }
         let mut mapped = Vec::new();
         mapped
@@ -887,13 +931,17 @@ fn ntfs_namespace_is_exfat_compatible(graph: &ObjectGraph) -> Result<bool, Prese
             .map_err(|_| PreservationError::AllocationFailed)?;
         mapped.extend(entry.name.iter().map(|unit| table.map(*unit)));
         if !folded.insert((entry.parent, mapped)) {
-            return Ok(false);
+            collision = true;
         }
     }
-    Ok(true)
+    Ok(if collision {
+        NtfsExfatNameClass::CaseCollision
+    } else {
+        NtfsExfatNameClass::Compatible
+    })
 }
 
-fn is_legal_exfat_name(name: &[u16]) -> bool {
+pub(crate) fn is_legal_exfat_name(name: &[u16]) -> bool {
     !name.is_empty()
         && name.len() <= 255
         && name != [u16::from(b'.')]
@@ -934,13 +982,13 @@ fn classify_stream_flags(graph: &ObjectGraph, result: &mut [FieldAssessment]) {
         .objects()
         .iter()
         .flat_map(|object| &object.streams)
-        .any(|stream| stream.flags.compressed)
+        .any(|stream| stream.flags.compressed || stream.flags.compression_block_bytes != 0)
     {
         set(
             result,
             PreservationField::Compression,
             FieldDisposition::EscrowRequired,
-            "NTFS compression state has no exFAT representation",
+            "NTFS LZNT1 streams are decompressed into dest-native bytes; the exact compressed mapping stays in escrow",
         );
     }
     if graph
@@ -1238,6 +1286,90 @@ pub fn decode_escrow(
     })
 }
 
+/// Rebuilds the inner NTFS snapshot from a validated schema-v4 escrow payload.
+///
+/// Only the current inner snapshot (v7) is restored. Historical v3–v6 layouts remain readable
+/// for integrity checks through [`decode_escrow`], but they do not authorize identity restore.
+///
+/// # Errors
+///
+/// Returns [`PreservationError`] when the outer envelope is invalid, the source is not NTFS, or
+/// the inner snapshot is not a complete v7 sidecar.
+pub fn decode_ntfs_sidecar_from_escrow(
+    bytes: &[u8],
+    limits: PreservationLimits,
+) -> Result<NtfsPreservationSidecar, PreservationError> {
+    let decoded = decode_escrow(bytes, limits)?;
+    if decoded.source != FileSystem::Ntfs {
+        return malformed(10, "escrow source is not NTFS");
+    }
+    let snapshot = decoded
+        .records
+        .first()
+        .ok_or(PreservationError::MalformedEscrow {
+            offset: HEADER_BYTES,
+            reason: "missing NTFS sidecar snapshot",
+        })?;
+    decode_ntfs_preservation_sidecar(&snapshot.value)
+}
+
+/// Rebuilds [`NtfsPreservationSidecar`] from an inner NTFS snapshot v7.
+///
+/// # Errors
+///
+/// Returns [`PreservationError`] for an unsupported snapshot version, truncated fields, invalid
+/// tags, UTF-16 validity disagreement, or unclaimed trailing bytes.
+pub fn decode_ntfs_preservation_sidecar(
+    snapshot: &[u8],
+) -> Result<NtfsPreservationSidecar, PreservationError> {
+    let mut reader = SnapshotCursor::new(snapshot, 0);
+    if reader.u16()? != 7 {
+        return malformed(0, "unsupported NTFS sidecar snapshot version");
+    }
+    let volume_serial_number = reader.u64()?;
+    let volume_label = decode_ntfs_volume_label(&mut reader)?;
+    let security_descriptors = decode_ntfs_security_evidence(&mut reader)?;
+    let root_reference = decode_reference(&mut reader)?;
+    let object_count = reader.count(1)?;
+    let mut objects = Vec::new();
+    objects
+        .try_reserve_exact(object_count)
+        .map_err(|_| PreservationError::AllocationFailed)?;
+    for _ in 0..object_count {
+        objects.push(NtfsObjectPreservation {
+            object: ObjectId(reader.u64()?),
+            source: decode_ntfs_object(&mut reader)?,
+        });
+    }
+    let extent_count = reader.count(25)?;
+    let mut source_extents = Vec::new();
+    source_extents
+        .try_reserve_exact(extent_count)
+        .map_err(|_| PreservationError::AllocationFailed)?;
+    for _ in 0..extent_count {
+        source_extents.push(decode_ntfs_extent(&mut reader)?);
+    }
+    let scanned_records = reader.u64()?;
+    let initialized_records = reader.u64()?;
+    let in_use_base_records = reader.u64()?;
+    let extension_records = reader.u64()?;
+    let bytes_read = reader.u64()?;
+    reader.finish()?;
+    Ok(NtfsPreservationSidecar {
+        volume_serial_number,
+        volume_label,
+        security_descriptors,
+        root_reference,
+        objects,
+        source_extents,
+        scanned_records,
+        initialized_records,
+        in_use_base_records,
+        extension_records,
+        bytes_read,
+    })
+}
+
 fn escrow_checksum(header_prefix: &[u8], body: &[u8]) -> u32 {
     let mut hasher = Hasher::new();
     hasher.update(header_prefix);
@@ -1257,12 +1389,40 @@ fn validate_snapshot(
     let version = u16::from_le_bytes([version[0], version[1]]);
     match source {
         FileSystem::ExFat if version == 2 => validate_exfat_snapshot(bytes, offset),
-        FileSystem::Ntfs if version == 4 => validate_ntfs_snapshot(bytes, offset, true),
+        FileSystem::Ntfs if version == 7 => {
+            validate_ntfs_snapshot(bytes, offset, NtfsSnapshotLayout::V7)
+        }
+        FileSystem::Ntfs if version == 6 => {
+            validate_ntfs_snapshot(bytes, offset, NtfsSnapshotLayout::V6)
+        }
+        FileSystem::Ntfs if version == 5 => {
+            validate_ntfs_snapshot(bytes, offset, NtfsSnapshotLayout::V5)
+        }
+        FileSystem::Ntfs if version == 4 => {
+            validate_ntfs_snapshot(bytes, offset, NtfsSnapshotLayout::V4)
+        }
         // Historical development snapshots used version 3 both immediately before and during the
         // attribute-census transition. Both layouts are fully walked; neither can authorize the
-        // current census-dependent preservation policy.
-        FileSystem::Ntfs if version == 3 => validate_ntfs_snapshot(bytes, offset, false)
-            .or_else(|_| validate_ntfs_snapshot(bytes, offset, true)),
+        // current census-dependent preservation policy. Version 4 is census-complete without the
+        // trailing optional $REPARSE_POINT payload introduced in version 5. Version 6 adds the
+        // per-stream compression-unit size. Version 7 appends optional captured named-stream
+        // initialized bytes on NonResident storage.
+        FileSystem::Ntfs if version == 3 => validate_ntfs_snapshot(
+            bytes,
+            offset,
+            NtfsSnapshotLayout::V3 {
+                has_attribute_census: false,
+            },
+        )
+        .or_else(|_| {
+            validate_ntfs_snapshot(
+                bytes,
+                offset,
+                NtfsSnapshotLayout::V3 {
+                    has_attribute_census: true,
+                },
+            )
+        }),
         FileSystem::Unknown => malformed(offset, "unknown snapshot filesystem"),
         _ => malformed(offset, "unsupported sidecar snapshot version"),
     }
@@ -1384,6 +1544,50 @@ impl<'a> SnapshotCursor<'a> {
         self.take(length)?;
         Ok(())
     }
+
+    fn optional_u32_value(&mut self) -> Result<Option<u32>, PreservationError> {
+        if self.boolean()? {
+            Ok(Some(self.u32()?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn optional_u64_value(&mut self) -> Result<Option<u64>, PreservationError> {
+        if self.boolean()? {
+            Ok(Some(self.u64()?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn utf16_units(&mut self) -> Result<(Vec<u16>, bool), PreservationError> {
+        let count = self.count(2)?;
+        let byte_length = count
+            .checked_mul(2)
+            .ok_or(PreservationError::ArithmeticOverflow)?;
+        let bytes = self.take(byte_length)?;
+        let mut units = Vec::new();
+        units
+            .try_reserve_exact(count)
+            .map_err(|_| PreservationError::AllocationFailed)?;
+        for pair in bytes.chunks_exact(2) {
+            units.push(u16::from_le_bytes([pair[0], pair[1]]));
+        }
+        let well_formed = char::decode_utf16(units.iter().copied()).all(|unit| unit.is_ok());
+        Ok((units, well_formed))
+    }
+
+    fn take_vec(&mut self) -> Result<Vec<u8>, PreservationError> {
+        let length = self.count(1)?;
+        let bytes = self.take(length)?;
+        let mut value = Vec::new();
+        value
+            .try_reserve_exact(length)
+            .map_err(|_| PreservationError::AllocationFailed)?;
+        value.extend_from_slice(bytes);
+        Ok(value)
+    }
 }
 
 fn validate_exfat_snapshot(bytes: &[u8], base: usize) -> Result<(), PreservationError> {
@@ -1495,14 +1699,56 @@ fn validate_u32_vector(reader: &mut SnapshotCursor<'_>) -> Result<(), Preservati
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+enum NtfsSnapshotLayout {
+    V3 { has_attribute_census: bool },
+    V4,
+    V5,
+    V6,
+    V7,
+}
+
+impl NtfsSnapshotLayout {
+    const fn expected_version(self) -> u16 {
+        match self {
+            Self::V3 { .. } => 3,
+            Self::V4 => 4,
+            Self::V5 => 5,
+            Self::V6 => 6,
+            Self::V7 => 7,
+        }
+    }
+
+    const fn has_attribute_census(self) -> bool {
+        match self {
+            Self::V3 {
+                has_attribute_census,
+            } => has_attribute_census,
+            Self::V4 | Self::V5 | Self::V6 | Self::V7 => true,
+        }
+    }
+
+    const fn has_reparse_payload(self) -> bool {
+        matches!(self, Self::V5 | Self::V6 | Self::V7)
+    }
+
+    const fn has_stream_compression_block(self) -> bool {
+        matches!(self, Self::V6 | Self::V7)
+    }
+
+    const fn has_captured_named_payload(self) -> bool {
+        matches!(self, Self::V7)
+    }
+}
+
 fn validate_ntfs_snapshot(
     bytes: &[u8],
     base: usize,
-    has_attribute_census: bool,
+    layout: NtfsSnapshotLayout,
 ) -> Result<(), PreservationError> {
     let mut reader = SnapshotCursor::new(bytes, base);
     let version = reader.u16()?;
-    if !matches!(version, 3 | 4) {
+    if version != layout.expected_version() {
         return malformed(base, "unsupported NTFS sidecar snapshot version");
     }
     reader.u64()?;
@@ -1534,7 +1780,7 @@ fn validate_ntfs_snapshot(
     let objects = reader.count(1)?;
     for _ in 0..objects {
         reader.u64()?;
-        validate_ntfs_object(&mut reader, has_attribute_census)?;
+        validate_ntfs_object(&mut reader, layout)?;
     }
     let extents = reader.count(25)?;
     for _ in 0..extents {
@@ -1554,7 +1800,7 @@ fn validate_reference(reader: &mut SnapshotCursor<'_>) -> Result<(), Preservatio
 
 fn validate_ntfs_object(
     reader: &mut SnapshotCursor<'_>,
-    has_attribute_census: bool,
+    layout: NtfsSnapshotLayout,
 ) -> Result<(), PreservationError> {
     validate_reference(reader)?;
     reader.u16()?;
@@ -1583,6 +1829,9 @@ fn validate_ntfs_object(
         reader.boolean()?;
         reader.boolean()?;
         reader.boolean()?;
+        if layout.has_stream_compression_block() {
+            reader.u64()?;
+        }
         let storage_offset = reader.base + reader.cursor;
         match reader.u8()? {
             1 => reader.bytes()?,
@@ -1596,11 +1845,14 @@ fn validate_ntfs_object(
                 for _ in 0..extents {
                     validate_extent(reader, false)?;
                 }
+                if layout.has_captured_named_payload() && reader.boolean()? {
+                    reader.bytes()?;
+                }
             }
             _ => return malformed(storage_offset, "invalid NTFS stream-storage tag"),
         }
     }
-    if has_attribute_census {
+    if layout.has_attribute_census() {
         let attributes = reader.count(1)?;
         for _ in 0..attributes {
             reader.u32()?;
@@ -1621,6 +1873,9 @@ fn validate_ntfs_object(
     reader.boolean()?;
     reader.boolean()?;
     reader.boolean()?;
+    if layout.has_reparse_payload() && reader.boolean()? {
+        reader.bytes()?;
+    }
     Ok(())
 }
 
@@ -1673,6 +1928,267 @@ fn validate_extent(
         }
     }
     Ok(())
+}
+
+fn decode_ntfs_volume_label(
+    reader: &mut SnapshotCursor<'_>,
+) -> Result<Option<Vec<u16>>, PreservationError> {
+    if !reader.boolean()? {
+        return Ok(None);
+    }
+    let length_offset = reader.base + reader.cursor;
+    let length = usize::from(reader.u8()?);
+    if length > 32 {
+        return malformed(length_offset, "NTFS snapshot label exceeds 32 UTF-16 units");
+    }
+    let encoded = reader.take(
+        length
+            .checked_mul(2)
+            .ok_or(PreservationError::ArithmeticOverflow)?,
+    )?;
+    let mut units = Vec::new();
+    units
+        .try_reserve_exact(length)
+        .map_err(|_| PreservationError::AllocationFailed)?;
+    for pair in encoded.chunks_exact(2) {
+        units.push(u16::from_le_bytes([pair[0], pair[1]]));
+    }
+    if char::decode_utf16(units.iter().copied()).any(|unit| unit.is_err()) {
+        return malformed(length_offset, "NTFS snapshot label contains invalid UTF-16");
+    }
+    Ok(Some(units))
+}
+
+fn decode_ntfs_security_evidence(
+    reader: &mut SnapshotCursor<'_>,
+) -> Result<NtfsSecurityDescriptorEvidence, PreservationError> {
+    let security_offset = reader.base + reader.cursor;
+    match reader.u8()? {
+        0 => Ok(NtfsSecurityDescriptorEvidence::Unavailable),
+        1 => Ok(NtfsSecurityDescriptorEvidence::PinnedNtfs3gWindows2003 {
+            sds: reader.take_vec()?,
+        }),
+        _ => malformed(security_offset, "invalid NTFS security snapshot tag"),
+    }
+}
+
+fn decode_reference(
+    reader: &mut SnapshotCursor<'_>,
+) -> Result<NtfsObjectReference, PreservationError> {
+    Ok(NtfsObjectReference {
+        record_number: reader.u64()?,
+        sequence_number: reader.u16()?,
+    })
+}
+
+fn decode_ntfs_object(reader: &mut SnapshotCursor<'_>) -> Result<NtfsObject, PreservationError> {
+    let reference = decode_reference(reader)?;
+    let hard_link_count = reader.u16()?;
+    let is_directory = reader.boolean()?;
+    let is_metadata = reader.boolean()?;
+    let standard_information = if reader.boolean()? {
+        Some(decode_standard_information(reader)?)
+    } else {
+        None
+    };
+    let file_names = decode_counted(reader, decode_file_name)?;
+    let data_streams = decode_counted(reader, decode_data_stream)?;
+    let attribute_census = decode_counted(reader, decode_ntfs_attribute_evidence)?;
+    let directory_entries = decode_counted(reader, decode_directory_entry)?;
+    let has_reparse_point = reader.boolean()?;
+    let has_attribute_list = reader.boolean()?;
+    let directory_index_complete = reader.boolean()?;
+    let reparse_point = if reader.boolean()? {
+        Some(reader.take_vec()?)
+    } else {
+        None
+    };
+    Ok(NtfsObject {
+        reference,
+        hard_link_count,
+        is_directory,
+        is_metadata,
+        standard_information,
+        file_names,
+        data_streams,
+        attribute_census,
+        directory_entries,
+        has_reparse_point,
+        reparse_point,
+        has_attribute_list,
+        directory_index_complete,
+    })
+}
+
+fn decode_counted<T>(
+    reader: &mut SnapshotCursor<'_>,
+    decode_one: fn(&mut SnapshotCursor<'_>) -> Result<T, PreservationError>,
+) -> Result<Vec<T>, PreservationError> {
+    let count = reader.count(1)?;
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(count)
+        .map_err(|_| PreservationError::AllocationFailed)?;
+    for _ in 0..count {
+        values.push(decode_one(reader)?);
+    }
+    Ok(values)
+}
+
+fn decode_standard_information(
+    reader: &mut SnapshotCursor<'_>,
+) -> Result<NtfsStandardInformation, PreservationError> {
+    Ok(NtfsStandardInformation {
+        creation_time: reader.u64()?,
+        modification_time: reader.u64()?,
+        mft_change_time: reader.u64()?,
+        access_time: reader.u64()?,
+        file_attributes: reader.u32()?,
+        owner_id: reader.optional_u32_value()?,
+        security_id: reader.optional_u32_value()?,
+        quota_charged: reader.optional_u64_value()?,
+        usn: reader.optional_u64_value()?,
+    })
+}
+
+fn decode_ntfs_name(reader: &mut SnapshotCursor<'_>) -> Result<NtfsName, PreservationError> {
+    let name_offset = reader.base + reader.cursor;
+    let (code_units, well_formed) = reader.utf16_units()?;
+    let declared = reader.boolean()?;
+    if well_formed != declared {
+        return malformed(
+            name_offset,
+            "NTFS UTF-16 validity evidence disagrees with the name",
+        );
+    }
+    Ok(NtfsName {
+        code_units,
+        is_well_formed: declared,
+    })
+}
+
+fn decode_file_name(reader: &mut SnapshotCursor<'_>) -> Result<NtfsFileName, PreservationError> {
+    let parent = decode_reference(reader)?;
+    let namespace_offset = reader.base + reader.cursor;
+    let namespace = match reader.u8()? {
+        1 => FileNameNamespace::Posix,
+        2 => FileNameNamespace::Win32,
+        3 => FileNameNamespace::Dos,
+        4 => FileNameNamespace::Win32AndDos,
+        _ => return malformed(namespace_offset, "invalid NTFS filename namespace tag"),
+    };
+    Ok(NtfsFileName {
+        parent,
+        namespace,
+        name: decode_ntfs_name(reader)?,
+        allocated_size: reader.u64()?,
+        data_size: reader.u64()?,
+        file_attributes: reader.u32()?,
+        reparse_tag_or_ea_size: reader.u32()?,
+    })
+}
+
+fn decode_data_stream(
+    reader: &mut SnapshotCursor<'_>,
+) -> Result<NtfsDataStream, PreservationError> {
+    let attribute_id = reader.u16()?;
+    let name = if reader.boolean()? {
+        Some(decode_ntfs_name(reader)?)
+    } else {
+        None
+    };
+    let compressed = reader.boolean()?;
+    let encrypted = reader.boolean()?;
+    let sparse = reader.boolean()?;
+    let compression_block_bytes = reader.u64()?;
+    let storage_offset = reader.base + reader.cursor;
+    let storage = match reader.u8()? {
+        1 => NtfsStreamStorage::Resident {
+            bytes: reader.take_vec()?,
+        },
+        2 => {
+            let allocated_bytes = reader.u64()?;
+            let data_bytes = reader.u64()?;
+            let initialized_bytes = reader.u64()?;
+            let compressed_bytes = reader.optional_u64_value()?;
+            let mapping_complete = reader.boolean()?;
+            let extents = decode_counted(reader, decode_ntfs_extent)?;
+            let captured_payload = if reader.boolean()? {
+                Some(reader.take_vec()?)
+            } else {
+                None
+            };
+            NtfsStreamStorage::NonResident {
+                allocated_bytes,
+                data_bytes,
+                initialized_bytes,
+                compressed_bytes,
+                mapping_complete,
+                extents,
+                captured_payload,
+            }
+        }
+        _ => return malformed(storage_offset, "invalid NTFS stream-storage tag"),
+    };
+    Ok(NtfsDataStream {
+        attribute_id,
+        name,
+        compressed,
+        encrypted,
+        sparse,
+        compression_block_bytes,
+        storage,
+    })
+}
+
+fn decode_ntfs_attribute_evidence(
+    reader: &mut SnapshotCursor<'_>,
+) -> Result<NtfsAttributeEvidence, PreservationError> {
+    let attribute_type = reader.u32()?;
+    let name = if reader.boolean()? {
+        Some(decode_ntfs_name(reader)?)
+    } else {
+        None
+    };
+    Ok(NtfsAttributeEvidence {
+        attribute_type,
+        name,
+        flags_raw: reader.u16()?,
+        flags_unknown_bits: reader.u16()?,
+        attribute_id: reader.u16()?,
+        resident: reader.boolean()?,
+    })
+}
+
+fn decode_directory_entry(
+    reader: &mut SnapshotCursor<'_>,
+) -> Result<NtfsDirectoryEntry, PreservationError> {
+    Ok(NtfsDirectoryEntry {
+        target: decode_reference(reader)?,
+        file_name: decode_file_name(reader)?,
+    })
+}
+
+fn decode_ntfs_extent(
+    reader: &mut SnapshotCursor<'_>,
+) -> Result<NtfsInventoryExtent, PreservationError> {
+    let stream_id = reader.u64()?;
+    let logical_offset = reader.u64()?;
+    let length = reader.u64()?;
+    let placement_offset = reader.base + reader.cursor;
+    let placement = match reader.u8()? {
+        1 => NtfsExtentPlacement::Physical {
+            byte_offset: reader.u64()?,
+        },
+        2 => NtfsExtentPlacement::Sparse,
+        _ => return malformed(placement_offset, "invalid snapshot extent-placement tag"),
+    };
+    Ok(NtfsInventoryExtent {
+        stream_id,
+        logical_offset,
+        length,
+        placement,
+    })
 }
 
 fn decode_ntfs_volume_identity(
@@ -2134,7 +2650,11 @@ fn encode_ntfs_sidecar(
     writer: &mut BoundedWriter,
     sidecar: &NtfsPreservationSidecar,
 ) -> Result<(), PreservationError> {
-    writer.u16(4)?;
+    // Inner NTFS snapshot v7 appends optional captured named-stream initialized bytes after each
+    // NonResident runlist. Version 6 added the per-stream compression-unit size after the three
+    // stream flag bools. Version 5 kept optional exact $REPARSE_POINT bytes after the trailing
+    // object flags. The outer escrow envelope remains ESCROW_SCHEMA_VERSION 4.
+    writer.u16(7)?;
     writer.u64(sidecar.volume_serial_number)?;
     writer.bool(sidecar.volume_label.is_some())?;
     if let Some(units) = &sidecar.volume_label {
@@ -2208,7 +2728,12 @@ fn encode_ntfs_object(
     }
     writer.bool(object.has_reparse_point)?;
     writer.bool(object.has_attribute_list)?;
-    writer.bool(object.directory_index_complete)
+    writer.bool(object.directory_index_complete)?;
+    writer.bool(object.reparse_point.is_some())?;
+    if let Some(payload) = &object.reparse_point {
+        writer.bytes(payload)?;
+    }
+    Ok(())
 }
 
 fn encode_ntfs_attribute_evidence(
@@ -2280,6 +2805,7 @@ fn encode_data_stream(
     writer.bool(stream.compressed)?;
     writer.bool(stream.encrypted)?;
     writer.bool(stream.sparse)?;
+    writer.u64(stream.compression_block_bytes)?;
     match &stream.storage {
         NtfsStreamStorage::Resident { bytes } => {
             writer.u8(1)?;
@@ -2292,6 +2818,7 @@ fn encode_data_stream(
             compressed_bytes,
             mapping_complete,
             extents,
+            captured_payload,
         } => {
             writer.u8(2)?;
             writer.u64(*allocated_bytes)?;
@@ -2302,6 +2829,10 @@ fn encode_data_stream(
             writer.usize(extents.len())?;
             for extent in extents {
                 encode_ntfs_extent(writer, *extent)?;
+            }
+            writer.bool(captured_payload.is_some())?;
+            if let Some(bytes) = captured_payload {
+                writer.bytes(bytes)?;
             }
             Ok(())
         }
@@ -2478,6 +3009,7 @@ mod tests {
             }],
             directory_entries: Vec::new(),
             has_reparse_point: false,
+            reparse_point: None,
             has_attribute_list: false,
             directory_index_complete: true,
         }
@@ -2505,6 +3037,7 @@ mod tests {
                 compressed: false,
                 encrypted: false,
                 sparse: false,
+                compression_block_bytes: 0,
                 storage: NtfsStreamStorage::NonResident {
                     allocated_bytes: 1_048_576,
                     data_bytes: 1_048_576,
@@ -2517,6 +3050,7 @@ mod tests {
                         length: 1_048_576,
                         placement: NtfsExtentPlacement::Sparse,
                     }],
+                    captured_payload: None,
                 },
             }],
             attribute_census: vec![NtfsAttributeEvidence {
@@ -2529,6 +3063,7 @@ mod tests {
             }],
             directory_entries: Vec::new(),
             has_reparse_point: false,
+            reparse_point: None,
             has_attribute_list: false,
             directory_index_complete: true,
         };
@@ -2802,6 +3337,221 @@ mod tests {
         );
     }
 
+    fn two_case_colliding_files(left: &str, right: &str) -> ObjectGraph {
+        let file = |id: u64, stream: u64| ObjectRecord {
+            id: ObjectId(id),
+            kind: ObjectKind::File,
+            link_count: 1,
+            semantics: ObjectSemantics::default(),
+            streams: vec![ObjectStream {
+                id: StreamId(stream),
+                name: None,
+                logical_bytes: 0,
+                initialized_bytes: 0,
+                mapped_bytes: 0,
+                allocated_bytes: 0,
+                flags: StreamFlags::default(),
+                storage: StreamStorage::Resident(Vec::new()),
+            }],
+        };
+        ObjectGraph::build(
+            ObjectId(1),
+            vec![
+                ObjectRecord {
+                    id: ObjectId(1),
+                    kind: ObjectKind::Directory,
+                    link_count: 0,
+                    semantics: ObjectSemantics::default(),
+                    streams: Vec::new(),
+                },
+                file(2, 2),
+                file(3, 3),
+            ],
+            vec![
+                NamespaceEntry {
+                    parent: ObjectId(1),
+                    target: ObjectId(2),
+                    name: left.encode_utf16().collect(),
+                },
+                NamespaceEntry {
+                    parent: ObjectId(1),
+                    target: ObjectId(3),
+                    name: right.encode_utf16().collect(),
+                },
+            ],
+            ExtentGraph::build(Vec::new(), 1_048_576, 8).expect("extents"),
+            GRAPH_LIMITS,
+        )
+        .expect("graph")
+    }
+
+    fn symlink_reparse_payload() -> Vec<u8> {
+        let mut payload = vec![0_u8; 16];
+        payload[..4].copy_from_slice(&0xa000_000c_u32.to_le_bytes());
+        payload[4..6].copy_from_slice(&8_u16.to_le_bytes());
+        payload
+    }
+
+    fn ntfs_with_reparse_point(payload: Option<Vec<u8>>) -> NormalizedNtfs {
+        let mut normalized = ntfs();
+        let mut objects = normalized.graph.objects().to_vec();
+        objects[0].semantics.is_reparse_point = true;
+        normalized.graph = ObjectGraph::build(
+            normalized.graph.root(),
+            objects,
+            normalized.graph.entries().to_vec(),
+            normalized.graph.extents().clone(),
+            GRAPH_LIMITS,
+        )
+        .expect("graph");
+        let source = &mut normalized.preservation.objects[0].source;
+        source.has_reparse_point = true;
+        source.reparse_point = payload;
+        source.attribute_census.push(NtfsAttributeEvidence {
+            attribute_type: NTFS_REPARSE_POINT,
+            name: None,
+            flags_raw: 0,
+            flags_unknown_bits: 0,
+            attribute_id: 8,
+            resident: true,
+        });
+        normalized
+    }
+
+    #[test]
+    fn ntfs_exfat_reparse_points_are_escrowed_when_payload_is_complete() {
+        let payload = symlink_reparse_payload();
+        let complete = ntfs_with_reparse_point(Some(payload.clone()));
+        let escrow = evaluate_ntfs(
+            &complete,
+            FileSystem::ExFat,
+            GuaranteeMode::Escrow,
+            PreservationLimits::default(),
+        )
+        .expect("policy");
+        assert_eq!(
+            disposition(&escrow, PreservationField::ReparsePoints),
+            FieldDisposition::EscrowRequired
+        );
+        assert_eq!(
+            disposition(&escrow, PreservationField::NtfsAttributes),
+            FieldDisposition::Native
+        );
+        assert!(escrow.permitted);
+        assert!(!escrow.blockers.contains(&PreservationField::ReparsePoints));
+        let snapshot = escrow.escrow.expect("escrow");
+        assert!(
+            snapshot
+                .windows(payload.len())
+                .any(|window| window == payload),
+            "exact $REPARSE_POINT bytes must appear in the inner NTFS snapshot"
+        );
+
+        let strict = evaluate_ntfs(
+            &complete,
+            FileSystem::ExFat,
+            GuaranteeMode::Strict,
+            PreservationLimits::default(),
+        )
+        .expect("policy");
+        assert!(strict.blockers.contains(&PreservationField::ReparsePoints));
+
+        let content_only = evaluate_ntfs(
+            &complete,
+            FileSystem::ExFat,
+            GuaranteeMode::ContentOnly,
+            PreservationLimits::default(),
+        )
+        .expect("policy");
+        assert!(
+            content_only
+                .explicit_losses
+                .contains(&PreservationField::ReparsePoints)
+        );
+        assert!(
+            !content_only
+                .blockers
+                .contains(&PreservationField::ReparsePoints)
+        );
+
+        let incomplete = ntfs_with_reparse_point(None);
+        let refused = evaluate_ntfs(
+            &incomplete,
+            FileSystem::ExFat,
+            GuaranteeMode::Escrow,
+            PreservationLimits::default(),
+        )
+        .expect("policy");
+        assert_eq!(
+            disposition(&refused, PreservationField::ReparsePoints),
+            FieldDisposition::Refusal
+        );
+        assert!(refused.blockers.contains(&PreservationField::ReparsePoints));
+        assert!(!refused.permitted);
+    }
+
+    #[test]
+    fn ntfs_exfat_case_collisions_are_escrowed_while_illegal_names_remain_refusals() {
+        let mut colliding = ntfs();
+        colliding.graph = two_case_colliding_files("ReadMe.txt", "README.TXT");
+        let escrow = evaluate_ntfs(
+            &colliding,
+            FileSystem::ExFat,
+            GuaranteeMode::Escrow,
+            PreservationLimits::default(),
+        )
+        .expect("policy");
+        assert_eq!(
+            disposition(&escrow, PreservationField::NamesAndCase),
+            FieldDisposition::EscrowRequired
+        );
+        assert!(escrow.permitted);
+        assert!(!escrow.blockers.contains(&PreservationField::NamesAndCase));
+
+        let strict = evaluate_ntfs(
+            &colliding,
+            FileSystem::ExFat,
+            GuaranteeMode::Strict,
+            PreservationLimits::default(),
+        )
+        .expect("policy");
+        assert!(strict.blockers.contains(&PreservationField::NamesAndCase));
+
+        let content_only = evaluate_ntfs(
+            &colliding,
+            FileSystem::ExFat,
+            GuaranteeMode::ContentOnly,
+            PreservationLimits::default(),
+        )
+        .expect("policy");
+        assert!(
+            content_only
+                .explicit_losses
+                .contains(&PreservationField::NamesAndCase)
+        );
+        assert!(
+            !content_only
+                .blockers
+                .contains(&PreservationField::NamesAndCase)
+        );
+
+        let mut illegal = ntfs();
+        illegal.graph = two_case_colliding_files("ok.txt", "bad:name.txt");
+        let refused = evaluate_ntfs(
+            &illegal,
+            FileSystem::ExFat,
+            GuaranteeMode::Escrow,
+            PreservationLimits::default(),
+        )
+        .expect("policy");
+        assert_eq!(
+            disposition(&refused, PreservationField::NamesAndCase),
+            FieldDisposition::Refusal
+        );
+        assert!(refused.blockers.contains(&PreservationField::NamesAndCase));
+        assert!(!refused.permitted);
+    }
+
     #[test]
     fn ntfs_identity_schema_rejects_invalid_flags_and_lengths() {
         let report = evaluate_ntfs(
@@ -2845,6 +3595,7 @@ mod tests {
                 sparse: false,
                 compressed: false,
                 encrypted: true,
+                compression_block_bytes: 0,
             },
             storage: StreamStorage::Resident(vec![7]),
         };
@@ -2882,6 +3633,80 @@ mod tests {
                 .contains(&PreservationField::Encryption)
         );
         assert_eq!(report.blockers, vec![PreservationField::Encryption]);
+    }
+
+    #[test]
+    fn ntfs_exfat_compression_is_escrowed_with_the_compression_unit() {
+        let mut normalized = ntfs();
+        let stream = ObjectStream {
+            id: StreamId(9),
+            name: None,
+            logical_bytes: 1,
+            initialized_bytes: 1,
+            mapped_bytes: 1,
+            allocated_bytes: 0,
+            flags: StreamFlags {
+                sparse: false,
+                compressed: true,
+                encrypted: false,
+                compression_block_bytes: 8192,
+            },
+            storage: StreamStorage::Resident(vec![7]),
+        };
+        let root = ObjectRecord {
+            id: ObjectId(1),
+            kind: ObjectKind::Directory,
+            link_count: 0,
+            semantics: ObjectSemantics::default(),
+            streams: vec![stream],
+        };
+        normalized.graph = ObjectGraph::build(
+            ObjectId(1),
+            vec![root],
+            Vec::new(),
+            ExtentGraph::build(Vec::new(), 1_048_576, 8).expect("extents"),
+            GRAPH_LIMITS,
+        )
+        .expect("graph");
+        normalized.preservation.objects[0]
+            .source
+            .data_streams
+            .push(NtfsDataStream {
+                attribute_id: 4,
+                name: None,
+                compressed: true,
+                encrypted: false,
+                sparse: false,
+                compression_block_bytes: 8192,
+                storage: NtfsStreamStorage::Resident { bytes: vec![7] },
+            });
+        let escrow = evaluate_ntfs(
+            &normalized,
+            FileSystem::ExFat,
+            GuaranteeMode::Escrow,
+            PreservationLimits::default(),
+        )
+        .expect("policy");
+        assert_eq!(
+            disposition(&escrow, PreservationField::Compression),
+            FieldDisposition::EscrowRequired
+        );
+        assert!(escrow.permitted);
+        let snapshot = escrow.escrow.expect("escrow");
+        assert!(
+            snapshot
+                .windows(8)
+                .any(|window| window == 8192_u64.to_le_bytes()),
+            "inner NTFS snapshot must retain the compression-unit size"
+        );
+        let strict = evaluate_ntfs(
+            &normalized,
+            FileSystem::ExFat,
+            GuaranteeMode::Strict,
+            PreservationLimits::default(),
+        )
+        .expect("policy");
+        assert!(strict.blockers.contains(&PreservationField::Compression));
     }
 
     #[test]
@@ -2994,9 +3819,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             disposition(&report, PreservationField::BadClusters),
-            FieldDisposition::Refusal
+            FieldDisposition::EscrowRequired
         );
-        assert!(report.blockers.contains(&PreservationField::BadClusters));
+        assert!(!report.blockers.contains(&PreservationField::BadClusters));
 
         let mut incomplete = ntfs();
         incomplete.preservation.objects.pop();
@@ -3210,7 +4035,7 @@ mod tests {
     }
 
     #[test]
-    fn decoder_keeps_legacy_ntfs_v3_snapshots_readable() {
+    fn decoder_keeps_current_ntfs_v7_snapshots_readable() {
         let report = evaluate_ntfs(
             &ntfs(),
             FileSystem::ExFat,
@@ -3218,21 +4043,17 @@ mod tests {
             PreservationLimits::default(),
         )
         .expect("policy");
-        let mut legacy = report.escrow.expect("escrow");
+        let current = report.escrow.expect("escrow");
         let snapshot_start = HEADER_BYTES + RECORD_HEADER_BYTES;
         assert_eq!(
-            &legacy[snapshot_start..snapshot_start + 2],
-            &4_u16.to_le_bytes()
+            &current[snapshot_start..snapshot_start + 2],
+            &7_u16.to_le_bytes()
         );
-        legacy[snapshot_start..snapshot_start + 2].copy_from_slice(&3_u16.to_le_bytes());
-        let checksum = escrow_checksum(&legacy[..24], &legacy[HEADER_BYTES..]);
-        legacy[24..28].copy_from_slice(&checksum.to_le_bytes());
-
-        let decoded = decode_escrow(&legacy, PreservationLimits::default()).expect("legacy v3");
+        let decoded = decode_escrow(&current, PreservationLimits::default()).expect("current v7");
         assert_eq!(
             &decoded.records[0].value[..2],
-            &3_u16.to_le_bytes(),
-            "the historical snapshot remains preserved verbatim"
+            &7_u16.to_le_bytes(),
+            "the current inner NTFS snapshot remains preserved verbatim"
         );
         assert_eq!(
             decoded.ntfs_volume_identity,
@@ -3240,6 +4061,11 @@ mod tests {
                 volume_serial_number: ntfs().preservation.volume_serial_number,
                 volume_label: NtfsVolumeLabelIdentity::Absent,
             })
+        );
+        assert_eq!(
+            decode_ntfs_sidecar_from_escrow(&current, PreservationLimits::default())
+                .expect("restore decoder"),
+            ntfs().preservation
         );
     }
 

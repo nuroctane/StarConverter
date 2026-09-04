@@ -37,6 +37,16 @@ const Q_INDEX_BYTES: usize =
 const O_INDEX_BYTES: usize = O_ADMINISTRATORS_ENTRY_BYTES + INDEX_ENTRY_HEADER_BYTES;
 const EMPTY_INDEX_BYTES: usize = INDEX_ENTRY_HEADER_BYTES;
 const ALL_INDEX_BYTES: usize = Q_INDEX_BYTES + O_INDEX_BYTES + 2 * EMPTY_INDEX_BYTES;
+/// `REPARSE_INDEX_KEY`: `le32 reparse_tag` followed by `leMFT_REF file_id`.
+const R_KEY_BYTES: usize = 12;
+/// `struct REPARSE_INDEX`: entry header, key, and a `le32 filling` pad to 8-byte alignment.
+const R_ENTRY_BYTES: usize = INDEX_ENTRY_HEADER_BYTES + R_KEY_BYTES + 4;
+const R_ENTRY_LENGTH_FIELD: u16 = 0x20;
+const R_KEY_LENGTH_FIELD: u16 = 0x0c;
+const _: () = assert!(R_ENTRY_LENGTH_FIELD as usize == R_ENTRY_BYTES);
+const _: () = assert!(R_KEY_LENGTH_FIELD as usize == R_KEY_BYTES);
+/// `INDX` record size used by every `$Extend` view index the serializer emits.
+pub const REPARSE_INDEX_BLOCK_BYTES: u32 = 4096;
 
 const QUOTA_DEFAULTS_ID: u32 = 1;
 const QUOTA_FIRST_USER_ID: u32 = 0x100;
@@ -138,8 +148,52 @@ pub struct NtfsExtendMetadata {
     pub quota_o_index_entries: Vec<u8>,
     /// The initial `$ObjId:$O` is empty unless `mkntfs --with-uuid` is requested.
     pub object_id_o_index_entries: Vec<u8>,
-    /// The initial `$Reparse:$R` is empty.
+    /// `$Reparse:$R` root entries: the formatter's initial index is empty; a serializer that
+    /// emits `$REPARSE_POINT` attributes replaces this with [`generate_reparse_r_index_entries`]
+    /// (or, when `reparse_r_spill` is set, with the separator entries of a spilled root built by
+    /// [`super::ntfs_reparse_index`]) so every reparse-flagged FILE record is listed exactly once.
     pub reparse_r_index_entries: Vec<u8>,
+    /// Present when `$Reparse:$R` does not fit its resident root and continues in
+    /// `$INDEX_ALLOCATION:$R` records. `None` for the pinned formatter's empty index.
+    pub reparse_r_spill: Option<NtfsReparseIndexSpill>,
+}
+
+/// Spilled `$Reparse:$R` streams beyond the resident `$INDEX_ROOT:$R` root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NtfsReparseIndexSpill {
+    /// Concatenated `INDX` records of `$INDEX_ALLOCATION:$R`.
+    pub index_allocation: Vec<u8>,
+    /// Resident `$BITMAP:$R` value.
+    pub bitmap: Vec<u8>,
+    /// VCN stored in each `INDX` record, in stream order.
+    pub block_vcns: Vec<u64>,
+    /// NTFS cluster size the `INDX` VCN units were derived from.
+    pub cluster_bytes: u32,
+    /// Resident `$INDEX_ROOT:$R` value budget the root was planned against.
+    pub resident_root_bytes: usize,
+}
+
+/// One `$Reparse:$R` key: the reparse tag and the owning FILE reference (with sequence number).
+///
+/// `layout.h` `REPARSE_INDEX_KEY` at the pinned NTFS-3G commit; `reparse.c:set_reparse_index`
+/// writes the 32-byte entry with zero data offset/length and `COLLATION_NTOFS_ULONGS` ordering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReparseIndexKey {
+    pub reparse_tag: u32,
+    pub file_reference: u64,
+}
+
+impl ReparseIndexKey {
+    /// The `COLLATION_NTOFS_ULONGS` view of the key: consecutive little-endian `u32` values.
+    #[must_use]
+    pub const fn collation_ulongs(self) -> [u32; 3] {
+        let reference = self.file_reference.to_le_bytes();
+        [
+            self.reparse_tag,
+            u32::from_le_bytes([reference[0], reference[1], reference[2], reference[3]]),
+            u32::from_le_bytes([reference[4], reference[5], reference[6], reference[7]]),
+        ]
+    }
 }
 
 /// One parsed quota control entry.
@@ -156,6 +210,8 @@ pub struct NtfsExtendValidation {
     pub quota_entries: [QuotaControlSummary; 2],
     pub quota_owner_id: u32,
     pub child_count: usize,
+    /// Independently parsed `$Reparse:$R` keys in on-disk (collation) order.
+    pub reparse_keys: Vec<ReparseIndexKey>,
     /// Always false: validation establishes conformance to the pinned profile, not safety to
     /// activate a converted filesystem.
     pub activation_authorized: bool,
@@ -226,6 +282,22 @@ pub enum NtfsExtendError {
         entry: usize,
         offset: usize,
     },
+    /// Two `$Reparse:$R` keys collate equal (same tag and FILE reference).
+    DuplicateReparseKey {
+        key: ReparseIndexKey,
+    },
+    /// `$Reparse:$R` entries are not in ascending `COLLATION_NTOFS_ULONGS` order.
+    ReparseKeyOrder {
+        entry: usize,
+    },
+    /// `$Reparse:$R` ends without a terminal entry or continues after it.
+    MissingTerminalEntry {
+        index: &'static str,
+    },
+    /// A spilled `$Reparse:$R` failed the independent `INDX` walk.
+    SpilledReparseIndex {
+        reason: String,
+    },
 }
 
 impl fmt::Display for NtfsExtendError {
@@ -273,6 +345,21 @@ impl fmt::Display for NtfsExtendError {
                 formatter,
                 "non-zero {index} entry {entry} padding at byte {offset}"
             ),
+            Self::DuplicateReparseKey { key } => write!(
+                formatter,
+                "duplicate $Reparse:$R key tag 0x{:08x} file reference 0x{:016x}",
+                key.reparse_tag, key.file_reference
+            ),
+            Self::ReparseKeyOrder { entry } => write!(
+                formatter,
+                "$Reparse:$R entry {entry} is not in ascending NTOFS_ULONGS collation order"
+            ),
+            Self::MissingTerminalEntry { index } => {
+                write!(formatter, "{index} lacks a single trailing terminal entry")
+            }
+            Self::SpilledReparseIndex { reason } => {
+                write!(formatter, "spilled $Reparse:$R is invalid: {reason}")
+            }
         }
     }
 }
@@ -324,6 +411,7 @@ pub fn generate_ntfs3g_extend_metadata(
         quota_o_index_entries: o,
         object_id_o_index_entries: make_empty_index("$ObjId:$O")?,
         reparse_r_index_entries: make_empty_index("$Reparse:$R")?,
+        reparse_r_spill: None,
     })
 }
 
@@ -375,7 +463,10 @@ pub fn validate_ntfs3g_extend_metadata(
     )?;
 
     validate_empty_index("$ObjId:$O", &metadata.object_id_o_index_entries)?;
-    validate_empty_index("$Reparse:$R", &metadata.reparse_r_index_entries)?;
+    let reparse_keys = match &metadata.reparse_r_spill {
+        None => parse_reparse_r_index_entries(&metadata.reparse_r_index_entries)?,
+        Some(spill) => parse_spilled_reparse_r_index(&metadata.reparse_r_index_entries, spill)?,
+    };
 
     if owner_id != administrators.owner_id {
         return Err(NtfsExtendError::InvalidIndexField {
@@ -389,8 +480,184 @@ pub fn validate_ntfs3g_extend_metadata(
         quota_entries: [defaults, administrators],
         quota_owner_id: owner_id,
         child_count: 3,
+        reparse_keys,
         activation_authorized: false,
     })
+}
+
+/// Builds the complete `$Reparse:$R` entry sequence for `keys`, sorted by
+/// `COLLATION_NTOFS_ULONGS`, followed by the terminal entry.
+///
+/// # Errors
+///
+/// Returns an error for invalid limits, two keys that collate equal, an output exceeding
+/// `limits.max_index_bytes`, or allocation failure.
+pub fn generate_reparse_r_index_entries(
+    keys: &[ReparseIndexKey],
+    limits: NtfsExtendLimits,
+) -> Result<Vec<u8>, NtfsExtendError> {
+    if limits.max_index_bytes == 0 {
+        return Err(NtfsExtendError::InvalidLimit {
+            field: "max_index_bytes",
+        });
+    }
+    let total = keys
+        .len()
+        .checked_mul(R_ENTRY_BYTES)
+        .and_then(|bytes| bytes.checked_add(INDEX_ENTRY_HEADER_BYTES))
+        .ok_or(NtfsExtendError::ByteLimitExceeded {
+            actual: usize::MAX,
+            maximum: limits.max_index_bytes,
+        })?;
+    if total > limits.max_index_bytes {
+        return Err(NtfsExtendError::ByteLimitExceeded {
+            actual: total,
+            maximum: limits.max_index_bytes,
+        });
+    }
+    let mut sorted = Vec::new();
+    sorted
+        .try_reserve_exact(keys.len())
+        .map_err(|_| NtfsExtendError::AllocationFailure {
+            target: "$Reparse:$R",
+        })?;
+    sorted.extend_from_slice(keys);
+    sorted.sort_unstable_by_key(|key| key.collation_ulongs());
+    for pair in sorted.windows(2) {
+        if pair[0].collation_ulongs() == pair[1].collation_ulongs() {
+            return Err(NtfsExtendError::DuplicateReparseKey { key: pair[1] });
+        }
+    }
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(total)
+        .map_err(|_| NtfsExtendError::AllocationFailure {
+            target: "$Reparse:$R",
+        })?;
+    for key in sorted {
+        push_u16(&mut output, 0);
+        push_u16(&mut output, 0);
+        push_u32(&mut output, 0);
+        push_u16(&mut output, R_ENTRY_LENGTH_FIELD);
+        push_u16(&mut output, R_KEY_LENGTH_FIELD);
+        push_u16(&mut output, 0);
+        push_u16(&mut output, 0);
+        push_u32(&mut output, key.reparse_tag);
+        push_u64(&mut output, key.file_reference);
+        push_u32(&mut output, 0);
+    }
+    append_terminal(&mut output);
+    Ok(output)
+}
+
+/// Independently parses a complete `$Reparse:$R` entry sequence.
+///
+/// Every non-terminal entry must be the exact 32-byte `REPARSE_INDEX` layout with zero data
+/// offset/length, zero flags, and zero filling; keys must strictly ascend under
+/// `COLLATION_NTOFS_ULONGS`; exactly one terminal entry must end the sequence.
+///
+/// # Errors
+///
+/// Returns an error for a truncated, malformed, unordered, duplicated, or unterminated sequence.
+pub fn parse_reparse_r_index_entries(
+    bytes: &[u8],
+) -> Result<Vec<ReparseIndexKey>, NtfsExtendError> {
+    const INDEX: &str = "$Reparse:$R";
+    let mut keys = Vec::new();
+    let mut offset = 0_usize;
+    let mut entry = 0_usize;
+    loop {
+        let Some(header) = bytes.get(offset..offset + INDEX_ENTRY_HEADER_BYTES) else {
+            return Err(NtfsExtendError::MissingTerminalEntry { index: INDEX });
+        };
+        let flags = read_u16(header, 12);
+        if flags & INDEX_ENTRY_END != 0 {
+            parse_terminal(INDEX, entry, header)?;
+            if offset + INDEX_ENTRY_HEADER_BYTES != bytes.len() {
+                return Err(NtfsExtendError::MissingTerminalEntry { index: INDEX });
+            }
+            return Ok(keys);
+        }
+        let Some(record) = bytes.get(offset..offset + R_ENTRY_BYTES) else {
+            return Err(NtfsExtendError::InvalidIndexLength {
+                index: INDEX,
+                actual: bytes.len() - offset,
+                expected: R_ENTRY_BYTES,
+            });
+        };
+        require_u16(INDEX, entry, "data_offset", record, 0, 0)?;
+        require_u16(INDEX, entry, "data_length", record, 2, 0)?;
+        require_u32(INDEX, entry, "reservedV", record, 4, 0)?;
+        require_u16(INDEX, entry, "length", record, 8, R_ENTRY_LENGTH_FIELD)?;
+        require_u16(INDEX, entry, "key_length", record, 10, R_KEY_LENGTH_FIELD)?;
+        require_u16(INDEX, entry, "flags", record, 12, 0)?;
+        require_u16(INDEX, entry, "reserved", record, 14, 0)?;
+        require_zero(INDEX, entry, record, 28..32)?;
+        let key = ReparseIndexKey {
+            reparse_tag: read_u32(record, 16),
+            file_reference: read_u64(record, 20),
+        };
+        if let Some(previous) = keys.last() {
+            if previous.collation_ulongs() >= key.collation_ulongs() {
+                return Err(if previous.collation_ulongs() == key.collation_ulongs() {
+                    NtfsExtendError::DuplicateReparseKey { key }
+                } else {
+                    NtfsExtendError::ReparseKeyOrder { entry }
+                });
+            }
+        }
+        keys.try_reserve(1)
+            .map_err(|_| NtfsExtendError::AllocationFailure { target: INDEX })?;
+        keys.push(key);
+        offset += R_ENTRY_BYTES;
+        entry += 1;
+    }
+}
+
+/// Walks a spilled `$Reparse:$R` (separator root plus `INDX` records) through the independent
+/// [`super::ntfs_reparse_index`] validator and returns every key in collation order.
+///
+/// # Errors
+///
+/// Returns an error when the root, allocation, bitmap, or VCN list is malformed, unordered,
+/// duplicated, or unreachable.
+pub fn parse_spilled_reparse_r_index(
+    root_entries: &[u8],
+    spill: &NtfsReparseIndexSpill,
+) -> Result<Vec<ReparseIndexKey>, NtfsExtendError> {
+    use super::ntfs_reparse_index::{
+        NtfsReparseIndexGeometry, NtfsReparseIndexLimits, SerializedNtfsReparseIndex,
+        compose_reparse_root_value, validate_serialized_ntfs_reparse_index,
+    };
+    let geometry = NtfsReparseIndexGeometry {
+        cluster_bytes: spill.cluster_bytes,
+        index_block_bytes: REPARSE_INDEX_BLOCK_BYTES,
+        resident_root_bytes: spill.resident_root_bytes,
+    };
+    let to_error = |error: super::ntfs_reparse_index::NtfsReparseIndexError| {
+        NtfsExtendError::SpilledReparseIndex {
+            reason: error.to_string(),
+        }
+    };
+    let index_root = compose_reparse_root_value(root_entries, true, geometry).map_err(to_error)?;
+    let serialized = SerializedNtfsReparseIndex {
+        index_root,
+        index_allocation: spill.index_allocation.clone(),
+        bitmap: spill.bitmap.clone(),
+        block_vcns: spill.block_vcns.clone(),
+    };
+    let validated = validate_serialized_ntfs_reparse_index(
+        &serialized,
+        geometry,
+        NtfsReparseIndexLimits::default(),
+    )
+    .map_err(to_error)?;
+    if !validated.spilled {
+        return Err(NtfsExtendError::SpilledReparseIndex {
+            reason: "spill streams present but the root has no children".to_owned(),
+        });
+    }
+    Ok(validated.keys)
 }
 
 const fn require_supported_profile(profile: NtfsExtendProfile) -> Result<(), NtfsExtendError> {
@@ -1136,6 +1403,120 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    const REPARSE_KEYS: [ReparseIndexKey; 4] = [
+        ReparseIndexKey {
+            reparse_tag: 0xa000_000c,
+            file_reference: (1 << 48) | 70,
+        },
+        ReparseIndexKey {
+            reparse_tag: 0xa000_0003,
+            file_reference: (1 << 48) | 64,
+        },
+        ReparseIndexKey {
+            reparse_tag: 0xa000_000c,
+            file_reference: (2 << 48) | 65,
+        },
+        ReparseIndexKey {
+            reparse_tag: 0xa000_000c,
+            file_reference: (1 << 48) | 65,
+        },
+    ];
+
+    #[test]
+    fn reparse_index_round_trips_in_ntofs_ulongs_order() {
+        let bytes =
+            generate_reparse_r_index_entries(&REPARSE_KEYS, NtfsExtendLimits::default()).unwrap();
+        assert_eq!(bytes.len(), 4 * R_ENTRY_BYTES + INDEX_ENTRY_HEADER_BYTES);
+        // First entry: mount-point tag 0xa0000003 on record 64.
+        assert_eq!(
+            &bytes[..R_ENTRY_BYTES],
+            &[
+                0, 0, 0, 0, 0, 0, 0, 0, 0x20, 0, 0x0c, 0, 0, 0, 0, 0, 0x03, 0, 0, 0xa0, 64, 0, 0,
+                0, 0, 0, 1, 0, 0, 0, 0, 0
+            ]
+        );
+        let parsed = parse_reparse_r_index_entries(&bytes).unwrap();
+        // Same tag: the low u32 of the reference orders before the high u32 (sequence number).
+        assert_eq!(
+            parsed,
+            vec![
+                REPARSE_KEYS[1],
+                REPARSE_KEYS[3],
+                REPARSE_KEYS[2],
+                REPARSE_KEYS[0]
+            ]
+        );
+
+        let mut metadata = generated();
+        metadata.reparse_r_index_entries = bytes;
+        let validation = validate_ntfs3g_extend_metadata(
+            NtfsExtendProfile::MkntfsNtfs31,
+            &metadata,
+            NtfsExtendLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(validation.reparse_keys, parsed);
+    }
+
+    #[test]
+    fn duplicate_reparse_keys_and_byte_limits_are_rejected() {
+        let duplicate = [REPARSE_KEYS[0], REPARSE_KEYS[1], REPARSE_KEYS[0]];
+        assert!(matches!(
+            generate_reparse_r_index_entries(&duplicate, NtfsExtendLimits::default()),
+            Err(NtfsExtendError::DuplicateReparseKey { key }) if key == REPARSE_KEYS[0]
+        ));
+        assert!(matches!(
+            generate_reparse_r_index_entries(
+                &REPARSE_KEYS,
+                NtfsExtendLimits {
+                    max_index_bytes: 4 * R_ENTRY_BYTES + INDEX_ENTRY_HEADER_BYTES - 1,
+                    max_children: 8,
+                },
+            ),
+            Err(NtfsExtendError::ByteLimitExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn malformed_reparse_index_sequences_are_rejected() {
+        let bytes =
+            generate_reparse_r_index_entries(&REPARSE_KEYS, NtfsExtendLimits::default()).unwrap();
+        for offset in [0, 2, 4, 8, 10, 14, 28, 31] {
+            let mut mutated = bytes.clone();
+            mutated[offset] ^= 0x01;
+            assert!(
+                parse_reparse_r_index_entries(&mutated).is_err(),
+                "offset {offset}"
+            );
+        }
+        // Swapping the first two entries breaks collation order.
+        let mut swapped = bytes.clone();
+        swapped.copy_within(R_ENTRY_BYTES..2 * R_ENTRY_BYTES, 0);
+        swapped[R_ENTRY_BYTES..2 * R_ENTRY_BYTES].copy_from_slice(&bytes[..R_ENTRY_BYTES]);
+        assert!(matches!(
+            parse_reparse_r_index_entries(&swapped),
+            Err(NtfsExtendError::ReparseKeyOrder { entry: 1 })
+        ));
+        // Truncation anywhere before the terminal fails.
+        for length in 0..bytes.len() {
+            assert!(parse_reparse_r_index_entries(&bytes[..length]).is_err());
+        }
+        // Bytes after the terminal fail.
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(matches!(
+            parse_reparse_r_index_entries(&trailing),
+            Err(NtfsExtendError::MissingTerminalEntry { .. })
+        ));
+        // A repeated key on disk fails.
+        let mut repeated = bytes;
+        repeated.copy_within(0..R_ENTRY_BYTES, R_ENTRY_BYTES);
+        assert!(matches!(
+            parse_reparse_r_index_entries(&repeated),
+            Err(NtfsExtendError::DuplicateReparseKey { .. })
+        ));
     }
 
     #[test]

@@ -416,6 +416,9 @@ impl PreparedConversion {
             staging_exclusions,
             limits.layout,
         )?;
+        if !layout.materializations.is_empty() {
+            return Err(ConversionError::InPlaceMaterializationUnsupported);
+        }
         let relocated_target = relocate_object_graph(projected_target_graph, &layout)?;
         if &relocated_target != target_graph {
             return Err(ConversionError::TargetGraphMismatch);
@@ -1337,6 +1340,7 @@ pub enum ConversionError {
     },
     RollbackRangeMismatch,
     RelocationBeforeImageRangeMismatch,
+    InPlaceMaterializationUnsupported,
     TargetGraphMismatch,
     CapsuleAlreadyStarted,
     CapsuleNotStarted,
@@ -1486,6 +1490,9 @@ impl fmt::Display for ConversionError {
             ),
             Self::RelocationBeforeImageRangeMismatch => formatter.write_str(
                 "relocation destination before-images do not exactly match solved destinations",
+            ),
+            Self::InPlaceMaterializationUnsupported => formatter.write_str(
+                "in-place activation cannot apply stream-level materialization; use create-new export",
             ),
             Self::TargetGraphMismatch => formatter.write_str(
                 "expected target graph does not equal the source graph after solved relocations",
@@ -2319,6 +2326,7 @@ fn digest_graph(graph: &ObjectGraph) -> [u8; 32] {
                 u8::from(stream.flags.compressed),
                 u8::from(stream.flags.encrypted),
             ]);
+            put_u64(&mut hasher, stream.flags.compression_block_bytes);
             match &stream.storage {
                 StreamStorage::Resident(bytes) => {
                     hasher.update([0]);
@@ -2419,6 +2427,11 @@ fn digest_plan(
             put_u64(&mut hasher, range.offset);
             put_u64(&mut hasher, range.length);
         }
+    }
+    for materialization in &layout.materializations {
+        put_u64(&mut hasher, materialization.stream.0);
+        put_u64(&mut hasher, materialization.destination.offset);
+        put_u64(&mut hasher, materialization.destination.length);
     }
     for (tag, set) in [
         (0_u8, writes.target_staging.as_slice()),

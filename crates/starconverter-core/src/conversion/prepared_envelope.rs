@@ -564,8 +564,10 @@ fn decode_state(
         reservations,
         layout: LayoutPlan {
             relocations,
+            materializations: Vec::new(),
             free_after_staging,
             relocated_bytes: header.relocated_bytes,
+            materialized_bytes: 0,
             largest_free_range: header.largest_free_range,
         },
         writes: OpaqueWriteSets {
@@ -1447,6 +1449,9 @@ fn validate_ranges(state: &EnvelopeState) -> Result<(), PreparedEnvelopeError> {
         .map(|range| range.length)
         .max()
         .unwrap_or(0);
+    if !state.layout.materializations.is_empty() || state.layout.materialized_bytes != 0 {
+        return Err(PreparedEnvelopeError::InvalidPreparedInvariant);
+    }
     if relocated_bytes != state.layout.relocated_bytes
         || largest_free_range != state.layout.largest_free_range
     {
@@ -1972,11 +1977,13 @@ mod tests {
                         length: 512,
                     },
                 }],
+                materializations: Vec::new(),
                 free_after_staging: vec![ByteRange {
                     offset: 15360,
                     length: 1024,
                 }],
                 relocated_bytes: 512,
+                materialized_bytes: 0,
                 largest_free_range: 1024,
             },
             writes: rollback,
