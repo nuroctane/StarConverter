@@ -1137,12 +1137,13 @@ where
         Some(relocation) => validate_relocations(source, relocation, preview.writes(), limits)?,
         None => (0, 0, Vec::new()),
     };
-    let (materialization_count, materialization_bytes, sorted_materializations) = match relocation {
-        Some(relocation) => {
-            validate_materializations(source, relocation, preview.writes(), limits)?
-        }
-        None => (0, 0, Vec::new()),
-    };
+    let (materialization_count, materialization_bytes, materializations, materialization_spans) =
+        match relocation {
+            Some(relocation) => {
+                validate_materializations(source, relocation, preview.writes(), limits)?
+            }
+            None => (0, 0, Vec::new(), Vec::new()),
+        };
     let applied_write_count = write_count
         .checked_add(relocation_count)
         .and_then(|count| count.checked_add(materialization_count))
@@ -1177,7 +1178,7 @@ where
         let relocated_source = RelocatedSourceView {
             source,
             relocations: &sorted_relocations,
-            materializations: &sorted_materializations,
+            materializations: &materialization_spans,
             source_graph: relocation.map(SealedRelocationPlan::source_graph),
         };
         build_manifest_with_reader(&relocated_source, target_graph, limits.verification)?
@@ -1222,7 +1223,7 @@ where
             source,
             output_guard.file_mut(),
             authority.source_graph(),
-            &sorted_materializations,
+            &materializations,
             limits.copy_chunk_bytes,
             relocation_bytes,
             payload_bytes,
@@ -1495,7 +1496,7 @@ struct RelocatedSourceView<'a> {
     source: &'a ImageFile,
     /// Sorted by destination offset and independently validated as disjoint.
     relocations: &'a [Relocation],
-    materializations: &'a [Materialization],
+    materializations: &'a [MaterializationSpan],
     source_graph: Option<&'a ObjectGraph>,
 }
 
@@ -1561,10 +1562,10 @@ impl BoundedImageReader for RelocatedSourceView<'_> {
 }
 
 fn covering_materialization(
-    materializations: &[Materialization],
+    materializations: &[MaterializationSpan],
     offset: u64,
     end: u64,
-) -> Option<&Materialization> {
+) -> Option<&MaterializationSpan> {
     let position = materializations.partition_point(|item| item.destination.offset <= offset);
     position
         .checked_sub(1)
@@ -1575,6 +1576,14 @@ fn covering_materialization(
                 .checked_add(item.destination.length)
                 .is_some_and(|destination_end| end <= destination_end)
         })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MaterializationSpan {
+    stream: crate::extent::StreamId,
+    logical_offset: u64,
+    destination: crate::geometry::ByteRange,
+    stream_destination_length: u64,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1724,10 +1733,10 @@ fn validate_materializations(
     authority: &SealedRelocationPlan,
     writes: &OpaqueWriteSets,
     limits: CandidateExportLimits,
-) -> Result<(usize, u64, Vec<Materialization>), CandidateExportError> {
+) -> Result<(usize, u64, Vec<Materialization>, Vec<MaterializationSpan>), CandidateExportError> {
     let source_graph = authority.source_graph();
     let target_graph = authority.target_graph();
-    let mut materializations = authority.layout().materializations.clone();
+    let materializations = authority.layout().materializations.clone();
     if materializations.len() > limits.max_writes {
         return Err(CandidateExportError::WriteLimitExceeded {
             actual: materializations.len(),
@@ -1735,22 +1744,11 @@ fn validate_materializations(
         });
     }
     let mut materialized_bytes = 0_u64;
+    let mut spans = Vec::new();
     for materialization in &materializations {
-        if materialization.destination.length == 0 {
+        if materialization.destinations.is_empty() {
             return Err(CandidateExportError::RelocationShape(
-                "materialization destination length must be nonzero",
-            ));
-        }
-        let destination_end = materialization
-            .destination
-            .offset
-            .checked_add(materialization.destination.length)
-            .ok_or(CandidateExportError::RelocationShape(
-                "materialization destination overflows",
-            ))?;
-        if destination_end > source.len() {
-            return Err(CandidateExportError::RelocationShape(
-                "materialization destination is outside the image",
+                "materialization must contain at least one destination span",
             ));
         }
         let stream = source_graph
@@ -1765,39 +1763,78 @@ fn validate_materializations(
             .ok_or(CandidateExportError::RelocationShape(
                 "source graph does not authorize a materialization read",
             ))?;
-        if materialization.destination.length < stream.logical_bytes {
+        let mut logical_offset = 0_u64;
+        for destination in &materialization.destinations {
+            if destination.length == 0 {
+                return Err(CandidateExportError::RelocationShape(
+                    "materialization destination span length must be nonzero",
+                ));
+            }
+            let destination_end = destination.offset.checked_add(destination.length).ok_or(
+                CandidateExportError::RelocationShape("materialization destination overflows"),
+            )?;
+            if destination_end > source.len() {
+                return Err(CandidateExportError::RelocationShape(
+                    "materialization destination is outside the image",
+                ));
+            }
+            logical_offset = logical_offset.checked_add(destination.length).ok_or(
+                CandidateExportError::ArithmeticOverflow("materialization logical coverage"),
+            )?;
+        }
+        let destination_length = logical_offset;
+        if destination_length < stream.logical_bytes {
             return Err(CandidateExportError::RelocationShape(
                 "materialization destination is smaller than logical stream bytes",
             ));
         }
-        let committed = target_graph.extents().extents().iter().any(|extent| {
-            extent.kind == ExtentKind::FileData
-                && extent.stream == materialization.stream
-                && extent.logical_offset == 0
-                && extent.length == materialization.destination.length
-                && extent.placement
-                    == Placement::Physical {
-                        byte_offset: materialization.destination.offset,
-                    }
-        });
-        if !committed {
-            return Err(CandidateExportError::RelocationShape(
-                "target graph does not commit a materialization destination",
-            ));
+        let mut logical_offset = 0_u64;
+        for destination in &materialization.destinations {
+            let committed = target_graph.extents().extents().iter().any(|extent| {
+                extent.kind == ExtentKind::FileData
+                    && extent.stream == materialization.stream
+                    && extent.logical_offset == logical_offset
+                    && extent.length == destination.length
+                    && extent.placement
+                        == Placement::Physical {
+                            byte_offset: destination.offset,
+                        }
+            });
+            if !committed {
+                return Err(CandidateExportError::RelocationShape(
+                    "target graph does not commit a materialization destination span",
+                ));
+            }
+            spans.try_reserve(1).map_err(|_| {
+                CandidateExportError::RelocationShape("could not allocate span proof")
+            })?;
+            spans.push(MaterializationSpan {
+                stream: materialization.stream,
+                logical_offset,
+                destination: *destination,
+                stream_destination_length: destination_length,
+            });
+            logical_offset = logical_offset.checked_add(destination.length).ok_or(
+                CandidateExportError::ArithmeticOverflow("materialization logical offset"),
+            )?;
         }
-        materialized_bytes = materialized_bytes
-            .checked_add(materialization.destination.length)
-            .ok_or(CandidateExportError::ArithmeticOverflow(
-                "materialization byte total",
-            ))?;
+        materialized_bytes = materialized_bytes.checked_add(destination_length).ok_or(
+            CandidateExportError::ArithmeticOverflow("materialization byte total"),
+        )?;
     }
     if materialized_bytes != authority.layout().materialized_bytes {
         return Err(CandidateExportError::RelocationShape(
             "materialized byte total disagrees with the layout",
         ));
     }
-    materializations.sort_unstable_by_key(|item| item.destination.offset);
-    if materializations.windows(2).any(|pair| {
+    if spans.len() > limits.max_writes {
+        return Err(CandidateExportError::WriteLimitExceeded {
+            actual: spans.len(),
+            maximum: limits.max_writes,
+        });
+    }
+    spans.sort_unstable_by_key(|item| item.destination.offset);
+    if spans.windows(2).any(|pair| {
         pair[0]
             .destination
             .offset
@@ -1808,7 +1845,7 @@ fn validate_materializations(
             "materialization destinations overlap",
         ));
     }
-    for materialization in &materializations {
+    for materialization in &spans {
         let destination_end =
             materialization.destination.offset + materialization.destination.length;
         for relocation in &authority.layout().relocations {
@@ -1845,22 +1882,33 @@ fn validate_materializations(
             }
         }
     }
-    Ok((materializations.len(), materialized_bytes, materializations))
+    Ok((spans.len(), materialized_bytes, materializations, spans))
 }
 
 fn read_materialized_logical(
     source: &ImageFile,
     graph: &ObjectGraph,
-    materialization: &Materialization,
+    materialization: &MaterializationSpan,
     offset: u64,
     length: usize,
 ) -> Result<Vec<u8>, CandidateExportError> {
-    let logical_offset = offset
+    let span_offset = offset
         .checked_sub(materialization.destination.offset)
         .ok_or(CandidateExportError::RelocationShape(
             "materialization read is before its destination",
         ))?;
-    let payload = reconstruct_stream_destination(source, graph, materialization)?;
+    let logical_offset = materialization
+        .logical_offset
+        .checked_add(span_offset)
+        .ok_or(CandidateExportError::ArithmeticOverflow(
+            "materialization read logical offset",
+        ))?;
+    let payload = reconstruct_stream_destination(
+        source,
+        graph,
+        materialization.stream,
+        materialization.stream_destination_length,
+    )?;
     let start = usize::try_from(logical_offset)
         .map_err(|_| CandidateExportError::ArithmeticOverflow("materialization read offset"))?;
     let end = start
@@ -1879,7 +1927,8 @@ fn read_materialized_logical(
 fn reconstruct_stream_destination(
     source: &ImageFile,
     graph: &ObjectGraph,
-    materialization: &Materialization,
+    materialized_stream: crate::extent::StreamId,
+    destination_length: u64,
 ) -> Result<Vec<u8>, CandidateExportError> {
     let stream = graph
         .objects()
@@ -1888,12 +1937,12 @@ fn reconstruct_stream_destination(
             object
                 .streams
                 .iter()
-                .find(|candidate| candidate.id == materialization.stream)
+                .find(|candidate| candidate.id == materialized_stream)
         })
         .ok_or(CandidateExportError::RelocationShape(
             "source graph does not authorize a materialization read",
         ))?;
-    let dest_len = usize::try_from(materialization.destination.length).map_err(|_| {
+    let dest_len = usize::try_from(destination_length).map_err(|_| {
         CandidateExportError::ArithmeticOverflow("materialization destination length")
     })?;
     let mut destination = vec![0_u8; dest_len];
@@ -1977,42 +2026,65 @@ where
         Some(payload_bytes),
     )?;
     for materialization in materializations {
-        let payload = reconstruct_stream_destination(source, source_graph, materialization)?;
-        let mut copied = 0_usize;
-        while copied < payload.len() {
-            let remaining = payload.len() - copied;
-            let length = remaining.min(chunk_bytes);
-            let destination_offset = materialization
-                .destination
-                .offset
-                .checked_add(u64::try_from(copied).map_err(|_| {
-                    CandidateExportError::ArithmeticOverflow("materialization write offset")
-                })?)
-                .ok_or(CandidateExportError::ArithmeticOverflow(
-                    "materialization write offset",
-                ))?;
-            output
-                .seek(SeekFrom::Start(destination_offset))
-                .map_err(|source| {
-                    CandidateExportError::io("seek materialization destination", source)
-                })?;
-            output
-                .write_all(&payload[copied..copied + length])
-                .map_err(|source| CandidateExportError::io("write materialized payload", source))?;
-            copied += length;
-            completed = completed
-                .checked_add(u64::try_from(length).map_err(|_| {
-                    CandidateExportError::ArithmeticOverflow("materialization progress")
-                })?)
-                .ok_or(CandidateExportError::ArithmeticOverflow(
-                    "materialization total progress",
-                ))?;
-            observe_cancellable(
-                observer,
-                CandidateWorkPhase::RelocatePayload,
-                completed,
-                Some(payload_bytes),
+        let destination_length = materialization
+            .destinations
+            .iter()
+            .try_fold(0_u64, |total, range| total.checked_add(range.length))
+            .ok_or(CandidateExportError::ArithmeticOverflow(
+                "materialization destination total",
+            ))?;
+        let payload = reconstruct_stream_destination(
+            source,
+            source_graph,
+            materialization.stream,
+            destination_length,
+        )?;
+        let mut logical_offset = 0_usize;
+        for destination in &materialization.destinations {
+            let span_length = usize::try_from(destination.length).map_err(|_| {
+                CandidateExportError::ArithmeticOverflow("materialization span length")
+            })?;
+            let span_end = logical_offset.checked_add(span_length).ok_or(
+                CandidateExportError::ArithmeticOverflow("materialization span end"),
             )?;
+            let mut copied = 0_usize;
+            while copied < span_length {
+                let length = (span_length - copied).min(chunk_bytes);
+                let destination_offset = destination
+                    .offset
+                    .checked_add(u64::try_from(copied).map_err(|_| {
+                        CandidateExportError::ArithmeticOverflow("materialization write offset")
+                    })?)
+                    .ok_or(CandidateExportError::ArithmeticOverflow(
+                        "materialization write offset",
+                    ))?;
+                output
+                    .seek(SeekFrom::Start(destination_offset))
+                    .map_err(|source| {
+                        CandidateExportError::io("seek materialization destination", source)
+                    })?;
+                let payload_start = logical_offset + copied;
+                output
+                    .write_all(&payload[payload_start..payload_start + length])
+                    .map_err(|source| {
+                        CandidateExportError::io("write materialized payload", source)
+                    })?;
+                copied += length;
+                completed = completed
+                    .checked_add(u64::try_from(length).map_err(|_| {
+                        CandidateExportError::ArithmeticOverflow("materialization progress")
+                    })?)
+                    .ok_or(CandidateExportError::ArithmeticOverflow(
+                        "materialization total progress",
+                    ))?;
+                observe_cancellable(
+                    observer,
+                    CandidateWorkPhase::RelocatePayload,
+                    completed,
+                    Some(payload_bytes),
+                )?;
+            }
+            logical_offset = span_end;
         }
     }
     Ok(())
@@ -2682,7 +2754,7 @@ mod tests {
     use crate::fs::ntfs_serialize::{
         NtfsDestinationInputs, NtfsObjectTimestamps, NtfsSerializeLimits, plan_ntfs_destination,
     };
-    use crate::geometry::{ByteRange, LayoutLimits, ReservationKind};
+    use crate::geometry::{LayoutLimits, ReservationKind};
     use crate::inspect::inspect_image;
     use crate::object::{
         NamespaceEntry, ObjectGraphLimits, ObjectId, ObjectKind, ObjectRecord, ObjectSemantics,
@@ -2858,20 +2930,128 @@ mod tests {
             },
         )
         .unwrap();
-        let payload = reconstruct_stream_destination(
-            &source,
-            &graph,
-            &Materialization {
-                stream: StreamId(2),
-                destination: ByteRange {
-                    offset: 4096,
-                    length: 4096,
+        let payload = reconstruct_stream_destination(&source, &graph, StreamId(2), 4096).unwrap();
+        assert_eq!(&payload[..6], b"ABCABC");
+        assert!(payload[6..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn multispan_materialization_scatter_and_virtual_reads_keep_logical_order() {
+        let source_file = TempFile::create(&vec![0_u8; 24 * 1024]);
+        let source = ImageFile::open(&source_file.path).unwrap();
+        let payload: Vec<u8> = (0_usize..6000)
+            .map(|index| u8::try_from(index % 251).unwrap())
+            .collect();
+        let graph = ObjectGraph::build(
+            ObjectId(1),
+            vec![
+                ObjectRecord {
+                    id: ObjectId(1),
+                    kind: ObjectKind::Directory,
+                    link_count: 0,
+                    semantics: ObjectSemantics::default(),
+                    streams: Vec::new(),
                 },
+                ObjectRecord {
+                    id: ObjectId(2),
+                    kind: ObjectKind::File,
+                    link_count: 1,
+                    semantics: ObjectSemantics::default(),
+                    streams: vec![ObjectStream {
+                        id: StreamId(2),
+                        name: None,
+                        logical_bytes: 6000,
+                        initialized_bytes: 6000,
+                        mapped_bytes: 6000,
+                        allocated_bytes: 0,
+                        flags: StreamFlags::default(),
+                        storage: StreamStorage::Resident(payload.clone()),
+                    }],
+                },
+            ],
+            vec![NamespaceEntry {
+                parent: ObjectId(1),
+                target: ObjectId(2),
+                name: "split.bin".encode_utf16().collect(),
+            }],
+            ExtentGraph::build(Vec::new(), 24 * 1024, 1).unwrap(),
+            ObjectGraphLimits {
+                max_objects: 4,
+                max_entries: 4,
+                max_streams: 4,
+                max_name_code_units: 255,
             },
         )
         .unwrap();
-        assert_eq!(&payload[..6], b"ABCABC");
-        assert!(payload[6..].iter().all(|byte| *byte == 0));
+        let destinations = vec![
+            crate::geometry::ByteRange {
+                offset: 8192,
+                length: 4096,
+            },
+            crate::geometry::ByteRange {
+                offset: 16 * 1024,
+                length: 4096,
+            },
+        ];
+        let materializations = vec![Materialization {
+            stream: StreamId(2),
+            destinations: destinations.clone(),
+        }];
+        let spans = vec![
+            MaterializationSpan {
+                stream: StreamId(2),
+                logical_offset: 0,
+                destination: destinations[0],
+                stream_destination_length: 8192,
+            },
+            MaterializationSpan {
+                stream: StreamId(2),
+                logical_offset: 4096,
+                destination: destinations[1],
+                stream_destination_length: 8192,
+            },
+        ];
+
+        let view = RelocatedSourceView {
+            source: &source,
+            relocations: &[],
+            materializations: &spans,
+            source_graph: Some(&graph),
+        };
+        assert_eq!(
+            view.read_exact_at(16 * 1024, 1904).unwrap(),
+            payload[4096..]
+        );
+
+        let output_path = temp_path("multispan-output.img");
+        fs::write(&output_path, vec![0_u8; 24 * 1024]).unwrap();
+        let mut output = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&output_path)
+            .unwrap();
+        apply_materializations_with_progress(
+            &source,
+            &mut output,
+            &graph,
+            &materializations,
+            777,
+            0,
+            8192,
+            &mut |_| CandidateWorkControl::Continue,
+        )
+        .unwrap();
+        drop(output);
+        let bytes = fs::read(&output_path).unwrap();
+        assert_eq!(&bytes[8192..12 * 1024], &payload[..4096]);
+        assert_eq!(&bytes[16 * 1024..16 * 1024 + 1904], &payload[4096..]);
+        assert!(
+            bytes[16 * 1024 + 1904..20 * 1024]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        fs::remove_file(output_path).unwrap();
     }
 
     fn minimal_exfat_image() -> Vec<u8> {
@@ -4970,7 +5150,7 @@ mod tests {
         let solved = solve_lossless_ntfs_to_exfat(draft, LayoutLimits::default()).unwrap();
         assert!(solved.layout().relocations.is_empty());
         assert_eq!(solved.layout().materializations.len(), 1);
-        let destination_range = solved.layout().materializations[0].destination;
+        let destination_range = solved.layout().materializations[0].destinations[0];
         assert_eq!(destination_range.length, 8192);
         assert_eq!(destination_range.offset % 8192, 0);
         let preview =
@@ -5040,7 +5220,7 @@ mod tests {
         let solved = solve_lossless_ntfs_to_exfat(draft, LayoutLimits::default()).unwrap();
         assert!(solved.layout().relocations.is_empty());
         assert_eq!(solved.layout().materializations.len(), 1);
-        let destination_range = solved.layout().materializations[0].destination;
+        let destination_range = solved.layout().materializations[0].destinations[0];
         assert_eq!(destination_range.length, 3 * 4096);
         let preview =
             preview_exfat_phase_writes(&source, &solved.destination, PreimageLimits::default())
@@ -5119,7 +5299,7 @@ mod tests {
         let solved = solve_lossless_ntfs_to_exfat(draft, LayoutLimits::default()).unwrap();
         assert!(solved.layout().relocations.is_empty());
         assert_eq!(solved.layout().materializations.len(), 1);
-        let destination_range = solved.layout().materializations[0].destination;
+        let destination_range = solved.layout().materializations[0].destinations[0];
         assert_eq!(destination_range.length, 4096);
         assert!(
             solved
@@ -5295,7 +5475,7 @@ mod tests {
         assert_eq!(dest_file.link_count, 1);
         assert_eq!(dest_file.streams.len(), 1);
         assert!(dest_file.streams[0].name.is_none());
-        let destination_range = solved.layout().materializations[0].destination;
+        let destination_range = solved.layout().materializations[0].destinations[0];
         let preview =
             preview_exfat_phase_writes(&source, &solved.destination, PreimageLimits::default())
                 .unwrap();
@@ -6304,7 +6484,7 @@ mod tests {
                 .filter(|object| object.kind == ObjectKind::Directory && object.id.0 != 5)
                 .all(|object| object.link_count == 1)
         );
-        let destination_range = solved.layout().materializations[0].destination;
+        let destination_range = solved.layout().materializations[0].destinations[0];
         let preview =
             preview_exfat_phase_writes(&source, &solved.destination, PreimageLimits::default())
                 .unwrap();
@@ -6358,7 +6538,7 @@ mod tests {
         let solved = solve_lossless_ntfs_to_exfat(draft, LayoutLimits::default()).unwrap();
         assert!(solved.layout().relocations.is_empty());
         assert_eq!(solved.layout().materializations.len(), 1);
-        let destination_range = solved.layout().materializations[0].destination;
+        let destination_range = solved.layout().materializations[0].destinations[0];
         assert_eq!(destination_range.length, 8192);
         let preview =
             preview_exfat_phase_writes(&source, &solved.destination, PreimageLimits::default())
@@ -6426,7 +6606,7 @@ mod tests {
         let solved = solve_lossless_ntfs_to_exfat(draft, LayoutLimits::default()).unwrap();
         assert!(solved.layout().relocations.is_empty());
         assert_eq!(solved.layout().materializations.len(), 1);
-        let destination_range = solved.layout().materializations[0].destination;
+        let destination_range = solved.layout().materializations[0].destinations[0];
         let preview =
             preview_exfat_phase_writes(&source, &solved.destination, PreimageLimits::default())
                 .unwrap();
@@ -6532,7 +6712,7 @@ mod tests {
         let solved = solve_lossless_ntfs_to_exfat(draft, LayoutLimits::default()).unwrap();
         assert!(solved.layout().relocations.is_empty());
         assert_eq!(solved.layout().materializations.len(), 1);
-        let destination_range = solved.layout().materializations[0].destination;
+        let destination_range = solved.layout().materializations[0].destinations[0];
         assert_eq!(destination_range.length, 8192);
         assert_eq!(destination_range.offset % 8192, 0);
         let preview =
@@ -6599,10 +6779,11 @@ mod tests {
         assert_eq!(solved.layout().relocations.len(), 1);
         assert_eq!(solved.layout().materializations.len(), 1);
         let relocation = solved.layout().relocations[0];
-        let materialization = solved.layout().materializations[0];
+        let materialization = &solved.layout().materializations[0];
         assert_eq!(relocation.source.offset, source_offset);
         assert_eq!(relocation.destination.offset % 8192, 0);
-        assert_eq!(materialization.destination.length, 8192);
+        assert_eq!(materialization.destinations.len(), 1);
+        assert_eq!(materialization.destinations[0].length, 8192);
         let payload_total = solved.layout().relocated_bytes + solved.layout().materialized_bytes;
         let preview =
             preview_exfat_phase_writes(&source, &solved.destination, PreimageLimits::default())
@@ -6641,7 +6822,7 @@ mod tests {
             &candidate_bytes[relocated_start..relocated_start + relocated_payload.len()],
             relocated_payload.as_slice()
         );
-        let materialized_start = usize::try_from(materialization.destination.offset).unwrap();
+        let materialized_start = usize::try_from(materialization.destinations[0].offset).unwrap();
         assert_eq!(
             &candidate_bytes[materialized_start..materialized_start + resident_payload.len()],
             resident_payload.as_slice()
@@ -6685,7 +6866,7 @@ mod tests {
         let solved = solve_lossless_exfat_to_ntfs(draft, LayoutLimits::default()).unwrap();
         assert!(solved.layout().relocations.is_empty());
         assert_eq!(solved.layout().materializations.len(), 1);
-        let destination_range = solved.layout().materializations[0].destination;
+        let destination_range = solved.layout().materializations[0].destinations[0];
         assert_eq!(destination_range.length, 8192);
         assert_eq!(destination_range.offset % 8192, 0);
         let preview =
@@ -6764,7 +6945,7 @@ mod tests {
         let solved = solve_lossless_exfat_to_ntfs(draft, LayoutLimits::default()).unwrap();
         assert!(solved.layout().relocations.is_empty());
         assert_eq!(solved.layout().materializations.len(), 1);
-        let destination_range = solved.layout().materializations[0].destination;
+        let destination_range = solved.layout().materializations[0].destinations[0];
         assert_eq!(destination_range.length, 4096);
         let preview =
             preview_ntfs_phase_writes(&source, &solved.destination, PreimageLimits::default())

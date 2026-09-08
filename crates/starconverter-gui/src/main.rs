@@ -2,7 +2,7 @@
 
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -30,7 +30,7 @@ use starconverter_core::fs::exfat_normalize::NormalizedExfat;
 use starconverter_core::geometry::{
     DestinationReservation, LayoutLimits, LayoutPlan, SourceAllocation,
 };
-use starconverter_core::image::ImageFile;
+use starconverter_core::image::{ImageFile, reject_device_like_path};
 use starconverter_core::inspect::{inspect_image, inspect_open_image};
 use starconverter_core::phase::{
     PhaseWritePreview, preview_exfat_phase_writes, preview_ntfs_phase_writes,
@@ -1190,7 +1190,7 @@ impl StarConverterApp {
             report.push('\n');
             report.push_str(preview);
         }
-        match fs::write(&path, report) {
+        match write_new_report(&path, report.as_bytes()) {
             Ok(()) => self.activity.push(format!(
                 "00:00:00  [SAVED] plan report :: {}",
                 path.display()
@@ -2711,30 +2711,36 @@ fn is_session_partial_name(name: &str) -> bool {
 }
 
 fn read_bounded_regular_file(path: &Path) -> Result<Vec<u8>, String> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|error| format!("could not inspect session document: {error}"))?;
-    if !metadata.file_type().is_file() {
-        return Err("session document is not a regular file".into());
-    }
-    if metadata.len() > u64::try_from(SESSION_MAX_BYTES).unwrap_or(u64::MAX) {
+    let image = ImageFile::open_with_limit(path, SESSION_MAX_BYTES)
+        .map_err(|error| format!("could not open session document safely: {error}"))?;
+    if image.len() > u64::try_from(SESSION_MAX_BYTES).unwrap_or(u64::MAX) {
         return Err(format!(
             "session document exceeds the {SESSION_MAX_BYTES}-byte limit"
         ));
     }
-    let file = OpenOptions::new()
-        .read(true)
+    let length = usize::try_from(image.len())
+        .map_err(|_| "session document length does not fit memory limits".to_owned())?;
+    image
+        .read_exact_at(0, length)
+        .map_err(|error| format!("could not read session document safely: {error}"))
+}
+
+fn write_new_report(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    reject_device_like_path(path).map_err(|error| format!("unsafe report destination: {error}"))?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
         .open(path)
-        .map_err(|error| format!("could not open session document: {error}"))?;
-    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
-    file.take(u64::try_from(SESSION_MAX_BYTES + 1).unwrap_or(u64::MAX))
-        .read_to_end(&mut bytes)
-        .map_err(|error| format!("could not read session document: {error}"))?;
-    if bytes.len() > SESSION_MAX_BYTES {
-        return Err(format!(
-            "session document exceeds the {SESSION_MAX_BYTES}-byte limit"
-        ));
+        .map_err(|error| format!("create-new report refused: {error}"))?;
+    let result = file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| format!("could not durably write report: {error}"));
+    drop(file);
+    if result.is_err() {
+        let _ = fs::remove_file(path);
     }
-    Ok(bytes)
+    result
 }
 
 fn verification_path_row(
@@ -3073,12 +3079,22 @@ fn relocation_preview_report(layout: &LayoutPlan) -> String {
     }
     let remaining = MAX_PLACEMENTS.saturating_sub(layout.relocations.len().min(MAX_PLACEMENTS));
     for materialization in layout.materializations.iter().take(remaining) {
+        let destination_bytes = materialization
+            .destinations
+            .iter()
+            .map(|range| range.length)
+            .sum::<u64>();
+        let first_destination = materialization
+            .destinations
+            .first()
+            .map_or(0, |range| range.offset);
         let _ = writeln!(
             report,
-            "[CREATE-NEW MATERIALIZE] stream={} destination={} bytes={}",
+            "[CREATE-NEW MATERIALIZE] stream={} spans={} first_destination={} bytes={}",
             materialization.stream.0,
-            materialization.destination.offset,
-            materialization.destination.length
+            materialization.destinations.len(),
+            first_destination,
+            destination_bytes
         );
     }
     if layout.materializations.len() > remaining {
@@ -3417,6 +3433,30 @@ mod tests {
         assert_eq!(first, plan_report(&plan));
         assert!(first.contains("NOT AN EXECUTABLE WRITE AUTHORIZATION"));
         assert!(first.contains("direction=exFAT -> NTFS"));
+    }
+
+    #[test]
+    fn report_writer_is_create_new_and_never_truncates_existing_files() {
+        let directory = session_test_directory("report-no-clobber");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("plan.txt");
+        fs::write(&path, b"source bytes").unwrap();
+
+        assert!(write_new_report(&path, b"replacement").is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"source bytes");
+
+        let fresh = directory.join("fresh-plan.txt");
+        write_new_report(&fresh, b"new report").unwrap();
+        assert_eq!(fs::read(&fresh).unwrap(), b"new report");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn report_writer_refuses_dos_devices_and_alternate_data_streams() {
+        for path in ["NUL:plan", "CON:report", "plan.txt:stream"] {
+            assert!(write_new_report(Path::new(path), b"never written").is_err());
+        }
     }
 
     #[test]

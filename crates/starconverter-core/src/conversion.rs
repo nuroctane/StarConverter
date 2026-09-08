@@ -2430,8 +2430,14 @@ fn digest_plan(
     }
     for materialization in &layout.materializations {
         put_u64(&mut hasher, materialization.stream.0);
-        put_u64(&mut hasher, materialization.destination.offset);
-        put_u64(&mut hasher, materialization.destination.length);
+        put_u64(
+            &mut hasher,
+            u64::try_from(materialization.destinations.len()).unwrap_or(u64::MAX),
+        );
+        for destination in &materialization.destinations {
+            put_u64(&mut hasher, destination.offset);
+            put_u64(&mut hasher, destination.length);
+        }
     }
     for (tag, set) in [
         (0_u8, writes.target_staging.as_slice()),

@@ -726,11 +726,21 @@ fn relocation_preview_lines(layout: &LayoutPlan) -> Vec<String> {
             .iter()
             .take(remaining)
             .map(|materialization| {
+                let destination_bytes = materialization
+                    .destinations
+                    .iter()
+                    .map(|range| range.length)
+                    .sum::<u64>();
+                let first_destination = materialization
+                    .destinations
+                    .first()
+                    .map_or(0, |range| range.offset);
                 format!(
-                    "[CREATE-NEW MATERIALIZE] stream={} destination={} bytes={}",
+                    "[CREATE-NEW MATERIALIZE] stream={} spans={} first_destination={} bytes={}",
                     materialization.stream.0,
-                    materialization.destination.offset,
-                    materialization.destination.length
+                    materialization.destinations.len(),
+                    first_destination,
+                    destination_bytes
                 )
             }),
     );
@@ -1759,10 +1769,10 @@ mod tests {
             relocations: Vec::new(),
             materializations: vec![Materialization {
                 stream: StreamId(3),
-                destination: ByteRange {
+                destinations: vec![ByteRange {
                     offset: 16_384,
                     length: 4096,
-                },
+                }],
             }],
             free_after_staging: Vec::new(),
             relocated_bytes: 0,

@@ -118,11 +118,15 @@ pub struct MaterializationRequest {
     pub destination_length: u64,
 }
 
-/// Sealed destination span for one materialized stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Ordered destination spans for one materialized stream.
+///
+/// Span order is logical stream order. A materialization may consume multiple noncontiguous
+/// physical ranges when the destination has enough proven aggregate staging capacity but no one
+/// free range is large enough.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Materialization {
     pub stream: StreamId,
-    pub destination: ByteRange,
+    pub destinations: Vec<ByteRange>,
 }
 
 /// Deterministic layout proof.
@@ -716,53 +720,78 @@ fn apply_materializations(
     }
     let mut actual_bytes = 0_u64;
     for materialization in &layout.materializations {
-        if materialization.destination.length == 0 {
+        if materialization.destinations.is_empty() {
             return Err(RelocatedGraphError::InvalidMaterialization {
                 stream: materialization.stream,
             });
         }
-        actual_bytes = actual_bytes
-            .checked_add(materialization.destination.length)
-            .ok_or(RelocatedGraphError::MaterializedByteCountMismatch {
+        let mut allocation_bytes = 0_u64;
+        for destination in &materialization.destinations {
+            if destination.length == 0 {
+                return Err(RelocatedGraphError::InvalidMaterialization {
+                    stream: materialization.stream,
+                });
+            }
+            destination
+                .end()
+                .map_err(|_| RelocatedGraphError::InvalidMaterialization {
+                    stream: materialization.stream,
+                })?;
+            allocation_bytes = allocation_bytes.checked_add(destination.length).ok_or(
+                RelocatedGraphError::InvalidMaterialization {
+                    stream: materialization.stream,
+                },
+            )?;
+        }
+        actual_bytes = actual_bytes.checked_add(allocation_bytes).ok_or(
+            RelocatedGraphError::MaterializedByteCountMismatch {
                 declared: layout.materialized_bytes,
                 actual: u64::MAX,
-            })?;
+            },
+        )?;
         let stream = find_file_stream_mut(objects, materialization.stream)?;
-        if materialization.destination.length < stream.logical_bytes {
+        if stream.logical_bytes == 0 || allocation_bytes < stream.logical_bytes {
             return Err(RelocatedGraphError::InvalidMaterialization {
                 stream: materialization.stream,
             });
         }
         stream.storage = StreamStorage::Extents;
-        stream.mapped_bytes = materialization.destination.length;
-        stream.allocated_bytes = materialization.destination.length;
+        stream.mapped_bytes = allocation_bytes;
+        stream.allocated_bytes = allocation_bytes;
+        // Materialization writes the decoded logical byte stream into ordinary target extents.
+        // Source-only compression evidence remains in preservation escrow; it is no longer a
+        // property of this destination stream.
+        stream.flags.compressed = false;
+        stream.flags.compression_block_bytes = 0;
         extents.retain(|extent| {
             !(extent.stream == materialization.stream && extent.kind == ExtentKind::FileData)
         });
         extents
-            .try_reserve(1)
+            .try_reserve(materialization.destinations.len())
             .map_err(|_| RelocatedGraphError::AllocationFailed)?;
-        extents.push(Extent {
-            stream: materialization.stream,
-            logical_offset: 0,
-            length: materialization.destination.length,
-            placement: Placement::Physical {
-                byte_offset: materialization.destination.offset,
-            },
-            kind: ExtentKind::FileData,
-        });
+        let mut logical_offset = 0_u64;
+        for destination in &materialization.destinations {
+            extents.push(Extent {
+                stream: materialization.stream,
+                logical_offset,
+                length: destination.length,
+                placement: Placement::Physical {
+                    byte_offset: destination.offset,
+                },
+                kind: ExtentKind::FileData,
+            });
+            logical_offset = logical_offset.checked_add(destination.length).ok_or(
+                RelocatedGraphError::InvalidMaterialization {
+                    stream: materialization.stream,
+                },
+            )?;
+        }
     }
     if actual_bytes != layout.materialized_bytes {
         return Err(RelocatedGraphError::MaterializedByteCountMismatch {
             declared: layout.materialized_bytes,
             actual: actual_bytes,
         });
-    }
-    for object in objects.iter_mut() {
-        for stream in &mut object.streams {
-            stream.flags.compressed = false;
-            stream.flags.compression_block_bytes = 0;
-        }
     }
     Ok(())
 }
@@ -1097,37 +1126,217 @@ fn solve_layout_with_domain_and_alignments_inner(
         limits.max_free_ranges,
     )?;
     let mut free = complement(volume_bytes, &occupied, limits.max_free_ranges)?;
+    let all_materializations_fit_contiguously = materializations_fit_contiguously(
+        &free,
+        materialization_requests,
+        destination_alignment,
+        destination_domain,
+        limits.max_free_ranges,
+    )?;
+
+    // Preserve every formerly successful single-span layout byte-for-byte. Only when at least one
+    // stream genuinely needs fragmented capacity do rigid one-piece relocations go first, which
+    // prevents a fragmented stream from consuming the only range large enough for a relocation.
+    let (relocations, relocated_bytes, materializations, materialized_bytes) =
+        if all_materializations_fit_contiguously {
+            let mut contiguous_free = free.clone();
+            let contiguous_attempt = (|| {
+                let (materializations, materialized_bytes, materialization_ranges) =
+                    allocate_materialization_requests(
+                        &mut contiguous_free,
+                        materialization_requests,
+                        destination_alignment,
+                        destination_domain,
+                        limits,
+                        false,
+                    )?;
+                ensure_work_range_cap(
+                    materialization_ranges,
+                    conflicts.len(),
+                    limits.max_relocations,
+                )?;
+                let (relocations, relocated_bytes) = allocate_relocation_conflicts(
+                    &mut contiguous_free,
+                    &conflicts,
+                    destination_alignment,
+                    destination_domain,
+                    limits.max_free_ranges,
+                )?;
+                Ok((
+                    relocations,
+                    relocated_bytes,
+                    materializations,
+                    materialized_bytes,
+                ))
+            })();
+            match contiguous_attempt {
+                Ok(result) => {
+                    free = contiguous_free;
+                    result
+                }
+                Err(LayoutError::InsufficientStagingSpace { .. }) => {
+                    allocate_relocations_then_fragmented_materializations(
+                        &mut free,
+                        &conflicts,
+                        materialization_requests,
+                        destination_alignment,
+                        destination_domain,
+                        limits,
+                    )?
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            allocate_relocations_then_fragmented_materializations(
+                &mut free,
+                &conflicts,
+                materialization_requests,
+                destination_alignment,
+                destination_domain,
+                limits,
+            )?
+        };
+    let largest_free_range = free.iter().map(|range| range.length).max().unwrap_or(0);
+    Ok(LayoutPlan {
+        relocations,
+        materializations,
+        free_after_staging: free,
+        relocated_bytes,
+        materialized_bytes,
+        largest_free_range,
+    })
+}
+
+fn allocate_relocations_then_fragmented_materializations(
+    free: &mut Vec<ByteRange>,
+    conflicts: &[SourceAllocation],
+    materialization_requests: &[MaterializationRequest],
+    destination_alignment: u64,
+    destination_domain: ByteRange,
+    limits: LayoutLimits,
+) -> Result<(Vec<Relocation>, u64, Vec<Materialization>, u64), LayoutError> {
+    let (relocations, relocated_bytes) = allocate_relocation_conflicts(
+        free,
+        conflicts,
+        destination_alignment,
+        destination_domain,
+        limits.max_free_ranges,
+    )?;
+    let remaining_ranges = limits
+        .max_relocations
+        .checked_sub(relocations.len())
+        .ok_or(LayoutError::RelocationLimitExceeded {
+            maximum: limits.max_relocations,
+        })?;
+    let materialization_limits = LayoutLimits {
+        max_relocations: remaining_ranges,
+        ..limits
+    };
+    let (materializations, materialized_bytes, _) = allocate_materialization_requests(
+        free,
+        materialization_requests,
+        destination_alignment,
+        destination_domain,
+        materialization_limits,
+        true,
+    )?;
+    Ok((
+        relocations,
+        relocated_bytes,
+        materializations,
+        materialized_bytes,
+    ))
+}
+
+fn materializations_fit_contiguously(
+    free: &[ByteRange],
+    requests: &[MaterializationRequest],
+    alignment: u64,
+    domain: ByteRange,
+    maximum_free_ranges: usize,
+) -> Result<bool, LayoutError> {
+    let mut trial = Vec::new();
+    trial
+        .try_reserve_exact(free.len())
+        .map_err(|_| LayoutError::AllocationFailed)?;
+    trial.extend_from_slice(free);
+    for request in requests {
+        if allocate_first_fit_aligned_within(
+            &mut trial,
+            request.destination_length,
+            alignment,
+            domain,
+            maximum_free_ranges,
+        )?
+        .is_none()
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn allocate_materialization_requests(
+    free: &mut Vec<ByteRange>,
+    requests: &[MaterializationRequest],
+    alignment: u64,
+    domain: ByteRange,
+    limits: LayoutLimits,
+    allow_fragmented: bool,
+) -> Result<(Vec<Materialization>, u64, usize), LayoutError> {
     let mut materializations = Vec::new();
     materializations
-        .try_reserve(materialization_requests.len())
+        .try_reserve(requests.len())
         .map_err(|_| LayoutError::AllocationFailed)?;
     let mut materialized_bytes = 0_u64;
-    for request in materialization_requests {
-        let destination = allocate_first_fit_aligned_within(
-            &mut free,
-            request.destination_length,
-            destination_alignment,
-            destination_domain,
-            limits.max_free_ranges,
-        )?
-        .ok_or_else(|| {
-            let (largest_free_range, total_free) =
-                free_capacity_within(&free, destination_domain, destination_alignment)
-                    .unwrap_or((0, 0));
-            LayoutError::InsufficientStagingSpace {
-                required: request.destination_length,
-                largest_free_range,
-                total_free,
-            }
-        })?;
+    let mut range_count = 0_usize;
+    for request in requests {
+        let remaining_range_capacity = limits.max_relocations.checked_sub(range_count).ok_or(
+            LayoutError::RelocationLimitExceeded {
+                maximum: limits.max_relocations,
+            },
+        )?;
+        let destinations = if allow_fragmented {
+            allocate_first_fit_fragmented_aligned_within(
+                free,
+                request.destination_length,
+                alignment,
+                domain,
+                remaining_range_capacity,
+                limits.max_free_ranges,
+            )?
+        } else {
+            allocate_first_fit_aligned_within(
+                free,
+                request.destination_length,
+                alignment,
+                domain,
+                limits.max_free_ranges,
+            )?
+            .map(|range| vec![range])
+        }
+        .ok_or_else(|| insufficient_space(free, request.destination_length, domain, alignment))?;
+        range_count = range_count
+            .checked_add(destinations.len())
+            .ok_or(LayoutError::AccountingOverflow)?;
         materialized_bytes = materialized_bytes
             .checked_add(request.destination_length)
             .ok_or(LayoutError::AccountingOverflow)?;
         materializations.push(Materialization {
             stream: request.stream,
-            destination,
+            destinations,
         });
     }
+    Ok((materializations, materialized_bytes, range_count))
+}
+
+fn allocate_relocation_conflicts(
+    free: &mut Vec<ByteRange>,
+    conflicts: &[SourceAllocation],
+    alignment: u64,
+    domain: ByteRange,
+    maximum_free_ranges: usize,
+) -> Result<(Vec<Relocation>, u64), LayoutError> {
     let mut relocations = Vec::new();
     relocations
         .try_reserve(conflicts.len())
@@ -1135,22 +1344,13 @@ fn solve_layout_with_domain_and_alignments_inner(
     let mut relocated_bytes = 0_u64;
     for allocation in conflicts {
         let destination = allocate_first_fit_aligned_within(
-            &mut free,
+            free,
             allocation.range.length,
-            destination_alignment,
-            destination_domain,
-            limits.max_free_ranges,
+            alignment,
+            domain,
+            maximum_free_ranges,
         )?
-        .ok_or_else(|| {
-            let (largest_free_range, total_free) =
-                free_capacity_within(&free, destination_domain, destination_alignment)
-                    .unwrap_or((0, 0));
-            LayoutError::InsufficientStagingSpace {
-                required: allocation.range.length,
-                largest_free_range,
-                total_free,
-            }
-        })?;
+        .ok_or_else(|| insufficient_space(free, allocation.range.length, domain, alignment))?;
         relocated_bytes = relocated_bytes
             .checked_add(allocation.range.length)
             .ok_or(LayoutError::AccountingOverflow)?;
@@ -1161,15 +1361,37 @@ fn solve_layout_with_domain_and_alignments_inner(
             destination,
         });
     }
-    let largest_free_range = free.iter().map(|range| range.length).max().unwrap_or(0);
-    Ok(LayoutPlan {
-        relocations,
-        materializations,
-        free_after_staging: free,
-        relocated_bytes,
-        materialized_bytes,
+    Ok((relocations, relocated_bytes))
+}
+
+fn insufficient_space(
+    free: &[ByteRange],
+    required: u64,
+    domain: ByteRange,
+    alignment: u64,
+) -> LayoutError {
+    let (largest_free_range, total_free) =
+        free_capacity_within(free, domain, alignment).unwrap_or((0, 0));
+    LayoutError::InsufficientStagingSpace {
+        required,
         largest_free_range,
-    })
+        total_free,
+    }
+}
+
+fn ensure_work_range_cap(
+    materialization_ranges: usize,
+    relocation_ranges: usize,
+    maximum: usize,
+) -> Result<(), LayoutError> {
+    if materialization_ranges
+        .checked_add(relocation_ranges)
+        .ok_or(LayoutError::AccountingOverflow)?
+        > maximum
+    {
+        return Err(LayoutError::RelocationLimitExceeded { maximum });
+    }
+    Ok(())
 }
 
 fn validate_limits(limits: LayoutLimits) -> Result<(), LayoutError> {
@@ -1612,6 +1834,115 @@ fn allocate_first_fit_aligned_within(
         }));
     }
     Ok(None)
+}
+
+/// Consumes one or more destination-aligned spans from a proven free list in deterministic
+/// physical first-fit order.
+///
+/// Allocation is transactional: failure leaves `free` unchanged. The returned range order is the
+/// logical order in which a materialized stream must be written. `maximum_ranges` bounds both
+/// output growth and the amount of fragmented work one stream can request.
+pub(crate) fn allocate_first_fit_fragmented_aligned_within(
+    free: &mut Vec<ByteRange>,
+    length: u64,
+    alignment: u64,
+    domain: ByteRange,
+    maximum_ranges: usize,
+    maximum_free_ranges: usize,
+) -> Result<Option<Vec<ByteRange>>, LayoutError> {
+    if alignment == 0 || !alignment.is_power_of_two() {
+        return Err(LayoutError::InvalidAlignment { alignment });
+    }
+    if length == 0 || length % alignment != 0 {
+        return Err(LayoutError::UnalignedRange {
+            offset: 0,
+            length,
+            alignment,
+        });
+    }
+    if domain.length == 0 {
+        return Err(LayoutError::ZeroLengthRange {
+            offset: domain.offset,
+        });
+    }
+    domain.end()?;
+    if domain.offset % alignment != 0 || domain.length % alignment != 0 {
+        return Err(LayoutError::UnalignedRange {
+            offset: domain.offset,
+            length: domain.length,
+            alignment,
+        });
+    }
+    if maximum_ranges == 0 {
+        return Err(LayoutError::RelocationLimitExceeded {
+            maximum: maximum_ranges,
+        });
+    }
+    if maximum_free_ranges == 0 {
+        return Err(LayoutError::InvalidLimit {
+            field: "max_free_ranges",
+        });
+    }
+
+    let mut working = Vec::new();
+    working
+        .try_reserve_exact(free.len())
+        .map_err(|_| LayoutError::AllocationFailed)?;
+    working.extend_from_slice(free);
+    let mut allocated = Vec::new();
+    allocated
+        .try_reserve(maximum_ranges.min(working.len()).min(1024))
+        .map_err(|_| LayoutError::AllocationFailed)?;
+    let mut remaining = length;
+    let domain_end = domain.end()?;
+
+    while remaining != 0 {
+        let mut next_length = None;
+        for range in &working {
+            let range_end = range.end()?;
+            let candidate_start = range.offset.max(domain.offset);
+            let candidate_end = range_end.min(domain_end);
+            if candidate_start >= candidate_end {
+                continue;
+            }
+            let aligned_start = candidate_start
+                .checked_add(alignment - 1)
+                .ok_or(LayoutError::AccountingOverflow)?
+                & !(alignment - 1);
+            if aligned_start >= candidate_end {
+                continue;
+            }
+            let usable = (candidate_end - aligned_start) & !(alignment - 1);
+            if usable != 0 {
+                next_length = Some(usable.min(remaining));
+                break;
+            }
+        }
+        let Some(next_length) = next_length else {
+            return Ok(None);
+        };
+        if allocated.len() == maximum_ranges {
+            return Err(LayoutError::RelocationLimitExceeded {
+                maximum: maximum_ranges,
+            });
+        }
+        let range = allocate_first_fit_aligned_within(
+            &mut working,
+            next_length,
+            alignment,
+            domain,
+            maximum_free_ranges,
+        )?
+        .expect("a range measured from the same free list must remain allocatable");
+        allocated
+            .try_reserve(1)
+            .map_err(|_| LayoutError::AllocationFailed)?;
+        allocated.push(range);
+        remaining -= next_length;
+    }
+
+    *free = working;
+    Ok(Some(allocated))
 }
 
 fn free_capacity_within(
@@ -2416,8 +2747,13 @@ mod tests {
         assert!(plan.relocations.is_empty());
         assert_eq!(plan.materializations.len(), 1);
         assert_eq!(plan.materializations[0].stream, StreamId(7));
-        assert_eq!(plan.materializations[0].destination.offset, 8192);
-        assert_eq!(plan.materializations[0].destination.length, 4096);
+        assert_eq!(
+            plan.materializations[0].destinations,
+            [ByteRange {
+                offset: 8192,
+                length: 4096,
+            }]
+        );
         assert_eq!(plan.materialized_bytes, 4096);
         assert_eq!(
             materialization_length_for_stream(&resident_payload_graph(), StreamId(7), 4096),
@@ -2585,10 +2921,10 @@ mod tests {
             relocations: Vec::new(),
             materializations: vec![Materialization {
                 stream: StreamId(7),
-                destination: ByteRange {
+                destinations: vec![ByteRange {
                     offset: 8192,
                     length: 4096,
-                },
+                }],
             }],
             free_after_staging: Vec::new(),
             relocated_bytes: 0,
@@ -2660,6 +2996,338 @@ mod tests {
                 LIMITS,
             ),
             Err(LayoutError::DestinationLengthUnaligned { .. })
+        ));
+    }
+
+    #[test]
+    fn fragmented_materialization_consumes_aligned_spans_in_first_fit_order() {
+        let plan = solve_layout_with_destination_domain_alignments_and_materializations(
+            32 * 1024,
+            512,
+            4096,
+            512,
+            ByteRange {
+                offset: 8192,
+                length: 20 * 1024,
+            },
+            Vec::new(),
+            vec![reservation(8192, 4096), reservation(16 * 1024, 4096)],
+            Vec::new(),
+            &[MaterializationRequest {
+                stream: StreamId(7),
+                destination_length: 12 * 1024,
+            }],
+            LIMITS,
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.materializations[0].destinations,
+            [
+                ByteRange {
+                    offset: 12 * 1024,
+                    length: 4096,
+                },
+                ByteRange {
+                    offset: 20 * 1024,
+                    length: 8192,
+                },
+            ]
+        );
+        assert_eq!(plan.materialized_bytes, 12 * 1024);
+    }
+
+    #[test]
+    fn fragmented_fallback_places_rigid_relocations_before_small_spans() {
+        let plan = solve_layout_with_destination_domain_alignments_and_materializations(
+            12_800,
+            512,
+            512,
+            512,
+            ByteRange {
+                offset: 4096,
+                length: 8704,
+            },
+            vec![allocation(1, 4096, 2048, true)],
+            vec![
+                reservation(4096, 512),
+                reservation(8192, 512),
+                reservation(9728, 512),
+                reservation(11_264, 512),
+            ],
+            Vec::new(),
+            &[MaterializationRequest {
+                stream: StreamId(7),
+                destination_length: 3072,
+            }],
+            LIMITS,
+        )
+        .unwrap();
+
+        assert_eq!(plan.relocations[0].destination.offset, 6144);
+        assert_eq!(
+            plan.materializations[0].destinations,
+            [
+                ByteRange {
+                    offset: 8704,
+                    length: 1024,
+                },
+                ByteRange {
+                    offset: 10_240,
+                    length: 1024,
+                },
+                ByteRange {
+                    offset: 11_776,
+                    length: 1024,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn contiguous_materialization_retries_when_it_would_starve_rigid_relocation() {
+        let plan = solve_layout_with_destination_domain_alignments_and_materializations(
+            24 * 1024,
+            512,
+            4096,
+            512,
+            ByteRange {
+                offset: 8192,
+                length: 16 * 1024,
+            },
+            vec![allocation(1, 0, 8192, true)],
+            vec![reservation(0, 512), reservation(16 * 1024, 4096)],
+            Vec::new(),
+            &[MaterializationRequest {
+                stream: StreamId(7),
+                destination_length: 4096,
+            }],
+            LIMITS,
+        )
+        .unwrap();
+
+        assert_eq!(plan.relocations[0].destination.offset, 8192);
+        assert_eq!(
+            plan.materializations[0].destinations,
+            [ByteRange {
+                offset: 20 * 1024,
+                length: 4096,
+            }]
+        );
+    }
+
+    #[test]
+    fn fragmented_allocator_is_transactional_and_enforces_range_cap() {
+        let original = vec![
+            ByteRange {
+                offset: 4096,
+                length: 4096,
+            },
+            ByteRange {
+                offset: 12 * 1024,
+                length: 4096,
+            },
+        ];
+        let domain = ByteRange {
+            offset: 4096,
+            length: 12 * 1024,
+        };
+
+        let mut capped = original.clone();
+        assert!(matches!(
+            allocate_first_fit_fragmented_aligned_within(
+                &mut capped,
+                8192,
+                4096,
+                domain,
+                1,
+                LIMITS.max_free_ranges,
+            ),
+            Err(LayoutError::RelocationLimitExceeded { maximum: 1 })
+        ));
+        assert_eq!(capped, original);
+
+        let mut short = original.clone();
+        assert_eq!(
+            allocate_first_fit_fragmented_aligned_within(
+                &mut short,
+                12 * 1024,
+                4096,
+                domain,
+                3,
+                LIMITS.max_free_ranges,
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(short, original);
+
+        let mut exact = original;
+        assert_eq!(
+            allocate_first_fit_fragmented_aligned_within(
+                &mut exact,
+                8192,
+                4096,
+                domain,
+                2,
+                LIMITS.max_free_ranges,
+            )
+            .unwrap()
+            .unwrap(),
+            [
+                ByteRange {
+                    offset: 4096,
+                    length: 4096,
+                },
+                ByteRange {
+                    offset: 12 * 1024,
+                    length: 4096,
+                },
+            ]
+        );
+        assert!(exact.is_empty());
+    }
+
+    #[test]
+    fn seal_materializes_ordered_noncontiguous_target_extents() {
+        let source = resident_payload_graph();
+        let source_stream = source.objects()[1].streams[0].clone();
+        let layout = LayoutPlan {
+            relocations: Vec::new(),
+            materializations: vec![Materialization {
+                stream: StreamId(7),
+                destinations: vec![
+                    ByteRange {
+                        offset: 12 * 1024,
+                        length: 512,
+                    },
+                    ByteRange {
+                        offset: 8192,
+                        length: 512,
+                    },
+                ],
+            }],
+            free_after_staging: Vec::new(),
+            relocated_bytes: 0,
+            materialized_bytes: 1024,
+            largest_free_range: 0,
+        };
+
+        let sealed = SealedRelocationPlan::seal(source, layout).unwrap();
+        let stream = &sealed.target_graph().objects()[1].streams[0];
+        assert_eq!(stream.logical_bytes, source_stream.logical_bytes);
+        assert_eq!(stream.initialized_bytes, source_stream.initialized_bytes);
+        assert_eq!(stream.name, source_stream.name);
+        assert_eq!(stream.flags, source_stream.flags);
+        assert_eq!(stream.mapped_bytes, 1024);
+        assert_eq!(stream.allocated_bytes, 1024);
+        assert_eq!(
+            sealed.target_graph().extents().extents(),
+            [
+                Extent {
+                    stream: StreamId(7),
+                    logical_offset: 0,
+                    length: 512,
+                    placement: Placement::Physical {
+                        byte_offset: 12 * 1024,
+                    },
+                    kind: ExtentKind::FileData,
+                },
+                Extent {
+                    stream: StreamId(7),
+                    logical_offset: 512,
+                    length: 512,
+                    placement: Placement::Physical { byte_offset: 8192 },
+                    kind: ExtentKind::FileData,
+                },
+            ]
+        );
+        assert!(matches!(
+            sealed.source_graph().objects()[1].streams[0].storage,
+            StreamStorage::Resident(_)
+        ));
+    }
+
+    #[test]
+    fn forged_multispan_materializations_fail_closed() {
+        let source = resident_payload_graph();
+        let layout_for = |destinations: Vec<ByteRange>, materialized_bytes| LayoutPlan {
+            relocations: Vec::new(),
+            materializations: vec![Materialization {
+                stream: StreamId(7),
+                destinations,
+            }],
+            free_after_staging: Vec::new(),
+            relocated_bytes: 0,
+            materialized_bytes,
+            largest_free_range: 0,
+        };
+
+        assert!(matches!(
+            SealedRelocationPlan::seal(source.clone(), layout_for(Vec::new(), 0)),
+            Err(RelocatedGraphError::InvalidMaterialization { .. })
+        ));
+        assert!(matches!(
+            SealedRelocationPlan::seal(
+                source.clone(),
+                layout_for(
+                    vec![ByteRange {
+                        offset: 8192,
+                        length: 0,
+                    }],
+                    0,
+                ),
+            ),
+            Err(RelocatedGraphError::InvalidMaterialization { .. })
+        ));
+        assert!(matches!(
+            SealedRelocationPlan::seal(
+                source.clone(),
+                layout_for(
+                    vec![
+                        ByteRange {
+                            offset: 8192,
+                            length: 512,
+                        },
+                        ByteRange {
+                            offset: 8448,
+                            length: 512,
+                        },
+                    ],
+                    1024,
+                ),
+            ),
+            Err(RelocatedGraphError::Extents(
+                ExtentGraphError::PhysicalOverlap { .. }
+            ))
+        ));
+        assert!(matches!(
+            SealedRelocationPlan::seal(
+                source.clone(),
+                layout_for(
+                    vec![ByteRange {
+                        offset: 32 * 1024 - 256,
+                        length: 512,
+                    }],
+                    512,
+                ),
+            ),
+            Err(RelocatedGraphError::Extents(
+                ExtentGraphError::PhysicalRangeOutsideVolume { .. }
+            ))
+        ));
+        assert!(matches!(
+            SealedRelocationPlan::seal(
+                source,
+                layout_for(
+                    vec![ByteRange {
+                        offset: 8192,
+                        length: 2,
+                    }],
+                    2,
+                ),
+            ),
+            Err(RelocatedGraphError::InvalidMaterialization { .. })
         ));
     }
 }

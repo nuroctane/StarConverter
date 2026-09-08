@@ -1408,7 +1408,7 @@ mod tests {
     const REPARSE_KEYS: [ReparseIndexKey; 4] = [
         ReparseIndexKey {
             reparse_tag: 0xa000_000c,
-            file_reference: (1 << 48) | 70,
+            file_reference: (1 << 48) | 0x0046,
         },
         ReparseIndexKey {
             reparse_tag: 0xa000_0003,
@@ -1416,11 +1416,11 @@ mod tests {
         },
         ReparseIndexKey {
             reparse_tag: 0xa000_000c,
-            file_reference: (2 << 48) | 65,
+            file_reference: (2 << 48) | 0x0041,
         },
         ReparseIndexKey {
             reparse_tag: 0xa000_000c,
-            file_reference: (1 << 48) | 65,
+            file_reference: (1 << 48) | 0x0041,
         },
     ];
 

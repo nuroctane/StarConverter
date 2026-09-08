@@ -568,9 +568,12 @@ impl<'plan> RegularImageCoordinator<'plan> {
         if !prepared.matches_regular_image(executor.identity()) {
             return Err(RegularImageCoordinatorError::PlanImageMismatch);
         }
-        let (store, recovery) =
-            CapsuleStore::resume_recovering(capsule_path, image_path, prepared.capsule_limits)
-                .map_err(RegularImageCoordinatorError::CapsuleStore)?;
+        let (store, recovery) = CapsuleStore::resume_recovering_with_identity(
+            capsule_path.as_ref(),
+            executor.identity(),
+            prepared.capsule_limits,
+        )
+        .map_err(RegularImageCoordinatorError::CapsuleStore)?;
         let coordinator = Self {
             store,
             executor,
@@ -1280,9 +1283,12 @@ impl RegularImageCoordinator<'static> {
         // non-test builds never accept that weaker exclusion.
         #[cfg(not(test))]
         let authority = OfflineRegularImageAuthority::mint(&executor)?;
-        let (store, recovery) =
-            CapsuleStore::resume_recovering(capsule_path, image_path, capsule_policy)
-                .map_err(RegularImageCoordinatorError::CapsuleStore)?;
+        let (store, recovery) = CapsuleStore::resume_recovering_with_identity(
+            capsule_path.as_ref(),
+            executor.identity(),
+            capsule_policy,
+        )
+        .map_err(RegularImageCoordinatorError::CapsuleStore)?;
         let prepared = PreparedConversion::from_restart_capsule(store.bytes(), capsule_policy)
             .map_err(RegularImageCoordinatorError::Conversion)?;
         if !prepared.matches_regular_image(executor.identity()) {

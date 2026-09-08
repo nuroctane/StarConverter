@@ -3352,7 +3352,10 @@ mod tests {
         let solved = solve_lossless_ntfs_to_exfat(draft, LayoutLimits::default()).unwrap();
         assert!(solved.layout().relocations.is_empty());
         assert_eq!(solved.layout().materializations.len(), 1);
-        assert_eq!(solved.layout().materializations[0].destination.length, 4096);
+        assert_eq!(
+            solved.layout().materializations[0].destinations[0].length,
+            4096
+        );
         assert!(solved
             .target_graph()
             .objects()

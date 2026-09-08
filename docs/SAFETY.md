@@ -139,6 +139,13 @@ newest generation, then flushes, rereads, and strict-scans the retained prefix. 
 complete corruption, ambiguous multi-generation growth, and an incomplete first generation are
 refused without mutation.
 
+Capsule resume compares safe cross-platform, handle-derived file identities before and after taking
+the exclusive capsule lock. On Windows the image identity binds a collision-resistant digest of
+the volume serial/file index key captured from the already-open image, so recovery never weakens
+the image's deny-share lock just to reopen its path. A differently named hard link to the image is
+therefore refused on Windows as well as Unix; canonical-path inequality alone is never treated as
+proof that the files differ.
+
 Successful exclusive capsule creation additionally synchronizes the canonical parent directory.
 Unix uses a directory `sync_all`; Windows opens the directory with
 `FILE_FLAG_BACKUP_SEMANTICS` and requires `FlushFileBuffers` success. A rejected or unsupported
@@ -168,6 +175,12 @@ schema decoder and direction check. Any failure removes only files newly created
 source is hashed before and after the export; success requires equality. This path deliberately does
 not consume `ActivationAuthorizedWrites`, because there is no source activation or rollback point to
 authorize. It does not qualify the separate in-place executor or any physical backend.
+
+Desktop plan reports follow the same no-clobber posture: the destination must be a non-device path
+that does not already exist, is opened with `create_new`, and is flushed before success is reported.
+Existing files—including the selected source image—are never truncated by “Save plan”. Recovered
+desktop sessions are read through the bounded regular-file backend instead of a metadata-then-open
+path race. Windows alternate-data-stream and reserved-DOS-device final components are refused.
 
 ## Threats outside the guarantee
 

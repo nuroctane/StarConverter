@@ -81,14 +81,19 @@ impl ImageIdentity {
         &self.platform
     }
 
-    fn from_metadata(canonical_path: PathBuf, metadata: &Metadata) -> Self {
-        Self {
+    fn from_metadata(
+        canonical_path: PathBuf,
+        file: &File,
+        metadata: &Metadata,
+    ) -> Result<Self, ImageError> {
+        Ok(Self {
             canonical_path,
             length: metadata.len(),
             modified: metadata.modified().ok(),
             created: metadata.created().ok(),
-            platform: platform_file_identity(metadata),
-        }
+            platform: platform_file_identity(file, metadata)
+                .map_err(|source| ImageError::io("inspect platform file identity", source))?,
+        })
     }
 
     pub(crate) fn matches_metadata(&self, metadata: &Metadata) -> bool {
@@ -96,7 +101,7 @@ impl ImageIdentity {
             && self.length == metadata.len()
             && self.modified == metadata.modified().ok()
             && self.created == metadata.created().ok()
-            && self.platform == platform_file_identity(metadata)
+            && same_platform_metadata(&self.platform, metadata)
     }
 
     /// Checks the fields that identify the same fixed-size container while allowing expected
@@ -106,6 +111,14 @@ impl ImageIdentity {
             && self.length == metadata.len()
             && self.created == metadata.created().ok()
             && same_platform_file(&self.platform, metadata)
+    }
+
+    /// Compares this captured identity with an already-open file without reopening its path.
+    pub(crate) fn matches_open_file(&self, file: &File) -> io::Result<bool> {
+        let metadata = file.metadata()?;
+        Ok(metadata.is_file()
+            && self.length == metadata.len()
+            && self.platform == platform_file_identity(file, &metadata)?)
     }
 
     /// Domain-separated token for binding a conversion plan to this exact regular-file
@@ -125,14 +138,9 @@ impl ImageIdentity {
                 hasher.update(inode.to_le_bytes());
             }
             #[cfg(windows)]
-            PlatformFileIdentity::Windows {
-                file_attributes,
-                creation_time,
-                ..
-            } => {
+            PlatformFileIdentity::Windows { same_file_key, .. } => {
                 hasher.update(b"windows\0");
-                hasher.update(file_attributes.to_le_bytes());
-                hasher.update(creation_time.to_le_bytes());
+                hasher.update(same_file_key);
             }
             #[cfg(not(any(unix, windows)))]
             PlatformFileIdentity::Unavailable => hasher.update(b"unavailable\0"),
@@ -176,6 +184,7 @@ pub enum PlatformFileIdentity {
         file_attributes: u32,
         creation_time: u64,
         last_write_time: u64,
+        same_file_key: [u8; 32],
     },
     #[cfg(not(any(unix, windows)))]
     Unavailable,
@@ -244,7 +253,7 @@ impl ImageFile {
             });
         }
 
-        let identity = ImageIdentity::from_metadata(canonical_path, &file_metadata);
+        let identity = ImageIdentity::from_metadata(canonical_path, &file, &file_metadata)?;
         if !identity.matches_metadata(&path_metadata) {
             return Err(ImageError::SourceChanged);
         }
@@ -280,7 +289,7 @@ impl ImageFile {
                 path: canonical_path,
             });
         }
-        let identity = ImageIdentity::from_metadata(canonical_path, &metadata);
+        let identity = ImageIdentity::from_metadata(canonical_path, &file, &metadata)?;
         Ok(Self {
             file,
             identity,
@@ -528,31 +537,95 @@ impl std::error::Error for ImageError {
 }
 
 #[cfg(unix)]
-fn platform_file_identity(metadata: &Metadata) -> PlatformFileIdentity {
+fn platform_file_identity(_file: &File, metadata: &Metadata) -> io::Result<PlatformFileIdentity> {
     use std::os::unix::fs::MetadataExt;
 
-    PlatformFileIdentity::Unix {
+    Ok(PlatformFileIdentity::Unix {
         device: metadata.dev(),
         inode: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+fn platform_file_identity(file: &File, metadata: &Metadata) -> io::Result<PlatformFileIdentity> {
+    use std::hash::Hash;
+    use std::os::windows::fs::MetadataExt;
+
+    let handle = same_file::Handle::from_file(file.try_clone()?)?;
+    let mut identity_hasher = FileIdentityHasher::new();
+    handle.hash(&mut identity_hasher);
+
+    Ok(PlatformFileIdentity::Windows {
+        file_attributes: metadata.file_attributes(),
+        creation_time: metadata.creation_time(),
+        last_write_time: metadata.last_write_time(),
+        same_file_key: identity_hasher.finalize(),
+    })
+}
+
+/// Collects a `Hash` implementation into a collision-resistant, domain-separated digest.
+///
+/// `same-file` hashes the Windows volume serial and file index without exposing or retaining its
+/// handle. Length framing keeps separate `Hash::write` calls unambiguous.
+#[cfg(windows)]
+struct FileIdentityHasher(Sha256);
+
+#[cfg(windows)]
+impl FileIdentityHasher {
+    fn new() -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"starconverter/windows-file-identity/v1\0");
+        Self(hasher)
+    }
+
+    fn finalize(self) -> [u8; 32] {
+        self.0.finalize().into()
     }
 }
 
 #[cfg(windows)]
-fn platform_file_identity(metadata: &Metadata) -> PlatformFileIdentity {
-    use std::os::windows::fs::MetadataExt;
+impl std::hash::Hasher for FileIdentityHasher {
+    fn finish(&self) -> u64 {
+        0
+    }
 
-    // Stronger by-handle volume/file identifiers are deferred until Rust exposes a stable API or
-    // StarConverter gains a narrowly reviewed Windows platform layer.
-    PlatformFileIdentity::Windows {
-        file_attributes: metadata.file_attributes(),
-        creation_time: metadata.creation_time(),
-        last_write_time: metadata.last_write_time(),
+    fn write(&mut self, bytes: &[u8]) {
+        self.0
+            .update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+        self.0.update(bytes);
     }
 }
 
 #[cfg(not(any(unix, windows)))]
-fn platform_file_identity(_metadata: &Metadata) -> PlatformFileIdentity {
-    PlatformFileIdentity::Unavailable
+fn platform_file_identity(_file: &File, _metadata: &Metadata) -> io::Result<PlatformFileIdentity> {
+    Ok(PlatformFileIdentity::Unavailable)
+}
+
+#[cfg(unix)]
+fn same_platform_metadata(expected: &PlatformFileIdentity, metadata: &Metadata) -> bool {
+    same_platform_file(expected, metadata)
+}
+
+#[cfg(windows)]
+fn same_platform_metadata(expected: &PlatformFileIdentity, metadata: &Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    matches!(
+        expected,
+        PlatformFileIdentity::Windows {
+            file_attributes,
+            creation_time,
+            last_write_time,
+            ..
+        } if *file_attributes == metadata.file_attributes()
+            && *creation_time == metadata.creation_time()
+            && *last_write_time == metadata.last_write_time()
+    )
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_platform_metadata(expected: &PlatformFileIdentity, _metadata: &Metadata) -> bool {
+    matches!(expected, PlatformFileIdentity::Unavailable)
 }
 
 #[cfg(unix)]
@@ -597,7 +670,15 @@ fn read_all_with(
     Ok(actual)
 }
 
-pub(crate) fn reject_device_like_path(path: &Path) -> Result<(), ImageError> {
+/// Refuses paths which name an operating-system device namespace or reserved DOS device.
+///
+/// Frontends should call this before opening any user-selected output as well as relying on the
+/// regular-image backends' own checks.
+///
+/// # Errors
+///
+/// Returns [`ImageError::DeviceLikePath`] when `path` is unsafe to treat as an ordinary file.
+pub fn reject_device_like_path(path: &Path) -> Result<(), ImageError> {
     if is_device_like_path(path) {
         Err(ImageError::DeviceLikePath {
             path: path.to_path_buf(),
@@ -657,9 +738,12 @@ fn is_device_like_path(path: &Path) -> bool {
         }
 
         if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+            if name.contains(':') {
+                return true;
+            }
             let stem = name
                 .trim_end_matches([' ', '.'])
-                .split('.')
+                .split(['.', ':'])
                 .next()
                 .unwrap_or("")
                 .to_ascii_uppercase();
@@ -872,5 +956,11 @@ mod tests {
             ImageFile::open("NUL"),
             Err(ImageError::DeviceLikePath { .. })
         ));
+        for path in ["NUL:report", "CON:stream", "COM1:payload", "plan.txt:ads"] {
+            assert!(matches!(
+                reject_device_like_path(Path::new(path)),
+                Err(ImageError::DeviceLikePath { .. })
+            ));
+        }
     }
 }

@@ -46,7 +46,10 @@ operating-system or GUI dependency. Implemented foundations include:
   records, list-resolved `$MFTMirr::$DATA`, `$MFT::$BITMAP`, `$Volume`, and `$Bitmap` metadata
   with VCN-split extents concatenated, and bounded object inventory;
 - `object` and `extent`: normalized namespace/stream model plus physical ownership validation;
-- `geometry`: deterministic destination reservations and conflict relocation;
+- `geometry`: deterministic destination reservations, conflict relocation, and sealed stream
+  materialization across one or more destination-aligned free spans. Rigid relocations are retried
+  before flexible fragmented materialization when legacy first-fit order would strand usable
+  capacity;
 - `capsule`: duplicated append-only generation headers, CRCs, SHA-256 payload identity, phase
   monotonicity, and a canonical first-generation `SCPREP02` plan envelope. The envelope commits the
   complete forward plan, source logical manifest, target feature rules, operational limits, and a
@@ -75,9 +78,10 @@ operating-system or GUI dependency. Implemented foundations include:
   graph and source-manifest commitment at every applicable boundary. It reconstructs an owned plan
   from capsule plus image after process loss, executes only sealed relocation authority, refuses all frontend access, separates
   verification from activation, and requires a private approval capability to finalize;
-- `candidate_export`: create-new-only full image copy, exact preview application, independent target
-  reinspection, logical manifest equality, validated escrow persistence, and source SHA-256
-  stability proof. It cannot overwrite or authorize in-place activation.
+- `candidate_export`: create-new-only full image copy, exact preview application, bounded scatter of
+  one logical materialized stream across sealed physical spans, independent target reinspection,
+  logical manifest equality, validated escrow persistence, and source SHA-256 stability proof. It
+  cannot overwrite or authorize in-place activation.
 
 The pure transaction coordinator is implemented: it validates complete/clean/offline evidence,
 feature preservation, relocation geometry, opaque sector write containment, capsule resume state,

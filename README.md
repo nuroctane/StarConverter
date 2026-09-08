@@ -262,11 +262,15 @@ installed. CI always tests both language stacks.
 - [x] Reproducible root/rich/edge external fixtures, read-only exfatprogs/NTFS-3G checks, and exFAT/NTFS FUSE payload mounts
 - [x] Formatter-origin exFAT/NTFS differential images with unchanged hashes and parser compatibility regressions
 - [x] Populated formatter-origin feature corpus with nested Unicode, allocation boundaries, fragmentation, and exact driver-read payload hashes
+- [x] Multi-span create-new materialization uses aggregate fragmented free capacity without changing
+  logical bytes, and preserves rigid relocation capacity through deterministic retry
 - [x] Native desktop exact-candidate preview with in-memory rollback capture and no executor authority
 - [x] Nonblocking desktop inspect/preview/export/verify jobs with stale-result and panic containment
 - [x] Byte-level candidate progress and cooperative cancellation through the last safe
       pre-publication checkpoint, with truthful non-cancellable publication reporting
 - [x] Bounded desktop session recovery with stale/corrupt/raw-device refusal and keyboard/contrast regressions
+- [x] Desktop plan reports are create-new/no-clobber, and capsule resume rejects image hard-link
+  aliases on Windows and Unix
 - [x] Deterministic wide/medium/compact desktop layouts, 44-point targets, and screen-reader-safe ASCII branding
 - [x] Stable responsive accessibility traversal from Source through Activity, independent of panel paint order
 - [x] Create-new exFAT→NTFS and NTFS→exFAT export with reinspection, manifest equality, source re-hash, and escrow sidecar

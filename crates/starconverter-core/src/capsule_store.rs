@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use crate::capsule::{CapsuleError, CapsuleLimits, recover_capsule, scan_capsule};
 use crate::capsule_fault::{CapsuleFaultBoundary, CapsuleFaultInjector, NoCapsuleFault};
-use crate::image::{ImageError, reject_device_like_path};
+use crate::image::{ImageError, ImageFile, ImageIdentity, reject_device_like_path};
 
 /// Strength of the exclusion held for the store lifetime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,7 +205,28 @@ impl CapsuleStore {
         recover_torn_tail: bool,
     ) -> Result<(Self, CapsuleRecoveryEvidence), CapsuleStoreError> {
         validate_limits_without_allocating(limits)?;
-        let image = canonical_regular_image(image_path)?;
+        let image = ImageFile::open(image_path).map_err(CapsuleStoreError::ImagePath)?;
+        let identity = image.identity().clone();
+        drop(image);
+        Self::resume_internal_with_identity(capsule_path, &identity, limits, recover_torn_tail)
+    }
+
+    pub(crate) fn resume_recovering_with_identity(
+        capsule_path: &Path,
+        image: &ImageIdentity,
+        limits: CapsuleLimits,
+    ) -> Result<(Self, CapsuleRecoveryEvidence), CapsuleStoreError> {
+        validate_limits_without_allocating(limits)?;
+        Self::resume_internal_with_identity(capsule_path, image, limits, true)
+    }
+
+    fn resume_internal_with_identity(
+        capsule_path: &Path,
+        image_identity: &ImageIdentity,
+        limits: CapsuleLimits,
+        recover_torn_tail: bool,
+    ) -> Result<(Self, CapsuleRecoveryEvidence), CapsuleStoreError> {
+        let image = image_identity.canonical_path();
         let requested = capsule_path;
         reject_device_like_path(requested).map_err(CapsuleStoreError::ImagePath)?;
         let canonical_path = fs::canonicalize(requested)
@@ -214,6 +235,15 @@ impl CapsuleStore {
         if canonical_path == image {
             return Err(CapsuleStoreError::CapsuleIsImage);
         }
+        let requested_capsule = File::open(&canonical_path)
+            .map_err(|source| CapsuleStoreError::io("open capsule identity handle", source))?;
+        if image_identity
+            .matches_open_file(&requested_capsule)
+            .map_err(|source| CapsuleStoreError::io("inspect capsule identity handle", source))?
+        {
+            return Err(CapsuleStoreError::CapsuleIsImage);
+        }
+        drop(requested_capsule);
 
         let file = open_exclusive(&canonical_path, false)?;
         let metadata = file
@@ -224,9 +254,10 @@ impl CapsuleStore {
                 path: canonical_path,
             });
         }
-        let image_metadata = fs::metadata(&image)
-            .map_err(|source| CapsuleStoreError::io("reinspect image path", source))?;
-        if same_platform_file(&metadata, &image_metadata) {
+        if image_identity
+            .matches_open_file(&file)
+            .map_err(|source| CapsuleStoreError::io("inspect capsule identity handle", source))?
+        {
             return Err(CapsuleStoreError::CapsuleIsImage);
         }
         let length = bounded_length(metadata.len(), limits.max_capsule_bytes)?;
@@ -880,19 +911,6 @@ fn validate_same_file_minimum(
         });
     }
     Ok(())
-}
-
-#[cfg(unix)]
-fn same_platform_file(left: &Metadata, right: &Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    left.dev() == right.dev() && left.ino() == right.ino()
-}
-
-#[cfg(not(unix))]
-const fn same_platform_file(_left: &Metadata, _right: &Metadata) -> bool {
-    // Windows deny-share access prevents replacement after opening. Stable Rust does not expose
-    // the volume serial/file index pair needed to prove that differently named paths are hardlinks.
-    false
 }
 
 #[cfg(windows)]
@@ -1811,7 +1829,6 @@ mod tests {
         ));
     }
 
-    #[cfg(unix)]
     #[test]
     fn resume_refuses_an_image_hardlink_alias() {
         let dir = TempDir::new();
@@ -1819,10 +1836,11 @@ mod tests {
         fs::write(&image, initial_capsule()).unwrap();
         let capsule = dir.join("capsule-alias.starcap");
         fs::hard_link(&image, &capsule).unwrap();
-        assert!(matches!(
-            CapsuleStore::resume(&capsule, &image, limits()),
-            Err(CapsuleStoreError::CapsuleIsImage)
-        ));
+        let result = CapsuleStore::resume(&capsule, &image, limits());
+        assert!(
+            matches!(result, Err(CapsuleStoreError::CapsuleIsImage)),
+            "hard-link alias result: {result:?}"
+        );
     }
 
     #[cfg(unix)]
