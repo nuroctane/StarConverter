@@ -537,6 +537,7 @@ impl std::error::Error for ImageError {
 }
 
 #[cfg(unix)]
+#[allow(clippy::unnecessary_wraps)] // Windows obtains the same cfg-polymorphic value fallibly.
 fn platform_file_identity(_file: &File, metadata: &Metadata) -> io::Result<PlatformFileIdentity> {
     use std::os::unix::fs::MetadataExt;
 
@@ -597,6 +598,7 @@ impl std::hash::Hasher for FileIdentityHasher {
 }
 
 #[cfg(not(any(unix, windows)))]
+#[allow(clippy::unnecessary_wraps)] // Windows obtains the same cfg-polymorphic value fallibly.
 fn platform_file_identity(_file: &File, _metadata: &Metadata) -> io::Result<PlatformFileIdentity> {
     Ok(PlatformFileIdentity::Unavailable)
 }
