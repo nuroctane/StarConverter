@@ -82,7 +82,8 @@ other removable drive unplugged. No automated test targets a physical device by 
 
 The image executor opens only an existing canonical regular file. It never creates, truncates, or
 resizes; lexically rejects Windows device namespaces and Unix `/dev`; checks the inspection identity
-and fixed length before mutation; takes Windows deny-share plus a whole-file lock (advisory locking
+and fixed length before mutation, including a handle-derived Windows volume/file-index comparison
+after the read-write handle is open; takes Windows deny-share plus a whole-file lock (advisory locking
 on other platforms); and accepts only a complete exact intent from an activation-authorized
 `PreparedConversion`. The plan's source identity is compared with a domain-separated token over the
 executor's canonical path, fixed length, and strongest stable platform container identity before
@@ -169,6 +170,12 @@ preimage capture, copying, and final hashing share one pinned read-only file ide
 source is copied in bounded chunks, candidate metadata and both boot copies are written only to the new file,
 and the result is flushed, reopened through the regular-image reader, fully inventoried, normalized,
 and compared to the planned logical namespace/content manifest.
+
+The verified partial identity is bound to its already-open handle. Immediately before publication,
+the partial pathname is reopened and both metadata invariants and stable handle identity must match.
+After the no-clobber hard link is created, the final pathname is opened and must identify the same
+file before namespace synchronization or partial-name cleanup begins. A foreign same-length output
+therefore fails closed and leaves both paths available for diagnosis.
 
 Escrow mode also requires a second create-new sidecar whose payload first passes the independent
 schema decoder and direction check. Any failure removes only files newly created by that call. The

@@ -162,7 +162,10 @@ post-publication cleanup/durability failures retain and report the exact partial
 recovery rather than deleting by pathname. The final candidate name is published only after
 verification; escrow is bound to the exact source, candidate, manifest, and direction.
 Inspection, planning, preimage capture, copying, and final source hashing share one pinned read-only
-file identity. Relocation export additionally seals the source graph, derived target graph, and
+file identity. Immediately before publication, the exporter opens the partial path and requires its
+handle-derived identity to match the verified partial handle; after linking, it opens the final path
+and proves that it names the same file before any cleanup. Relocation export additionally seals the
+source graph, derived target graph, and
 layout as one opaque capability and compares a pre-planning source snapshot before creating a
 candidate, so a payload-only edit cannot silently become the new plan. The command hashes the
 source again before success and never uses the in-place activation-authority type. See

@@ -37,7 +37,10 @@ Current publication uses hard links to obtain atomic create-new/no-clobber behav
 directories must therefore support hard links. In particular, requesting a final image or escrow
 path directly on exFAT/FAT, or on another filesystem that does not implement hard links, fails
 closed before exposing a completed name. Export to a supported local filesystem, verify and back
-up the pair, and copy it to removable media separately if needed. On Unix, successful publication
+up the pair, and copy it to removable media separately if needed. The exporter reopens the partial
+path before linking and the final path afterward, requiring the stable handle identity to match the
+verified file in both cases; a same-length foreign file is not accepted as successful publication.
+On Unix, successful publication
 includes parent-directory synchronization before and after partial-name cleanup. Windows stable
 safe Rust does not expose the required directory-handle flush, so successful evidence explicitly
 reports directory durability as `unsupported`; an operating-system or power failure can still

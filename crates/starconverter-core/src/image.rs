@@ -116,9 +116,10 @@ impl ImageIdentity {
     /// Compares this captured identity with an already-open file without reopening its path.
     pub(crate) fn matches_open_file(&self, file: &File) -> io::Result<bool> {
         let metadata = file.metadata()?;
+        let platform = platform_file_identity(file, &metadata)?;
         Ok(metadata.is_file()
             && self.length == metadata.len()
-            && self.platform == platform_file_identity(file, &metadata)?)
+            && same_platform_handle(&self.platform, &platform))
     }
 
     /// Domain-separated token for binding a conversion plan to this exact regular-file
@@ -719,6 +720,39 @@ fn same_platform_file(expected: &PlatformFileIdentity, _metadata: &Metadata) -> 
     matches!(expected, PlatformFileIdentity::Unavailable)
 }
 
+#[cfg(unix)]
+fn same_platform_handle(expected: &PlatformFileIdentity, actual: &PlatformFileIdentity) -> bool {
+    expected == actual
+}
+
+#[cfg(windows)]
+fn same_platform_handle(expected: &PlatformFileIdentity, actual: &PlatformFileIdentity) -> bool {
+    matches!(
+        (expected, actual),
+        (
+            PlatformFileIdentity::Windows {
+                same_file_key: expected_key,
+                ..
+            },
+            PlatformFileIdentity::Windows {
+                same_file_key: actual_key,
+                ..
+            }
+        ) if expected_key == actual_key
+    )
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_platform_handle(expected: &PlatformFileIdentity, actual: &PlatformFileIdentity) -> bool {
+    matches!(
+        (expected, actual),
+        (
+            PlatformFileIdentity::Unavailable,
+            PlatformFileIdentity::Unavailable
+        )
+    )
+}
+
 fn is_device_like_path(path: &Path) -> bool {
     let normalized = path.to_string_lossy().replace('\\', "/");
     let lowercase = normalized.to_ascii_lowercase();
@@ -838,6 +872,28 @@ mod tests {
         let other = ImageFile::open(&second.path).unwrap();
         assert_eq!(reopened.identity().stable_container_token(), first_token);
         assert_ne!(other.identity().stable_container_token(), first_token);
+    }
+
+    #[test]
+    fn open_handle_identity_distinguishes_same_length_files() {
+        let first = TempEntry::file(b"same length");
+        let second = TempEntry::file(b"other data!");
+        let image = ImageFile::open(&first.path).unwrap();
+        let reopened = File::open(&first.path).unwrap();
+        let foreign = File::open(&second.path).unwrap();
+
+        assert!(image.identity().matches_open_file(&reopened).unwrap());
+        assert!(!image.identity().matches_open_file(&foreign).unwrap());
+    }
+
+    #[test]
+    fn open_handle_identity_survives_expected_same_length_writes() {
+        let temp = TempEntry::file(b"before data");
+        let image = ImageFile::open(&temp.path).unwrap();
+        fs::write(&temp.path, b"after data!").unwrap();
+        let rewritten = File::open(&temp.path).unwrap();
+
+        assert!(image.identity().matches_open_file(&rewritten).unwrap());
     }
 
     #[test]

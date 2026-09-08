@@ -2535,10 +2535,22 @@ impl NewFileGuard {
             .file()
             .metadata()
             .map_err(|source| CandidateExportError::io("revalidate partial handle", source))?;
-        let path_metadata = fs::metadata(path)
+        let path_file = File::open(path).map_err(|source| {
+            CandidateExportError::io("open partial path for revalidation", source)
+        })?;
+        let path_metadata = path_file
+            .metadata()
             .map_err(|source| CandidateExportError::io("revalidate partial path", source))?;
+        let handle_matches = identity
+            .matches_open_file(self.file())
+            .map_err(|source| CandidateExportError::io("identify partial handle", source))?;
+        let path_matches = identity
+            .matches_open_file(&path_file)
+            .map_err(|source| CandidateExportError::io("identify partial path", source))?;
         if identity.matches_container_metadata(&handle_metadata)
             && identity.matches_container_metadata(&path_metadata)
+            && handle_matches
+            && path_matches
         {
             Ok(())
         } else {
@@ -2590,13 +2602,20 @@ impl NewFileGuard {
         }
         // From this point onward the final path exists. Never let Drop obscure a partial-success
         // state by deleting the partial without being able to report whether cleanup was durable.
-        let published_metadata = fs::metadata(destination)
+        let published_file = File::open(destination)
+            .map_err(|source| CandidateExportError::io("open published output", source))?;
+        let published_metadata = published_file
+            .metadata()
             .map_err(|source| CandidateExportError::io("inspect published output", source))?;
-        if !self
+        let identity = self
             .verified_identity
             .as_ref()
-            .is_some_and(|identity| identity.matches_container_metadata(&published_metadata))
-        {
+            .expect("verified identity was required before publication");
+        let published_matches = identity.matches_container_metadata(&published_metadata)
+            && identity
+                .matches_open_file(&published_file)
+                .map_err(|source| CandidateExportError::io("identify published output", source))?;
+        if !published_matches {
             return Err(CandidateExportError::PublishedIdentityMismatch(
                 destination.to_path_buf(),
             ));
@@ -2810,6 +2829,24 @@ mod tests {
             } else {
                 Ok(DirectoryDurability::Synchronized)
             }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct ForeignPublicationIo;
+
+    impl PublicationIo for ForeignPublicationIo {
+        fn hard_link(&self, partial: &Path, destination: &Path) -> io::Result<()> {
+            let length = fs::metadata(partial)?.len();
+            fs::write(destination, vec![b'x'; usize::try_from(length).unwrap()])
+        }
+
+        fn remove_partial(&self, partial: &Path) -> io::Result<()> {
+            fs::remove_file(partial)
+        }
+
+        fn sync_parent(&self, _destination: &Path) -> io::Result<DirectoryDurability> {
+            Ok(DirectoryDurability::Synchronized)
         }
     }
 
@@ -7447,6 +7484,25 @@ mod tests {
         assert_eq!(fs::read(&partial).unwrap(), b"candidate");
         let _ = fs::remove_file(destination);
         let _ = fs::remove_file(partial);
+    }
+
+    #[test]
+    fn publication_rejects_a_foreign_same_length_output() {
+        let destination = temp_path("foreign-publication.img");
+        let mut guard = NewFileGuard::create_partial(&destination).unwrap();
+        guard.file_mut().write_all(b"verified").unwrap();
+        guard.file().sync_all().unwrap();
+        guard.bind_current_identity().unwrap();
+        let partial = guard.path.clone();
+
+        assert!(matches!(
+            guard.publish_with(&destination, &ForeignPublicationIo),
+            Err(CandidateExportError::PublishedIdentityMismatch(path)) if path == destination
+        ));
+        assert_eq!(fs::read(&destination).unwrap(), b"xxxxxxxx");
+        assert_eq!(fs::read(&partial).unwrap(), b"verified");
+        fs::remove_file(destination).unwrap();
+        fs::remove_file(partial).unwrap();
     }
 
     #[cfg(unix)]

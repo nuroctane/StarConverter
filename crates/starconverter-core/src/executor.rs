@@ -413,7 +413,10 @@ impl ImageExecutor {
         let opened_metadata = file
             .metadata()
             .map_err(|source| ExecutorError::io("inspect opened image", source))?;
-        if !expected.matches_metadata(&opened_metadata) {
+        let opened_matches = expected
+            .matches_open_file(&file)
+            .map_err(|source| ExecutorError::io("identify opened image", source))?;
+        if !expected.matches_metadata(&opened_metadata) || !opened_matches {
             return Err(ExecutorError::IdentityMismatch);
         }
         fs4::FileExt::try_lock(&file)
@@ -887,7 +890,11 @@ impl ImageExecutor {
             .file
             .metadata()
             .map_err(|source| ExecutorError::io("revalidate opened image", source))?;
-        if !self.identity.matches_container_metadata(&handle_metadata) {
+        let handle_matches = self
+            .identity
+            .matches_open_file(&self.file)
+            .map_err(|source| ExecutorError::io("identify opened image", source))?;
+        if !self.identity.matches_container_metadata(&handle_metadata) || !handle_matches {
             return Err(ExecutorError::IdentityMismatch);
         }
         let current_path = fs::canonicalize(&self.canonical_path)
