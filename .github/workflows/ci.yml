@@ -13,6 +13,34 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  external-images:
+    name: Independent unmounted image checks
+    runs-on: ubuntu-24.04
+    env:
+      LC_ALL: C.UTF-8
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install independent readers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends exfatprogs ntfs-3g
+          dpkg-query -W exfatprogs ntfs-3g
+      - name: Test evidence harness
+        run: python3 -m unittest discover -s scripts -p test_external_images.py
+      - name: Generate regular image corpus
+        run: cargo test -p starconverter-core --test export_external_fixtures -- --ignored --nocapture
+      - name: Check images without mounting
+        run: python3 scripts/validate-external-images.py target/external-validator-fixtures --report target/external-unmounted-report.json
+      - name: Upload independent evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: external-unmounted-evidence
+          path: target/external-unmounted-report.json
+          if-no-files-found: warn
+
   rust:
     name: Rust / ${{ matrix.os }}
     strategy:

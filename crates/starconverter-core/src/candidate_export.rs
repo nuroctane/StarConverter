@@ -374,8 +374,16 @@ pub enum CandidateExportError {
         partial_path: PathBuf,
         source: io::Error,
     },
+    PublishedInspectionFailed {
+        published_path: PathBuf,
+        partial_path: PathBuf,
+        source: io::Error,
+    },
     PartialIdentityMismatch(PathBuf),
-    PublishedIdentityMismatch(PathBuf),
+    PublishedIdentityMismatch {
+        published_path: PathBuf,
+        partial_path: PathBuf,
+    },
 }
 
 impl fmt::Display for CandidateExportError {
@@ -557,15 +565,29 @@ impl fmt::Display for CandidateExportError {
                 destination.display(),
                 partial_path.display(),
             ),
+            Self::PublishedInspectionFailed {
+                published_path,
+                partial_path,
+                source,
+            } => write!(
+                formatter,
+                "published {} but could not verify its opened file identity; partial was retained at {}: {source}",
+                published_path.display(),
+                partial_path.display(),
+            ),
             Self::PartialIdentityMismatch(path) => write!(
                 formatter,
                 "verified partial path no longer identifies the pinned file: {}",
                 path.display(),
             ),
-            Self::PublishedIdentityMismatch(path) => write!(
+            Self::PublishedIdentityMismatch {
+                published_path,
+                partial_path,
+            } => write!(
                 formatter,
-                "published path does not identify the verified pinned file: {}",
-                path.display(),
+                "published path {} does not identify the verified pinned file; partial was retained at {}",
+                published_path.display(),
+                partial_path.display(),
             ),
         }
     }
@@ -577,7 +599,8 @@ impl std::error::Error for CandidateExportError {
             Self::Io { source, .. }
             | Self::PublishedDirectorySyncFailed { source, .. }
             | Self::PublishedPartialCleanupFailed { source, .. }
-            | Self::PublicationFailed { source, .. } => Some(source),
+            | Self::PublicationFailed { source, .. }
+            | Self::PublishedInspectionFailed { source, .. } => Some(source),
             Self::Image(source) => Some(source),
             Self::Preservation(source) => Some(source),
             Self::Inspection(source) => Some(source),
@@ -2602,11 +2625,13 @@ impl NewFileGuard {
         }
         // From this point onward the final path exists. Never let Drop obscure a partial-success
         // state by deleting the partial without being able to report whether cleanup was durable.
-        let published_file = File::open(destination)
-            .map_err(|source| CandidateExportError::io("open published output", source))?;
-        let published_metadata = published_file
-            .metadata()
-            .map_err(|source| CandidateExportError::io("inspect published output", source))?;
+        let published_error = |source| CandidateExportError::PublishedInspectionFailed {
+            published_path: destination.to_path_buf(),
+            partial_path: self.path.clone(),
+            source,
+        };
+        let published_file = File::open(destination).map_err(&published_error)?;
+        let published_metadata = published_file.metadata().map_err(&published_error)?;
         let identity = self
             .verified_identity
             .as_ref()
@@ -2614,11 +2639,12 @@ impl NewFileGuard {
         let published_matches = identity.matches_container_metadata(&published_metadata)
             && identity
                 .matches_open_file(&published_file)
-                .map_err(|source| CandidateExportError::io("identify published output", source))?;
+                .map_err(&published_error)?;
         if !published_matches {
-            return Err(CandidateExportError::PublishedIdentityMismatch(
-                destination.to_path_buf(),
-            ));
+            return Err(CandidateExportError::PublishedIdentityMismatch {
+                published_path: destination.to_path_buf(),
+                partial_path: self.path.clone(),
+            });
         }
         let first_sync = io.sync_parent(destination).map_err(|source| {
             CandidateExportError::PublishedDirectorySyncFailed {
@@ -2847,6 +2873,23 @@ mod tests {
 
         fn sync_parent(&self, _destination: &Path) -> io::Result<DirectoryDurability> {
             Ok(DirectoryDurability::Synchronized)
+        }
+    }
+
+    struct MissingPublicationIo;
+
+    impl PublicationIo for MissingPublicationIo {
+        fn hard_link(&self, _partial: &Path, _destination: &Path) -> io::Result<()> {
+            // Model namespace removal between successful publication and its readback.
+            Ok(())
+        }
+
+        fn remove_partial(&self, _partial: &Path) -> io::Result<()> {
+            panic!("unverified publication must not clean up its partial")
+        }
+
+        fn sync_parent(&self, _destination: &Path) -> io::Result<DirectoryDurability> {
+            panic!("unverified publication must not report namespace durability")
         }
     }
 
@@ -7497,11 +7540,45 @@ mod tests {
 
         assert!(matches!(
             guard.publish_with(&destination, &ForeignPublicationIo),
-            Err(CandidateExportError::PublishedIdentityMismatch(path)) if path == destination
+            Err(CandidateExportError::PublishedIdentityMismatch {
+                published_path,
+                partial_path,
+            }) if published_path == destination && partial_path == partial
         ));
         assert_eq!(fs::read(&destination).unwrap(), b"xxxxxxxx");
         assert_eq!(fs::read(&partial).unwrap(), b"verified");
         fs::remove_file(destination).unwrap();
+        fs::remove_file(partial).unwrap();
+    }
+
+    #[test]
+    fn missing_published_path_reports_both_paths_and_retains_partial() {
+        let destination = temp_path("missing-publication.img");
+        let mut guard = NewFileGuard::create_partial(&destination).unwrap();
+        guard.file_mut().write_all(b"verified").unwrap();
+        guard.file().sync_all().unwrap();
+        guard.bind_current_identity().unwrap();
+        let partial = guard.path.clone();
+
+        let error = guard
+            .publish_with(&destination, &MissingPublicationIo)
+            .unwrap_err();
+        assert!(matches!(
+            &error,
+            CandidateExportError::PublishedInspectionFailed {
+                published_path,
+                partial_path,
+                source,
+            } if published_path == &destination
+                && partial_path == &partial
+                && source.kind() == io::ErrorKind::NotFound
+        ));
+        let message = error.to_string();
+        assert!(message.contains(&destination.display().to_string()));
+        assert!(message.contains(&partial.display().to_string()));
+        assert!(std::error::Error::source(&error).is_some());
+        assert_eq!(fs::read(&partial).unwrap(), b"verified");
+        assert!(!destination.exists());
         fs::remove_file(partial).unwrap();
     }
 

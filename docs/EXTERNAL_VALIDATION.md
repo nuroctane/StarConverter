@@ -328,3 +328,27 @@ filesystem and partition observations, payload hashes, CHKDSK exit/transcript, W
 PowerShell versions, and filesystem-driver versions. A report is written only after every requested
 case succeeds, and an existing report path is never replaced. The detached-preflight mode is
 explicitly labeled and must not be mistaken for Windows filesystem-driver qualification.
+
+## Continuous unmounted structural checks
+
+The `Independent unmounted image checks` CI job regenerates the regular-file corpus on Ubuntu
+24.04 and invokes distro exfatprogs and NTFS-3G directly. The script
+`scripts/validate-external-images.py` requires the exact 29-artifact inventory before starting:
+seven exFAT images, eight NTFS images, seven escrow sidecars, four VHD wrappers, and three
+manifests. Missing, nonregular, symbolic-link, and hard-link inputs are refused.
+
+The seven exFAT images receive `fsck.exfat -n`; the eight NTFS images each receive `ntfsinfo -m`,
+recursive `ntfsls`, and `ntfsfix -n`. No mount helper, repair flag, elevation, or device discovery is
+used for validation. Whole VHD wrappers are hashed but never supplied to raw filesystem readers;
+the corresponding filesystem partition images are checked directly.
+
+The runner records distro package versions in its log and uploads a create-new JSON report with
+every command, exit status, transcript, and before/after SHA-256 for all 29 artifacts. It checks the
+hashes even after tool failures and timeouts. A failed validator or changed artifact makes the job
+fail. This is recurring independent structural evidence; it does not qualify Windows drivers,
+prove every logical payload, or authorize in-place activation. The existing WSL mount-based
+runner remains a separate, broader qualification lane.
+
+The CI corpus lives in an isolated job workspace. The harness validates paths before starting
+external tools; it does not establish exclusion against a hostile process replacing files during
+validation. Production conversion continues to require its own locked-handle authority.

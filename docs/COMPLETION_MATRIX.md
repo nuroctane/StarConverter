@@ -38,3 +38,8 @@ may claim image conversion or physical-volume support.
   unqualified losslessness claims.
 
 The current repository is a **copy-conversion pre-alpha**. In-place activation remains blocked.
+
+The continuous independent image lane now regenerates all 29 corpus artifacts and performs 31
+unmounted exfatprogs/NTFS-3G structural checks with before/after hashes and archived JSON evidence.
+See `EXTERNAL_VALIDATION.md` for its exact scope. This gate does not replace payload-driver,
+Windows CHKDSK, or activation qualification.

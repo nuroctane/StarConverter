@@ -74,6 +74,11 @@ but its survival across the triggering power/OS failure was not proven. In every
 the path pair, preserve the console evidence, rerun `verify-export` when both final artifacts exist,
 and choose new final/sidecar names for any retry. Never promote a partial by renaming it.
 
+If the final path cannot be opened or fails the stable file-identity check after publication, the
+error reports both the final and retained partial paths. Neither is automatically deleted in that
+state. Preserve the error and both artifacts for diagnosis; a final name alone is insufficient
+evidence that the verified file was published successfully.
+
 ## Existing final name or lone sidecar
 
 The exporter never overwrites. If the requested image already exists, verify it rather than retrying
