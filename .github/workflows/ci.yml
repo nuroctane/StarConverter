@@ -31,6 +31,7 @@ jobs:
         run: |
           python3 -m unittest discover -s scripts -p test_external_images.py
           python3 -m unittest discover -s scripts -p test_ntfs_payloads.py
+          python3 -m unittest discover -s scripts -p test_large_directory.py
       - name: Generate regular image corpus
         id: generate
         run: cargo test -p starconverter-core --test export_external_fixtures -- --ignored --nocapture
@@ -39,6 +40,9 @@ jobs:
       - name: Check NTFS logical bytes without mounting
         if: ${{ !cancelled() && steps.generate.outcome == 'success' }}
         run: python3 scripts/validate-ntfs-payloads.py target/external-validator-fixtures --report target/ntfs-payload-report.json
+      - name: Traverse large NTFS directory without mounting
+        if: ${{ !cancelled() && steps.generate.outcome == 'success' }}
+        run: python3 scripts/validate-large-directory.py target/external-large-directory-fixtures --report target/large-directory-report.json
       - name: Upload independent evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -47,6 +51,7 @@ jobs:
           path: |
             target/external-unmounted-report.json
             target/ntfs-payload-report.json
+            target/large-directory-report.json
           if-no-files-found: warn
 
   rust:

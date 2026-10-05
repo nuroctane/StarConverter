@@ -363,6 +363,30 @@ manifests, output floods, timeouts, linked inputs, mutation, and report no-clobb
 These checks establish the selected logical payloads, not directory completeness, Windows driver
 compatibility, preservation of all metadata or specialized NTFS features, or in-place activation.
 
+## Continuous large-directory routing checks
+
+A separate four-artifact corpus in `target/external-large-directory-fixtures` contains a 32 MiB
+exFAT source, its public-export NTFS candidate, its bound escrow, and an exact 128-row manifest.
+All files are empty and have long Unicode names under `/alpha`. The generator reinspects the
+actual candidate and requires nonresident `$INDEX_ALLOCATION:$I30`, complete directory inventory,
+leaf blocks, and at least one internal `INDX` node. This prevents the case from silently regressing
+into a small resident-only index.
+
+`scripts/validate-large-directory.py` checks source and target structure with `fsck.exfat -n`,
+`ntfsinfo -m`, and `ntfsfix -n`; compares the exact name multiset from `ntfsls -a -p /alpha`; and
+requires all 128 `ntfscat` path lookups to succeed with zero bytes. The expected listing includes
+exactly one NTFS-3G-synthesized self entry (`.`); the root-parent entry is filtered by NTFS-3G's
+metadata rule. Name order is deliberately ignored, but missing, duplicate, and foreign names fail.
+The commands follow the [NTFS-3G manual](https://manpages.ubuntu.com/manpages/noble/man8/ntfsls.8.html)
+and the tool's [listing implementation](https://github.com/tuxera/ntfs-3g/blob/2022.10.3/ntfsprogs/ntfsls.c).
+
+Manifest bytes must exactly match bounded deterministic expectations before tools start. Binary
+output is bounded (32 KiB for listing/structural transcripts, zero for empty-file payloads), reader
+timeouts fail closed, and all four input hashes are compared after failures. The create-new JSON
+report is uploaded alongside the existing corpus reports. This is independent qualification of
+the generated multi-level index's enumeration and lookup routing, not native-driver mounting,
+arbitrary NTFS directory profiles, metadata losslessness, or activation authorization.
+
 The CI corpus lives in an isolated job workspace. The harness validates paths before starting
 external tools; it does not establish exclusion against a hostile process replacing files during
 validation. Production conversion continues to require its own locked-handle authority.

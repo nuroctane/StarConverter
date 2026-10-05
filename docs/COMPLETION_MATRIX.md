@@ -44,3 +44,8 @@ unmounted exfatprogs/NTFS-3G structural checks with before/after hashes and arch
 It also performs 30 bounded binary NTFS-3G logical-payload reads with exact lengths and SHA-256
 across rich, edge, and misaligned-source images. See `EXTERNAL_VALIDATION.md` for its exact scope.
 These gates do not replace Windows payload-driver/CHKDSK or activation qualification.
+
+A separate 128-file long-Unicode-name directory corpus requires an actual nonresident `$I30`
+allocation with internal `INDX` nodes, then independently checks exact NTFS-3G enumeration and
+all 128 empty-file path lookups. Its source, candidate, escrow, and manifest are hashed before
+and after the 132 unmounted checks; this profile does not qualify arbitrary directory trees.

@@ -27,10 +27,12 @@ use starconverter_core::fs::exfat_upcase_serialize::{
     RECOMMENDED_EXFAT_UPCASE_PROFILE, RecommendedExfatUpcaseLimits,
     generate_recommended_exfat_upcase,
 };
+use starconverter_core::fs::ntfs_index::{NtfsIndexLimits, parse_index_block};
 use starconverter_core::fs::ntfs_serialize::{
     NtfsDestinationInputs, NtfsSerializeLimits, plan_ntfs_destination,
 };
 use starconverter_core::geometry::LayoutLimits;
+use starconverter_core::inspect::BootSector;
 use starconverter_core::object::{
     NamespaceEntry, ObjectGraph, ObjectGraphLimits, ObjectId, ObjectKind, ObjectRecord,
     ObjectSemantics, ObjectStream, StreamFlags, StreamStorage,
@@ -966,4 +968,190 @@ fn export_structural_candidate_images() {
     println!("converted edge NTFS candidate: {exported_edge_ntfs:?}");
     println!("converted edge exFAT candidate: {exported_edge_exfat:?}");
     println!("edge manifest: {}", edge_manifest_path.display());
+}
+
+fn large_directory_graph() -> (ObjectGraph, Vec<ExfatObjectMetadata>, String) {
+    let root = ObjectId(1);
+    let directory = ObjectId(2);
+    let mut objects = vec![
+        ObjectRecord {
+            id: root,
+            kind: ObjectKind::Directory,
+            link_count: 0,
+            semantics: ObjectSemantics::default(),
+            streams: Vec::new(),
+        },
+        ObjectRecord {
+            id: directory,
+            kind: ObjectKind::Directory,
+            link_count: 1,
+            semantics: ObjectSemantics::default(),
+            streams: Vec::new(),
+        },
+    ];
+    let mut entries = vec![NamespaceEntry {
+        parent: root,
+        target: directory,
+        name: "alpha".encode_utf16().collect(),
+    }];
+    let mut manifest = String::new();
+    let empty_sha256 = payload_digest(0, 0);
+    for ordinal in 0..128_u64 {
+        let object = ObjectId(ordinal + 3);
+        let name = format!(
+            "entry-{ordinal:03}-Ωmega-深度-rocket-🚀-{}.bin",
+            "n".repeat(96)
+        );
+        objects.push(ObjectRecord {
+            id: object,
+            kind: ObjectKind::File,
+            link_count: 1,
+            semantics: ObjectSemantics::default(),
+            streams: vec![ObjectStream {
+                id: StreamId(ordinal + 100),
+                name: None,
+                logical_bytes: 0,
+                initialized_bytes: 0,
+                mapped_bytes: 0,
+                allocated_bytes: 0,
+                flags: StreamFlags::default(),
+                storage: StreamStorage::Resident(Vec::new()),
+            }],
+        });
+        writeln!(&mut manifest, "/alpha/{name}\t0\t{empty_sha256}").unwrap();
+        entries.push(NamespaceEntry {
+            parent: directory,
+            target: object,
+            name: name.encode_utf16().collect(),
+        });
+    }
+    let graph = ObjectGraph::build(
+        root,
+        objects,
+        entries,
+        ExtentGraph::build(Vec::new(), IMAGE_BYTES, 256).unwrap(),
+        ObjectGraphLimits {
+            max_objects: 256,
+            max_entries: 256,
+            max_streams: 256,
+            max_name_code_units: 255,
+        },
+    )
+    .unwrap();
+    let metadata = graph
+        .objects()
+        .iter()
+        .filter(|object| object.id != root)
+        .map(|object| ExfatObjectMetadata {
+            object: object.id,
+            file_attributes: match object.kind {
+                ObjectKind::Directory => 0x11,
+                ObjectKind::File => 0x21,
+            },
+            timestamps: rich_timestamp(),
+        })
+        .collect();
+    (graph, metadata, manifest)
+}
+
+fn assert_large_directory_index(image: &ImageFile) -> usize {
+    let inspection = inspect_open_image(image).unwrap();
+    assert_eq!(inspection.image_bytes, IMAGE_BYTES);
+    assert!(inspection.profile.inventory_complete);
+    let BootSector::Ntfs(boot) = inspection.boot_sector else {
+        panic!("large-directory candidate must be NTFS");
+    };
+    assert_eq!(boot.cluster_size_bytes, 4096);
+    let inventory = inspection.ntfs_inventory.as_ref().unwrap();
+    let alpha = inventory
+        .objects
+        .iter()
+        .find(|object| {
+            object.is_directory
+                && object.file_names.iter().any(|file_name| {
+                    file_name.name.code_units == "alpha".encode_utf16().collect::<Vec<_>>()
+                })
+        })
+        .unwrap();
+    assert!(alpha.directory_index_complete);
+    assert_eq!(alpha.directory_entries.len(), 128);
+    let allocation = alpha
+        .attribute_census
+        .iter()
+        .find(|attribute| {
+            attribute.attribute_type == 0xa0
+                && attribute.name.as_ref().is_some_and(|name| {
+                    name.code_units == "$I30".encode_utf16().collect::<Vec<_>>()
+                })
+        })
+        .expect("large directory must spill into $INDEX_ALLOCATION:$I30");
+    assert!(!allocation.resident);
+    let mut blocks = 0;
+    let mut internal_blocks = 0;
+    for run in inventory.physical_allocations.iter().filter(|run| {
+        run.record_number == alpha.reference.record_number
+            && run.attribute_type == 0xa0
+            && run.attribute_id == allocation.attribute_id
+    }) {
+        for cluster in 0..run.cluster_count {
+            let offset = (run.start_lcn + cluster) * boot.cluster_size_bytes;
+            let bytes = image.read_exact_at(offset, 4096).unwrap();
+            let block = parse_index_block(
+                &bytes,
+                Some(run.starting_vcn + cluster),
+                NtfsIndexLimits {
+                    max_root_bytes: 1024,
+                    max_block_bytes: 4096,
+                    max_entries_per_node: 256,
+                    max_name_code_units: 255,
+                },
+            )
+            .unwrap();
+            blocks += 1;
+            if block.header.has_children {
+                internal_blocks += 1;
+            }
+        }
+    }
+    assert!(blocks > internal_blocks, "index must contain leaf blocks");
+    assert!(
+        internal_blocks >= 1,
+        "index must contain internal INDX nodes"
+    );
+    internal_blocks
+}
+
+#[test]
+#[ignore = "writes isolated regular large-directory image fixtures under target"]
+fn export_large_directory_candidate_images() {
+    let directory = fixture_directory()
+        .parent()
+        .unwrap()
+        .join("external-large-directory-fixtures");
+    fs::create_dir_all(&directory).unwrap();
+    let (graph, metadata, manifest) = large_directory_graph();
+    let upcase =
+        generate_recommended_exfat_upcase(RecommendedExfatUpcaseLimits::default()).unwrap();
+    let source_path = directory.join("exfat-large-directory.img");
+    fs::write(
+        &source_path,
+        exfat_image(&graph, &metadata, upcase.encoded_bytes(), 0),
+    )
+    .unwrap();
+    let candidate = export_ntfs_candidate(
+        &directory,
+        &source_path,
+        "converted-large-directory-exfat-to-ntfs.img",
+        0,
+    );
+    let internal_blocks = {
+        let image = ImageFile::open(&candidate.output_path).unwrap();
+        assert_large_directory_index(&image)
+    };
+    let manifest_path = directory.join("large-directory-manifest.tsv");
+    fs::write(&manifest_path, manifest).unwrap();
+    println!("large-directory exFAT source: {}", source_path.display());
+    println!("large-directory NTFS candidate: {candidate:?}");
+    println!("large-directory internal INDX nodes: {internal_blocks}");
+    println!("large-directory manifest: {}", manifest_path.display());
 }

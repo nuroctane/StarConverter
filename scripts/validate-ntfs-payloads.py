@@ -101,8 +101,11 @@ def parse_manifest(path: Path, expected_count: int) -> tuple:
     return tuple(entries)
 
 
-def read_payload(command: list[str], timeout: float = 30) -> tuple[int, bytes, bytes]:
+def read_payload(command: list[str], timeout: float = 30,
+                 stdout_limit: int = MAX_PAYLOAD) -> tuple[int, bytes, bytes]:
     """Drain binary pipes within strict caps; kill overflow and hung readers."""
+    if not isinstance(stdout_limit, int) or not 0 <= stdout_limit <= 128 * 1024:
+        raise ValueError("invalid reader stdout limit")
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                stdin=subprocess.DEVNULL)
     outputs = [b"", b""]
@@ -119,7 +122,7 @@ def read_payload(command: list[str], timeout: float = 30) -> tuple[int, bytes, b
         finally:
             pipe.close()
 
-    threads = [threading.Thread(target=drain, args=(0, process.stdout, MAX_PAYLOAD), daemon=True),
+    threads = [threading.Thread(target=drain, args=(0, process.stdout, stdout_limit), daemon=True),
                threading.Thread(target=drain, args=(1, process.stderr, 4096), daemon=True)]
     for thread in threads:
         thread.start()
