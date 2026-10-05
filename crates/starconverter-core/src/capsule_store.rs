@@ -468,7 +468,6 @@ impl CapsuleStore {
                 self.generation_count = actual_generations;
                 self.ensure_unchanged()?;
                 self.poisoned = false;
-                Ok(())
             }
             Err(strict_error) => {
                 let recovered =
@@ -490,9 +489,9 @@ impl CapsuleStore {
                 }
                 self.ensure_unchanged()?;
                 self.poisoned = false;
-                Ok(())
             }
         }
+        Ok(())
     }
 
     fn persist_suffix_with_faults<F: CapsuleFaultInjector>(

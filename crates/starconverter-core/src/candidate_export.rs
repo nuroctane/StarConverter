@@ -2630,8 +2630,8 @@ impl NewFileGuard {
             partial_path: self.path.clone(),
             source,
         };
-        let published_file = File::open(destination).map_err(&published_error)?;
-        let published_metadata = published_file.metadata().map_err(&published_error)?;
+        let published_file = File::open(destination).map_err(published_error)?;
+        let published_metadata = published_file.metadata().map_err(published_error)?;
         let identity = self
             .verified_identity
             .as_ref()
@@ -2639,7 +2639,7 @@ impl NewFileGuard {
         let published_matches = identity.matches_container_metadata(&published_metadata)
             && identity
                 .matches_open_file(&published_file)
-                .map_err(&published_error)?;
+                .map_err(published_error)?;
         if !published_matches {
             return Err(CandidateExportError::PublishedIdentityMismatch {
                 published_path: destination.to_path_buf(),
