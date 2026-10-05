@@ -390,3 +390,39 @@ arbitrary NTFS directory profiles, metadata losslessness, or activation authoriz
 The CI corpus lives in an isolated job workspace. The harness validates paths before starting
 external tools; it does not establish exclusion against a hostile process replacing files during
 validation. Production conversion continues to require its own locked-handle authority.
+
+## Formatter-origin ADS compatibility probe (not yet qualified)
+
+`scripts/validate-formatter-ads.py` creates a fresh 64 MiB ordinary image beneath an explicitly
+supplied existing workspace. NTFS-3G `mkntfs` formats only that new file; `ntfscp` adds a 14-byte
+unnamed stream, a 16-byte resident named stream, and an 8193-byte nonresident named stream.
+NTFS-3G independently checks their exact binary bytes and source storage forms. The harness then
+attempts an escrow NTFS -> exFAT -> NTFS create-new round trip, with read-only structural checks,
+exact restored names/sizes/bytes, bounded subprocess output, and before/after artifact hashes.
+Restored residency is recorded, not required to reproduce the original layout. All case files
+remain available after success or failure; the JSON report is create-new, never overwritten.
+
+Run only in an isolated fixture workspace, with independent tools on PATH:
+
+```text
+python3 scripts/validate-formatter-ads.py target --cli <starconverter executable> --report target/<new-report>.json
+python3 -m unittest discover -s scripts -p test_formatter_ads.py
+```
+
+The October 2026 NTFS-3G 2022.10.3 run is **not a passing round-trip qualification**. It exposed
+nonzero quadword-alignment slack after a mapping-pairs zero terminator, left by resident-to-
+nonresident promotion. Attribute parsing now accepts at most seven such alignment bytes without
+interpreting them as runs; standalone mapping-pairs parsing remains strict. This follows the
+[Microsoft attribute format](https://learn.microsoft.com/en-us/windows/win32/devnotes/attribute-record-header).
+Geometry, run-count, VCN, LCN, terminator, and resource bounds remain enforced.
+
+After that compatibility fix, the source inventories completely, but conversion still refuses
+`NtfsAttributes`: this independently formatted source contains resident and nonresident inline
+`$SECURITY_DESCRIPTOR` attributes (`0x50`). Their presence now contributes access-control
+semantics even when a 48-byte `$STANDARD_INFORMATION` has no security ID. Census evidence does
+not capture descriptor bytes; the pinned `$Secure:$SDS` profile is not a substitute for them.
+Strict and escrow modes continue to refuse this unsupported attribute; content-only assessment
+records it as an explicit loss and is not a lossless workaround. Do not strip descriptors,
+patch source security, or allowlist the attribute to make the probe pass. This harness is not in
+the passing continuous lane until descriptor capture, validation, escrow retention, restoration,
+and independent descriptor-byte comparisons are implemented and proven.

@@ -24,7 +24,8 @@ use crate::fs::ntfs_record::{
     MAX_FILE_RECORD_SIZE, MftReference, NtfsFileRecord, NtfsFileRecordError, parse_file_record,
 };
 use crate::fs::ntfs_runlist::{
-    ExtentLocation, MappingPairsError, MappingPairsLimits, NtfsRunlist, parse_mapping_pairs,
+    ExtentLocation, MappingPairsError, MappingPairsLimits, NtfsRunlist,
+    parse_attribute_mapping_pairs,
 };
 use crate::image::{BoundedImageReader, ImageError, ImageFile};
 
@@ -712,7 +713,7 @@ fn parse_unnamed_mft_data_runlist(
             reason: "$MFT $DATA mapping exceeds the caller run cap",
         });
     }
-    Ok(parse_mapping_pairs(
+    Ok(parse_attribute_mapping_pairs(
         data.mapping_pairs,
         MappingPairsLimits {
             starting_vcn: data.lowest_vcn,
@@ -1077,7 +1078,7 @@ fn parse_mft_attribute_list_runlist(
             reason: "$MFT $ATTRIBUTE_LIST mapping exceeds the caller run cap",
         });
     }
-    let runlist = parse_mapping_pairs(
+    let runlist = parse_attribute_mapping_pairs(
         data.mapping_pairs,
         MappingPairsLimits {
             starting_vcn: data.lowest_vcn,
@@ -1477,7 +1478,7 @@ fn parse_mft_mirror_data(
             .ok_or(NtfsDiscoveryError::UnsupportedMftMirrorStorage {
                 reason: "$MFTMirr first data extent has no size evidence",
             })?;
-        let runlist = parse_mapping_pairs(
+        let runlist = parse_attribute_mapping_pairs(
             data.mapping_pairs,
             MappingPairsLimits {
                 starting_vcn: data.lowest_vcn,
@@ -1509,7 +1510,7 @@ fn parse_mft_mirror_data(
                     maximum: limits.max_runs,
                 },
             ))?;
-        let extra = parse_mapping_pairs(
+        let extra = parse_attribute_mapping_pairs(
             data.mapping_pairs,
             MappingPairsLimits {
                 starting_vcn: data.lowest_vcn,

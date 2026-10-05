@@ -17,7 +17,8 @@ use crate::fs::ntfs_attribute::{
 use crate::fs::ntfs_discovery::{MftBootstrap, NtfsDiscoveryError, read_mft_record_with_reader};
 use crate::fs::ntfs_record::{MftReference, NtfsFileRecord};
 use crate::fs::ntfs_runlist::{
-    ExtentLocation, MappingPairsError, MappingPairsLimits, NtfsRunlist, parse_mapping_pairs,
+    ExtentLocation, MappingPairsError, MappingPairsLimits, NtfsRunlist,
+    parse_attribute_mapping_pairs,
 };
 use crate::image::{BoundedImageReader, ImageError, ImageFile};
 
@@ -940,7 +941,7 @@ fn read_list_value(
                     reason: "stream contains uninitialized bytes",
                 });
             }
-            let mut runlist = parse_mapping_pairs(
+            let mut runlist = parse_attribute_mapping_pairs(
                 data.mapping_pairs,
                 MappingPairsLimits {
                     starting_vcn: 0,
@@ -1183,7 +1184,7 @@ fn attribute_list_continuation_runlist(
             found_vcn: body.lowest_vcn,
         });
     }
-    Ok(parse_mapping_pairs(
+    Ok(parse_attribute_mapping_pairs(
         body.mapping_pairs,
         MappingPairsLimits {
             starting_vcn: body.lowest_vcn,

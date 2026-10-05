@@ -29,7 +29,7 @@ use crate::fs::ntfs_record::NtfsFileRecord;
 use crate::fs::ntfs_reparse_index::{read_reparse_index_block, read_reparse_index_root};
 use crate::fs::ntfs_runlist::{
     ExtentLocation, MappingPairsError, MappingPairsLimits, NtfsExtent, NtfsRunlist,
-    parse_mapping_pairs,
+    parse_attribute_mapping_pairs,
 };
 use crate::image::{BoundedImageReader, ImageError, ImageFile};
 
@@ -1419,7 +1419,7 @@ fn inventory_physical_allocations_where(
         let AttributeBody::NonResident(body) = &attribute.body else {
             continue;
         };
-        let runlist = parse_mapping_pairs(
+        let runlist = parse_attribute_mapping_pairs(
             body.mapping_pairs,
             MappingPairsLimits {
                 starting_vcn: body.lowest_vcn,
@@ -1548,7 +1548,7 @@ fn inventory_data_stream(
                         maximum: limits.max_runs_per_stream,
                     });
                 }
-                let runlist = parse_mapping_pairs(
+                let runlist = parse_attribute_mapping_pairs(
                     continuation_body.mapping_pairs,
                     MappingPairsLimits {
                         starting_vcn: continuation_body.lowest_vcn,
@@ -2425,7 +2425,7 @@ fn parse_index_allocation(
             record_number,
             attribute_id: attribute.id,
         })?;
-    let runlist = parse_mapping_pairs(
+    let runlist = parse_attribute_mapping_pairs(
         body.mapping_pairs,
         MappingPairsLimits {
             starting_vcn: 0,
@@ -2475,7 +2475,7 @@ fn read_attribute_value(
                     maximum: limits.max_attribute_bytes,
                 });
             }
-            let runlist = parse_mapping_pairs(
+            let runlist = parse_attribute_mapping_pairs(
                 body.mapping_pairs,
                 MappingPairsLimits {
                     starting_vcn: 0,

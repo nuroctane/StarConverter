@@ -260,6 +260,27 @@ pub fn parse_mapping_pairs(
     bytes: &[u8],
     limits: MappingPairsLimits,
 ) -> Result<NtfsRunlist, MappingPairsError> {
+    parse_mapping_pairs_with_padding(bytes, limits, false)
+}
+
+/// Parses mapping pairs from a validated nonresident attribute's aligned tail.
+///
+/// NTFS-3G can retain resident-value bytes in the final attribute alignment padding after
+/// promotion to nonresident storage. Only the final zero terminator's exact 0..7-byte alignment
+/// tail may contain nonzero bytes here. Longer or unaligned nonzero tails remain refused, and
+/// standalone/canonical mapping-pairs parsing still requires zero padding throughout.
+pub(crate) fn parse_attribute_mapping_pairs(
+    bytes: &[u8],
+    limits: MappingPairsLimits,
+) -> Result<NtfsRunlist, MappingPairsError> {
+    parse_mapping_pairs_with_padding(bytes, limits, true)
+}
+
+fn parse_mapping_pairs_with_padding(
+    bytes: &[u8],
+    limits: MappingPairsLimits,
+    attribute_alignment_padding: bool,
+) -> Result<NtfsRunlist, MappingPairsError> {
     let mut extents = Vec::new();
     let mut offset = 0_usize;
     let mut encoded_runs = 0_usize;
@@ -275,7 +296,12 @@ pub fn parse_mapping_pairs(
         };
         if header == 0 {
             let bytes_consumed = offset + 1;
-            validate_zero_padding(bytes, bytes_consumed)?;
+            if !(attribute_alignment_padding
+                && bytes.len() % 8 == 0
+                && bytes.len() - bytes_consumed <= 7)
+            {
+                validate_zero_padding(bytes, bytes_consumed)?;
+            }
             match limits.expected_next_vcn {
                 Some(expected) if next_vcn != expected => {
                     return Err(MappingPairsError::ExpectedNextVcnMismatch {
@@ -710,6 +736,83 @@ mod tests {
                 value: 0x7f,
             })
         );
+    }
+
+    #[test]
+    fn attribute_alignment_accepts_exact_formatter_origin_resident_slack() {
+        // NTFS-3G ntfscp promotes an 8193-byte named stream: attribute length 88,
+        // mapping-pairs offset 80. These final three bytes are old resident data.
+        let bytes = [0x21, 3, 0, 0x22, 0, 0x37, 0x38, 0x39];
+        let mut config = limits();
+        config.volume_cluster_count = 16_384;
+        config.expected_next_vcn = Some(3);
+        let parsed = parse_attribute_mapping_pairs(&bytes, config).unwrap();
+        assert_eq!(parsed.bytes_consumed, 5);
+        assert_eq!(parsed.encoded_runs, 1);
+        assert_eq!(parsed.next_vcn, 3);
+        assert_eq!(parsed.physical_clusters, 3);
+        assert_eq!(
+            parsed.extents,
+            vec![NtfsExtent {
+                vcn: 0,
+                length: 3,
+                location: ExtentLocation::Physical { lcn: 0x2200 },
+            }]
+        );
+        assert_eq!(
+            parse_mapping_pairs(&bytes, config),
+            Err(MappingPairsError::TrailingNonZeroByte {
+                offset: 5,
+                value: 0x37
+            })
+        );
+        config.expected_next_vcn = Some(4);
+        assert!(matches!(
+            parse_attribute_mapping_pairs(&bytes, config),
+            Err(MappingPairsError::ExpectedNextVcnMismatch { .. })
+        ));
+        config.expected_next_vcn = Some(3);
+        config.volume_cluster_count = 0x2202;
+        assert!(matches!(
+            parse_attribute_mapping_pairs(&bytes, config),
+            Err(MappingPairsError::PhysicalRunOutOfBounds { .. })
+        ));
+    }
+
+    #[test]
+    fn attribute_alignment_padding_never_extends_the_canonical_runlist() {
+        // Exercise representable padding lengths with arbitrary bytes, including headers that
+        // would encode runs if incorrectly interpreted after the real terminator.
+        for consumed in std::iter::once(1).chain(3..=8) {
+            let mut bytes = match consumed {
+                1 => vec![0],
+                width => {
+                    let length_width = u8::try_from(width - 2).unwrap();
+                    let mut encoded = vec![length_width, 1];
+                    encoded.resize(width - 1, 0);
+                    encoded.push(0);
+                    encoded
+                }
+            };
+            let actual_consumed = bytes.len();
+            bytes.resize(8, 0x11);
+            let parsed = parse_attribute_mapping_pairs(&bytes, limits()).unwrap();
+            assert_eq!(parsed.bytes_consumed, actual_consumed);
+            assert_eq!(parsed.encoded_runs, usize::from(consumed != 1));
+        }
+        for bytes in [
+            &[0, 0x11][..],
+            &[0, 0x11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0][..],
+        ] {
+            assert!(matches!(
+                parse_attribute_mapping_pairs(bytes, limits()),
+                Err(MappingPairsError::TrailingNonZeroByte { .. })
+            ));
+        }
+        assert!(matches!(
+            parse_attribute_mapping_pairs(&[0x11, 1, 1], limits()),
+            Err(MappingPairsError::MissingTerminator)
+        ));
     }
 
     #[test]

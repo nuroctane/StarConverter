@@ -21,7 +21,8 @@ use crate::fs::ntfs_bitmap::{NtfsBitmapError, TailEvidence, parse_bitmap};
 use crate::fs::ntfs_discovery::{MftBootstrap, NtfsDiscoveryError, read_mft_record_with_reader};
 use crate::fs::ntfs_record::NtfsFileRecord;
 use crate::fs::ntfs_runlist::{
-    ExtentLocation, MappingPairsError, MappingPairsLimits, NtfsRunlist, parse_mapping_pairs,
+    ExtentLocation, MappingPairsError, MappingPairsLimits, NtfsRunlist,
+    parse_attribute_mapping_pairs,
 };
 use crate::image::{BoundedImageReader, ImageError, ImageFile};
 
@@ -915,7 +916,7 @@ fn parse_stream_extent_runlist(
     let AttributeBody::NonResident(body) = &attribute.body else {
         return Err(kind.unsupported("extent is resident"));
     };
-    let runlist = parse_mapping_pairs(
+    let runlist = parse_attribute_mapping_pairs(
         body.mapping_pairs,
         MappingPairsLimits {
             starting_vcn,

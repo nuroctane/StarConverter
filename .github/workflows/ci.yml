@@ -32,6 +32,7 @@ jobs:
           python3 -m unittest discover -s scripts -p test_external_images.py
           python3 -m unittest discover -s scripts -p test_ntfs_payloads.py
           python3 -m unittest discover -s scripts -p test_large_directory.py
+          python3 -m unittest discover -s scripts -p test_formatter_ads.py
       - name: Generate regular image corpus
         id: generate
         run: cargo test -p starconverter-core --test export_external_fixtures -- --ignored --nocapture

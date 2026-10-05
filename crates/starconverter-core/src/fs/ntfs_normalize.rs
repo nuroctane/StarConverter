@@ -490,7 +490,14 @@ pub fn normalize_inventory(
             },
             link_count: graph_links,
             semantics: ObjectSemantics {
-                has_security_descriptor: standard.security_id.is_some(),
+                // Older STANDARD_INFORMATION records have no security ID, but may carry an
+                // inline SECURITY_DESCRIPTOR. Census evidence proves presence, not capture;
+                // preservation policy must still refuse this unsupported attribute.
+                has_security_descriptor: standard.security_id.is_some()
+                    || source
+                        .attribute_census
+                        .iter()
+                        .any(|attribute| attribute.attribute_type == 0x50),
                 is_reparse_point: source.has_reparse_point,
             },
             streams,
@@ -1256,6 +1263,51 @@ mod tests {
                 SemanticFeature::HardLinks,
             ]
         );
+    }
+
+    #[test]
+    fn inline_security_descriptor_presence_does_not_require_a_security_id() {
+        for resident in [true, false] {
+            let mut source = basic();
+            for object in &mut source.objects {
+                object.standard_information.as_mut().unwrap().security_id = None;
+            }
+            let absent = normalize_inventory(&source, 65_536, LIMITS).unwrap();
+            assert!(
+                !absent
+                    .graph
+                    .features()
+                    .contains(&SemanticFeature::AccessControl)
+            );
+            for object in &mut source.objects {
+                object
+                    .attribute_census
+                    .push(crate::fs::ntfs_inventory::NtfsAttributeEvidence {
+                        attribute_type: 0x50,
+                        name: None,
+                        flags_raw: 0,
+                        flags_unknown_bits: 0,
+                        attribute_id: 7,
+                        resident,
+                    });
+            }
+            let normalized = normalize_inventory(&source, 65_536, LIMITS).unwrap();
+            assert!(
+                normalized
+                    .graph
+                    .features()
+                    .contains(&SemanticFeature::AccessControl)
+            );
+            assert!(
+                normalized
+                    .graph
+                    .objects()
+                    .iter()
+                    .all(|object| { object.semantics.has_security_descriptor })
+            );
+            assert_eq!(normalized.preservation.objects[0].source, source.objects[0]);
+            assert_eq!(normalized.preservation.objects[1].source, source.objects[1]);
+        }
     }
 
     fn file_name_with_namespace(

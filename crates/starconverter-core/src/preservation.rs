@@ -592,11 +592,16 @@ fn ntfs_assessments(
                     .any(|object| object.id == preserved.object)
             })
             .all(|object| {
-                object
+                !object
                     .source
-                    .standard_information
-                    .and_then(|standard| standard.security_id)
-                    .is_none_or(|security_id| matches!(security_id, 0x100 | 0x101))
+                    .attribute_census
+                    .iter()
+                    .any(|attribute| attribute.attribute_type == 0x50)
+                    && object
+                        .source
+                        .standard_information
+                        .and_then(|standard| standard.security_id)
+                        .is_none_or(|security_id| matches!(security_id, 0x100 | 0x101))
             });
         set(
             &mut result,
@@ -3741,6 +3746,49 @@ mod tests {
     }
 
     #[test]
+    fn inline_security_descriptors_are_not_losslessly_allowlisted() {
+        for resident in [true, false] {
+            for mode in [
+                GuaranteeMode::Strict,
+                GuaranteeMode::Escrow,
+                GuaranteeMode::ContentOnly,
+            ] {
+                let mut source = ntfs();
+                source.preservation.objects[0].source.attribute_census.push(
+                    NtfsAttributeEvidence {
+                        attribute_type: 0x50,
+                        name: None,
+                        flags_raw: 0,
+                        flags_unknown_bits: 0,
+                        attribute_id: 9,
+                        resident,
+                    },
+                );
+                let report = evaluate_ntfs(
+                    &source,
+                    FileSystem::ExFat,
+                    mode,
+                    PreservationLimits::default(),
+                )
+                .unwrap();
+                assert_eq!(
+                    disposition(&report, PreservationField::NtfsAttributes),
+                    FieldDisposition::Refusal
+                );
+                if mode == GuaranteeMode::ContentOnly {
+                    assert!(
+                        report
+                            .explicit_losses
+                            .contains(&PreservationField::NtfsAttributes)
+                    );
+                } else {
+                    assert!(report.blockers.contains(&PreservationField::NtfsAttributes));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn unsupported_and_missing_ntfs_attribute_census_is_a_refusal() {
         let mut unsupported = ntfs();
         unsupported.preservation.objects[0]
@@ -3892,6 +3940,37 @@ mod tests {
             decoded.ntfs_security_descriptors,
             Some(NtfsSecurityDescriptorEscrow::PinnedNtfs3gWindows2003 { sds: secure.sds })
         );
+        // A proven global SDS does not prove object-specific inline descriptor bytes.
+        for resident in [true, false] {
+            let mut inline = source.clone();
+            let object = &mut inline.preservation.objects[0].source;
+            object.standard_information.as_mut().unwrap().security_id = None;
+            object.attribute_census.push(NtfsAttributeEvidence {
+                attribute_type: 0x50,
+                name: None,
+                flags_raw: 0,
+                flags_unknown_bits: 0,
+                attribute_id: 9,
+                resident,
+            });
+            let report = evaluate_ntfs(
+                &inline,
+                FileSystem::ExFat,
+                GuaranteeMode::Escrow,
+                PreservationLimits::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                disposition(&report, PreservationField::SecurityDescriptors),
+                FieldDisposition::Refusal
+            );
+            assert!(
+                report
+                    .blockers
+                    .contains(&PreservationField::SecurityDescriptors)
+            );
+            assert!(report.blockers.contains(&PreservationField::NtfsAttributes));
+        }
     }
 
     #[test]
