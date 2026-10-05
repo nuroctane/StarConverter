@@ -88,9 +88,13 @@ sidecar/final pair for the retry, and do not infer that an image conversion comp
 
 ## What escrow cannot do yet
 
-The sidecar is integrity-checked, candidate-bound preservation evidence, but the current pre-alpha does not yet expose a
-command that reapplies NTFS-only semantics after a later reverse conversion. It is not a substitute
-for a source backup. Restoration, in-place rollback/finalize, physical-device recovery, and repair
+The sidecar is integrity-checked, candidate-bound preservation evidence. A supported NTFS→exFAT
+export can return to a new NTFS image using `convert-image --restore-escrow` (or the desktop
+restore-escrow field). Restoration verifies the sidecar direction and source image SHA-256 before
+planning. It restores only the tested, versioned contract described in `COMPLETION_MATRIX.md`,
+including supported extra names, named streams, reparse payloads, timestamps, attributes, serial,
+and label. It does not recreate the original disk layout or every NTFS feature and is not a
+substitute for a source backup. In-place rollback/finalize, physical-device recovery, and repair
 operations remain explicit roadmap gates.
 
 The Windows VHD qualification script is also validation-only: it attaches two repository fixtures

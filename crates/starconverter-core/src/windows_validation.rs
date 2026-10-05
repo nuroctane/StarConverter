@@ -1011,7 +1011,7 @@ mod tests {
             assert_eq!(driver.partition_offset_bytes(), PARTITION_OFFSET_BYTES);
             assert_eq!(driver.payloads().len(), 3);
             assert_eq!(driver.chkdsk_exit_code(), 0);
-            assert!(!driver.chkdsk_output().is_empty());
+            assert_ne!(driver.chkdsk_output(), &[] as &[String]);
         }
     }
 

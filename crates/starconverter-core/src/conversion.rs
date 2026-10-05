@@ -2846,7 +2846,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(decoded.plan_digest, plan.plan_digest());
-        assert!(decoded.relocation_destinations.is_empty());
+        assert_eq!(decoded.relocation_destinations, Vec::new());
         assert_eq!(decoded.target_staging, plan.writes.target_staging_rollback);
         assert_eq!(decoded.backup_boot, plan.writes.backup_boot_rollback);
         assert_eq!(decoded.activation, plan.writes.activation_rollback);

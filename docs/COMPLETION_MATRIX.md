@@ -41,5 +41,6 @@ The current repository is a **copy-conversion pre-alpha**. In-place activation r
 
 The continuous independent image lane now regenerates all 29 corpus artifacts and performs 31
 unmounted exfatprogs/NTFS-3G structural checks with before/after hashes and archived JSON evidence.
-See `EXTERNAL_VALIDATION.md` for its exact scope. This gate does not replace payload-driver,
-Windows CHKDSK, or activation qualification.
+It also performs 30 bounded binary NTFS-3G logical-payload reads with exact lengths and SHA-256
+across rich, edge, and misaligned-source images. See `EXTERNAL_VALIDATION.md` for its exact scope.
+These gates do not replace Windows payload-driver/CHKDSK or activation qualification.

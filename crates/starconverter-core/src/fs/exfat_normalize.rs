@@ -696,7 +696,7 @@ mod tests {
         assert_eq!(normalized.preservation.volume_serial_number, 0x1234_abcd);
         assert!(normalized.preservation.volume_label.is_none());
         assert_eq!(normalized.preservation.filesystem_extents.len(), 2);
-        assert!(normalized.graph.objects()[0].streams.is_empty());
+        assert_eq!(normalized.graph.objects()[0].streams, Vec::new());
         assert_eq!(normalized.preservation.allocated_bad_clusters, 1);
     }
 

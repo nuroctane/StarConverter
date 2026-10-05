@@ -1556,7 +1556,7 @@ mod tests {
         )
         .unwrap();
         assert!(spill.is_spilled());
-        assert!(!spill.block_vcns.is_empty());
+        assert_ne!(spill.block_vcns, Vec::<u64>::new());
         validate_serialized_ntfs_directory_index(
             &spill,
             &table,

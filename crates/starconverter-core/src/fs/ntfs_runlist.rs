@@ -654,13 +654,13 @@ mod tests {
     #[test]
     fn accepts_empty_list_and_zero_length_sparse_compatibility_run() {
         let empty = parse_mapping_pairs(&[0, 0], limits()).expect("empty terminated runlist");
-        assert!(empty.extents.is_empty());
+        assert_eq!(empty.extents, Vec::new());
         assert_eq!(empty.encoded_runs, 0);
         assert_eq!(empty.bytes_consumed, 1);
 
         let zero_sparse = parse_mapping_pairs(&[0x01, 0, 0], limits())
             .expect("NTFS-3G-compatible zero sparse run");
-        assert!(zero_sparse.extents.is_empty());
+        assert_eq!(zero_sparse.extents, Vec::new());
         assert_eq!(zero_sparse.encoded_runs, 1);
         assert_eq!(zero_sparse.decoded_clusters, 0);
     }

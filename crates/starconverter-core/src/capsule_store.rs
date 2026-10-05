@@ -1359,7 +1359,7 @@ mod tests {
 
             let on_disk = fs::read(&capsule).unwrap();
             if boundary == CapsuleFaultBoundary::BeforeWrite {
-                assert!(on_disk.is_empty());
+                assert_eq!(on_disk, Vec::<u8>::new());
                 assert!(CapsuleStore::resume_recovering(&capsule, &image, limits()).is_err());
             } else {
                 assert_eq!(on_disk, initial);

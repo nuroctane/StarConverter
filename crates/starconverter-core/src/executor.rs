@@ -1404,7 +1404,7 @@ mod tests {
                     .unwrap();
                 recorder.seen
             };
-            assert!(!discovery.is_empty());
+            assert_ne!(discovery, Vec::new());
             assert!(discovery.iter().all(|point| point.kind == kind));
             for cut in 0..discovery.len() {
                 let temp = TempImage::new(&original);

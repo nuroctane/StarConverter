@@ -2002,7 +2002,7 @@ mod tests {
                 .expect("evaluate policy")
                 .expect("normalized policy");
         assert!(!report.permitted);
-        assert!(!report.blockers.is_empty());
+        assert_ne!(report.blockers, Vec::new());
         let rendered = render_preservation_policy(Some(&report));
         assert!(rendered.contains("| status      : REFUSED"));
         assert!(rendered.contains("[BLOCK]"));
@@ -2018,7 +2018,7 @@ mod tests {
             evaluate_inspection_policy(&inspection, FileSystem::Ntfs, GuaranteeMode::ContentOnly)
                 .expect("evaluate policy")
                 .expect("normalized policy");
-        assert!(!report.explicit_losses.is_empty());
+        assert_ne!(report.explicit_losses, Vec::new());
         assert!(report.escrow.is_none());
         let rendered = render_preservation_policy(Some(&report));
         assert!(rendered.contains("[LOSS]"));

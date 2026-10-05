@@ -1705,7 +1705,7 @@ mod tests {
                 .unwrap();
             assert!(preserved.source.is_metadata);
             assert!(preserved.source.standard_information.is_none());
-            assert!(preserved.source.file_names.is_empty());
+            assert_eq!(preserved.source.file_names, Vec::new());
         }
         let extend = normalized
             .preservation

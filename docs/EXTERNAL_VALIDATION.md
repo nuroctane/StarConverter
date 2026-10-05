@@ -345,9 +345,23 @@ the corresponding filesystem partition images are checked directly.
 The runner records distro package versions in its log and uploads a create-new JSON report with
 every command, exit status, transcript, and before/after SHA-256 for all 29 artifacts. It checks the
 hashes even after tool failures and timeouts. A failed validator or changed artifact makes the job
-fail. This is recurring independent structural evidence; it does not qualify Windows drivers,
-prove every logical payload, or authorize in-place activation. The existing WSL mount-based
-runner remains a separate, broader qualification lane.
+fail. This is recurring independent structural evidence. The existing WSL mount-based runner
+remains a separate, broader qualification lane.
+
+The same job runs `scripts/validate-ntfs-payloads.py`, which makes 30 binary `ntfscat` reads:
+three rich-corpus files in each of three NTFS images, ten edge-corpus files in each of two NTFS
+images, and the misaligned-source relocation payload. The eight inputs (six regular images and
+two manifests) must be unaliased regular files. Bounded, strict UTF-8 TSV manifests must match
+the deterministic exporter expectations before any reader starts. Every output must have a
+successful exit status, exact logical byte length, and exact SHA-256; even an empty output cannot
+pass after a failed tool exit. Binary stdout and diagnostics are capped, hung readers are killed,
+and all eight input hashes are compared again after failures. A separate create-new
+`ntfs-payload-report.json` records expected/actual sizes and digests without embedding file bytes.
+Harness regressions cover corrupt, truncated, excess, empty, binary, and Unicode outputs, bad
+manifests, output floods, timeouts, linked inputs, mutation, and report no-clobber behavior.
+
+These checks establish the selected logical payloads, not directory completeness, Windows driver
+compatibility, preservation of all metadata or specialized NTFS features, or in-place activation.
 
 The CI corpus lives in an isolated job workspace. The harness validates paths before starting
 external tools; it does not establish exclusion against a hostile process replacing files during

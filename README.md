@@ -68,9 +68,12 @@ cannot:
 | **Escrow** | Preserve ordinary exFAT usability and store NTFS-only semantics in a checksummed capsule for restoration. |
 | **Content only** | Preserve file bytes and common metadata, with no full semantic round-trip promise. |
 
-Escrow capture, checksumming, and candidate binding are implemented, but the command which reapplies
-that evidence during a later exFAT→NTFS restoration is not. Escrow output is therefore preservation
-evidence in this pre-alpha, not yet a completed round-trip restoration workflow.
+Escrow capture, checksumming, candidate binding, and bounded restoration to a new NTFS image are
+implemented. `convert-image --restore-escrow PATH` consumes the sidecar from the NTFS→exFAT export
+only after its direction and candidate SHA-256 match the selected exFAT source. Tested extra names,
+named streams, reparse payloads, timestamps, attributes, serial, and label can be restored; this
+does not recreate the original disk layout or promise restoration of every NTFS feature. See the
+exact supported contract in [`docs/COMPLETION_MATRIX.md`](docs/COMPLETION_MATRIX.md).
 
 No mode can protect against physical media failure, faulty firmware, bad RAM, or a device that lies
 about completed cache flushes. A backup remains mandatory for valuable data.
@@ -133,6 +136,7 @@ cargo run -p starconverter-cli -- demo
 cargo run -p starconverter-cli -- inspect "C:\path\to\volume.img"
 cargo run -p starconverter-cli -- preview "C:\path\to\volume.img" --mode escrow
 cargo run -p starconverter-cli -- convert-image "C:\path\source.img" "C:\path\new-target.img" --mode escrow
+cargo run -p starconverter-cli -- convert-image "C:\path\exported-exfat.img" "C:\path\restored-ntfs.img" --to ntfs --mode escrow --restore-escrow "C:\path\exported-exfat.img.starconverter-escrow"
 cargo run -p starconverter-cli -- verify-export "C:\path\new-target.img" "C:\path\new-target.img.starconverter-escrow" --source "C:\path\source.img"
 cargo run -p starconverter-cli -- verify-windows-report "C:\path\windows-validation.json"
 cargo run -p starconverter-gui

@@ -3882,7 +3882,7 @@ mod tests {
         });
         output.textures_delta.clear();
 
-        assert!(!observed_sizes.is_empty());
+        assert_ne!(observed_sizes, Vec::new());
         for size in observed_sizes {
             assert!(
                 size.x >= MIN_INTERACTION_SIZE && size.y >= MIN_INTERACTION_SIZE,

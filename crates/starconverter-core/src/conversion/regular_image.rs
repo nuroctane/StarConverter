@@ -2306,7 +2306,7 @@ mod tests {
     #[test]
     fn stages_only_through_target_staged_and_flushes_capsule_after_image() {
         let (_dir, image_path, capsule_path, prepared) = fixture();
-        assert!(prepared.layout().relocations.is_empty());
+        assert_eq!(prepared.layout().relocations, Vec::new());
         let image = ImageFile::open(&image_path).unwrap();
         let identity = image.identity().clone();
         drop(image);

@@ -3956,7 +3956,7 @@ mod tests {
         )
         .unwrap();
         let solved = solve_lossless_ntfs_to_exfat(draft, LayoutLimits::default()).unwrap();
-        assert!(solved.layout().relocations.is_empty());
+        assert_eq!(solved.layout().relocations, Vec::new());
         assert_eq!(solved.layout().materializations.len(), 1);
         let preview =
             preview_exfat_phase_writes(&source, &solved.destination, PreimageLimits::default())
@@ -5228,7 +5228,7 @@ mod tests {
         )
         .unwrap();
         let solved = solve_lossless_ntfs_to_exfat(draft, LayoutLimits::default()).unwrap();
-        assert!(solved.layout().relocations.is_empty());
+        assert_eq!(solved.layout().relocations, Vec::new());
         assert_eq!(solved.layout().materializations.len(), 1);
         let destination_range = solved.layout().materializations[0].destinations[0];
         assert_eq!(destination_range.length, 8192);
@@ -5298,7 +5298,7 @@ mod tests {
         )
         .unwrap();
         let solved = solve_lossless_ntfs_to_exfat(draft, LayoutLimits::default()).unwrap();
-        assert!(solved.layout().relocations.is_empty());
+        assert_eq!(solved.layout().relocations, Vec::new());
         assert_eq!(solved.layout().materializations.len(), 1);
         let destination_range = solved.layout().materializations[0].destinations[0];
         assert_eq!(destination_range.length, 3 * 4096);
@@ -5377,7 +5377,7 @@ mod tests {
                     && stream.flags.compression_block_bytes == 8192)
         );
         let solved = solve_lossless_ntfs_to_exfat(draft, LayoutLimits::default()).unwrap();
-        assert!(solved.layout().relocations.is_empty());
+        assert_eq!(solved.layout().relocations, Vec::new());
         assert_eq!(solved.layout().materializations.len(), 1);
         let destination_range = solved.layout().materializations[0].destinations[0];
         assert_eq!(destination_range.length, 4096);
@@ -6616,7 +6616,7 @@ mod tests {
         )
         .unwrap();
         let solved = solve_lossless_ntfs_to_exfat(draft, LayoutLimits::default()).unwrap();
-        assert!(solved.layout().relocations.is_empty());
+        assert_eq!(solved.layout().relocations, Vec::new());
         assert_eq!(solved.layout().materializations.len(), 1);
         let destination_range = solved.layout().materializations[0].destinations[0];
         assert_eq!(destination_range.length, 8192);
@@ -6684,7 +6684,7 @@ mod tests {
         )
         .unwrap();
         let solved = solve_lossless_ntfs_to_exfat(draft, LayoutLimits::default()).unwrap();
-        assert!(solved.layout().relocations.is_empty());
+        assert_eq!(solved.layout().relocations, Vec::new());
         assert_eq!(solved.layout().materializations.len(), 1);
         let destination_range = solved.layout().materializations[0].destinations[0];
         let preview =
@@ -6790,7 +6790,7 @@ mod tests {
         )
         .unwrap();
         let solved = solve_lossless_ntfs_to_exfat(draft, LayoutLimits::default()).unwrap();
-        assert!(solved.layout().relocations.is_empty());
+        assert_eq!(solved.layout().relocations, Vec::new());
         assert_eq!(solved.layout().materializations.len(), 1);
         let destination_range = solved.layout().materializations[0].destinations[0];
         assert_eq!(destination_range.length, 8192);
@@ -6944,7 +6944,7 @@ mod tests {
         )
         .unwrap();
         let solved = solve_lossless_exfat_to_ntfs(draft, LayoutLimits::default()).unwrap();
-        assert!(solved.layout().relocations.is_empty());
+        assert_eq!(solved.layout().relocations, Vec::new());
         assert_eq!(solved.layout().materializations.len(), 1);
         let destination_range = solved.layout().materializations[0].destinations[0];
         assert_eq!(destination_range.length, 8192);
@@ -7023,7 +7023,7 @@ mod tests {
         )
         .unwrap();
         let solved = solve_lossless_exfat_to_ntfs(draft, LayoutLimits::default()).unwrap();
-        assert!(solved.layout().relocations.is_empty());
+        assert_eq!(solved.layout().relocations, Vec::new());
         assert_eq!(solved.layout().materializations.len(), 1);
         let destination_range = solved.layout().materializations[0].destinations[0];
         assert_eq!(destination_range.length, 4096);

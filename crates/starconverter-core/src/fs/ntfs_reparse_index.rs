@@ -1459,7 +1459,7 @@ mod tests {
             NtfsReparseIndexLimits::default(),
         )
         .unwrap();
-        assert!(validated.keys.is_empty());
+        assert_eq!(validated.keys, Vec::new());
     }
 
     #[test]

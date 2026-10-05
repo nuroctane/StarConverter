@@ -3160,15 +3160,15 @@ mod tests {
                 match mode {
                     GuaranteeMode::Strict => {
                         assert!(report.escrow.is_none());
-                        assert!(report.explicit_losses.is_empty());
+                        assert_eq!(report.explicit_losses, Vec::new());
                     }
                     GuaranteeMode::Escrow => {
                         assert!(report.escrow.is_some());
-                        assert!(report.explicit_losses.is_empty());
+                        assert_eq!(report.explicit_losses, Vec::new());
                     }
                     GuaranteeMode::ContentOnly => {
                         assert!(report.escrow.is_none());
-                        assert!(!report.explicit_losses.is_empty());
+                        assert_ne!(report.explicit_losses, Vec::new());
                     }
                 }
             }
@@ -3191,7 +3191,7 @@ mod tests {
             disposition(&report, PreservationField::VolumeSerial),
             FieldDisposition::CanonicalTransform
         );
-        assert!(report.explicit_losses.is_empty());
+        assert_eq!(report.explicit_losses, Vec::new());
         assert!(report.escrow.is_none());
     }
 
@@ -3218,7 +3218,7 @@ mod tests {
         assert_eq!(decoded.source, FileSystem::Ntfs);
         assert_eq!(decoded.target, FileSystem::ExFat);
         assert_eq!(decoded.records.len(), 1);
-        assert!(!decoded.records[0].value.is_empty());
+        assert_ne!(decoded.records[0].value, Vec::<u8>::new());
         assert_eq!(
             decoded.ntfs_volume_identity,
             Some(NtfsVolumeIdentity {

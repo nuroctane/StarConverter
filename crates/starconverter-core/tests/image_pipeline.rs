@@ -171,7 +171,7 @@ fn assert_activation_blocked(
             gaps,
         }) => {
             assert_eq!(actual, filesystem);
-            assert!(!gaps.is_empty());
+            assert_ne!(gaps, &[] as &[&str]);
         }
         other => panic!("expected activation gate, got {other:?}"),
     }

@@ -2744,7 +2744,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(plan.relocations.is_empty());
+        assert_eq!(plan.relocations, Vec::new());
         assert_eq!(plan.materializations.len(), 1);
         assert_eq!(plan.materializations[0].stream, StreamId(7));
         assert_eq!(
@@ -3185,7 +3185,7 @@ mod tests {
                 },
             ]
         );
-        assert!(exact.is_empty());
+        assert_eq!(exact, Vec::new());
     }
 
     #[test]
