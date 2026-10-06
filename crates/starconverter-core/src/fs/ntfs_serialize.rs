@@ -71,6 +71,9 @@ use crate::fs::ntfs_reparse_index::{
 use crate::fs::ntfs_secure::{
     NtfsSecureLimits, NtfsSecureMetadata, NtfsSecureProfile, generate_ntfs_secure_metadata,
 };
+use crate::fs::ntfs_security_descriptor::{
+    NtfsSecurityDescriptorError, NtfsSecurityDescriptorLimits, validate_ntfs_security_descriptor,
+};
 use crate::fs::ntfs_upcase_serialize::{
     NtfsUpcaseError, NtfsUpcaseLimits, NtfsUpcaseTable, generate_ntfs3g_windows61_upcase,
 };
@@ -94,6 +97,7 @@ const FILE_RECORD_DIRECTORY: u16 = 0x0002;
 const STANDARD_INFORMATION: u32 = 0x10;
 const ATTRIBUTE_LIST: u32 = 0x20;
 const FILE_NAME: u32 = 0x30;
+const SECURITY_DESCRIPTOR: u32 = 0x50;
 const ATTRIBUTE_LIST_ENTRY_HEADER: usize = 26;
 /// Fail closed rather than inventing a non-resident `$ATTRIBUTE_LIST`.
 const MAX_FILE_EXTENSION_RECORDS: usize = 4096;
@@ -177,6 +181,10 @@ pub struct NtfsVolumeProfile<'a> {
     pub bad_cluster_ranges: &'a [ByteRange],
     /// Exact resident `$REPARSE_POINT` attribute values for dest objects.
     pub reparse_points: &'a [(ObjectId, &'a [u8])],
+    /// Exact inline `$SECURITY_DESCRIPTOR` values for dest objects, emitted as resident
+    /// attributes. Each must pass the bounded self-relative validator. An object listed here may
+    /// carry security ID 0 in `$STANDARD_INFORMATION`, meaning the inline descriptor governs.
+    pub security_descriptors: &'a [(ObjectId, &'a [u8])],
 }
 
 /// The four timestamps stored by both `$STANDARD_INFORMATION` and `$FILE_NAME`.
@@ -211,7 +219,9 @@ pub struct NtfsObjectMetadata {
     pub timestamps: NtfsObjectTimestamps,
     pub dos_file_attributes: u32,
     /// `$Secure` identifier. The current profile accepts only its pinned ordinary read/write
-    /// descriptor because exFAT supplies no ACL semantics from which to infer another descriptor.
+    /// descriptor because exFAT supplies no ACL semantics from which to infer another descriptor,
+    /// or zero when the object carries an exact inline descriptor in
+    /// [`NtfsVolumeProfile::security_descriptors`].
     pub security_id: u32,
 }
 
@@ -289,6 +299,7 @@ pub struct NtfsDestinationDraft {
     volume_label: Option<Vec<u16>>,
     bad_cluster_ranges: Vec<ByteRange>,
     reparse_points: Vec<(ObjectId, Vec<u8>)>,
+    security_descriptors: Vec<(ObjectId, Vec<u8>)>,
     limits: NtfsSerializeLimits,
 }
 
@@ -360,6 +371,11 @@ pub enum NtfsSerializeError {
     ObjectMetadataSecurityProfileMismatch {
         object: ObjectId,
         security_id: u32,
+    },
+    /// An inline `$SECURITY_DESCRIPTOR` value is outside the bounded self-relative profile.
+    InvalidSecurityDescriptor {
+        object: ObjectId,
+        source: NtfsSecurityDescriptorError,
     },
     EntryLimitExceeded {
         actual: usize,
@@ -532,6 +548,11 @@ impl fmt::Display for NtfsSerializeError {
             } => write!(
                 f,
                 "object {} security ID {security_id:#x} is not the pinned ordinary read/write `$Secure` descriptor {NTFS3G_SECURITY_ID_READ_WRITE:#x}",
+                object.0
+            ),
+            Self::InvalidSecurityDescriptor { object, source } => write!(
+                f,
+                "object {} inline $SECURITY_DESCRIPTOR is outside the supported profile: {source}",
                 object.0
             ),
             Self::EntryLimitExceeded { actual, maximum } => {
@@ -1005,6 +1026,11 @@ pub fn draft_ntfs_destination_with_metadata_and_volume(
             .iter()
             .map(|(object, payload)| (*object, payload.to_vec()))
             .collect(),
+        security_descriptors: volume
+            .security_descriptors
+            .iter()
+            .map(|(object, payload)| (*object, payload.to_vec()))
+            .collect(),
         limits,
     })
 }
@@ -1028,6 +1054,11 @@ pub fn finalize_ntfs_destination(
         .iter()
         .map(|(object, payload)| (*object, payload.as_slice()))
         .collect();
+    let security_descriptors: Vec<(ObjectId, &[u8])> = draft
+        .security_descriptors
+        .iter()
+        .map(|(object, payload)| (*object, payload.as_slice()))
+        .collect();
     let mut plan = plan_ntfs_destination_impl(
         relocated_graph,
         draft.inputs,
@@ -1036,6 +1067,7 @@ pub fn finalize_ntfs_destination(
             volume_label: draft.volume_label.as_deref(),
             bad_cluster_ranges: &draft.bad_cluster_ranges,
             reparse_points: &reparse_points,
+            security_descriptors: &security_descriptors,
         },
         draft.limits,
         true,
@@ -1381,6 +1413,7 @@ fn allocate_file_attribute_list_runs(
     records: &BTreeMap<ObjectId, u64>,
     metadata_by_object: &BTreeMap<ObjectId, NtfsObjectMetadata>,
     reparse_by_object: &BTreeMap<ObjectId, &[u8]>,
+    security_by_object: &BTreeMap<ObjectId, &[u8]>,
     layout: MetadataLayout,
     limits: NtfsSerializeLimits,
     overflow_runs: &BTreeMap<StreamId, NamedResidentOverflow>,
@@ -1401,6 +1434,7 @@ fn allocate_file_attribute_list_runs(
             layout,
             metadata_by_object[&object.id],
             reparse_by_object.get(&object.id).copied(),
+            security_by_object.get(&object.id).copied(),
             limits,
             PayloadPlacementMode::Final,
             overflow_runs,
@@ -1427,6 +1461,7 @@ fn allocate_directory_attribute_list_runs(
     records: &BTreeMap<ObjectId, u64>,
     metadata_by_object: &BTreeMap<ObjectId, NtfsObjectMetadata>,
     reparse_by_object: &BTreeMap<ObjectId, &[u8]>,
+    security_by_object: &BTreeMap<ObjectId, &[u8]>,
     directory_indexes: &[PlannedDirectoryIndex],
     layout: MetadataLayout,
     limits: NtfsSerializeLimits,
@@ -1449,6 +1484,7 @@ fn allocate_directory_attribute_list_runs(
                 .map_or(&[][..], Vec::as_slice)
         };
         let reparse = reparse_by_object.get(&object.id).copied();
+        let security_descriptor = security_by_object.get(&object.id).copied();
         let mut attributes = directory_prefix_attributes(
             record_number,
             names,
@@ -1456,9 +1492,8 @@ fn allocate_directory_attribute_list_runs(
             metadata_by_object[&object.id],
             reparse,
         )?;
-        let reparse_suffix = directory_reparse_suffix(object.id, reparse, limits)?;
-        if !directory_needs_attribute_list(object.id, &attributes, layout.cluster, &reparse_suffix)?
-        {
+        let exact_suffix = directory_exact_suffix(object.id, reparse, security_descriptor, limits)?;
+        if !directory_needs_attribute_list(object.id, &attributes, layout.cluster, &exact_suffix)? {
             continue;
         }
         let index = directory_index_by_object
@@ -1477,6 +1512,7 @@ fn allocate_directory_attribute_list_runs(
             index,
             layout.cluster,
             reparse,
+            security_descriptor,
             limits,
         )?;
         if !directory_needs_nonresident_attribute_list(&attributes)? {
@@ -1566,9 +1602,11 @@ fn plan_ntfs_destination_impl(
     let mut objects: Vec<&ObjectRecord> = graph.objects().iter().collect();
     objects.sort_unstable_by_key(|object| object.id);
     let reparse_by_object = reparse_payload_map(volume.reparse_points, &objects)?;
+    let security_by_object = security_descriptor_map(volume.security_descriptors, &objects)?;
     validate_objects(&objects, graph, limits, &reparse_by_object, payload_mode)?;
     validate_names(graph.entries(), &upcase)?;
-    let metadata_by_object = validate_object_metadata(&objects, metadata, limits.max_objects)?;
+    let metadata_by_object =
+        validate_object_metadata(&objects, metadata, &security_by_object, limits.max_objects)?;
 
     let mut placements = Vec::new();
     placements
@@ -1638,6 +1676,7 @@ fn plan_ntfs_destination_impl(
             &record_by_object,
             &metadata_by_object,
             &reparse_by_object,
+            &security_by_object,
             packing_layout,
             limits,
             &overflow_runs,
@@ -1652,6 +1691,7 @@ fn plan_ntfs_destination_impl(
         &record_by_object,
         &metadata_by_object,
         &reparse_by_object,
+        &security_by_object,
         packing_layout,
         limits,
         payload_mode,
@@ -1693,6 +1733,7 @@ fn plan_ntfs_destination_impl(
         graph,
         &metadata_by_object,
         &reparse_by_object,
+        &security_by_object,
         preliminary_layout,
         inputs.timestamp,
         &upcase,
@@ -1762,6 +1803,7 @@ fn plan_ntfs_destination_impl(
             &record_by_object,
             &metadata_by_object,
             &reparse_by_object,
+            &security_by_object,
             &directory_indexes,
             layout,
             limits,
@@ -1835,6 +1877,7 @@ fn plan_ntfs_destination_impl(
         layout.cluster,
         first_extension_record,
         reparse_by_object.get(&graph.root()).copied(),
+        security_by_object.get(&graph.root()).copied(),
         limits,
         &list_runs,
     )?;
@@ -1912,6 +1955,7 @@ fn plan_ntfs_destination_impl(
                 layout.cluster,
                 next_extension,
                 reparse_by_object.get(&object.id).copied(),
+                security_by_object.get(&object.id).copied(),
                 limits,
                 &list_runs,
             )?,
@@ -1924,6 +1968,7 @@ fn plan_ntfs_destination_impl(
                 layout,
                 metadata_by_object[&object.id],
                 reparse_by_object.get(&object.id).copied(),
+                security_by_object.get(&object.id).copied(),
                 limits,
                 payload_mode,
                 next_extension,
@@ -2159,6 +2204,7 @@ fn validate_volume_profile(volume: NtfsVolumeProfile<'_>) -> Result<(), NtfsSeri
 fn validate_object_metadata(
     objects: &[&ObjectRecord],
     metadata: &[NtfsObjectMetadata],
+    security_by_object: &BTreeMap<ObjectId, &[u8]>,
     maximum: usize,
 ) -> Result<BTreeMap<ObjectId, NtfsObjectMetadata>, NtfsSerializeError> {
     if metadata.len() > maximum {
@@ -2198,7 +2244,10 @@ fn validate_object_metadata(
                 attributes: value.dos_file_attributes,
             });
         }
-        if value.security_id != NTFS3G_SECURITY_ID_READ_WRITE {
+        // Security ID 0 is only meaningful when an inline descriptor governs the object.
+        let inline_governed =
+            value.security_id == 0 && security_by_object.contains_key(&value.object);
+        if value.security_id != NTFS3G_SECURITY_ID_READ_WRITE && !inline_governed {
             return Err(NtfsSerializeError::ObjectMetadataSecurityProfileMismatch {
                 object: value.object,
                 security_id: value.security_id,
@@ -2306,6 +2355,27 @@ fn reparse_payload_map<'a>(
                 actual: payload.len(),
             });
         }
+        if map.insert(object, payload).is_some() {
+            return Err(NtfsSerializeError::DuplicateObjectMetadata { object });
+        }
+    }
+    Ok(map)
+}
+
+/// Validates every inline descriptor against the bounded self-relative profile before any record
+/// is budgeted, so a malformed descriptor is a typed refusal rather than a record-overflow symptom.
+fn security_descriptor_map<'a>(
+    descriptors: &'a [(ObjectId, &'a [u8])],
+    objects: &[&ObjectRecord],
+) -> Result<BTreeMap<ObjectId, &'a [u8]>, NtfsSerializeError> {
+    let known: BTreeSet<ObjectId> = objects.iter().map(|object| object.id).collect();
+    let mut map = BTreeMap::new();
+    for &(object, payload) in descriptors {
+        if !known.contains(&object) {
+            return Err(NtfsSerializeError::UnknownObjectMetadata { object });
+        }
+        validate_ntfs_security_descriptor(payload, NtfsSecurityDescriptorLimits::default())
+            .map_err(|source| NtfsSerializeError::InvalidSecurityDescriptor { object, source })?;
         if map.insert(object, payload).is_some() {
             return Err(NtfsSerializeError::DuplicateObjectMetadata { object });
         }
@@ -3518,6 +3588,7 @@ fn plan_directory_indexes(
     graph: &ObjectGraph,
     metadata_by_object: &BTreeMap<ObjectId, NtfsObjectMetadata>,
     reparse_by_object: &BTreeMap<ObjectId, &[u8]>,
+    security_by_object: &BTreeMap<ObjectId, &[u8]>,
     layout: MetadataLayout,
     timestamp: u64,
     upcase: &NtfsUpcaseTable,
@@ -3540,7 +3611,9 @@ fn plan_directory_indexes(
         let record_number = records[&object.id];
         let object_metadata = metadata_by_object[&object.id];
         let reparse_point = reparse_by_object.get(&object.id).copied();
-        let reparse_suffix = directory_reparse_suffix(object.id, reparse_point, limits)?;
+        let security_descriptor = security_by_object.get(&object.id).copied();
+        let reparse_suffix =
+            directory_exact_suffix(object.id, reparse_point, security_descriptor, limits)?;
         let prefix = if object.id == graph.root() {
             let root_name = NamespaceEntry {
                 parent: graph.root(),
@@ -3582,7 +3655,7 @@ fn plan_directory_indexes(
                 object.id,
                 &prefix,
                 false,
-                reparse_point.is_some(),
+                reparse_suffix.len(),
                 &reparse_suffix,
                 layout,
                 allow_nonresident_list,
@@ -3624,7 +3697,7 @@ fn plan_directory_indexes(
                     object.id,
                     &prefix,
                     true,
-                    reparse_point.is_some(),
+                    reparse_suffix.len(),
                     &spill_suffix,
                     layout,
                     allow_nonresident_list,
@@ -3795,21 +3868,20 @@ fn dummy_attribute_list_continuation() -> Result<Vec<u8>, NtfsSerializeError> {
     nonresident_attribute_from_pairs(ATTRIBUTE_LIST, &pairs, 1, 1, 0, 0, 0, u16::MAX - 1, false)
 }
 
+/// `exact_attributes` counts the unnamed exact attributes (`$SECURITY_DESCRIPTOR`,
+/// `$REPARSE_POINT`) the directory record carries beyond its names and index.
 fn directory_attribute_list_needs_split(
     prefix: &[Vec<u8>],
     spilled: bool,
-    has_reparse: bool,
+    exact_attributes: usize,
     cluster: u64,
 ) -> Result<bool, NtfsSerializeError> {
     if cluster == 0 {
         return Err(NtfsSerializeError::ArithmeticOverflow);
     }
-    let mut extra = if spilled { 3_usize } else { 1_usize };
-    if has_reparse {
-        extra = extra
-            .checked_add(1)
-            .ok_or(NtfsSerializeError::ArithmeticOverflow)?;
-    }
+    let extra = if spilled { 3_usize } else { 1_usize }
+        .checked_add(exact_attributes)
+        .ok_or(NtfsSerializeError::ArithmeticOverflow)?;
     let extra_bytes = extra
         .checked_mul(align_eight(
             ATTRIBUTE_LIST_ENTRY_HEADER
@@ -3829,7 +3901,7 @@ fn directory_attribute_list_needs_split(
 fn directory_budget_prefix_with_list(
     prefix: &[Vec<u8>],
     spilled: bool,
-    has_reparse: bool,
+    exact_attributes: usize,
     nonresident: bool,
     layout: MetadataLayout,
 ) -> Result<Vec<Vec<u8>>, NtfsSerializeError> {
@@ -3837,12 +3909,9 @@ fn directory_budget_prefix_with_list(
         return Err(NtfsSerializeError::ArithmeticOverflow);
     }
     let names = prefix.len().saturating_sub(1);
-    let mut extra = if spilled { 4_usize } else { 2_usize };
-    if has_reparse {
-        extra = extra
-            .checked_add(1)
-            .ok_or(NtfsSerializeError::ArithmeticOverflow)?;
-    }
+    let extra = if spilled { 4_usize } else { 2_usize }
+        .checked_add(exact_attributes)
+        .ok_or(NtfsSerializeError::ArithmeticOverflow)?;
     let entries = names
         .checked_add(extra)
         .ok_or(NtfsSerializeError::ArithmeticOverflow)?;
@@ -3853,7 +3922,7 @@ fn directory_budget_prefix_with_list(
     };
     let mut with_list = vec![prefix[0].clone(), list];
     if nonresident
-        && directory_attribute_list_needs_split(prefix, spilled, has_reparse, layout.cluster)?
+        && directory_attribute_list_needs_split(prefix, spilled, exact_attributes, layout.cluster)?
     {
         with_list.push(dummy_attribute_list_continuation()?);
     }
@@ -3865,17 +3934,18 @@ fn directory_list_budget_prefix(
     object: ObjectId,
     prefix: &[Vec<u8>],
     spilled: bool,
-    has_reparse: bool,
+    exact_attributes: usize,
     suffix: &[Vec<u8>],
     layout: MetadataLayout,
     allow_nonresident: bool,
 ) -> Result<Vec<Vec<u8>>, NtfsSerializeError> {
-    let resident = directory_budget_prefix_with_list(prefix, spilled, has_reparse, false, layout)?;
+    let resident =
+        directory_budget_prefix_with_list(prefix, spilled, exact_attributes, false, layout)?;
     match directory_index_root_budget(object, &resident, suffix) {
         Ok(_) => Ok(resident),
         Err(NtfsSerializeError::DirectoryIndexOverflow { .. }) if allow_nonresident => {
             let nonresident =
-                directory_budget_prefix_with_list(prefix, spilled, has_reparse, true, layout)?;
+                directory_budget_prefix_with_list(prefix, spilled, exact_attributes, true, layout)?;
             directory_index_root_budget(object, &nonresident, suffix)?;
             Ok(nonresident)
         }
@@ -3913,15 +3983,23 @@ fn directory_reparse_attribute(
     resident_attribute(REPARSE_POINT, None, instance, payload)
 }
 
-fn directory_reparse_suffix(
+/// Budget stand-ins for the exact unnamed attributes a directory record carries besides its
+/// names and `$I30` index: `$SECURITY_DESCRIPTOR` (type 0x50, before the index root) and
+/// `$REPARSE_POINT` (type 0xc0, after it). Instance ids here are placeholders; only sizes matter.
+fn directory_exact_suffix(
     object: ObjectId,
-    payload: Option<&[u8]>,
+    reparse_point: Option<&[u8]>,
+    security_descriptor: Option<&[u8]>,
     limits: NtfsSerializeLimits,
 ) -> Result<Vec<Vec<u8>>, NtfsSerializeError> {
-    match payload {
-        Some(bytes) => Ok(vec![directory_reparse_attribute(object, bytes, limits, 5)?]),
-        None => Ok(Vec::new()),
+    let mut suffix = Vec::new();
+    if let Some(bytes) = security_descriptor {
+        suffix.push(resident_attribute(SECURITY_DESCRIPTOR, None, 6, bytes)?);
     }
+    if let Some(bytes) = reparse_point {
+        suffix.push(directory_reparse_attribute(object, bytes, limits, 5)?);
+    }
+    Ok(suffix)
 }
 
 fn directory_prefix_attributes(
@@ -4138,6 +4216,7 @@ fn build_directory_record(
     cluster: u64,
     first_extension_record: u64,
     reparse_point: Option<&[u8]>,
+    security_descriptor: Option<&[u8]>,
     limits: NtfsSerializeLimits,
     list_runs: &BTreeMap<u64, NamedResidentOverflow>,
 ) -> Result<PackedFileRecords, NtfsSerializeError> {
@@ -4158,9 +4237,10 @@ fn build_directory_record(
         object_metadata,
         reparse_point,
     )?;
-    let reparse_suffix = directory_reparse_suffix(index.object, reparse_point, limits)?;
+    let exact_suffix =
+        directory_exact_suffix(index.object, reparse_point, security_descriptor, limits)?;
     let needs_list =
-        directory_needs_attribute_list(index.object, &attributes, cluster, &reparse_suffix)?;
+        directory_needs_attribute_list(index.object, &attributes, cluster, &exact_suffix)?;
     let next_id = hard_links
         .checked_add(1)
         .ok_or(NtfsSerializeError::ArithmeticOverflow)?;
@@ -4170,6 +4250,7 @@ fn build_directory_record(
         index,
         cluster,
         reparse_point,
+        security_descriptor,
         limits,
     )?;
     if !needs_list {
@@ -4229,8 +4310,21 @@ fn append_directory_index_attributes(
     index: &PlannedDirectoryIndex,
     cluster: u64,
     reparse_point: Option<&[u8]>,
+    security_descriptor: Option<&[u8]>,
     limits: NtfsSerializeLimits,
 ) -> Result<(), NtfsSerializeError> {
+    // Attribute type 0x50 sorts between the `$FILE_NAME`s and `$INDEX_ROOT` (0x90).
+    if let Some(payload) = security_descriptor {
+        attributes.push(resident_attribute(
+            SECURITY_DESCRIPTOR,
+            None,
+            next_id,
+            payload,
+        )?);
+        next_id = next_id
+            .checked_add(1)
+            .ok_or(NtfsSerializeError::ArithmeticOverflow)?;
+    }
     let i30: Vec<u16> = "$I30".encode_utf16().collect();
     attributes.push(resident_attribute(
         INDEX_ROOT,
@@ -4395,8 +4489,8 @@ fn plan_directory_attribute_groups(
     let mut file_names = Vec::new();
     for (index, attribute) in attributes.iter().enumerate() {
         match attribute_type_of(attribute)? {
-            STANDARD_INFORMATION | ATTRIBUTE_LIST | INDEX_ROOT | INDEX_ALLOCATION | BITMAP
-            | REPARSE_POINT => {
+            STANDARD_INFORMATION | ATTRIBUTE_LIST | SECURITY_DESCRIPTOR | INDEX_ROOT
+            | INDEX_ALLOCATION | BITMAP | REPARSE_POINT => {
                 base_payload.push(index);
             }
             FILE_NAME => file_names.push(index),
@@ -4535,6 +4629,7 @@ fn count_file_extension_records(
     records: &BTreeMap<ObjectId, u64>,
     metadata_by_object: &BTreeMap<ObjectId, NtfsObjectMetadata>,
     reparse_by_object: &BTreeMap<ObjectId, &[u8]>,
+    security_by_object: &BTreeMap<ObjectId, &[u8]>,
     layout: MetadataLayout,
     limits: NtfsSerializeLimits,
     payload_mode: PayloadPlacementMode,
@@ -4560,6 +4655,7 @@ fn count_file_extension_records(
                     layout,
                     metadata_by_object[&object.id],
                     reparse_by_object.get(&object.id).copied(),
+                    security_by_object.get(&object.id).copied(),
                     limits,
                     payload_mode,
                     overflow_runs,
@@ -4574,6 +4670,7 @@ fn count_file_extension_records(
             }
             ObjectKind::Directory => {
                 let reparse = reparse_by_object.get(&object.id).copied();
+                let security_descriptor = security_by_object.get(&object.id).copied();
                 let prefix = directory_prefix_attributes(
                     record_number,
                     names,
@@ -4581,12 +4678,13 @@ fn count_file_extension_records(
                     metadata_by_object[&object.id],
                     reparse,
                 )?;
-                let reparse_suffix = directory_reparse_suffix(object.id, reparse, limits)?;
+                let exact_suffix =
+                    directory_exact_suffix(object.id, reparse, security_descriptor, limits)?;
                 if directory_needs_attribute_list(
                     object.id,
                     &prefix,
                     layout.cluster,
-                    &reparse_suffix,
+                    &exact_suffix,
                 )? {
                     directory_file_name_extension_count(
                         record_number,
@@ -4758,8 +4856,8 @@ fn directory_needs_nonresident_attribute_list(
     let mut base_lengths = vec![list_attr_len];
     for attribute in attributes {
         match attribute_type_of(attribute)? {
-            STANDARD_INFORMATION | ATTRIBUTE_LIST | INDEX_ROOT | INDEX_ALLOCATION | BITMAP
-            | REPARSE_POINT => {
+            STANDARD_INFORMATION | ATTRIBUTE_LIST | SECURITY_DESCRIPTOR | INDEX_ROOT
+            | INDEX_ALLOCATION | BITMAP | REPARSE_POINT => {
                 base_lengths.push(attribute.len());
             }
             FILE_NAME => {}
@@ -5213,6 +5311,7 @@ fn file_record(
     layout: MetadataLayout,
     metadata: NtfsObjectMetadata,
     reparse_point: Option<&[u8]>,
+    security_descriptor: Option<&[u8]>,
     limits: NtfsSerializeLimits,
     payload_mode: PayloadPlacementMode,
     first_extension_record: u64,
@@ -5232,6 +5331,7 @@ fn file_record(
         layout,
         metadata,
         reparse_point,
+        security_descriptor,
         limits,
         payload_mode,
         overflow_runs,
@@ -5272,6 +5372,7 @@ fn file_attributes(
     layout: MetadataLayout,
     metadata: NtfsObjectMetadata,
     reparse_point: Option<&[u8]>,
+    security_descriptor: Option<&[u8]>,
     limits: NtfsSerializeLimits,
     payload_mode: PayloadPlacementMode,
     overflow_runs: &BTreeMap<StreamId, NamedResidentOverflow>,
@@ -5304,6 +5405,18 @@ fn file_attributes(
             reparse_tag,
         )?;
         attrs.push(resident_attribute(FILE_NAME, None, next_id, &value)?);
+        next_id = next_id
+            .checked_add(1)
+            .ok_or(NtfsSerializeError::ArithmeticOverflow)?;
+    }
+    // Attribute type 0x50 sorts between the `$FILE_NAME`s and the `$DATA` streams (0x80).
+    if let Some(payload) = security_descriptor {
+        attrs.push(resident_attribute(
+            SECURITY_DESCRIPTOR,
+            None,
+            next_id,
+            payload,
+        )?);
         next_id = next_id
             .checked_add(1)
             .ok_or(NtfsSerializeError::ArithmeticOverflow)?;
@@ -8317,6 +8430,7 @@ mod tests {
                     length: 4096,
                 }],
                 reparse_points: &[],
+                security_descriptors: &[],
             },
             NtfsSerializeLimits::default(),
         )
@@ -8437,6 +8551,7 @@ mod tests {
                     length: 4096,
                 }],
                 reparse_points: &[],
+                security_descriptors: &[],
             },
             NtfsSerializeLimits::default(),
         )
@@ -9566,6 +9681,7 @@ mod tests {
                 volume_label: Some(&label),
                 bad_cluster_ranges: &[],
                 reparse_points: &[],
+                security_descriptors: &[],
             },
             NtfsSerializeLimits::default(),
         )
@@ -9604,6 +9720,7 @@ mod tests {
                     volume_label: Some(&too_long),
                     bad_cluster_ranges: &[],
                     reparse_points: &[],
+                    security_descriptors: &[],
                 },
                 NtfsSerializeLimits::default(),
             ),
@@ -9618,10 +9735,175 @@ mod tests {
                     volume_label: Some(&[0xd800]),
                     bad_cluster_ranges: &[],
                     reparse_points: &[],
+                    security_descriptors: &[],
                 },
                 NtfsSerializeLimits::default(),
             ),
             Err(NtfsSerializeError::InvalidVolumeLabel { .. })
+        ));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn inline_security_descriptors_are_emitted_in_order_and_round_trip_exactly() {
+        let graph = two_file_graph();
+        let descriptor = crate::fs::ntfs_security_descriptor::sample_self_relative_descriptor();
+        // The root directory relies solely on its inline descriptor; the first file keeps the
+        // pinned `$Secure` identifier alongside an inline copy; the second file has none.
+        let mut metadata = exact_metadata();
+        metadata[0].security_id = 0;
+        let descriptors: Vec<(ObjectId, &[u8])> = vec![
+            (ObjectId(1), descriptor.as_slice()),
+            (ObjectId(2), descriptor.as_slice()),
+        ];
+        let plan = plan_ntfs_destination_with_metadata_and_volume(
+            &graph,
+            inputs(),
+            &metadata,
+            NtfsVolumeProfile {
+                security_descriptors: &descriptors,
+                ..NtfsVolumeProfile::default()
+            },
+            NtfsSerializeLimits::default(),
+        )
+        .unwrap();
+
+        for (record_number, expect_descriptor) in [(5_usize, true), (27, true), (28, false)] {
+            let parsed = parse_file_record(record(&plan, record_number)).unwrap();
+            let attributes = parse_attribute_list(
+                parsed.repaired_bytes(),
+                usize::from(parsed.attributes_offset),
+                usize::try_from(parsed.bytes_in_use).unwrap(),
+                attr_limits(),
+            )
+            .unwrap();
+            let types: Vec<u32> = attributes
+                .attributes
+                .iter()
+                .map(|attribute| attribute.attribute_type)
+                .collect();
+            let mut sorted = types.clone();
+            sorted.sort_unstable();
+            assert_eq!(types, sorted, "record {record_number} attribute order");
+            let emitted: Vec<&[u8]> = attributes
+                .attributes
+                .iter()
+                .filter(|attribute| attribute.attribute_type == SECURITY_DESCRIPTOR)
+                .map(|attribute| match &attribute.body {
+                    AttributeBody::Resident(resident) => {
+                        assert!(attribute.name.is_none());
+                        resident.value
+                    }
+                    AttributeBody::NonResident(_) => panic!("resident $SECURITY_DESCRIPTOR"),
+                })
+                .collect();
+            let expected: Vec<&[u8]> = if expect_descriptor {
+                vec![descriptor.as_slice()]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(emitted, expected, "record {record_number}");
+        }
+
+        let mut image = vec![0_u8; usize::try_from(IMAGE_BYTES).unwrap()];
+        for write in &plan.staging_writes {
+            let offset = usize::try_from(write.offset).unwrap();
+            image[offset..offset + write.bytes.len()].copy_from_slice(&write.bytes);
+        }
+        let backup = usize::try_from(plan.backup_boot_write.offset).unwrap();
+        image[backup..backup + 512].copy_from_slice(&plan.backup_boot_write.bytes);
+        image[..512].copy_from_slice(&plan.primary_boot_write.bytes);
+        let temp = TempImage::create(&image);
+        let inspection = crate::inspect::inspect_image(&temp.0).unwrap();
+        let inventory = inspection.ntfs_inventory.as_ref().unwrap();
+        for (record_number, expected_id, expected_descriptor) in [
+            (5_u64, Some(0), Some(descriptor.clone())),
+            (
+                27,
+                Some(NTFS3G_SECURITY_ID_READ_WRITE),
+                Some(descriptor.clone()),
+            ),
+            (28, Some(NTFS3G_SECURITY_ID_READ_WRITE), None),
+        ] {
+            let object = inventory
+                .objects
+                .iter()
+                .find(|object| object.reference.record_number == record_number)
+                .unwrap();
+            assert_eq!(
+                object.standard_information.unwrap().security_id,
+                expected_id,
+                "record {record_number}"
+            );
+            assert_eq!(
+                object.has_security_descriptor,
+                expected_descriptor.is_some(),
+                "record {record_number}"
+            );
+            assert_eq!(
+                object.security_descriptor, expected_descriptor,
+                "record {record_number}"
+            );
+        }
+        let normalized = inspection.normalized_ntfs.as_ref().unwrap();
+        assert!(
+            normalized
+                .graph
+                .objects()
+                .iter()
+                .all(|object| object.semantics.has_security_descriptor)
+        );
+        assert!(inspection.profile.inventory_complete);
+
+        // Security ID 0 is refused unless an inline descriptor governs the object.
+        assert!(matches!(
+            plan_ntfs_destination_with_metadata_and_volume(
+                &graph,
+                inputs(),
+                &metadata,
+                NtfsVolumeProfile::default(),
+                NtfsSerializeLimits::default(),
+            ),
+            Err(NtfsSerializeError::ObjectMetadataSecurityProfileMismatch {
+                object: ObjectId(1),
+                security_id: 0,
+            })
+        ));
+        // Malformed descriptors are refused before any bytes are planned.
+        let truncated = &descriptor[..12];
+        let malformed: Vec<(ObjectId, &[u8])> = vec![(ObjectId(1), truncated)];
+        assert!(matches!(
+            plan_ntfs_destination_with_metadata_and_volume(
+                &graph,
+                inputs(),
+                &metadata,
+                NtfsVolumeProfile {
+                    security_descriptors: &malformed,
+                    ..NtfsVolumeProfile::default()
+                },
+                NtfsSerializeLimits::default(),
+            ),
+            Err(NtfsSerializeError::InvalidSecurityDescriptor {
+                object: ObjectId(1),
+                ..
+            })
+        ));
+        // Descriptors for unknown objects are refused.
+        let unknown: Vec<(ObjectId, &[u8])> = vec![(ObjectId(9), descriptor.as_slice())];
+        assert!(matches!(
+            plan_ntfs_destination_with_metadata_and_volume(
+                &graph,
+                inputs(),
+                &metadata,
+                NtfsVolumeProfile {
+                    security_descriptors: &unknown,
+                    ..NtfsVolumeProfile::default()
+                },
+                NtfsSerializeLimits::default(),
+            ),
+            Err(NtfsSerializeError::UnknownObjectMetadata {
+                object: ObjectId(9)
+            })
         ));
     }
 

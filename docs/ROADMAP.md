@@ -59,10 +59,16 @@ point produces an ambiguous writable mount.
 - versioned semantic escrow capture and integrity binding (implemented); restore of extra non-DOS hard links, resident named streams, captured nonempty non-resident named streams, and resident file and directory `$REPARSE_POINT` payloads matches dest objects by dest-native path; create-new NTFS serialize dest-cluster-materializes a non-resident `$ATTRIBUTE_LIST` when the resident form cannot fit the base FILE record, splits file and directory lists that need two or more clusters into a one-cluster first extent plus a VCN-contiguous continuation, and splits `$DATA` mapping pairs that cannot fit one empty FILE record into VCN-contiguous continuation extents; source discovery concatenates same-record `$MFT` `$DATA` fragments, follows record zero's resident or non-resident (VCN-split) `$ATTRIBUTE_LIST` to mapped `$MFT` extension records, and resolves `$MFTMirr::$DATA`, `$MFT::$BITMAP`, `$Volume`, and `$Bitmap` through their own `$ATTRIBUTE_LIST` with VCN-split extents concatenated; rematerialized reparse points populate the `$Extend:$R` view index, which spills into `$INDEX_ALLOCATION:$R` `INDX` records (multi-level when needed) once the resident `$Reparse` root overflows, and the read-only inventory walks resident or spilled `$R` on any NTFS volume and reconciles it against the `$REPARSE_POINT` census (failing closed on stale, unlisted, mismatched, or duplicate keys); the exFAT→NTFS convert path (CLI `--restore-escrow`, GUI restore-escrow field) consumes a candidate-bound NTFS→exFAT sidecar after direction and source-SHA-256 binding checks and restores exact timestamps/attributes/serial/label with the identities, proven by an in-tree NTFS→exFAT(+escrow)→NTFS round trip; named streams the sidecar cannot capture (above the inventory cap, sparse, or LZNT1) travel as hidden+system dest-native carrier files under `\.starconverter-escrow` and are folded back into their owners on the escrow-restored return trip (proven in-tree with a 16 MiB + 4 KiB ADS); `$MFT` continuation hosts outside the first-extent map remain pending
 - exFAT benign vendor entry object IDs (target contract, not current capability)
 - round-trip restoration to NTFS
-- formatter-origin inline `$SECURITY_DESCRIPTOR` support: bounded resident and nonresident
-  capture, self-relative descriptor validation, exact escrow retention, target restoration, and
-  independent `ntfscat -a 0x50` byte comparisons; census-only evidence remains a refusal, including
-  when `$STANDARD_INFORMATION` omits a security ID (not implemented)
+- formatter-origin inline `$SECURITY_DESCRIPTOR` support (implemented in-tree): the read-only
+  inventory captures unnamed resident and fully mapped nonresident `0x50` values up to 64 KiB, the
+  bounded self-relative validator accepts owner/group SIDs plus ACL revision 2/4 with
+  allow/deny/audit ACEs and refuses everything else, exact bytes travel in the v8 inner NTFS
+  escrow snapshot, and the escrow-restored exFAT→NTFS path re-emits them as resident attributes
+  (security ID 0 when the inline descriptor alone governs, the pinned `$Secure` ID when both
+  coexist), proven by the in-tree NTFS→exFAT(+escrow)→NTFS round trip on the root and a junction;
+  census-only evidence, malformed descriptors, and unpinned security IDs remain refusals,
+  including when `$STANDARD_INFORMATION` omits a security ID; independent `ntfscat -a 0x50` byte
+  comparison against a formatter-origin image remains pending
 
 Exit evidence: strict mode refuses every non-native semantic; escrow mode restores exact tested
 metadata and reports anything outside its versioned contract.

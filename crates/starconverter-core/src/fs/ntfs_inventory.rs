@@ -31,11 +31,13 @@ use crate::fs::ntfs_runlist::{
     ExtentLocation, MappingPairsError, MappingPairsLimits, NtfsExtent, NtfsRunlist,
     parse_attribute_mapping_pairs,
 };
+use crate::fs::ntfs_security_descriptor::NtfsSecurityDescriptorLimits;
 use crate::image::{BoundedImageReader, ImageError, ImageFile};
 
 const STANDARD_INFORMATION: u32 = 0x10;
 const ATTRIBUTE_LIST: u32 = 0x20;
 const FILE_NAME: u32 = 0x30;
+const SECURITY_DESCRIPTOR: u32 = 0x50;
 const VOLUME_NAME: u32 = 0x60;
 const DATA: u32 = 0x80;
 const INDEX_ROOT: u32 = 0x90;
@@ -247,6 +249,12 @@ pub struct NtfsObject {
     pub has_reparse_point: bool,
     /// Exact unnamed `$REPARSE_POINT` attribute bytes when the mapping is complete.
     pub reparse_point: Option<Vec<u8>>,
+    /// Whether the record carries an inline `$SECURITY_DESCRIPTOR` attribute (formatter-origin
+    /// volumes predating `$Secure`, or NTFS-3G volumes with per-record descriptors).
+    pub has_security_descriptor: bool,
+    /// Exact unnamed `$SECURITY_DESCRIPTOR` value when the mapping is complete and bounded.
+    /// `has_security_descriptor && security_descriptor.is_none()` is census-only evidence.
+    pub security_descriptor: Option<Vec<u8>>,
     pub has_attribute_list: bool,
     pub directory_index_complete: bool,
 }
@@ -1251,6 +1259,8 @@ fn inventory_base_record(
     }
     let (has_reparse_point, reparse_point) =
         inventory_reparse_point(record_number, attributes, limits)?;
+    let (has_security_descriptor, security_descriptor) =
+        inventory_security_descriptor(record_number, attributes, boot, limits, image, bytes_read)?;
     inventory_physical_allocations(
         record_number,
         attributes,
@@ -1335,6 +1345,8 @@ fn inventory_base_record(
             directory_entries: Vec::new(),
             has_reparse_point,
             reparse_point,
+            has_security_descriptor,
+            security_descriptor,
             has_attribute_list,
             directory_index_complete: !record.flags.is_directory(),
         },
@@ -1392,6 +1404,88 @@ fn inventory_reparse_point(
         found = Some(Some(payload));
     }
     Ok(found.map_or((false, None), |payload| (true, payload)))
+}
+
+/// Captures the exact unnamed `$SECURITY_DESCRIPTOR` value when it is fully mapped and within
+/// the bounded descriptor profile size.
+///
+/// Named, duplicated, flagged, oversized, or incompletely mapped attributes are reported as
+/// present without bytes. Downstream policy treats that as census-only evidence and refuses
+/// rather than guessing at a descriptor it cannot reproduce. Structural validation of the
+/// captured bytes is the policy layer's job, so an inventory stays usable for analysis of
+/// descriptors outside the supported profile.
+fn inventory_security_descriptor(
+    record_number: u64,
+    attributes: &[NtfsAttribute<'_>],
+    boot: &NtfsBootSector,
+    limits: NtfsInventoryLimits,
+    image: &dyn BoundedImageReader,
+    bytes_read: &mut u64,
+) -> Result<(bool, Option<Vec<u8>>), NtfsInventoryError> {
+    let mut matching = attributes
+        .iter()
+        .filter(|attribute| attribute.attribute_type == SECURITY_DESCRIPTOR);
+    let Some(attribute) = matching.next() else {
+        return Ok((false, None));
+    };
+    if matching.next().is_some() || attribute.name.is_some() || attribute.flags.raw != 0 {
+        return Ok((true, None));
+    }
+    let max_capture = NtfsSecurityDescriptorLimits::default()
+        .max_bytes
+        .min(limits.max_resident_data_bytes);
+    match &attribute.body {
+        AttributeBody::Resident(body) => {
+            if body.value.len() > max_capture {
+                return Ok((true, None));
+            }
+            let mut payload = Vec::new();
+            payload
+                .try_reserve_exact(body.value.len())
+                .map_err(|_| NtfsInventoryError::AllocationFailed)?;
+            payload.extend_from_slice(body.value);
+            Ok((true, Some(payload)))
+        }
+        AttributeBody::NonResident(body) => {
+            let Some(sizes) = body.sizes else {
+                return Ok((true, None));
+            };
+            if body.lowest_vcn != 0
+                || sizes.initialized != sizes.data
+                || sizes.data > u64::try_from(max_capture).unwrap_or(u64::MAX)
+            {
+                return Ok((true, None));
+            }
+            let runlist = parse_attribute_mapping_pairs(
+                body.mapping_pairs,
+                MappingPairsLimits {
+                    starting_vcn: 0,
+                    expected_next_vcn: Some(body.expected_next_vcn),
+                    volume_cluster_count: boot.cluster_count,
+                    max_runs: limits.max_runs_per_stream,
+                    max_decoded_clusters: boot.cluster_count,
+                },
+            )?;
+            let mapped_bytes = runlist
+                .next_vcn
+                .checked_mul(boot.cluster_size_bytes)
+                .ok_or(NtfsInventoryError::GeometryOverflow {
+                    calculation: "security descriptor mapped bytes",
+                })?;
+            if mapped_bytes < sizes.allocated {
+                return Ok((true, None));
+            }
+            let extents = normalize_extents(
+                record_number,
+                attribute.id,
+                &runlist,
+                boot.cluster_size_bytes,
+            )?;
+            let payload =
+                read_initialized_extent_bytes(image, sizes.data, &extents, limits, bytes_read)?;
+            Ok((true, payload))
+        }
+    }
 }
 
 fn inventory_physical_allocations(
@@ -1672,6 +1766,19 @@ fn capture_named_nonresident_payload(
     let Some(image) = image else {
         return Ok(None);
     };
+    read_initialized_extent_bytes(image, initialized_bytes, extents, limits, bytes_read)
+}
+
+/// Reads the first `initialized_bytes` of a non-resident value whose extents are contiguous,
+/// physical, and start at logical offset zero. Any other layout yields `None` rather than a
+/// partial or zero-filled payload.
+fn read_initialized_extent_bytes(
+    image: &dyn BoundedImageReader,
+    initialized_bytes: u64,
+    extents: &[NtfsInventoryExtent],
+    limits: NtfsInventoryLimits,
+    bytes_read: &mut u64,
+) -> Result<Option<Vec<u8>>, NtfsInventoryError> {
     let mut ordered = extents.to_vec();
     ordered.sort_unstable_by_key(|extent| extent.logical_offset);
     let mut expected = 0_u64;
@@ -1689,7 +1796,7 @@ fn capture_named_nonresident_payload(
             expected
                 .checked_add(extent.length)
                 .ok_or(NtfsInventoryError::GeometryOverflow {
-                    calculation: "named stream capture coverage",
+                    calculation: "non-resident capture coverage",
                 })?;
     }
     if expected < initialized_bytes {
@@ -1697,7 +1804,7 @@ fn capture_named_nonresident_payload(
     }
     let length =
         usize::try_from(initialized_bytes).map_err(|_| NtfsInventoryError::GeometryOverflow {
-            calculation: "named stream capture length",
+            calculation: "non-resident capture length",
         })?;
     let total =
         bytes_read
@@ -1727,22 +1834,22 @@ fn capture_named_nonresident_payload(
         }
         let NtfsExtentPlacement::Physical { byte_offset } = extent.placement else {
             return Err(NtfsInventoryError::GeometryOverflow {
-                calculation: "named stream capture sparse run",
+                calculation: "non-resident capture sparse run",
             });
         };
         let chunk = (initialized_bytes - cursor).min(extent.length);
         let chunk_len =
             usize::try_from(chunk).map_err(|_| NtfsInventoryError::GeometryOverflow {
-                calculation: "named stream capture chunk",
+                calculation: "non-resident capture chunk",
             })?;
         let dest = usize::try_from(cursor).map_err(|_| NtfsInventoryError::GeometryOverflow {
-            calculation: "named stream capture offset",
+            calculation: "non-resident capture offset",
         })?;
         read_chunked(image, byte_offset, &mut output[dest..dest + chunk_len])?;
         cursor = cursor
             .checked_add(chunk)
             .ok_or(NtfsInventoryError::GeometryOverflow {
-                calculation: "named stream capture cursor",
+                calculation: "non-resident capture cursor",
             })?;
     }
     *bytes_read = total;
@@ -2781,6 +2888,7 @@ mod tests {
     use super::*;
     use crate::fs::ntfs::{NtfsBootSector, RecordSize};
     use crate::fs::ntfs_normalize::{NtfsNormalizeLimits, normalize_inventory};
+    use crate::fs::ntfs_security_descriptor::sample_self_relative_descriptor;
     use crate::object::ObjectGraphLimits;
     use crate::overlay::{OverlayLimits, OverlayPlan, OverlayWrite};
     use crate::preservation::{
@@ -3250,6 +3358,8 @@ mod tests {
             directory_entries: Vec::new(),
             has_reparse_point: false,
             reparse_point: None,
+            has_security_descriptor: false,
+            security_descriptor: None,
             has_attribute_list: false,
             directory_index_complete: true,
         };
@@ -3320,6 +3430,8 @@ mod tests {
             }],
             has_reparse_point: false,
             reparse_point: None,
+            has_security_descriptor: false,
+            security_descriptor: None,
             has_attribute_list: false,
             directory_index_complete: true,
         };
@@ -3468,6 +3580,178 @@ mod tests {
             inventory_reparse_point(16, &[parsed], NtfsInventoryLimits::default()).unwrap();
         assert!(present);
         assert_eq!(captured, None);
+    }
+
+    #[test]
+    fn captures_resident_security_descriptor_bytes_and_reports_census_only_forms() {
+        let payload = sample_self_relative_descriptor();
+        let encoded = resident_attribute(SECURITY_DESCRIPTOR, 8, &payload);
+        let parsed = parse_test_attribute(&encoded);
+        let temp = TempImage::create(&vec![0_u8; 128 * 512]);
+        let image = ImageFile::open(&temp.0).unwrap();
+        let mut bytes_read = 0_u64;
+        let (present, captured) = inventory_security_descriptor(
+            16,
+            &[parsed],
+            &boot(),
+            NtfsInventoryLimits::default(),
+            &image,
+            &mut bytes_read,
+        )
+        .unwrap();
+        assert!(present);
+        assert_eq!(captured.as_deref(), Some(payload.as_slice()));
+        assert_eq!(bytes_read, 0);
+
+        let (present, captured) = inventory_security_descriptor(
+            16,
+            &[],
+            &boot(),
+            NtfsInventoryLimits::default(),
+            &image,
+            &mut bytes_read,
+        )
+        .unwrap();
+        assert!(!present);
+        assert_eq!(captured, None);
+
+        let named = named_resident_attribute(
+            SECURITY_DESCRIPTOR,
+            8,
+            &"sd".encode_utf16().collect::<Vec<_>>(),
+            &payload,
+        );
+        let parsed = parse_test_attribute(&named);
+        let (present, captured) = inventory_security_descriptor(
+            16,
+            &[parsed],
+            &boot(),
+            NtfsInventoryLimits::default(),
+            &image,
+            &mut bytes_read,
+        )
+        .unwrap();
+        assert!(present);
+        assert_eq!(captured, None);
+
+        let first = resident_attribute(SECURITY_DESCRIPTOR, 8, &payload);
+        let second = resident_attribute(SECURITY_DESCRIPTOR, 9, &payload);
+        let parsed_first = parse_test_attribute(&first);
+        let parsed_second = parse_test_attribute(&second);
+        let (present, captured) = inventory_security_descriptor(
+            16,
+            &[parsed_first, parsed_second],
+            &boot(),
+            NtfsInventoryLimits::default(),
+            &image,
+            &mut bytes_read,
+        )
+        .unwrap();
+        assert!(present);
+        assert_eq!(captured, None);
+
+        let oversized = resident_attribute(SECURITY_DESCRIPTOR, 8, &[0; 96]);
+        let parsed = parse_test_attribute(&oversized);
+        let (present, captured) = inventory_security_descriptor(
+            16,
+            &[parsed],
+            &boot(),
+            NtfsInventoryLimits {
+                max_resident_data_bytes: 64,
+                ..NtfsInventoryLimits::default()
+            },
+            &image,
+            &mut bytes_read,
+        )
+        .unwrap();
+        assert!(present);
+        assert_eq!(captured, None);
+    }
+
+    #[test]
+    fn captures_fully_mapped_nonresident_security_descriptor_bytes() {
+        let payload = sample_self_relative_descriptor();
+        let data_len = u64::try_from(payload.len()).unwrap();
+        let mut image_bytes = vec![0_u8; 128 * 512];
+        image_bytes[8 * 4096..8 * 4096 + payload.len()].copy_from_slice(&payload);
+        let temp = TempImage::create(&image_bytes);
+        let image = ImageFile::open(&temp.0).unwrap();
+
+        let mut nonresident =
+            nonresident_attribute(8, 0, 0, 0, 4096, data_len, data_len, 0, &[0x11, 1, 8, 0]);
+        nonresident[0..4].copy_from_slice(&SECURITY_DESCRIPTOR.to_le_bytes());
+        let parsed = parse_test_attribute(&nonresident);
+        let mut bytes_read = 0_u64;
+        let (present, captured) = inventory_security_descriptor(
+            16,
+            &[parsed],
+            &boot(),
+            NtfsInventoryLimits::default(),
+            &image,
+            &mut bytes_read,
+        )
+        .unwrap();
+        assert!(present);
+        assert_eq!(captured.as_deref(), Some(payload.as_slice()));
+        assert_eq!(bytes_read, data_len);
+
+        // A descriptor whose initialized size trails its data size cannot be reproduced exactly.
+        let mut partial = nonresident_attribute(
+            8,
+            0,
+            0,
+            0,
+            4096,
+            data_len,
+            data_len - 8,
+            0,
+            &[0x11, 1, 8, 0],
+        );
+        partial[0..4].copy_from_slice(&SECURITY_DESCRIPTOR.to_le_bytes());
+        let parsed = parse_test_attribute(&partial);
+        let (present, captured) = inventory_security_descriptor(
+            16,
+            &[parsed],
+            &boot(),
+            NtfsInventoryLimits::default(),
+            &image,
+            &mut bytes_read,
+        )
+        .unwrap();
+        assert!(present);
+        assert_eq!(captured, None);
+    }
+
+    #[test]
+    fn inventories_inline_security_descriptor_in_the_bounded_census() {
+        let payload = sample_self_relative_descriptor();
+        let inventory = inventory_reparse_fixture(
+            &[(
+                0,
+                record_with_attributes(
+                    0,
+                    1,
+                    None,
+                    &[resident_attribute(SECURITY_DESCRIPTOR, 8, &payload)],
+                ),
+            )],
+            NtfsInventoryLimits::default(),
+        )
+        .unwrap();
+        assert!(inventory.objects[0].has_security_descriptor);
+        assert_eq!(
+            inventory.objects[0].security_descriptor.as_deref(),
+            Some(payload.as_slice())
+        );
+        assert!(
+            inventory.objects[0]
+                .attribute_census
+                .iter()
+                .any(|attribute| attribute.attribute_type == SECURITY_DESCRIPTOR
+                    && attribute.resident
+                    && attribute.name.is_none())
+        );
+        assert!(inventory.is_complete());
     }
 
     /// Twelve-record MFT (three clusters at LCN 4) so `$Extend` (record 11) is inside the scan.

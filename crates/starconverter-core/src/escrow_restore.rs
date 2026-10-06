@@ -25,6 +25,9 @@ use crate::extent::StreamId;
 use crate::fs::ntfs_index::FileNameNamespace;
 use crate::fs::ntfs_inventory::{NtfsFileName, NtfsObject, NtfsStreamStorage};
 use crate::fs::ntfs_normalize::NtfsPreservationSidecar;
+use crate::fs::ntfs_security_descriptor::{
+    NtfsSecurityDescriptorError, NtfsSecurityDescriptorLimits, validate_ntfs_security_descriptor,
+};
 use crate::object::{
     NamespaceEntry, ObjectGraph, ObjectGraphError, ObjectGraphLimits, ObjectId, ObjectKind,
     ObjectRecord, ObjectStream, StreamFlags, StreamStorage,
@@ -69,6 +72,13 @@ pub enum NtfsRestoreError {
     AmbiguousDestinationNames(ObjectId),
     MissingDestNativeName(ObjectId),
     IncompleteReparse(ObjectId),
+    /// The escrow proves an inline `$SECURITY_DESCRIPTOR` exists but did not capture its bytes.
+    IncompleteSecurityDescriptor(ObjectId),
+    /// The escrowed descriptor bytes are outside the bounded supported self-relative profile.
+    InvalidSecurityDescriptor {
+        object: ObjectId,
+        source: NtfsSecurityDescriptorError,
+    },
     NameDisambiguationFailed {
         parent: ObjectId,
     },
@@ -91,11 +101,14 @@ pub enum NtfsRestoreError {
     EscrowPayload(PreservationError),
 }
 
-/// Dest-native graph plus resident `$REPARSE_POINT` bytes keyed by dest [`ObjectId`].
+/// Dest-native graph plus exact `$REPARSE_POINT` and `$SECURITY_DESCRIPTOR` bytes keyed by dest
+/// [`ObjectId`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestoredNtfsIdentities {
     pub graph: ObjectGraph,
     pub reparse_points: BTreeMap<ObjectId, Vec<u8>>,
+    /// Validated self-relative inline descriptors, including the root's when the source had one.
+    pub security_descriptors: BTreeMap<ObjectId, Vec<u8>>,
     /// Dest [`ObjectId`] → sidecar [`ObjectId`] (source MFT record number) for every dest object
     /// that the sidecar identified by dest-native path, including the root.
     pub source_by_dest: BTreeMap<ObjectId, ObjectId>,
@@ -198,6 +211,16 @@ impl fmt::Display for NtfsRestoreError {
             Self::IncompleteReparse(object) => write!(
                 formatter,
                 "escrow object {} is a reparse point without resident $REPARSE_POINT bytes",
+                object.0
+            ),
+            Self::IncompleteSecurityDescriptor(object) => write!(
+                formatter,
+                "escrow object {} carries an inline $SECURITY_DESCRIPTOR without captured bytes",
+                object.0
+            ),
+            Self::InvalidSecurityDescriptor { object, source } => write!(
+                formatter,
+                "escrow object {} inline $SECURITY_DESCRIPTOR is outside the supported profile: {source}",
                 object.0
             ),
             Self::NameDisambiguationFailed { parent } => write!(
@@ -326,6 +349,7 @@ pub fn restore_ntfs_identities_with_evidence(
     let mut entries = dest_native.entries().to_vec();
     let mut used_streams = BTreeSet::new();
     let mut reparse_points = BTreeMap::new();
+    let mut security_descriptors = BTreeMap::new();
     for object in &objects {
         for stream in &object.streams {
             used_streams.insert(stream.id);
@@ -336,12 +360,15 @@ pub fn restore_ntfs_identities_with_evidence(
         let Some(sidecar_id) = dest_to_sidecar.get(&object.id).copied() else {
             continue;
         };
-        if sidecar_id == ObjectId(sidecar.root_reference.record_number) {
-            continue;
-        }
         let Some(source) = sidecar_by_id.get(&sidecar_id).copied() else {
             continue;
         };
+        if sidecar_id == ObjectId(sidecar.root_reference.record_number) {
+            // The root keeps its dest-native names and index, but a formatter-origin inline
+            // descriptor on record 5 is still exact evidence that must be reattached.
+            restore_security_descriptor(object, source, &mut security_descriptors)?;
+            continue;
+        }
         if skip_sidecar_object(source) {
             continue;
         }
@@ -356,6 +383,7 @@ pub fn restore_ntfs_identities_with_evidence(
         restore_namespace_entries(object.id, source, &mut entries, &id_map)?;
         restore_named_streams(object, source, &mut used_streams, &carriers)?;
         restore_reparse_point(object, source, &mut reparse_points)?;
+        restore_security_descriptor(object, source, &mut security_descriptors)?;
     }
     let removed_objects = remove_escrow_carriers(
         dest_native.root(),
@@ -406,6 +434,7 @@ pub fn restore_ntfs_identities_with_evidence(
     Ok(RestoredNtfsIdentities {
         graph,
         reparse_points,
+        security_descriptors,
         source_by_dest: dest_to_sidecar,
         removed_objects,
     })
@@ -632,6 +661,32 @@ fn restore_reparse_point(
     };
     object.semantics.is_reparse_point = true;
     reparse_points.insert(object.id, payload.clone());
+    Ok(())
+}
+
+/// Reattaches an exact inline `$SECURITY_DESCRIPTOR` value to a dest object.
+///
+/// Census-only evidence (presence without bytes) and descriptors outside the bounded supported
+/// profile are refusals: a destination must never be given a descriptor the escrow cannot prove.
+fn restore_security_descriptor(
+    object: &mut ObjectRecord,
+    source: &NtfsObject,
+    security_descriptors: &mut BTreeMap<ObjectId, Vec<u8>>,
+) -> Result<(), NtfsRestoreError> {
+    if !source.has_security_descriptor {
+        return Ok(());
+    }
+    let Some(payload) = source.security_descriptor.as_ref() else {
+        return Err(NtfsRestoreError::IncompleteSecurityDescriptor(object.id));
+    };
+    validate_ntfs_security_descriptor(payload, NtfsSecurityDescriptorLimits::default()).map_err(
+        |source| NtfsRestoreError::InvalidSecurityDescriptor {
+            object: object.id,
+            source,
+        },
+    )?;
+    object.semantics.has_security_descriptor = true;
+    security_descriptors.insert(object.id, payload.clone());
     Ok(())
 }
 
@@ -896,6 +951,7 @@ mod tests {
         NtfsDataStream, NtfsFileName, NtfsName, NtfsObject, NtfsObjectReference, NtfsStreamStorage,
     };
     use crate::fs::ntfs_normalize::NtfsObjectPreservation;
+    use crate::fs::ntfs_security_descriptor::sample_self_relative_descriptor;
     use crate::fs::ntfs_serialize::{
         NtfsDestinationInputs, NtfsDestinationPlan, NtfsSerializeLimits, plan_ntfs_destination,
         plan_ntfs_destination_with_reparse_points,
@@ -1051,6 +1107,8 @@ mod tests {
             directory_entries: Vec::new(),
             has_reparse_point: false,
             reparse_point: None,
+            has_security_descriptor: false,
+            security_descriptor: None,
             has_attribute_list: false,
             directory_index_complete: true,
         }
@@ -1800,5 +1858,74 @@ mod tests {
             .unwrap();
         assert!(source.has_reparse_point);
         assert_eq!(source.reparse_point.as_deref(), Some(payload.as_slice()));
+    }
+
+    #[test]
+    fn restore_reattaches_exact_inline_security_descriptors_including_the_root() {
+        let dest = dest_native_file_graph();
+        let descriptor = sample_self_relative_descriptor();
+        let mut file = identity_file(
+            vec![file_name(1, FileNameNamespace::Win32, "alpha.txt")],
+            Vec::new(),
+        );
+        file.has_security_descriptor = true;
+        file.security_descriptor = Some(descriptor.clone());
+        let mut sidecar = sidecar_with_file(file);
+        let root = &mut sidecar.objects[0].source;
+        root.has_security_descriptor = true;
+        root.security_descriptor = Some(descriptor.clone());
+
+        let restored = restore_ntfs_identities_with_evidence(&dest, &sidecar).unwrap();
+        assert_eq!(
+            restored
+                .security_descriptors
+                .get(&ObjectId(1))
+                .map(Vec::as_slice),
+            Some(descriptor.as_slice())
+        );
+        assert_eq!(
+            restored
+                .security_descriptors
+                .get(&ObjectId(2))
+                .map(Vec::as_slice),
+            Some(descriptor.as_slice())
+        );
+        assert!(
+            restored
+                .graph
+                .objects()
+                .iter()
+                .all(|object| object.semantics.has_security_descriptor)
+        );
+    }
+
+    #[test]
+    fn restore_refuses_census_only_and_malformed_security_descriptors() {
+        let dest = dest_native_file_graph();
+        let mut census_only = identity_file(
+            vec![file_name(1, FileNameNamespace::Win32, "alpha.txt")],
+            Vec::new(),
+        );
+        census_only.has_security_descriptor = true;
+        assert_eq!(
+            restore_ntfs_identities_with_evidence(&dest, &sidecar_with_file(census_only)).err(),
+            Some(NtfsRestoreError::IncompleteSecurityDescriptor(ObjectId(2)))
+        );
+
+        let mut malformed = identity_file(
+            vec![file_name(1, FileNameNamespace::Win32, "alpha.txt")],
+            Vec::new(),
+        );
+        let mut truncated = sample_self_relative_descriptor();
+        truncated.truncate(12);
+        malformed.has_security_descriptor = true;
+        malformed.security_descriptor = Some(truncated);
+        assert!(matches!(
+            restore_ntfs_identities_with_evidence(&dest, &sidecar_with_file(malformed)),
+            Err(NtfsRestoreError::InvalidSecurityDescriptor {
+                object: ObjectId(2),
+                ..
+            })
+        ));
     }
 }

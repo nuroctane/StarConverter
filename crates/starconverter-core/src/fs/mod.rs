@@ -29,6 +29,7 @@ pub mod ntfs_region;
 pub mod ntfs_reparse_index;
 pub mod ntfs_runlist;
 pub mod ntfs_secure;
+pub mod ntfs_security_descriptor;
 pub mod ntfs_serialize;
 pub mod ntfs_upcase_serialize;
 pub mod ntfs_volume;

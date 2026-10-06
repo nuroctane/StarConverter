@@ -29,12 +29,17 @@ use crate::fs::ntfs_normalize::{
     NormalizedNtfs, NtfsObjectPreservation, NtfsPreservationSidecar, NtfsSecurityDescriptorEvidence,
 };
 use crate::fs::ntfs_secure::{NtfsSecureLimits, NtfsSecureProfile, generate_ntfs_secure_metadata};
+use crate::fs::ntfs_security_descriptor::{
+    NtfsSecurityDescriptorLimits, validate_ntfs_security_descriptor,
+};
 use crate::object::{ObjectGraph, ObjectId};
 use crate::{FileSystem, GuaranteeMode};
 
 const ESCROW_MAGIC: [u8; 8] = *b"SCESCROW";
 /// Current on-disk escrow schema version.
 pub const ESCROW_SCHEMA_VERSION: u16 = 4;
+/// Current inner NTFS sidecar snapshot version carried inside a schema-v4 envelope.
+const NTFS_SNAPSHOT_VERSION: u16 = 8;
 const HEADER_BYTES: usize = 28;
 const RECORD_HEADER_BYTES: usize = 6;
 const EXFAT_SOURCE: u8 = 1;
@@ -579,43 +584,12 @@ fn ntfs_assessments(
         .iter()
         .any(|object| object.semantics.has_security_descriptor)
     {
-        let exact_pinned = matches!(
-            sidecar.security_descriptors,
-            NtfsSecurityDescriptorEvidence::PinnedNtfs3gWindows2003 { .. }
-        ) && sidecar
-            .objects
-            .iter()
-            .filter(|preserved| {
-                graph
-                    .objects()
-                    .iter()
-                    .any(|object| object.id == preserved.object)
-            })
-            .all(|object| {
-                !object
-                    .source
-                    .attribute_census
-                    .iter()
-                    .any(|attribute| attribute.attribute_type == 0x50)
-                    && object
-                        .source
-                        .standard_information
-                        .and_then(|standard| standard.security_id)
-                        .is_none_or(|security_id| matches!(security_id, 0x100 | 0x101))
-            });
+        let (disposition, reason) = classify_ntfs_security_descriptors(graph, sidecar);
         set(
             &mut result,
             PreservationField::SecurityDescriptors,
-            if exact_pinned {
-                FieldDisposition::EscrowRequired
-            } else {
-                FieldDisposition::Refusal
-            },
-            if exact_pinned {
-                "exact pinned self-relative descriptors are retained in escrow while exFAT cannot enforce them"
-            } else {
-                "object security presence is known but exact self-relative descriptor bytes are absent"
-            },
+            disposition,
+            reason,
         );
     }
     if sidecar.objects.iter().any(|object| {
@@ -771,6 +745,7 @@ fn ntfs_assessments(
 const NTFS_STANDARD_INFORMATION: u32 = 0x10;
 const NTFS_ATTRIBUTE_LIST: u32 = 0x20;
 const NTFS_FILE_NAME: u32 = 0x30;
+const NTFS_SECURITY_DESCRIPTOR: u32 = 0x50;
 const NTFS_VOLUME_NAME: u32 = 0x60;
 const NTFS_VOLUME_INFORMATION: u32 = 0x70;
 const NTFS_DATA: u32 = 0x80;
@@ -793,13 +768,106 @@ fn ntfs_attribute_supported(attribute: &NtfsAttributeEvidence) -> bool {
         NTFS_STANDARD_INFORMATION | NTFS_FILE_NAME | NTFS_VOLUME_NAME | NTFS_VOLUME_INFORMATION => {
             unnamed && attribute.resident && attribute.flags_raw == 0
         }
-        NTFS_ATTRIBUTE_LIST | NTFS_REPARSE_POINT => unnamed && attribute.flags_raw == 0,
+        // Inline descriptors are structurally admitted here; whether their exact bytes were
+        // captured and validated is decided by the SecurityDescriptors field.
+        NTFS_ATTRIBUTE_LIST | NTFS_REPARSE_POINT | NTFS_SECURITY_DESCRIPTOR => {
+            unnamed && attribute.flags_raw == 0
+        }
         NTFS_DATA => true,
         NTFS_INDEX_ROOT => attribute.resident && attribute.flags_raw == 0,
         NTFS_INDEX_ALLOCATION => !attribute.resident && attribute.flags_raw == 0,
         NTFS_BITMAP => attribute.flags_raw == 0,
         _ => false,
     }
+}
+
+/// Decides whether every graph object's security evidence is exact enough to escrow.
+///
+/// Two sources of truth are accepted and may coexist on one volume: `$Secure` identifiers that
+/// resolve inside the pinned NTFS-3G Windows-2003 `$SDS`, and inline `$SECURITY_DESCRIPTOR`
+/// attributes whose exact bytes were captured and pass the bounded self-relative validator. An
+/// inline attribute whose bytes were not captured (census-only), a descriptor outside the
+/// supported profile, or an unpinned `$Secure` identifier is a refusal, never a default.
+fn classify_ntfs_security_descriptors(
+    graph: &ObjectGraph,
+    sidecar: &NtfsPreservationSidecar,
+) -> (FieldDisposition, &'static str) {
+    let pinned = matches!(
+        sidecar.security_descriptors,
+        NtfsSecurityDescriptorEvidence::PinnedNtfs3gWindows2003 { .. }
+    );
+    let mut needs_pinned = false;
+    let mut census_only = false;
+    let mut unsupported_inline = false;
+    let mut unpinned_identifier = false;
+    for preserved in sidecar.objects.iter().filter(|preserved| {
+        graph
+            .objects()
+            .iter()
+            .any(|object| object.id == preserved.object)
+    }) {
+        let source = &preserved.source;
+        let security_id = source
+            .standard_information
+            .and_then(|standard| standard.security_id);
+        // The census is consulted too so an inventory that saw the attribute without capturing
+        // it can never be mistaken for one that has no inline descriptor at all.
+        let inline_present = source.has_security_descriptor
+            || source
+                .attribute_census
+                .iter()
+                .any(|attribute| attribute.attribute_type == NTFS_SECURITY_DESCRIPTOR);
+        if inline_present {
+            match source.security_descriptor.as_deref() {
+                None => census_only = true,
+                Some(bytes) => {
+                    if validate_ntfs_security_descriptor(
+                        bytes,
+                        NtfsSecurityDescriptorLimits::default(),
+                    )
+                    .is_err()
+                    {
+                        unsupported_inline = true;
+                    }
+                }
+            }
+            // A zero identifier means "use the inline descriptor"; a pinned identifier takes
+            // precedence on a `$Secure` volume and is still required to resolve.
+            match security_id {
+                None | Some(0) => {}
+                Some(0x100 | 0x101) => needs_pinned = true,
+                Some(_) => unpinned_identifier = true,
+            }
+        } else {
+            match security_id {
+                None => {}
+                Some(0x100 | 0x101) => needs_pinned = true,
+                Some(_) => unpinned_identifier = true,
+            }
+        }
+    }
+    if census_only {
+        return (
+            FieldDisposition::Refusal,
+            "an inline $SECURITY_DESCRIPTOR is present but its exact bytes were not captured",
+        );
+    }
+    if unsupported_inline {
+        return (
+            FieldDisposition::Refusal,
+            "an inline $SECURITY_DESCRIPTOR is outside the bounded self-relative profile",
+        );
+    }
+    if unpinned_identifier || (needs_pinned && !pinned) {
+        return (
+            FieldDisposition::Refusal,
+            "object security presence is known but exact self-relative descriptor bytes are absent",
+        );
+    }
+    (
+        FieldDisposition::EscrowRequired,
+        "exact self-relative descriptors are retained in escrow while exFAT cannot enforce them",
+    )
 }
 
 fn classify_ntfs_reparse_points(
@@ -1293,13 +1361,13 @@ pub fn decode_escrow(
 
 /// Rebuilds the inner NTFS snapshot from a validated schema-v4 escrow payload.
 ///
-/// Only the current inner snapshot (v7) is restored. Historical v3–v6 layouts remain readable
+/// Only the current inner snapshot (v8) is restored. Historical v3–v7 layouts remain readable
 /// for integrity checks through [`decode_escrow`], but they do not authorize identity restore.
 ///
 /// # Errors
 ///
 /// Returns [`PreservationError`] when the outer envelope is invalid, the source is not NTFS, or
-/// the inner snapshot is not a complete v7 sidecar.
+/// the inner snapshot is not a complete v8 sidecar.
 pub fn decode_ntfs_sidecar_from_escrow(
     bytes: &[u8],
     limits: PreservationLimits,
@@ -1318,7 +1386,7 @@ pub fn decode_ntfs_sidecar_from_escrow(
     decode_ntfs_preservation_sidecar(&snapshot.value)
 }
 
-/// Rebuilds [`NtfsPreservationSidecar`] from an inner NTFS snapshot v7.
+/// Rebuilds [`NtfsPreservationSidecar`] from an inner NTFS snapshot v8.
 ///
 /// # Errors
 ///
@@ -1328,7 +1396,7 @@ pub fn decode_ntfs_preservation_sidecar(
     snapshot: &[u8],
 ) -> Result<NtfsPreservationSidecar, PreservationError> {
     let mut reader = SnapshotCursor::new(snapshot, 0);
-    if reader.u16()? != 7 {
+    if reader.u16()? != NTFS_SNAPSHOT_VERSION {
         return malformed(0, "unsupported NTFS sidecar snapshot version");
     }
     let volume_serial_number = reader.u64()?;
@@ -1394,6 +1462,9 @@ fn validate_snapshot(
     let version = u16::from_le_bytes([version[0], version[1]]);
     match source {
         FileSystem::ExFat if version == 2 => validate_exfat_snapshot(bytes, offset),
+        FileSystem::Ntfs if version == 8 => {
+            validate_ntfs_snapshot(bytes, offset, NtfsSnapshotLayout::V8)
+        }
         FileSystem::Ntfs if version == 7 => {
             validate_ntfs_snapshot(bytes, offset, NtfsSnapshotLayout::V7)
         }
@@ -1411,7 +1482,8 @@ fn validate_snapshot(
         // current census-dependent preservation policy. Version 4 is census-complete without the
         // trailing optional $REPARSE_POINT payload introduced in version 5. Version 6 adds the
         // per-stream compression-unit size. Version 7 appends optional captured named-stream
-        // initialized bytes on NonResident storage.
+        // initialized bytes on NonResident storage. Version 8 appends inline
+        // $SECURITY_DESCRIPTOR presence and optional exact bytes after the reparse payload.
         FileSystem::Ntfs if version == 3 => validate_ntfs_snapshot(
             bytes,
             offset,
@@ -1711,6 +1783,7 @@ enum NtfsSnapshotLayout {
     V5,
     V6,
     V7,
+    V8,
 }
 
 impl NtfsSnapshotLayout {
@@ -1721,6 +1794,7 @@ impl NtfsSnapshotLayout {
             Self::V5 => 5,
             Self::V6 => 6,
             Self::V7 => 7,
+            Self::V8 => 8,
         }
     }
 
@@ -1729,20 +1803,24 @@ impl NtfsSnapshotLayout {
             Self::V3 {
                 has_attribute_census,
             } => has_attribute_census,
-            Self::V4 | Self::V5 | Self::V6 | Self::V7 => true,
+            Self::V4 | Self::V5 | Self::V6 | Self::V7 | Self::V8 => true,
         }
     }
 
     const fn has_reparse_payload(self) -> bool {
-        matches!(self, Self::V5 | Self::V6 | Self::V7)
+        matches!(self, Self::V5 | Self::V6 | Self::V7 | Self::V8)
     }
 
     const fn has_stream_compression_block(self) -> bool {
-        matches!(self, Self::V6 | Self::V7)
+        matches!(self, Self::V6 | Self::V7 | Self::V8)
     }
 
     const fn has_captured_named_payload(self) -> bool {
-        matches!(self, Self::V7)
+        matches!(self, Self::V7 | Self::V8)
+    }
+
+    const fn has_security_descriptor(self) -> bool {
+        matches!(self, Self::V8)
     }
 }
 
@@ -1881,6 +1959,12 @@ fn validate_ntfs_object(
     if layout.has_reparse_payload() && reader.boolean()? {
         reader.bytes()?;
     }
+    if layout.has_security_descriptor() {
+        reader.boolean()?;
+        if reader.boolean()? {
+            reader.bytes()?;
+        }
+    }
     Ok(())
 }
 
@@ -2008,6 +2092,12 @@ fn decode_ntfs_object(reader: &mut SnapshotCursor<'_>) -> Result<NtfsObject, Pre
     } else {
         None
     };
+    let has_security_descriptor = reader.boolean()?;
+    let security_descriptor = if reader.boolean()? {
+        Some(reader.take_vec()?)
+    } else {
+        None
+    };
     Ok(NtfsObject {
         reference,
         hard_link_count,
@@ -2020,6 +2110,8 @@ fn decode_ntfs_object(reader: &mut SnapshotCursor<'_>) -> Result<NtfsObject, Pre
         directory_entries,
         has_reparse_point,
         reparse_point,
+        has_security_descriptor,
+        security_descriptor,
         has_attribute_list,
         directory_index_complete,
     })
@@ -2655,11 +2747,13 @@ fn encode_ntfs_sidecar(
     writer: &mut BoundedWriter,
     sidecar: &NtfsPreservationSidecar,
 ) -> Result<(), PreservationError> {
-    // Inner NTFS snapshot v7 appends optional captured named-stream initialized bytes after each
-    // NonResident runlist. Version 6 added the per-stream compression-unit size after the three
-    // stream flag bools. Version 5 kept optional exact $REPARSE_POINT bytes after the trailing
-    // object flags. The outer escrow envelope remains ESCROW_SCHEMA_VERSION 4.
-    writer.u16(7)?;
+    // Inner NTFS snapshot v8 appends inline $SECURITY_DESCRIPTOR presence and optional exact
+    // bytes after the optional $REPARSE_POINT payload. Version 7 appended optional captured
+    // named-stream initialized bytes after each NonResident runlist. Version 6 added the
+    // per-stream compression-unit size after the three stream flag bools. Version 5 kept optional
+    // exact $REPARSE_POINT bytes after the trailing object flags. The outer escrow envelope
+    // remains ESCROW_SCHEMA_VERSION 4.
+    writer.u16(NTFS_SNAPSHOT_VERSION)?;
     writer.u64(sidecar.volume_serial_number)?;
     writer.bool(sidecar.volume_label.is_some())?;
     if let Some(units) = &sidecar.volume_label {
@@ -2736,6 +2830,11 @@ fn encode_ntfs_object(
     writer.bool(object.directory_index_complete)?;
     writer.bool(object.reparse_point.is_some())?;
     if let Some(payload) = &object.reparse_point {
+        writer.bytes(payload)?;
+    }
+    writer.bool(object.has_security_descriptor)?;
+    writer.bool(object.security_descriptor.is_some())?;
+    if let Some(payload) = &object.security_descriptor {
         writer.bytes(payload)?;
     }
     Ok(())
@@ -2871,6 +2970,7 @@ mod tests {
     use crate::fs::exfat_normalize::{ExfatObjectPreservation, ExfatPreservationSidecar};
     use crate::fs::exfat_upcase::{UpcaseLimits, UpcaseTable};
     use crate::fs::ntfs_normalize::{NtfsObjectPreservation, NtfsPreservationSidecar};
+    use crate::fs::ntfs_security_descriptor::sample_self_relative_descriptor;
     use crate::object::{
         NamespaceEntry, ObjectGraphLimits, ObjectId, ObjectKind, ObjectRecord, ObjectSemantics,
         ObjectStream, StreamFlags, StreamStorage,
@@ -3015,6 +3115,8 @@ mod tests {
             directory_entries: Vec::new(),
             has_reparse_point: false,
             reparse_point: None,
+            has_security_descriptor: false,
+            security_descriptor: None,
             has_attribute_list: false,
             directory_index_complete: true,
         }
@@ -3069,6 +3171,8 @@ mod tests {
             directory_entries: Vec::new(),
             has_reparse_point: false,
             reparse_point: None,
+            has_security_descriptor: false,
+            security_descriptor: None,
             has_attribute_list: false,
             directory_index_complete: true,
         };
@@ -3745,25 +3849,45 @@ mod tests {
         );
     }
 
+    fn ntfs_with_inline_security_descriptor(resident: bool) -> NormalizedNtfs {
+        let mut source = ntfs();
+        let mut objects = source.graph.objects().to_vec();
+        objects[0].semantics.has_security_descriptor = true;
+        source.graph = crate::object::ObjectGraph::build(
+            source.graph.root(),
+            objects,
+            source.graph.entries().to_vec(),
+            source.graph.extents().clone(),
+            crate::object::ObjectGraphLimits {
+                max_objects: 2,
+                max_entries: 2,
+                max_streams: 2,
+                max_name_code_units: 255,
+            },
+        )
+        .unwrap();
+        let object = &mut source.preservation.objects[0].source;
+        object.has_security_descriptor = true;
+        object.attribute_census.push(NtfsAttributeEvidence {
+            attribute_type: NTFS_SECURITY_DESCRIPTOR,
+            name: None,
+            flags_raw: 0,
+            flags_unknown_bits: 0,
+            attribute_id: 9,
+            resident,
+        });
+        source
+    }
+
     #[test]
-    fn inline_security_descriptors_are_not_losslessly_allowlisted() {
+    fn census_only_inline_security_descriptors_are_refused_in_every_mode() {
         for resident in [true, false] {
             for mode in [
                 GuaranteeMode::Strict,
                 GuaranteeMode::Escrow,
                 GuaranteeMode::ContentOnly,
             ] {
-                let mut source = ntfs();
-                source.preservation.objects[0].source.attribute_census.push(
-                    NtfsAttributeEvidence {
-                        attribute_type: 0x50,
-                        name: None,
-                        flags_raw: 0,
-                        flags_unknown_bits: 0,
-                        attribute_id: 9,
-                        resident,
-                    },
-                );
+                let source = ntfs_with_inline_security_descriptor(resident);
                 let report = evaluate_ntfs(
                     &source,
                     FileSystem::ExFat,
@@ -3771,20 +3895,81 @@ mod tests {
                     PreservationLimits::default(),
                 )
                 .unwrap();
-                assert_eq!(
+                // The attribute type is understood; the missing exact bytes are the refusal.
+                assert_ne!(
                     disposition(&report, PreservationField::NtfsAttributes),
+                    FieldDisposition::Refusal
+                );
+                assert_eq!(
+                    disposition(&report, PreservationField::SecurityDescriptors),
                     FieldDisposition::Refusal
                 );
                 if mode == GuaranteeMode::ContentOnly {
                     assert!(
                         report
                             .explicit_losses
-                            .contains(&PreservationField::NtfsAttributes)
+                            .contains(&PreservationField::SecurityDescriptors)
                     );
                 } else {
-                    assert!(report.blockers.contains(&PreservationField::NtfsAttributes));
+                    assert!(
+                        report
+                            .blockers
+                            .contains(&PreservationField::SecurityDescriptors)
+                    );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn captured_inline_security_descriptors_are_escrowed_and_malformed_ones_refused() {
+        for resident in [true, false] {
+            let mut source = ntfs_with_inline_security_descriptor(resident);
+            source.preservation.objects[0].source.security_descriptor =
+                Some(sample_self_relative_descriptor());
+            let report = evaluate_ntfs(
+                &source,
+                FileSystem::ExFat,
+                GuaranteeMode::Escrow,
+                PreservationLimits::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                disposition(&report, PreservationField::SecurityDescriptors),
+                FieldDisposition::EscrowRequired
+            );
+            assert!(report.permitted, "{:?}", report.blockers);
+            let decoded = decode_ntfs_sidecar_from_escrow(
+                report.escrow.as_deref().unwrap(),
+                PreservationLimits::default(),
+            )
+            .unwrap();
+            assert_eq!(decoded, source.preservation);
+            assert_eq!(
+                decoded.objects[0].source.security_descriptor,
+                Some(sample_self_relative_descriptor())
+            );
+
+            // Truncating the captured bytes makes the descriptor fail validation.
+            let mut truncated = sample_self_relative_descriptor();
+            truncated.truncate(12);
+            source.preservation.objects[0].source.security_descriptor = Some(truncated);
+            let report = evaluate_ntfs(
+                &source,
+                FileSystem::ExFat,
+                GuaranteeMode::Escrow,
+                PreservationLimits::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                disposition(&report, PreservationField::SecurityDescriptors),
+                FieldDisposition::Refusal
+            );
+            assert!(
+                report
+                    .blockers
+                    .contains(&PreservationField::SecurityDescriptors)
+            );
         }
     }
 
@@ -3969,7 +4154,25 @@ mod tests {
                     .blockers
                     .contains(&PreservationField::SecurityDescriptors)
             );
-            assert!(report.blockers.contains(&PreservationField::NtfsAttributes));
+            // The attribute itself is understood; only the missing capture is refused.
+            assert!(!report.blockers.contains(&PreservationField::NtfsAttributes));
+
+            // Exact validated bytes alongside the pinned SDS lift the refusal into escrow.
+            let object = &mut inline.preservation.objects[0].source;
+            object.has_security_descriptor = true;
+            object.security_descriptor = Some(sample_self_relative_descriptor());
+            let report = evaluate_ntfs(
+                &inline,
+                FileSystem::ExFat,
+                GuaranteeMode::Escrow,
+                PreservationLimits::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                disposition(&report, PreservationField::SecurityDescriptors),
+                FieldDisposition::EscrowRequired
+            );
+            assert!(report.permitted, "{:?}", report.blockers);
         }
     }
 
@@ -4114,7 +4317,7 @@ mod tests {
     }
 
     #[test]
-    fn decoder_keeps_current_ntfs_v7_snapshots_readable() {
+    fn decoder_keeps_current_ntfs_v8_snapshots_readable() {
         let report = evaluate_ntfs(
             &ntfs(),
             FileSystem::ExFat,
@@ -4126,12 +4329,12 @@ mod tests {
         let snapshot_start = HEADER_BYTES + RECORD_HEADER_BYTES;
         assert_eq!(
             &current[snapshot_start..snapshot_start + 2],
-            &7_u16.to_le_bytes()
+            &NTFS_SNAPSHOT_VERSION.to_le_bytes()
         );
-        let decoded = decode_escrow(&current, PreservationLimits::default()).expect("current v7");
+        let decoded = decode_escrow(&current, PreservationLimits::default()).expect("current v8");
         assert_eq!(
             &decoded.records[0].value[..2],
-            &7_u16.to_le_bytes(),
+            &NTFS_SNAPSHOT_VERSION.to_le_bytes(),
             "the current inner NTFS snapshot remains preserved verbatim"
         );
         assert_eq!(

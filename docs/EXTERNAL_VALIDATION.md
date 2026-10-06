@@ -416,13 +416,24 @@ interpreting them as runs; standalone mapping-pairs parsing remains strict. This
 [Microsoft attribute format](https://learn.microsoft.com/en-us/windows/win32/devnotes/attribute-record-header).
 Geometry, run-count, VCN, LCN, terminator, and resource bounds remain enforced.
 
-After that compatibility fix, the source inventories completely, but conversion still refuses
-`NtfsAttributes`: this independently formatted source contains resident and nonresident inline
-`$SECURITY_DESCRIPTOR` attributes (`0x50`). Their presence now contributes access-control
-semantics even when a 48-byte `$STANDARD_INFORMATION` has no security ID. Census evidence does
-not capture descriptor bytes; the pinned `$Secure:$SDS` profile is not a substitute for them.
-Strict and escrow modes continue to refuse this unsupported attribute; content-only assessment
-records it as an explicit loss and is not a lossless workaround. Do not strip descriptors,
-patch source security, or allowlist the attribute to make the probe pass. This harness is not in
-the passing continuous lane until descriptor capture, validation, escrow retention, restoration,
-and independent descriptor-byte comparisons are implemented and proven.
+After that compatibility fix, the source inventories completely, but it contains resident and
+nonresident inline `$SECURITY_DESCRIPTOR` attributes (`0x50`), whose presence contributes
+access-control semantics even when a 48-byte `$STANDARD_INFORMATION` has no security ID.
+
+Inline descriptor support is now implemented in-tree. The read-only inventory captures the exact
+bytes of unnamed resident and fully mapped nonresident `0x50` attributes up to 64 KiB; a bounded
+self-relative validator (owner/group SIDs, ACL revision 2 or 4, allow/deny/audit ACEs only) must
+accept them; the preservation policy then classifies `SecurityDescriptors` as escrow-required and
+the v8 inner NTFS escrow snapshot retains the exact bytes. The escrow-restored exFAT→NTFS path
+re-emits each descriptor as a resident `0x50` attribute, with security ID 0 when the inline
+descriptor alone governs the object and the pinned `$Secure` identifier when both coexist. The
+in-tree NTFS→exFAT(+escrow)→NTFS round trip proves byte-exact restoration on the root and on a
+junction. Census-only evidence (presence without captured bytes), malformed or out-of-profile
+descriptors, named or flagged `0x50` attributes, and unpinned security IDs remain refusals in
+strict and escrow modes; content-only assessment records them as explicit losses and is not a
+lossless workaround. Do not strip descriptors, patch source security, or widen the validator to
+make the probe pass.
+
+This harness is still not in the passing continuous lane: the formatter-origin probe has not been
+re-run against the new capture path, and the independent `ntfscat -a 0x50` byte comparison of
+every restored descriptor against the NTFS-3G source has not yet been recorded here.

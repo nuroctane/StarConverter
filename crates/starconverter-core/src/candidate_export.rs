@@ -5596,6 +5596,8 @@ mod tests {
         objects: Vec<(Vec<&'static str>, NtfsObjectTimestamps, u32)>,
         junction_payload: Vec<u8>,
         symlink_payload: Vec<u8>,
+        /// Exact inline `$SECURITY_DESCRIPTOR` carried by the root and the junction.
+        security_descriptor: Vec<u8>,
     }
 
     fn reparse_payload(tag: u32, data: &[u8]) -> Vec<u8> {
@@ -5642,6 +5644,8 @@ mod tests {
             is_reparse_point: true,
             ..ObjectSemantics::default()
         };
+        let security_descriptor =
+            crate::fs::ntfs_security_descriptor::sample_self_relative_descriptor();
         let graph = ObjectGraph::build(
             ObjectId(1),
             vec![
@@ -5649,7 +5653,10 @@ mod tests {
                     id: ObjectId(1),
                     kind: ObjectKind::Directory,
                     link_count: 0,
-                    semantics: ObjectSemantics::default(),
+                    semantics: ObjectSemantics {
+                        has_security_descriptor: true,
+                        ..ObjectSemantics::default()
+                    },
                     streams: Vec::new(),
                 },
                 ObjectRecord {
@@ -5713,12 +5720,15 @@ mod tests {
                 dos_file_attributes: attributes,
                 security_id: NTFS3G_SECURITY_ID_READ_WRITE,
             };
-        let object_metadata = vec![
+        let mut object_metadata = vec![
             metadata(1, ObjectKind::Directory, root_stamps, 0x16),
             metadata(2, ObjectKind::File, file_stamps, 0x21),
             metadata(3, ObjectKind::Directory, junction_stamps, 0x10),
             metadata(4, ObjectKind::File, symlink_stamps, 0x20),
         ];
+        // The root is governed solely by its inline descriptor (a formatter-origin shape); the
+        // junction carries an inline copy next to the pinned `$Secure` identifier.
+        object_metadata[0].security_id = 0;
         let label: Vec<u16> = "Round Trip Volume 2025".encode_utf16().collect();
         let serial = 0x1122_3344_5566_7788;
         let plan = plan_ntfs_destination_with_metadata_and_volume(
@@ -5737,6 +5747,10 @@ mod tests {
                 reparse_points: &[
                     (ObjectId(3), junction_payload.as_slice()),
                     (ObjectId(4), symlink_payload.as_slice()),
+                ],
+                security_descriptors: &[
+                    (ObjectId(1), security_descriptor.as_slice()),
+                    (ObjectId(3), security_descriptor.as_slice()),
                 ],
             },
             NtfsSerializeLimits::default(),
@@ -5764,6 +5778,7 @@ mod tests {
             ],
             junction_payload,
             symlink_payload,
+            security_descriptor,
         }
     }
 
@@ -5800,6 +5815,15 @@ mod tests {
         let inspection = inspect_open_image(&source_image).unwrap();
         let normalized = inspection.normalized_ntfs.as_deref().unwrap();
         assert_eq!(normalized.graph.objects().len(), 4);
+        assert_eq!(
+            normalized
+                .preservation
+                .objects
+                .iter()
+                .filter(|preserved| preserved.source.security_descriptor.is_some())
+                .count(),
+            2
+        );
 
         // Forward: NTFS -> exFAT with escrow.
         let draft = draft_lossless_ntfs_to_exfat(
@@ -5809,6 +5833,16 @@ mod tests {
             NtfsToExfatLimits::default(),
         )
         .unwrap();
+        assert_eq!(
+            draft
+                .preservation()
+                .assessments
+                .iter()
+                .find(|assessment| assessment.field
+                    == crate::preservation::PreservationField::SecurityDescriptors)
+                .map(|assessment| assessment.disposition),
+            Some(crate::preservation::FieldDisposition::EscrowRequired)
+        );
         let solved = solve_lossless_ntfs_to_exfat(draft, LayoutLimits::default()).unwrap();
         let preview = preview_exfat_phase_writes(
             &source_image,
@@ -5943,6 +5977,7 @@ mod tests {
             .expect("restored unnamed stream");
         assert_eq!(stream_bytes(unnamed), b"abc");
         let mut listed_reparse = Vec::new();
+        let mut restored_descriptors = 0usize;
         let mut checked_objects = 0usize;
         for preserved in &restored.preservation.objects {
             let object = &preserved.source;
@@ -5999,6 +6034,13 @@ mod tests {
                         Some(source.junction_payload.as_slice())
                     );
                     listed_reparse.push(object.reference);
+                    // Inline descriptor next to the pinned `$Secure` identifier.
+                    assert_eq!(standard.security_id, Some(0x101));
+                    assert_eq!(
+                        object.security_descriptor.as_deref(),
+                        Some(source.security_descriptor.as_slice())
+                    );
+                    restored_descriptors += 1;
                 }
                 Some("link.lnk") => {
                     assert!(!object.is_directory);
@@ -6007,11 +6049,28 @@ mod tests {
                         Some(source.symlink_payload.as_slice())
                     );
                     listed_reparse.push(object.reference);
+                    assert_eq!(standard.security_id, Some(0x101));
+                    assert!(object.security_descriptor.is_none());
                 }
-                _ => assert!(object.reparse_point.is_none()),
+                None => {
+                    assert!(object.reparse_point.is_none());
+                    // The root is governed solely by its exact inline descriptor.
+                    assert_eq!(standard.security_id, Some(0));
+                    assert_eq!(
+                        object.security_descriptor.as_deref(),
+                        Some(source.security_descriptor.as_slice())
+                    );
+                    restored_descriptors += 1;
+                }
+                _ => {
+                    assert!(object.reparse_point.is_none());
+                    assert_eq!(standard.security_id, Some(0x101));
+                    assert!(object.security_descriptor.is_none());
+                }
             }
         }
         assert_eq!(listed_reparse.len(), 2);
+        assert_eq!(restored_descriptors, 2);
         assert_eq!(checked_objects, source.objects.len());
 
         // `$Extend\$Reparse:$R` lists exactly those two reparse points.

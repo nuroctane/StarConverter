@@ -491,9 +491,10 @@ pub fn normalize_inventory(
             link_count: graph_links,
             semantics: ObjectSemantics {
                 // Older STANDARD_INFORMATION records have no security ID, but may carry an
-                // inline SECURITY_DESCRIPTOR. Census evidence proves presence, not capture;
-                // preservation policy must still refuse this unsupported attribute.
+                // inline SECURITY_DESCRIPTOR. Presence alone is not capture; preservation
+                // policy decides whether the exact bytes were retained or must refuse.
                 has_security_descriptor: standard.security_id.is_some()
+                    || source.has_security_descriptor
                     || source
                         .attribute_census
                         .iter()
@@ -1150,6 +1151,8 @@ mod tests {
             directory_entries: entries,
             has_reparse_point: false,
             reparse_point: None,
+            has_security_descriptor: false,
+            security_descriptor: None,
             has_attribute_list: false,
             directory_index_complete: true,
         }
@@ -1168,6 +1171,8 @@ mod tests {
             directory_entries: Vec::new(),
             has_reparse_point: false,
             reparse_point: None,
+            has_security_descriptor: false,
+            security_descriptor: None,
             has_attribute_list: false,
             directory_index_complete: true,
         }
@@ -1186,6 +1191,8 @@ mod tests {
             directory_entries: Vec::new(),
             has_reparse_point: false,
             reparse_point: None,
+            has_security_descriptor: false,
+            security_descriptor: None,
             has_attribute_list: false,
             directory_index_complete: true,
         }
@@ -1736,6 +1743,8 @@ mod tests {
             directory_entries: Vec::new(),
             has_reparse_point: false,
             reparse_point: None,
+            has_security_descriptor: false,
+            security_descriptor: None,
             has_attribute_list: false,
             directory_index_complete: true,
         });

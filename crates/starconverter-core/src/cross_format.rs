@@ -635,6 +635,7 @@ pub fn plan_lossless_exfat_to_ntfs(
             volume_label: volume_label.as_deref(),
             bad_cluster_ranges: &bad_cluster_ranges,
             reparse_points: &[],
+            security_descriptors: &[],
         },
         limits.serializer,
     )?;
@@ -701,6 +702,7 @@ pub fn draft_lossless_exfat_to_ntfs(
             volume_label: volume_label.as_deref(),
             bad_cluster_ranges: &bad_cluster_ranges,
             reparse_points: &[],
+            security_descriptors: &[],
         },
         limits.serializer,
     )?;
@@ -729,8 +731,9 @@ pub fn draft_lossless_exfat_to_ntfs(
 /// removed), resident `$REPARSE_POINT` payloads (listed in `$Extend:$R`), and exact
 /// `$STANDARD_INFORMATION` timestamps and DOS attributes. The volume keeps the original 64-bit
 /// NTFS serial and full-length label. Objects the escrow does not know (added on the exFAT side)
-/// keep exFAT-derived metadata. Security descriptors remain the pinned ordinary profile, and exact
-/// source MFT numbers and runlists are not rematerialized.
+/// keep exFAT-derived metadata. Exact inline `$SECURITY_DESCRIPTOR` values held in escrow are
+/// rematerialized as resident attributes; otherwise security descriptors remain the pinned
+/// ordinary profile. Exact source MFT numbers and runlists are not rematerialized.
 ///
 /// # Errors
 ///
@@ -778,6 +781,11 @@ pub fn draft_escrow_restored_exfat_to_ntfs(
         .iter()
         .map(|(object, payload)| (*object, payload.as_slice()))
         .collect();
+    let security_descriptors: Vec<(ObjectId, &[u8])> = restored
+        .security_descriptors
+        .iter()
+        .map(|(object, payload)| (*object, payload.as_slice()))
+        .collect();
     let mut destination = draft_ntfs_destination_with_metadata_and_volume(
         &restored.graph,
         inputs,
@@ -786,6 +794,7 @@ pub fn draft_escrow_restored_exfat_to_ntfs(
             volume_label: volume_label.as_deref(),
             bad_cluster_ranges: &bad_cluster_ranges,
             reparse_points: &reparse_points,
+            security_descriptors: &security_descriptors,
         },
         limits.serializer,
     )?;
@@ -863,6 +872,11 @@ fn restore_ntfs_object_metadata(
             access_time: standard.access_time,
         };
         entry.dos_file_attributes = attributes;
+        // Without an exact inline descriptor the pinned `$Secure` profile stays in force, which
+        // the policy already required of the escrowed source.
+        if restored.security_descriptors.contains_key(&entry.object) {
+            entry.security_id = standard.security_id.unwrap_or(0);
+        }
     }
     Ok(metadata)
 }
@@ -2350,6 +2364,8 @@ mod tests {
             directory_entries: Vec::new(),
             has_reparse_point: false,
             reparse_point: None,
+            has_security_descriptor: false,
+            security_descriptor: None,
             has_attribute_list: false,
             directory_index_complete: true,
         }
