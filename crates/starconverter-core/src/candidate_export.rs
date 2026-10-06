@@ -5596,8 +5596,12 @@ mod tests {
         objects: Vec<(Vec<&'static str>, NtfsObjectTimestamps, u32)>,
         junction_payload: Vec<u8>,
         symlink_payload: Vec<u8>,
-        /// Exact inline `$SECURITY_DESCRIPTOR` carried by the root and the junction.
+        /// Exact inline `$SECURITY_DESCRIPTOR` carried by the junction (resident-sized).
         security_descriptor: Vec<u8>,
+        /// Exact inline `$SECURITY_DESCRIPTOR` carried by the root (nonresident-sized).
+        root_security_descriptor: Vec<u8>,
+        /// Exact bytes of the nonresident `fork` named stream.
+        fork_payload: Vec<u8>,
     }
 
     fn reparse_payload(tag: u32, data: &[u8]) -> Vec<u8> {
@@ -5616,6 +5620,7 @@ mod tests {
         };
 
         const VOLUME_BYTES: u64 = 64 * 1024 * 1024;
+        const FORK_BYTES: usize = 8193;
         // 2025-era FILETIME base with sub-10 ms tick offsets that exFAT cannot represent.
         const BASE: u64 = 0x01dc_0000_0000_0000;
         let stamps = |offset: u64| NtfsObjectTimestamps {
@@ -5646,6 +5651,15 @@ mod tests {
         };
         let security_descriptor =
             crate::fs::ntfs_security_descriptor::sample_self_relative_descriptor();
+        // The mkntfs root descriptor shape (4140 bytes): far beyond the resident budget, so the
+        // restore must emit it nonresident over its own clusters.
+        let root_security_descriptor =
+            crate::fs::ntfs_security_descriptor::sample_self_relative_descriptor_with_aces(205);
+        // Larger than the resident budget, so the source formatter writes the fork nonresident
+        // and the escrow restore must re-materialize the captured bytes rather than inline them.
+        let fork_payload: Vec<u8> = (0..FORK_BYTES)
+            .map(|index| u8::try_from(index % 251).unwrap())
+            .collect();
         let graph = ObjectGraph::build(
             ObjectId(1),
             vec![
@@ -5664,7 +5678,10 @@ mod tests {
                     kind: ObjectKind::File,
                     link_count: 2,
                     semantics: ObjectSemantics::default(),
-                    streams: vec![resident(2, None, b"abc"), resident(3, Some("fork"), b"xyz")],
+                    streams: vec![
+                        resident(2, None, b"abc"),
+                        resident(3, Some("fork"), &fork_payload),
+                    ],
                 },
                 ObjectRecord {
                     id: ObjectId(3),
@@ -5749,7 +5766,7 @@ mod tests {
                     (ObjectId(4), symlink_payload.as_slice()),
                 ],
                 security_descriptors: &[
-                    (ObjectId(1), security_descriptor.as_slice()),
+                    (ObjectId(1), root_security_descriptor.as_slice()),
                     (ObjectId(3), security_descriptor.as_slice()),
                 ],
             },
@@ -5779,6 +5796,8 @@ mod tests {
             junction_payload,
             symlink_payload,
             security_descriptor,
+            root_security_descriptor,
+            fork_payload,
         }
     }
 
@@ -5823,6 +5842,19 @@ mod tests {
                 .filter(|preserved| preserved.source.security_descriptor.is_some())
                 .count(),
             2
+        );
+        let fork_name: Vec<u16> = "fork".encode_utf16().collect();
+        let source_fork = normalized
+            .graph
+            .objects()
+            .iter()
+            .flat_map(|object| object.streams.iter())
+            .find(|stream| stream.name.as_deref() == Some(fork_name.as_slice()))
+            .expect("source named stream");
+        assert_eq!(source_fork.storage, StreamStorage::Extents);
+        assert_eq!(
+            source_fork.logical_bytes,
+            u64::try_from(source.fork_payload.len()).unwrap()
         );
 
         // Forward: NTFS -> exFAT with escrow.
@@ -5963,13 +5995,15 @@ mod tests {
                 }
             }
         };
-        let fork_name: Vec<u16> = "fork".encode_utf16().collect();
         let fork = file
             .streams
             .iter()
             .find(|stream| stream.name.as_deref() == Some(fork_name.as_slice()))
             .expect("restored named stream");
-        assert_eq!(stream_bytes(fork), b"xyz");
+        // The captured fork exceeds the resident budget, so the restore must place it
+        // nonresident and byte-exact rather than refuse the draft.
+        assert_eq!(fork.storage, StreamStorage::Extents);
+        assert_eq!(stream_bytes(fork), source.fork_payload);
         let unnamed = file
             .streams
             .iter()
@@ -6054,11 +6088,12 @@ mod tests {
                 }
                 None => {
                     assert!(object.reparse_point.is_none());
-                    // The root is governed solely by its exact inline descriptor.
+                    // The root is governed solely by its exact inline descriptor, which is too
+                    // large for its FILE record and comes back from a nonresident attribute.
                     assert_eq!(standard.security_id, Some(0));
                     assert_eq!(
                         object.security_descriptor.as_deref(),
-                        Some(source.security_descriptor.as_slice())
+                        Some(source.root_security_descriptor.as_slice())
                     );
                     restored_descriptors += 1;
                 }

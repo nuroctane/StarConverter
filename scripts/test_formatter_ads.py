@@ -23,6 +23,13 @@ def storage_dump():
         for name, size, _, resident in validator.STREAMS).encode("utf-8")
 
 
+def descriptor(target):
+    """A revision-1 self-relative header followed by distinct filler per object."""
+    header = bytes([1, 0, 0x04, 0x80]) + (20).to_bytes(4, "little") * 4
+    filler = {"root": bytes(4120), "payload": bytes(range(60))}[target]
+    return header + filler
+
+
 class FormatterAdsTests(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
@@ -39,6 +46,9 @@ class FormatterAdsTests(unittest.TestCase):
             return 0, b"tool 1.0\n", b""
         if command[0] == "ntfsinfo" and "-F" in command:
             return 0, storage_dump(), b""
+        if command[0] == "ntfscat" and command[1] == "-a":
+            self.assertEqual(command[2], "0x50")
+            return 0, descriptor("root" if command[3] == "-i" else "payload"), b""
         if command[0] == "ntfscat":
             name = command[2] if command[1] == "-n" else ""
             item = next(item for item in validator.STREAMS if item[0] == name)
@@ -71,6 +81,59 @@ class FormatterAdsTests(unittest.TestCase):
         exfat_checks = [c for c in self.calls if c[0] == "fsck.exfat"]
         self.assertEqual(len(exfat_checks), 1)
         self.assertEqual(exfat_checks[0], ["fsck.exfat", "-n", str(case / "exfat.img")])
+        self.assertEqual(report["schema"], "starconverter.formatter-ads.v2")
+        self.assertEqual(len(report["descriptors"]), 4)
+        self.assertTrue(all(check["passed"] for check in report["descriptors"]))
+        restored = [c for c in report["descriptors"] if c["image"] == "restored"]
+        self.assertEqual([(c["object"], c["bytes"]) for c in restored],
+                         [("root", 4140), ("payload", 80)])
+        self.assertTrue(all(c["sha256"] == c["expected_sha256"] for c in restored))
+        dumps = [c for c in self.calls if c[0] == "ntfscat" and c[1] == "-a"]
+        self.assertEqual(dumps, [
+            ["ntfscat", "-a", "0x50", "-i", "5", str(case / "source.img")],
+            ["ntfscat", "-a", "0x50", str(case / "source.img"), "/payload.bin"],
+            ["ntfscat", "-a", "0x50", "-i", "5", str(case / "restored.img")],
+            ["ntfscat", "-a", "0x50", str(case / "restored.img"), "/payload.bin"]])
+
+    def test_restored_descriptor_mismatch_fails_exact_object(self):
+        for target, mutate in (("root", lambda data: data[:-1] + b"\x01"),
+                               ("payload", lambda data: data + b"\x00")):
+            def run(command, **kwargs):
+                code, output, error = self.runner(command, **kwargs)
+                if (command[0] == "ntfscat" and command[1] == "-a"
+                        and any(part.endswith("restored.img") for part in command)
+                        and ("-i" in command) == (target == "root")):
+                    output = mutate(output)
+                return code, output, error
+
+            report = self.validate(run)
+            self.assertFalse(report["passed"])
+            self.assertIn(f"restored-descriptor-{target}", report["failures"][0])
+            self.assertIn(f"mismatch for {target}", report["failures"][0])
+            self.assertEqual(report["before_sha256"], report["after_sha256"])
+
+    def test_missing_or_implausible_descriptor_cannot_pass(self):
+        for output in (b"", b"\x02\x00\x04\x80" + bytes(16), b"\x01\x00\x04\x00" + bytes(16),
+                       bytes(validator.MAX_DESCRIPTOR_BYTES + 1)):
+            def run(command, **kwargs):
+                if command[0] == "ntfscat" and command[1] == "-a":
+                    return 0, output, b""
+                return self.runner(command, **kwargs)
+
+            report = self.validate(run)
+            self.assertFalse(report["passed"])
+            self.assertIn("source-descriptor-root", report["failures"][0])
+
+    def test_descriptor_dump_tool_failure_fails_closed(self):
+        def run(command, **kwargs):
+            if command[0] == "ntfscat" and command[1] == "-a":
+                return 1, b"", b"Cannot find attribute type 0x50."
+            return self.runner(command, **kwargs)
+
+        report = self.validate(run)
+        self.assertFalse(report["passed"])
+        self.assertIn("Cannot find attribute type 0x50", report["failures"][0])
+        self.assertEqual(report["descriptors"], [])
 
     def test_no_tool_runs_for_unapproved_workspace(self):
         def run(*args, **kwargs):

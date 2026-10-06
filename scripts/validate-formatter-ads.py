@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Independent formatter-origin ADS roundtrip on a fresh, unmounted regular image."""
+"""Independent formatter-origin ADS and inline security descriptor roundtrip on a fresh,
+unmounted regular image."""
 
 from __future__ import annotations
 
@@ -25,10 +26,29 @@ IMAGE_BYTES = 64 * 1024 * 1024
 TOOLS = ("mkntfs", "ntfscp", "ntfscat", "ntfsinfo", "ntfsfix", "fsck.exfat")
 STREAMS = (("", 14, 40, True), ("sc-small", 16, 50, True),
            ("sc-large", 8193, 60, False))
+# Objects whose inline $SECURITY_DESCRIPTOR (attribute 0x50) mkntfs/ntfscp write and the
+# restore must return byte for byte: the root directory (MFT record 5) and the populated file.
+DESCRIPTORS = ("root", "payload")
+MAX_DESCRIPTOR_BYTES = 64 * 1024
 
 
 def payload(seed: int, length: int) -> bytes:
     return bytes((seed + offset) % 251 for offset in range(length))
+
+
+def descriptor_command(ntfscat: str, image: Path, target: str) -> list[str]:
+    if target == "root":
+        return [ntfscat, "-a", "0x50", "-i", "5", str(image)]
+    return [ntfscat, "-a", "0x50", str(image), "/payload.bin"]
+
+
+def check_descriptor(data: bytes) -> None:
+    """Independent sanity for a dumped descriptor: bounded, self-relative, revision 1."""
+    if not 20 <= len(data) <= MAX_DESCRIPTOR_BYTES:
+        raise ValueError(f"inline security descriptor has implausible length {len(data)}")
+    control = int.from_bytes(data[2:4], "little")
+    if data[0] != 1 or data[1] != 0 or not control & 0x8000:
+        raise ValueError("dumped bytes are not a revision-1 self-relative security descriptor")
 
 
 def linked(metadata) -> bool:
@@ -127,12 +147,15 @@ def validate(workspace: Path, cli: str, programs: dict[str, str], run=reader.rea
     source, exfat, restored = (case / name for name in ("source.img", "exfat.img", "restored.img"))
     escrow = case / "exfat.img.starconverter-escrow"
     manifest = case / "streams.tsv"
-    report = {"schema": "starconverter.formatter-ads.v1", "passed": False,
-              "scope": "fresh unmounted regular-image ADS roundtrip; no activation qualification",
+    report = {"schema": "starconverter.formatter-ads.v2", "passed": False,
+              "scope": "fresh unmounted regular-image ADS and inline security descriptor "
+                       "roundtrip; no activation qualification",
               "case_directory": str(case), "checks": [], "failures": [], "versions": {},
-              "before_sha256": {}, "after_sha256": {}, "storage": {}, "payloads": []}
+              "before_sha256": {}, "after_sha256": {}, "storage": {}, "payloads": [],
+              "descriptors": []}
     step = "create-source"
     identities = {}
+    source_descriptors = {}
 
     def execute(label, command, limit=64 * 1024):
         nonlocal step
@@ -184,6 +207,24 @@ def validate(workspace: Path, cli: str, programs: dict[str, str], run=reader.rea
             report["payloads"].append(check)
             if not check["passed"]:
                 raise ValueError(f"binary ADS content mismatch for {name or 'unnamed'}")
+        for target in DESCRIPTORS:
+            actual = execute(f"{label}-descriptor-{target}",
+                             descriptor_command(programs["ntfscat"], image, target),
+                             MAX_DESCRIPTOR_BYTES)
+            check_descriptor(actual)
+            check = {"image": label, "object": target, "bytes": len(actual),
+                     "sha256": hashlib.sha256(actual).hexdigest()}
+            if label == "source":
+                source_descriptors[target] = actual
+                check["passed"] = True
+            else:
+                expected = source_descriptors.get(target)
+                check["expected_sha256"] = (hashlib.sha256(expected).hexdigest()
+                                            if expected is not None else None)
+                check["passed"] = expected is not None and actual == expected
+            report["descriptors"].append(check)
+            if not check["passed"]:
+                raise ValueError(f"inline security descriptor mismatch for {target}")
 
     try:
         with source.open("xb") as stream:
@@ -260,7 +301,8 @@ def validate(workspace: Path, cli: str, programs: dict[str, str], run=reader.rea
                     report["failures"].append(f"fixture bytes changed: {name}")
             except (OSError, ValueError) as error:
                 report["failures"].append(f"post-validation hash {name}: {error}")
-    report["passed"] = not report["failures"] and len(report["payloads"]) == 6
+    report["passed"] = (not report["failures"] and len(report["payloads"]) == 6
+                        and len(report["descriptors"]) == 2 * len(DESCRIPTORS))
     return report
 
 
@@ -282,7 +324,8 @@ def main() -> int:
         parser.error("required independent formatter/readers missing from PATH")
     report = validate(args.workspace, args.cli, programs)
     write_report(args.report, report)
-    print(f"{'PASS' if report['passed'] else 'FAIL'}: formatter-origin ADS; artifacts {report['case_directory']}")
+    print(f"{'PASS' if report['passed'] else 'FAIL'}: formatter-origin ADS + inline "
+          f"$SECURITY_DESCRIPTOR; artifacts {report['case_directory']}")
     for failure in report["failures"]:
         print(failure)
     return 0 if report["passed"] else 1

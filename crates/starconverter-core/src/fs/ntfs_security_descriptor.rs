@@ -144,14 +144,28 @@ impl std::error::Error for NtfsSecurityDescriptorError {}
 #[cfg(test)]
 #[must_use]
 pub(crate) fn sample_self_relative_descriptor() -> Vec<u8> {
+    sample_self_relative_descriptor_with_aces(1)
+}
+
+/// Like [`sample_self_relative_descriptor`] but with `aces` identical access-allowed ACEs, so
+/// tests can build descriptors that exceed a resident attribute budget. The result is
+/// `48 + 20 * aces` bytes; mkntfs writes a 4140-byte root descriptor, so 205 ACEs (4148 bytes)
+/// model that shape.
+#[cfg(test)]
+#[must_use]
+pub(crate) fn sample_self_relative_descriptor_with_aces(aces: usize) -> Vec<u8> {
     let mut bytes = vec![0; HEADER_BYTES];
     bytes[0] = 1;
     bytes[2..4].copy_from_slice(&(SELF_RELATIVE | DACL_PRESENT).to_le_bytes());
     bytes[16..20].copy_from_slice(&20_u32.to_le_bytes());
-    let mut acl = vec![2, 0, 0, 0, 1, 0, 0, 0, 0, 0, 20, 0];
-    acl.extend_from_slice(&0x001f_01ff_u32.to_le_bytes());
-    acl.extend_from_slice(&[1, 1, 0, 0, 0, 0, 0, 5]);
-    acl.extend_from_slice(&18_u32.to_le_bytes());
+    let mut acl = vec![2, 0, 0, 0, 0, 0, 0, 0];
+    acl[4..6].copy_from_slice(&u16::try_from(aces).unwrap().to_le_bytes());
+    for _ in 0..aces {
+        acl.extend_from_slice(&[0, 0, 20, 0]);
+        acl.extend_from_slice(&0x001f_01ff_u32.to_le_bytes());
+        acl.extend_from_slice(&[1, 1, 0, 0, 0, 0, 0, 5]);
+        acl.extend_from_slice(&18_u32.to_le_bytes());
+    }
     acl.extend_from_slice(&[0xa5; 4]);
     let acl_size = u16::try_from(acl.len()).unwrap();
     acl[2..4].copy_from_slice(&acl_size.to_le_bytes());

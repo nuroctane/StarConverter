@@ -64,11 +64,14 @@ point produces an ambiguous writable mount.
   bounded self-relative validator accepts owner/group SIDs plus ACL revision 2/4 with
   allow/deny/audit ACEs and refuses everything else, exact bytes travel in the v8 inner NTFS
   escrow snapshot, and the escrow-restored exFAT→NTFS path re-emits them as resident attributes
-  (security ID 0 when the inline descriptor alone governs, the pinned `$Secure` ID when both
-  coexist), proven by the in-tree NTFS→exFAT(+escrow)→NTFS round trip on the root and a junction;
-  census-only evidence, malformed descriptors, and unpinned security IDs remain refusals,
-  including when `$STANDARD_INFORMATION` omits a security ID; independent `ntfscat -a 0x50` byte
-  comparison against a formatter-origin image remains pending
+  or, when they exceed the FILE-record budget, as nonresident attributes in the reserved metadata
+  region (security ID 0 when the inline descriptor alone governs, the pinned `$Secure` ID when
+  both coexist), proven by the in-tree NTFS→exFAT(+escrow)→NTFS round trip on the root (4148-byte
+  descriptor) and a junction; census-only evidence, malformed descriptors, and unpinned security
+  IDs remain refusals, including when `$STANDARD_INFORMATION` omits a security ID; the
+  formatter-origin probe (`scripts/validate-formatter-ads.py`, NTFS-3G 2022.10.3) passes with
+  independent `ntfscat -a 0x50` byte comparison of the restored root and file descriptors
+  recorded in `docs/EXTERNAL_VALIDATION.md`
 
 Exit evidence: strict mode refuses every non-native semantic; escrow mode restores exact tested
 metadata and reports anything outside its versioned contract.

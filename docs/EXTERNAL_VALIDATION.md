@@ -391,7 +391,7 @@ The CI corpus lives in an isolated job workspace. The harness validates paths be
 external tools; it does not establish exclusion against a hostile process replacing files during
 validation. Production conversion continues to require its own locked-handle authority.
 
-## Formatter-origin ADS compatibility probe (not yet qualified)
+## Formatter-origin ADS and inline security descriptor probe
 
 `scripts/validate-formatter-ads.py` creates a fresh 64 MiB ordinary image beneath an explicitly
 supplied existing workspace. NTFS-3G `mkntfs` formats only that new file; `ntfscp` adds a 14-byte
@@ -399,8 +399,12 @@ unnamed stream, a 16-byte resident named stream, and an 8193-byte nonresident na
 NTFS-3G independently checks their exact binary bytes and source storage forms. The harness then
 attempts an escrow NTFS -> exFAT -> NTFS create-new round trip, with read-only structural checks,
 exact restored names/sizes/bytes, bounded subprocess output, and before/after artifact hashes.
-Restored residency is recorded, not required to reproduce the original layout. All case files
-remain available after success or failure; the JSON report is create-new, never overwritten.
+Restored residency is recorded, not required to reproduce the original layout. The schema-v2
+report also dumps the inline `$SECURITY_DESCRIPTOR` of the root directory (`ntfscat -a 0x50 -i 5`)
+and of `/payload.bin` (`ntfscat -a 0x50 <image> /payload.bin`) on the source and on the restored
+image, requires each dump to be a bounded revision-1 self-relative descriptor, and fails the
+exact object whose restored bytes differ from the NTFS-3G source. All case files remain available
+after success or failure; the JSON report is create-new, never overwritten.
 
 Run only in an isolated fixture workspace, with independent tools on PATH:
 
@@ -434,6 +438,38 @@ strict and escrow modes; content-only assessment records them as explicit losses
 lossless workaround. Do not strip descriptors, patch source security, or widen the validator to
 make the probe pass.
 
-This harness is still not in the passing continuous lane: the formatter-origin probe has not been
-re-run against the new capture path, and the independent `ntfscat -a 0x50` byte comparison of
-every restored descriptor against the NTFS-3G source has not yet been recorded here.
+Re-running the probe against the capture path exposed two restore-side defects, both fixed
+in-tree with regression tests:
+
+- The layout draft refused the captured 8193-byte named stream with `ResidentDataTooLarge`
+  because draft serialization treated every captured resident stream as resident. The draft now
+  emits a run-less placeholder for oversized file streams, which the solver materializes into
+  destination clusters before final serialization (the final path is unchanged and still refuses).
+- `mkntfs` gives the root directory a 4140-byte nonresident `$SECURITY_DESCRIPTOR` that cannot
+  sit inside a 1 KiB FILE record. The serializer now lays descriptors larger than the resident
+  budget contiguously at the front of the reserved directory-index metadata region (identically
+  in draft and final) and emits them as nonresident `0x50` attributes; a budget mismatch between
+  the two passes fails closed with `DestinationLayoutChanged`.
+
+### 2026-10 formatter-origin run (passing)
+
+Tools: NTFS-3G 2022.10.3 (`mkntfs`, `ntfscp`, `ntfsls`, `ntfscat`, `ntfsinfo`, `ntfsfix`) and
+exfatprogs 1.2.2 (`fsck.exfat`) from the Ubuntu noble packages, unpacked into a WSL root without
+installation. Report `target/formatter-ads-report-security-capture-04.json`, schema
+`starconverter.formatter-ads.v2`, `passed: true`, no failures.
+
+| Object | Source | Restored | SHA-256 |
+| --- | --- | --- | --- |
+| root (`-i 5`) | 4140 bytes, nonresident | 4140 bytes, nonresident | `e28720fb…dd2a3e34` identical |
+| `/payload.bin` | 80 bytes, resident | 80 bytes, resident | `88785f28…7686305` identical |
+
+`$MFT` carries no `0x50` attribute on either image. The three `$DATA` streams round-trip
+byte-exact (14, 16, and 8193 bytes); the restored unnamed and 16-byte named streams are
+nonresident because the solver materializes captured payload into destination clusters, which
+the harness records rather than requires. Earlier reports `…-capture-01.json` (draft
+`ResidentDataTooLarge`) and `…-capture-02.json` (root `INDEX_ALLOCATION` refusal caused by the
+oversized descriptor) document the two failures above and are retained as evidence.
+
+This is independent qualification of exact inline descriptor and ADS round-tripping on one
+formatter-origin image, not native-driver mounting, arbitrary descriptor profiles beyond the
+bounded validator, or activation authorization.
