@@ -10109,7 +10109,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
     fn oversized_security_descriptors_are_emitted_nonresident_and_round_trip_exactly() {
         use crate::fs::ntfs_security_descriptor::sample_self_relative_descriptor_with_aces;
 

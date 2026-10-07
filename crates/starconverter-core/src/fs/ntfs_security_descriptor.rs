@@ -388,24 +388,19 @@ fn validate_aliasing(
     sacl: &ParsedAcl,
     dacl: &ParsedAcl,
 ) -> Result<(), Error> {
-    if let (Some(first), Some(second)) = (owner, group)
-        && first.overlaps(second)
-        && first != second
-    {
-        return Err(Error::UnsupportedAliasing { first, second });
-    }
-    if let (Some(first), Some(second)) = (sacl.range, dacl.range)
-        && first.overlaps(second)
-        && first != second
-    {
-        return Err(Error::UnsupportedAliasing { first, second });
+    for (first, second) in [(owner, group), (sacl.range, dacl.range)] {
+        if let (Some(first), Some(second)) = (first, second) {
+            if first.overlaps(second) && first != second {
+                return Err(Error::UnsupportedAliasing { first, second });
+            }
+        }
     }
     for sid_range in [owner, group].into_iter().flatten() {
         for parsed in [sacl, dacl] {
-            if let Some(acl_range) = parsed.range
-                && sid_range.overlaps(acl_range)
-                && !parsed.ace_sids.contains(&sid_range)
-            {
+            let Some(acl_range) = parsed.range else {
+                continue;
+            };
+            if sid_range.overlaps(acl_range) && !parsed.ace_sids.contains(&sid_range) {
                 return Err(Error::UnsupportedAliasing {
                     first: sid_range,
                     second: acl_range,
