@@ -15,7 +15,7 @@ hashes. The non-elevated preflight therefore refused the regenerated candidates.
 Both pins were refreshed from the regenerated fixtures and now read:
 
 ```text
-converted Windows NTFS VHD   851095C857EDE374FFDA037CD0AE6EFA75F4B0FE77E1AB0449DDE5FE1F088B06
+converted Windows NTFS VHD   4F537D4F171B530E6D5F7491466B38CC2888D7C63F90CD3D6275775D949B6387
 converted Windows exFAT VHD  BC6301CEE56057A1AFD6B5BEF6D0A44770A9AF8093AF1A7D511240F4D53FCEF3
 ```
 
@@ -151,8 +151,24 @@ and empty `$DATA`; `$LogFile` 2 MiB) alongside the earlier invariants. The NTFS 
 `8510...8B06`. The exFAT pin moved for the first time, to `BC63...CEF3`: the rich NTFS source
 fixture is produced by the same serializer, so its escrow sidecar now preserves four additional
 metadata records (the exFAT volume structure itself is unchanged apart from that embedded
-sidecar). Whether the Windows driver now mounts the NTFS candidate is answered by the next
-`windows-vhd` lane run.
+sidecar).
+
+CI run 37600289533 was the first in which `ntfs.sys` mounted the candidate: the diagnostic
+probe's read-write copy came up as `FileSystem='NTFS'` with the converted root entries listed
+(`alpha`, `System Volume Information`, `readme.txt`), `fsutil fsinfo` reported a healthy NTFS
+3.1 volume, and `chkdsk` exited 0 ("Windows has scanned the file system and found no problems")
+on both the read-only attach and the read-write copy. The gate itself still failed because it
+attaches read-only, and that mount was refused with `fsutil` Error 19 (`ERROR_WRITE_PROTECT`)
+while the Windows-formatted control mounted read-only without complaint. The one remaining
+structural difference was `$LogFile`: the candidate carried the all-`0xff` `mkntfs` profile,
+which has no restart page, so `ntfs.sys` treated the journal as uninitialized and had to write
+one before mounting (the read-write copy shows exactly that, reporting LFS 2.0 afterwards); the
+control carries two clean LFS 1.1 restart pages. The serializer now writes the already
+implemented `CanonicalCleanLfsV1_1` profile instead: two identical MST-protected LFS 1.1
+restart pages with the clean flag, one `NTFS` client on the free list and none in use, followed
+by erased pages. That is the state Linux NTFS3 (`fs/ntfs3/fslog.c`, pinned commit) writes after
+a replay and the state both it and the Windows restart logic treat as "nothing to replay, nothing
+to write". The NTFS pin moved to `4F53...6387`; the exFAT pin was unaffected.
 
 ## 2026-09-01 forced NTFS-to-exFAT relocation qualification
 

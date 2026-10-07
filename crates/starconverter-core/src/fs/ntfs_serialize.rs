@@ -153,7 +153,7 @@ const SPARSE_NONRESIDENT_HEADER_BYTES: usize = 72;
 /// Pinned NTFS-3G `$Secure` descriptor used for ordinary read/write objects.
 pub const NTFS3G_SECURITY_ID_READ_WRITE: u32 = 0x101;
 const ACTIVATION_GAPS: &[&str] = &[
-    "$LogFile uses the pinned NTFS-3G erased clean profile, not a verified modern Windows-native profile",
+    "$LogFile uses the pinned clean LFS 1.1 restart-page profile, not a verified modern Windows-native profile",
     "$Secure uses a pinned NTFS-3G Windows-2003-era profile, not a verified modern Windows-native profile",
     "$Extend uses a pinned NTFS-3G bootstrap profile whose exact bytes are not specified by Microsoft",
     "$Extend case-sensitivity semantics remain a FIXME in the pinned formatter profile",
@@ -163,7 +163,7 @@ const ACTIVATION_GAPS: &[&str] = &[
 
 const STRUCTURAL_ACTIVATION_GAPS: &[&str] = &[
     "per-object NTFS timestamps and DOS attributes were synthesized by the structural compatibility wrapper",
-    "$LogFile uses the pinned NTFS-3G erased clean profile, not a verified modern Windows-native profile",
+    "$LogFile uses the pinned clean LFS 1.1 restart-page profile, not a verified modern Windows-native profile",
     "$Secure uses a pinned NTFS-3G Windows-2003-era profile, not a verified modern Windows-native profile",
     "$Extend uses a pinned NTFS-3G bootstrap profile whose exact bytes are not specified by Microsoft",
     "$Extend case-sensitivity semantics remain a FIXME in the pinned formatter profile",
@@ -807,8 +807,12 @@ fn mandatory_metadata(
         component: "$BadClus:$Bad",
         reason: error.to_string(),
     })?;
+    // Two clean LFS 1.1 restart pages with no client in use, the state Linux NTFS3 leaves after a
+    // replay. The all-`0xff` `mkntfs` profile has no restart page at all, which `ntfs.sys`
+    // treats as an uninitialized journal it must write before mounting; on write-protected media
+    // that mount fails with `ERROR_WRITE_PROTECT` even though `chkdsk` is clean.
     let logfile = generate_ntfs_logfile(
-        NtfsLogFileProfile::Ntfs3gErased,
+        NtfsLogFileProfile::CanonicalCleanLfsV1_1,
         NtfsLogFileConfig::ntfs31_lfs_v1_1(logfile_bytes, 0),
         NtfsLogFileLimits {
             max_bytes: maximum_bytes,
@@ -8814,8 +8818,13 @@ mod tests {
         );
         let logfile_validation =
             validate_ntfs_logfile(logfile, NtfsLogFileLimits::default()).unwrap();
-        assert_eq!(logfile_validation.profile, NtfsLogFileProfile::Ntfs3gErased);
+        assert_eq!(
+            logfile_validation.profile,
+            NtfsLogFileProfile::CanonicalCleanLfsV1_1
+        );
         assert!(logfile_validation.is_clean);
+        assert_eq!(logfile_validation.restart_page_count, 2);
+        assert_eq!(logfile_validation.open_log_count, Some(0));
         let logfile_record = parse_file_record(record(&plan, 2)).unwrap();
         let logfile_attrs = parse_attribute_list(
             logfile_record.repaired_bytes(),
