@@ -220,6 +220,15 @@ exporter asserts the nonresident `$I30` allocation with internal `INDX` nodes on
 image before wrapping it, and runs the same Windows system-record invariants on the new VHD. The
 non-elevated preflight passed against all three pins and its report verified through the CLI.
 
+Result (CI run 37607555581, `windows-latest`, Windows 10.0.26100, `ntfs.sys` 10.0.26100.1): the
+large-directory VHD attached read-only without a drive letter, `ntfs.sys` mounted it as `NTFS`,
+enumeration of `alpha` returned exactly the 128 pinned names, all 128 lookups served zero-length
+files with the empty SHA-256, `chkdsk` walked 156 file records and 170 file-name links across its
+three stages and reported "found no problems", the image detached, and the VHD hash was unchanged.
+Both rich cases passed again, the report verified, and all nine CI jobs were green. **This is the
+first Windows filesystem-driver acceptance of a StarConverter nonresident NTFS directory index
+with internal `INDX` nodes.**
+
 ## 2026-09-01 forced NTFS-to-exFAT relocation qualification
 
 A dedicated 32 MiB NTFS 3.1 regular image placed one 8,192-byte file at byte
