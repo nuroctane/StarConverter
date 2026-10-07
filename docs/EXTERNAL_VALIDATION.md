@@ -252,6 +252,14 @@ verifier now requires exactly five pinned cases and rejects an edge case whose l
 truncated or whose payload list belongs to another case. The non-elevated preflight passed
 against all five pins and its report verified through the CLI.
 
+Result (CI run 37610197730, `windows-latest`, Windows 10.0.26100): all five cases `[PASS]`. The
+edge NTFS VHD mounted read-only, `ntfs.sys` served all ten payloads byte-exactly including the
+255-code-unit name, `Straße.txt`, and `rocket-🚀.bin`, and `chkdsk` walked 39 file records and 55
+file-name links with "found no problems". The edge exFAT VHD mounted read-only, `exfat.sys` served
+the same ten payloads, and `chkdsk` found no problems. The report verified and every CI job was
+green. The Windows gate now covers five converted candidates: both rich conversions, the
+nonresident-index directory corpus, and the edge corpus in both directions.
+
 ## 2026-09-01 forced NTFS-to-exFAT relocation qualification
 
 A dedicated 32 MiB NTFS 3.1 regular image placed one 8,192-byte file at byte
