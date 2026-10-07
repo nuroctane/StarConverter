@@ -170,6 +170,29 @@ by erased pages. That is the state Linux NTFS3 (`fs/ntfs3/fslog.c`, pinned commi
 a replay and the state both it and the Windows restart logic treat as "nothing to replay, nothing
 to write". The NTFS pin moved to `4F53...6387`; the exFAT pin was unaffected.
 
+### Windows driver acceptance of both candidates
+
+CI run 37602490520 (`windows-latest`, Windows 10.0.26100, PowerShell 5.1.26100.33438, `ntfs.sys`
+10.0.26100.1, `exfat.sys` 10.0.26100.33438, `chkdsk` 10.0.26100.33296) passed both harness
+cases. The converted NTFS VHD attached read-only without a drive letter, `ntfs.sys` mounted it as
+`NTFS` (`fsutil fsinfo volumeinfo` reported `Is ReadOnly`), the driver served all three payloads
+with exact sizes and SHA-256 values, `chkdsk` exited 0 with "Windows has scanned the file system
+and found no problems", the image detached, and the VHD hash `4F53...6387` was unchanged before
+and after. The exFAT case passed identically against `BC63...CEF3`. **This is the first Windows
+filesystem-driver acceptance of a StarConverter NTFS candidate.** The diagnostic probe's
+read-write copy also mounted and passed `chkdsk`; on that copy Windows upgraded the journal to
+LFS 2.0, which is why the gate judges the read-only attach and the before/after hash.
+
+The lane still exited 1, in the step after both passes: `starconverter verify-windows-report`
+refused the create-new JSON report with "invalid volume GUID path". The verifier expected
+`\\?\Volume\{GUID}\` (a stray backslash before the brace) and its own fixture encoded the same
+malformed shape, so the defect was invisible until a driver case produced a real path. The gate
+had never reached the verifier with a passing NTFS case before. The prefix is now
+`\\?\Volume{`, the fixture matches, and a unit test pins the exact path the Windows mount manager
+reported (`\\?\Volume{53435754-0000-0000-0000-100000000000}\`) alongside the malformed variants.
+The downloaded `windows-vhd-report.json` from run 37602490520 verifies through the corrected CLI
+locally: mode `read-only-windows-driver`, two cases, `payloads=3 / chkdsk-exit=0` on each.
+
 ## 2026-09-01 forced NTFS-to-exFAT relocation qualification
 
 A dedicated 32 MiB NTFS 3.1 regular image placed one 8,192-byte file at byte

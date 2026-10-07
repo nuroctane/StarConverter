@@ -892,7 +892,7 @@ fn valid_local_vhd_path(value: &str) -> bool {
 
 fn valid_volume_guid_path(value: &str) -> bool {
     let Some(guid) = value
-        .strip_prefix(r"\\?\Volume\{")
+        .strip_prefix(r"\\?\Volume{")
         .and_then(|value| value.strip_suffix(r"}\"))
     else {
         return false;
@@ -940,7 +940,7 @@ mod tests {
     fn driver_case(name: &str, filesystem: &str, hash: &str, path: &str) -> String {
         let path = serde_json::to_string(path).unwrap();
         format!(
-            r#"{{"Name":"{name}","FileSystem":"{filesystem}","VhdPath":{path},"VhdBytes":34603520,"VirtualBytes":34603008,"Sha256Before":"{hash}","Sha256After":"{hash}","DetachedBefore":true,"DetachedAfter":true,"ReadOnlyAttached":true,"NoDriveLetter":true,"PartitionOffsetBytes":1048576,"VolumeGuidPath":"\\\\?\\Volume\\{{01234567-89ab-cdef-0123-456789abcdef}}\\","Payloads":[{{"Path":"readme.txt","Length":14,"Sha256":"DEEE70659646C5B4F25155E113967DB5AAEE6F9616232A85DEE3AFB1159D6FFB"}},{{"Path":"alpha\\empty.dat","Length":0,"Sha256":"E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855"}},{{"Path":"alpha\\Ωmega\\fragmented.bin","Length":6000,"Sha256":"6F5B3BEF759FFD6505BEB8112B023A869B1B771946F88BAEC7F016CCFB1035D6"}}],"ChkdskExitCode":0,"ChkdskOutput":["Windows has scanned the file system and found no problems."]}}"#
+            r#"{{"Name":"{name}","FileSystem":"{filesystem}","VhdPath":{path},"VhdBytes":34603520,"VirtualBytes":34603008,"Sha256Before":"{hash}","Sha256After":"{hash}","DetachedBefore":true,"DetachedAfter":true,"ReadOnlyAttached":true,"NoDriveLetter":true,"PartitionOffsetBytes":1048576,"VolumeGuidPath":"\\\\?\\Volume{{01234567-89ab-cdef-0123-456789abcdef}}\\","Payloads":[{{"Path":"readme.txt","Length":14,"Sha256":"DEEE70659646C5B4F25155E113967DB5AAEE6F9616232A85DEE3AFB1159D6FFB"}},{{"Path":"alpha\\empty.dat","Length":0,"Sha256":"E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855"}},{{"Path":"alpha\\Ωmega\\fragmented.bin","Length":6000,"Sha256":"6F5B3BEF759FFD6505BEB8112B023A869B1B771946F88BAEC7F016CCFB1035D6"}}],"ChkdskExitCode":0,"ChkdskOutput":["Windows has scanned the file system and found no problems."]}}"#
         )
     }
 
@@ -1196,6 +1196,27 @@ mod tests {
             verify_windows_vhd_validation_report(valid.as_bytes(), limits),
             Err(WindowsValidationError::InvalidLimit("max_report_bytes"))
         ));
+    }
+
+    #[test]
+    fn volume_guid_path_matches_the_shape_the_windows_mount_manager_reports() {
+        // Exactly what `Get-Partition ... AccessPaths` reported in the elevated lane.
+        assert!(valid_volume_guid_path(
+            r"\\?\Volume{53435754-0000-0000-0000-100000000000}\"
+        ));
+        assert!(valid_volume_guid_path(
+            r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\"
+        ));
+        for invalid in [
+            r"\\?\Volume\{53435754-0000-0000-0000-100000000000}\",
+            r"\\?\Volume{53435754-0000-0000-0000-100000000000}",
+            r"\\.\Volume{53435754-0000-0000-0000-100000000000}\",
+            r"\\?\Volume{53435754-0000-0000-0000-10000000000}\",
+            r"\\?\Volume{5343575g-0000-0000-0000-100000000000}\",
+            "",
+        ] {
+            assert!(!valid_volume_guid_path(invalid), "{invalid}");
+        }
     }
 
     #[test]

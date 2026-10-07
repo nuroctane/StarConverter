@@ -294,7 +294,9 @@ installed. CI always tests both language stacks.
 - [x] Scheduled RustSec/Go vulnerability scans and weekly Cargo, Go, and GitHub Actions update proposals
 - [ ] Close serializer activation gaps and qualify the cross-filesystem metadata profiles
 - [ ] In-place image conversion with durable recovery/finalize workflow
-- [ ] Windows `chkdsk`/mount validation of generated and recovered images
+- [x] Elevated Windows `ntfs.sys`/`exfat.sys` read-only mount, payload, and `chkdsk` validation of the
+      converted VHD candidates in CI (`windows-vhd` lane, evidence in `docs/EXTERNAL_VALIDATION.md`)
+- [ ] Windows `chkdsk`/mount validation of recovered and Windows-origin images
 - [ ] Explicitly gated physical-volume support
 
 The staged implementation plan lives in [`docs/ROADMAP.md`](docs/ROADMAP.md); the evidence required
