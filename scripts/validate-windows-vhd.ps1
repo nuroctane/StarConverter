@@ -24,6 +24,17 @@ function Assert-One {
     return $Values[0]
 }
 
+function Test-HasDriveLetter {
+    param([AllowNull()][object]$Letter)
+    # The Storage module reports an unassigned letter as $null on volumes but as [char]0 on
+    # partitions, so a plain null comparison would wrongly reject every letterless partition.
+    if ($null -eq $Letter) {
+        return $false
+    }
+    $text = ([string]$Letter).Trim([char]0)
+    return -not [string]::IsNullOrWhiteSpace($text)
+}
+
 if (-not $PreflightOnly -and -not (Test-IsAdministrator)) {
     throw "Windows VHD validation requires an elevated PowerShell 5.1 prompt."
 }
@@ -183,13 +194,13 @@ foreach ($case in $cases) {
         if ($partition.Offset -ne 1MB) {
             throw "Expected a 1 MiB partition offset, found $($partition.Offset) bytes."
         }
-        if ($null -ne $partition.DriveLetter) {
-            throw "No drive letter may be assigned during validation."
+        if (Test-HasDriveLetter -Letter $partition.DriveLetter) {
+            throw "No drive letter may be assigned during validation (partition letter $($partition.DriveLetter))."
         }
 
         $volume = Assert-One -Values @($partition | Get-Volume) -Description "associated volume"
-        if ($null -ne $volume.DriveLetter) {
-            throw "No drive letter may be assigned during validation."
+        if (Test-HasDriveLetter -Letter $volume.DriveLetter) {
+            throw "No drive letter may be assigned during validation (volume letter $($volume.DriveLetter))."
         }
         if ($volume.FileSystem -ine $case.FileSystem) {
             throw "Expected $($case.FileSystem), found $($volume.FileSystem)."
@@ -222,18 +233,27 @@ foreach ($case in $cases) {
 
         Write-Host "[CHECK] $($case.Name) at $($volume.Path)"
         $volumePath = $volume.Path
-        $chkdskOutput = @(& "$env:SystemRoot\System32\chkdsk.exe" $volume.Path 2>&1 | ForEach-Object {
-            Write-Host $_
-            $_.ToString()
-        })
-        $chkdskExit = $LASTEXITCODE
+        # Windows PowerShell 5.1 turns redirected native stderr into terminating errors under
+        # Stop; the exit code, not stderr presence, is the CHKDSK verdict.
+        $previousPreference = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        try {
+            $chkdskOutput = @(& "$env:SystemRoot\System32\chkdsk.exe" $volume.Path 2>&1 | ForEach-Object {
+                Write-Host $_
+                $_.ToString()
+            })
+            $chkdskExit = $LASTEXITCODE
+        }
+        finally {
+            $ErrorActionPreference = $previousPreference
+        }
         if ($chkdskExit -ne 0) {
             throw "CHKDSK reported exit code $chkdskExit; no repair was attempted."
         }
     }
     finally {
         if ($attached) {
-            Dismount-DiskImage -ImagePath $vhdPath -StorageType VHD -ErrorAction Continue
+            $null = Dismount-DiskImage -ImagePath $vhdPath -StorageType VHD -ErrorAction Continue
         }
     }
 
