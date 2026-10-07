@@ -63,6 +63,38 @@ jobs:
             target/formatter-ads-report.json
           if-no-files-found: warn
 
+  windows-vhd:
+    name: Windows filesystem-driver VHD gate
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Regenerate the pinned Windows VHD candidates
+        run: cargo test -p starconverter-core --test export_external_fixtures export_structural_candidate_images -- --ignored --nocapture
+      - name: Build CLI for report verification
+        run: cargo build -p starconverter-cli
+      - name: Detached identity preflight
+        shell: powershell
+        run: .\scripts\validate-windows-vhd.ps1 -PreflightOnly -ReportPath target\windows-vhd-preflight-report.json
+      - name: Attach read-only without a drive letter, CHKDSK, detach, re-hash
+        id: driver
+        shell: powershell
+        run: .\scripts\validate-windows-vhd.ps1 -ReportPath target\windows-vhd-report.json
+      - name: Verify the driver report with the CLI
+        if: ${{ !cancelled() && steps.driver.outcome == 'success' }}
+        shell: powershell
+        run: .\target\debug\starconverter.exe verify-windows-report target\windows-vhd-report.json
+      - name: Upload Windows driver evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: windows-vhd-evidence
+          path: |
+            target/windows-vhd-preflight-report.json
+            target/windows-vhd-report.json
+          if-no-files-found: warn
+
   rust:
     name: Rust / ${{ matrix.os }}
     strategy:

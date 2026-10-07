@@ -43,7 +43,9 @@ use starconverter_core::preimage::PreimageLimits;
 use starconverter_core::validation_vhd::{
     FixedVhdConfig, FixedVhdLimits, ONE_MIB_PARTITION_ALIGNMENT_SECTORS, wrap_fixed_vhd,
 };
-use starconverter_core::{GuaranteeMode, image::ImageFile, inspect::inspect_open_image};
+use starconverter_core::{
+    GuaranteeMode, image::ImageFile, inspect::inspect_open_image, windows_validation,
+};
 
 const IMAGE_BYTES: u64 = 32 * 1024 * 1024;
 const GRAPH_LIMITS: ObjectGraphLimits = ObjectGraphLimits {
@@ -766,7 +768,40 @@ fn export_windows_vhd_candidates(
     .unwrap();
     let exfat_path = directory.join("converted-rich-ntfs-to-exfat-windows.vhd");
     fs::write(&exfat_path, exfat_vhd.bytes).unwrap();
+
+    // The Windows harness and the report parser both pin these exact VHD identities. Asserting
+    // them here turns every serializer byte change into a visible, deliberate pin refresh instead
+    // of a silent drift that the elevated gate would only discover later.
+    for (path, expected) in [
+        (&ntfs_path, windows_validation::NTFS_CASE_HASH),
+        (&exfat_path, windows_validation::EXFAT_CASE_HASH),
+    ] {
+        let bytes = fs::read(path).unwrap();
+        assert_eq!(
+            u64::try_from(bytes.len()).unwrap(),
+            windows_validation::PINNED_VHD_BYTES,
+            "{}",
+            path.display()
+        );
+        let actual = upper_hex(&Sha256::digest(&bytes));
+        assert_eq!(
+            actual,
+            expected,
+            "pinned Windows VHD identity drifted for {}; refresh windows_validation.rs, \
+             scripts/validate-windows-vhd.ps1, and docs/EXTERNAL_VALIDATION.md together",
+            path.display()
+        );
+        println!("pinned Windows VHD identity: {actual} {}", path.display());
+    }
     (ntfs_path, exfat_path)
+}
+
+fn upper_hex(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(output, "{byte:02X}").unwrap();
+    }
+    output
 }
 
 fn export_edge_corpus(

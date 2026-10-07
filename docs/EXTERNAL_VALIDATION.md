@@ -4,6 +4,39 @@ StarConverter's own parsers are not sufficient evidence of interoperability. Thi
 independent, read-only checks against regular-file candidates. It does **not** authorize activation,
 image conversion, writable mounting, repair, or physical-device access.
 
+## 2026-10-07 Windows VHD pin refresh, drift guard, and continuous driver lane
+
+The two Windows VHD candidates drifted from their 2026-08-25 pins without any check noticing:
+the inline `$SECURITY_DESCRIPTOR`, nonresident security-descriptor, `$MFT` fixpoint, and exFAT
+benign-entry escrow changes all altered the exported bytes while
+`scripts/validate-windows-vhd.ps1`, `windows_validation.rs`, and this log still carried the old
+hashes. The non-elevated preflight therefore refused the regenerated candidates.
+
+Both pins were refreshed from the regenerated fixtures and now read:
+
+```text
+converted Windows NTFS VHD   ED4CD7630790095EB0704C1DEE4AA8B25249A5A0F2F98385FB36FD749F9CAC9B
+converted Windows exFAT VHD  3F52FE1A6997A5DAFBA4B66D4C7947E9DFAEAB801A578E597775D9C3F3F0EA41
+```
+
+Two guards now keep the three pin sites in lockstep:
+
+- `export_external_fixtures` re-hashes both generated VHDs and asserts the public
+  `windows_validation::{NTFS_CASE_HASH, EXFAT_CASE_HASH, PINNED_VHD_BYTES}` constants, so any
+  serializer byte change fails the Linux `external-images` lane until the pins are refreshed on
+  purpose.
+- A `windows_validation` unit test reads `scripts/validate-windows-vhd.ps1` and asserts the same
+  two case names and hashes, all three payload lengths and hashes, and both VHD byte lengths.
+
+CI gained a `windows-vhd` lane on `windows-latest`, which runs elevated. It regenerates the two
+candidates, runs the detached preflight, then the full harness: `Mount-DiskImage -Access ReadOnly
+-NoDriveLetter`, one read-only non-boot MBR disk, one LBA-2048 partition, expected filesystem,
+volume GUID round trip, exact payload sizes and hashes through the Windows filesystem driver,
+`chkdsk` without repair flags, detach in `finally`, and before/after VHD hash equality. The
+create-new JSON report is verified by `starconverter verify-windows-report` and uploaded as
+`windows-vhd-evidence`. The non-elevated local preflight passed against the refreshed pins and its
+report verified through the CLI (Windows 10.0.26200, PowerShell 5.1.26100.8655).
+
 ## 2026-09-01 forced NTFS-to-exFAT relocation qualification
 
 A dedicated 32 MiB NTFS 3.1 regular image placed one 8,192-byte file at byte
@@ -57,8 +90,8 @@ converted edge exFAT         39E0CE5B51102F1E333871C4F4CE76CC84D2063ADAFD11FD007
 
 This refresh qualifies the current bytes only against the listed Linux tools and read-only
 filesystem-driver paths. The non-elevated Windows detached-VHD preflight also passed against the
-two refreshed pinned hashes above. Windows attachment, `chkdsk`, payload access, detach, and hash
-qualification remain pending separately.
+two refreshed pinned hashes above. The two Windows VHD hashes listed here were superseded on
+2026-10-07; see that section for the current pins and the continuous Windows driver lane.
 
 ## Reproducing the fixtures
 
@@ -294,25 +327,25 @@ checkout were removed after evidence was recorded.
   does not cover
   alternate streams, hard links, ACLs, sparse/compressed data, reparse points,
   multi-level directory indexes, or a completed cross-format execution.
-- No candidate has been mounted by Windows, mounted writable, repaired, converted in-place, or
-  tested on a physical drive.
+- No candidate has been mounted writable, repaired, converted in-place, or tested on a physical
+  drive. Windows attachment is read-only, letterless, and limited to the two pinned rich-corpus
+  VHDs exercised by the `windows-vhd` CI lane.
 
-The next external gates are Windows-origin feature images and disposable-VHD `chkdsk`, detach,
-hash comparison, and StarConverter reinspection.
+The next external gates are Windows-origin feature images and StarConverter reinspection of
+Windows-attached candidates.
 
-The current desktop session is not elevated. Microsoft documents that VHD attachment requires
-administrator privileges, so the generated VHDs were not attached in this run. When that gate is
-authorized, it must use `Mount-DiskImage -Access ReadOnly -NoDriveLetter`, operate only on exact
-copied VHD paths, resolve the associated volume through that image, run `chkdsk` against its volume
-GUID without repair flags, detach in a `finally` path, and confirm hashes again.
+Microsoft documents that VHD attachment requires administrator privileges, so the local desktop
+session never attaches the generated VHDs. The elevated gate runs on the `windows-latest` CI
+runner instead. It uses `Mount-DiskImage -Access ReadOnly -NoDriveLetter`, operates only on exact
+generated VHD paths, resolves the associated volume through that image, runs `chkdsk` against its
+volume GUID without repair flags, detaches in a `finally` path, and confirms hashes again.
 
 The fail-closed harness for that gate is `scripts/validate-windows-vhd.ps1`. It pins both VHD names,
 lengths, and SHA-256 values; refuses network/reparse/clustered inputs and already-attached images;
 asserts one read-only non-boot MBR virtual disk, one LBA-2048 partition, one expected filesystem,
 no drive letter, an exact volume-to-image association, and exact sizes/SHA-256 values for all three
 rich-corpus payloads through the Windows filesystem driver; then detaches and re-hashes in all
-paths. It must be run later from an elevated Windows PowerShell 5.1 prompt. It has not been run in
-this non-elevated session, so Windows filesystem qualification remains pending.
+paths. It requires an elevated Windows PowerShell 5.1 prompt when run by hand.
 
 The detached, non-elevated identity/container preflight is safe to run separately and performs no
 attachment:

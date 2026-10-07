@@ -16,10 +16,21 @@ const VHD_BYTES: u64 = 34_603_520;
 const VIRTUAL_BYTES: u64 = 34_603_008;
 const PARTITION_OFFSET_BYTES: u64 = 1024 * 1024;
 
-const NTFS_CASE_NAME: &str = "exFAT-to-NTFS rich conversion";
-const NTFS_CASE_HASH: &str = "F58C1F68BF819331EA9B42EDE8646A3EC7F4D7A34A77034249ACBE04802B2DC3";
-const EXFAT_CASE_NAME: &str = "NTFS-to-exFAT rich conversion";
-const EXFAT_CASE_HASH: &str = "8FC03DE6F777B3473FCF08322C6B8159AD73E372CCEF3BB459853CF423C3EC47";
+/// Pinned case name for the exFAT-to-NTFS rich-conversion Windows VHD candidate.
+pub const NTFS_CASE_NAME: &str = "exFAT-to-NTFS rich conversion";
+/// Pinned upper-case SHA-256 of `converted-rich-exfat-to-ntfs-windows.vhd`.
+///
+/// The fixture exporter regenerates that VHD and asserts this value, so any serializer change that
+/// alters the candidate bytes fails CI until the pin here, in `scripts/validate-windows-vhd.ps1`,
+/// and in `docs/EXTERNAL_VALIDATION.md` is refreshed deliberately.
+pub const NTFS_CASE_HASH: &str = "ED4CD7630790095EB0704C1DEE4AA8B25249A5A0F2F98385FB36FD749F9CAC9B";
+/// Pinned case name for the NTFS-to-exFAT rich-conversion Windows VHD candidate.
+pub const EXFAT_CASE_NAME: &str = "NTFS-to-exFAT rich conversion";
+/// Pinned upper-case SHA-256 of `converted-rich-ntfs-to-exfat-windows.vhd`.
+pub const EXFAT_CASE_HASH: &str =
+    "3F52FE1A6997A5DAFBA4B66D4C7947E9DFAEAB801A578E597775D9C3F3F0EA41";
+/// Exact regular-file length of both pinned fixed VHD candidates.
+pub const PINNED_VHD_BYTES: u64 = VHD_BYTES;
 
 const EXPECTED_PAYLOADS: [(&str, u64, &str); 3] = [
     (
@@ -996,7 +1007,7 @@ mod tests {
                 .iter()
                 .all(|case| case.driver_evidence().is_none())
         );
-        assert_eq!(evidence.cases()[0].sha256()[0], 0xf5);
+        assert_eq!(evidence.cases()[0].sha256()[0], 0xed);
     }
 
     #[test]
@@ -1185,5 +1196,44 @@ mod tests {
             verify_windows_vhd_validation_report(valid.as_bytes(), limits),
             Err(WindowsValidationError::InvalidLimit("max_report_bytes"))
         ));
+    }
+
+    #[test]
+    fn powershell_harness_pins_the_same_fixture_identities_as_this_parser() {
+        let script_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("scripts")
+            .join("validate-windows-vhd.ps1");
+        let script = std::fs::read_to_string(&script_path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", script_path.display()));
+
+        for (name, hash) in [
+            (NTFS_CASE_NAME, NTFS_CASE_HASH),
+            (EXFAT_CASE_NAME, EXFAT_CASE_HASH),
+        ] {
+            let name_line = format!("Name = \"{name}\"");
+            let hash_line = format!("Sha256 = \"{hash}\"");
+            let name_at = script
+                .find(&name_line)
+                .unwrap_or_else(|| panic!("script lacks case {name_line}"));
+            let hash_at = script
+                .find(&hash_line)
+                .unwrap_or_else(|| panic!("script lacks pin {hash_line}"));
+            assert!(
+                hash_at > name_at && hash_at - name_at < 400,
+                "pin {hash} is not attached to case {name}"
+            );
+        }
+        assert_eq!(
+            script.matches("Sha256 = \"").count(),
+            2 + EXPECTED_PAYLOADS.len()
+        );
+        for (path, length, hash) in EXPECTED_PAYLOADS {
+            assert!(script.contains(&format!("Length = {length}")), "{path}");
+            assert!(script.contains(&format!("Sha256 = \"{hash}\"")), "{path}");
+        }
+        assert!(script.contains(&format!("-ne {PINNED_VHD_BYTES} -or")));
+        assert!(script.contains(&format!("Size -ne {VIRTUAL_BYTES}")));
     }
 }
