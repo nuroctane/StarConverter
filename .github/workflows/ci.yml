@@ -85,6 +85,10 @@ jobs:
         if: ${{ !cancelled() && steps.driver.outcome == 'success' }}
         shell: powershell
         run: .\target\debug\starconverter.exe verify-windows-report target\windows-vhd-report.json
+      - name: Diagnostic mount probe (never gates)
+        if: ${{ !cancelled() }}
+        shell: powershell
+        run: .\scripts\probe-windows-vhd-mount.ps1
       - name: Upload Windows driver evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

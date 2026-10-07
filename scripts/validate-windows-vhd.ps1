@@ -286,12 +286,15 @@ foreach ($case in $cases) {
 
             Write-Host "[CHECK] $($case.Name) at $($volume.Path)"
             $volumePath = $volume.Path
+            # chkdsk rejects a volume GUID path with its trailing separator as "no mount point or
+            # drive letter"; without the separator it addresses the letterless volume directly.
+            $chkdskTarget = $volume.Path.TrimEnd('\')
             # Windows PowerShell 5.1 turns redirected native stderr into terminating errors under
             # Stop; the exit code, not stderr presence, is the CHKDSK verdict.
             $previousPreference = $ErrorActionPreference
             $ErrorActionPreference = "Continue"
             try {
-                $chkdskOutput = @(& "$env:SystemRoot\System32\chkdsk.exe" $volume.Path 2>&1 | ForEach-Object {
+                $chkdskOutput = @(& "$env:SystemRoot\System32\chkdsk.exe" $chkdskTarget 2>&1 | ForEach-Object {
                     Write-Host $_
                     $_.ToString()
                 })
