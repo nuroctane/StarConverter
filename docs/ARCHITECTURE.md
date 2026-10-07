@@ -221,12 +221,17 @@ base FILE record. File and directory lists that span two or more clusters emit a
 extent with whole-stream sizes plus a VCN-contiguous continuation. `$DATA` mapping pairs that cannot
 fit one empty FILE record become VCN-contiguous continuation extents. Source discovery concatenates
 same-record `$MFT` `$DATA` fragments and follows record zero's `$ATTRIBUTE_LIST`, resident or
-non-resident on volume clusters (VCN-split continuation extents in record zero or in already-mapped
-extension records), to already-mapped `$MFT` extension records. Records 1, 3, and 6 (`$MFTMirr`,
-`$Volume`, `$Bitmap`) and record zero's `$BITMAP` are likewise read through their own
-`$ATTRIBUTE_LIST` when present, and VCN-split `$MFTMirr::$DATA`, `$MFT::$BITMAP`, and
-`$Bitmap::$DATA` extents are concatenated in VCN order; a continuation host outside the decoded map
-remains incomplete evidence.
+non-resident on volume clusters (VCN-split continuation extents in record zero or in extension
+records), to `$MFT` extension records resolved to a fixpoint: like `ntfs_mft_load` in NTFS-3G,
+each `$DATA` or list extent whose host record becomes readable through any already-decoded extent
+is adopted, so hosts may sit beyond the contiguous first-extent prefix and in any VCN order. A host
+that is readable only through the extent it itself maps, or that no listed extent exposes, leaves
+`mapping_complete == false`; a list that is still partial once the mapping covers the allocation,
+or extents that exceed the allocation, fail closed. Records 1, 3, and 6 (`$MFTMirr`, `$Volume`,
+`$Bitmap`) and record zero's `$BITMAP` are likewise read through their own `$ATTRIBUTE_LIST` when
+present, and VCN-split `$MFTMirr::$DATA`, `$MFT::$BITMAP`, and `$Bitmap::$DATA` extents are
+concatenated in VCN order; a continuation host outside the decoded `$MFT` map remains incomplete
+evidence.
 The NTFS serializer lists every emitted `$REPARSE_POINT` once in the `$Extend\$Reparse:$R` view index (tag plus FILE reference, `COLLATION_NTOFS_ULONGS` order). `fs::ntfs_reparse_index` builds that index from fixed 32-byte `REPARSE_INDEX` entries: it stays resident while the `$Reparse` FILE record can hold every key, and otherwise spills into 4 KiB `INDX` leaf records (adding internal `INDX` levels when the separator root would overflow) whose `$INDEX_ALLOCATION:$R` occupies dest metadata clusters directly after the spilled `$I30` allocations, with a resident `$BITMAP:$R`. The `$Reparse` root budget is derived from the record's real `$STANDARD_INFORMATION`, `$FILE_NAME`, allocation, and bitmap attribute bytes, and the same module walks the emitted root and every `INDX` record independently (virtual update-sequence repair, canonical headers, child-VCN reachability, strict collation) before `ntfs_extend` accepts the typed `$Extend` metadata.
 
 The read-only NTFS inventory closes the loop from the other side. `fs::ntfs_inventory` locates `$Extend\$Reparse` by its `$FILE_NAME` under record 11 (not by assuming record 26), reads its `$INDEX_ROOT:$R` through the lenient `ntfs_reparse_index::read_reparse_index_root` reader, and, when the root has children, walks every `INDX` record of `$INDEX_ALLOCATION:$R` through the runlist and `$BITMAP:$R` with `read_reparse_index_block` (update-sequence repair, declared-VCN check, fixed `REPARSE_INDEX` entry geometry, but no assumption about `$LogFile` sequence numbers, update-sequence values, or unused bytes, so volumes written by Windows or NTFS-3G qualify). The walked keys are then reconciled against the `$REPARSE_POINT` census: every key must name an in-use base record with the same sequence number whose unnamed `$REPARSE_POINT` carries the same tag, and every such record must be keyed exactly once. Stale keys, unlisted records, tag disagreements, duplicate keys, a missing `$Reparse` metafile beside reparse points, or a second `$Reparse` metafile are hard `NtfsInventoryError`s because a converter cannot know which side to trust. `NtfsInventory::reparse_index` records the outcome as `Absent`, `Reconciled { keys, spilled, index_blocks }`, or `Unavailable` (only when the record census itself was bounded), and `inspect-image` prints it.

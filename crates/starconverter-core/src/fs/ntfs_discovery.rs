@@ -5,10 +5,13 @@
 //! follows that trust chain using regular image-file reads only. Same-record unnamed `$DATA`
 //! fragments are concatenated in VCN order. Record zero's `$ATTRIBUTE_LIST` (resident, or
 //! non-resident on volume clusters, including a VCN-split list whose continuation extent sits in
-//! record zero or in an already-mapped extension record) is then followed to unnamed `$DATA` hosts
-//! inside the growing map. A continuation host outside the current map remains explicit
-//! incomplete mapping evidence rather than a guess.
+//! record zero or in an extension record) is then followed to unnamed `$DATA` hosts, resolving
+//! them to a fixpoint: an extent hosted beyond the contiguous prefix becomes readable as soon as
+//! any other listed extent exposes its host, so `$DATA` and list continuations may be stored in
+//! any VCN order. Only a host that no decoded extent ever exposes remains explicit incomplete
+//! mapping evidence rather than a guess.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::fs::ntfs::NtfsBootSector;
@@ -24,7 +27,7 @@ use crate::fs::ntfs_record::{
     MAX_FILE_RECORD_SIZE, MftReference, NtfsFileRecord, NtfsFileRecordError, parse_file_record,
 };
 use crate::fs::ntfs_runlist::{
-    ExtentLocation, MappingPairsError, MappingPairsLimits, NtfsRunlist,
+    ExtentLocation, MappingPairsError, MappingPairsLimits, NtfsExtent, NtfsRunlist,
     parse_attribute_mapping_pairs,
 };
 use crate::image::{BoundedImageReader, ImageError, ImageFile};
@@ -84,8 +87,9 @@ pub struct MftBootstrap {
     pub initialized_bytes: u64,
     /// Whether the decoded mapping covers the complete `$DATA` allocation.
     ///
-    /// `false` means a `$DATA` or `$ATTRIBUTE_LIST` continuation host lies outside the decoded
-    /// mapping, or record zero advertises allocation that no attribute maps.
+    /// `false` means a `$DATA` or `$ATTRIBUTE_LIST` continuation host is unreachable through every
+    /// decoded extent (resolved to a fixpoint), or record zero advertises allocation that no
+    /// attribute maps.
     pub mapping_complete: bool,
     pub record_zero_sequence_number: u16,
 }
@@ -831,6 +835,96 @@ fn refresh_mft_mapping_complete(
     Ok(())
 }
 
+/// Record zero's unnamed `$ATTRIBUTE_LIST` value as far as the current `$MFT` mapping exposes it.
+enum MftAttributeList {
+    Complete(Vec<u8>),
+    /// Non-resident, VCN-split list whose later extents are hosted in extension records that
+    /// are not yet readable; `runlist` covers the known prefix.
+    Partial {
+        runlist: NtfsRunlist,
+        data_bytes: u64,
+    },
+}
+
+/// Locates record zero's unnamed `$ATTRIBUTE_LIST`, reading it whole when record zero alone maps
+/// its complete value; `None` when record zero carries no list.
+fn initial_mft_attribute_list(
+    image: &dyn BoundedImageReader,
+    boot: &NtfsBootSector,
+    limits: NtfsDiscoveryLimits,
+    record_zero: &NtfsFileRecord,
+    budget: &mut ReadBudget,
+) -> Result<Option<MftAttributeList>, NtfsDiscoveryError> {
+    let attributes = parse_mft_record_attributes(record_zero, boot, limits)?;
+    let Some(source) = mft_attribute_list_source(&attributes.attributes, boot, limits)? else {
+        return Ok(None);
+    };
+    Ok(Some(match source {
+        MftAttributeListSource::Resident(value) => MftAttributeList::Complete(value.to_vec()),
+        MftAttributeListSource::NonResident {
+            runlist,
+            data_bytes,
+        } => {
+            if mapped_byte_length(&runlist, boot)? >= data_bytes {
+                MftAttributeList::Complete(read_runlist_prefix(
+                    image,
+                    boot,
+                    &runlist,
+                    data_bytes,
+                    budget,
+                    "$MFT $ATTRIBUTE_LIST",
+                )?)
+            } else {
+                MftAttributeList::Partial {
+                    runlist,
+                    data_bytes,
+                }
+            }
+        }
+    }))
+}
+
+/// Parses the list entries currently readable: the whole value, or the mapped prefix of a
+/// partial list (a truncated final entry is tolerated there).
+fn known_mft_attribute_list_entries(
+    image: &dyn BoundedImageReader,
+    boot: &NtfsBootSector,
+    limits: NtfsDiscoveryLimits,
+    budget: &mut ReadBudget,
+    list: &MftAttributeList,
+) -> Result<Vec<AttributeListEntry>, NtfsDiscoveryError> {
+    match list {
+        MftAttributeList::Complete(value) => {
+            parse_attribute_list_value(value, limits.max_attributes, limits.max_name_code_units)
+        }
+        MftAttributeList::Partial {
+            runlist,
+            data_bytes,
+        } => {
+            let mapped = mapped_byte_length(runlist, boot)?;
+            let prefix = read_runlist_prefix(
+                image,
+                boot,
+                runlist,
+                mapped.min(*data_bytes),
+                budget,
+                "$MFT $ATTRIBUTE_LIST prefix",
+            )?;
+            parse_attribute_list_prefix(&prefix, limits.max_attributes, limits.max_name_code_units)
+        }
+    }
+    .map_err(|_| NtfsDiscoveryError::UnsupportedDataStorage {
+        reason: "$MFT $ATTRIBUTE_LIST is malformed",
+    })
+}
+
+/// Follows record zero's `$ATTRIBUTE_LIST` to every unnamed `$DATA` extent whose host record can
+/// be read, until the mapping covers the allocation or no further host is reachable.
+///
+/// Hosts are resolved to a fixpoint rather than strictly in VCN order: an extent hosted beyond
+/// the contiguous prefix is still decoded once some other decoded extent covers its host record,
+/// and VCN-split list continuations are followed the same way. The result is either a complete
+/// contiguous runlist or explicit incomplete evidence; nothing is guessed.
 fn extend_mft_mapping_from_attribute_list(
     image: &dyn BoundedImageReader,
     boot: &NtfsBootSector,
@@ -843,70 +937,186 @@ fn extend_mft_mapping_from_attribute_list(
     if mft.mapping_complete {
         return Ok(());
     }
-    let Some(value) =
-        mft_attribute_list_value(image, boot, limits, record_zero, record_size, budget, mft)?
+    let Some(mut list) = initial_mft_attribute_list(image, boot, limits, record_zero, budget)?
     else {
         return Ok(());
     };
-    let entries =
-        parse_attribute_list_value(&value, limits.max_attributes, limits.max_name_code_units)
-            .map_err(|_| NtfsDiscoveryError::UnsupportedDataStorage {
-                reason: "$MFT $ATTRIBUTE_LIST is malformed",
-            })?;
     let expected_base = MftReference {
         record_number: 0,
         sequence_number: record_zero.sequence_number,
     };
-    let mut consumed = 0_usize;
-    while !mft.mapping_complete {
-        let Some(entry) = next_unnamed_mft_data_entry(&entries, mft.runlist.next_vcn) else {
-            return Ok(());
-        };
-        if entry.file_reference.record_number == 0 {
-            return Err(NtfsDiscoveryError::UnsupportedDataStorage {
-                reason: "$MFT $ATTRIBUTE_LIST names a record-zero $DATA continuation that was not present",
-            });
-        }
-        if !record_is_mapped(mft, boot, entry.file_reference.record_number)? {
-            return Ok(());
-        }
-        consumed = consumed
-            .checked_add(1)
-            .ok_or(NtfsDiscoveryError::GeometryOverflow {
-                calculation: "$MFT $ATTRIBUTE_LIST continuation count",
-            })?;
-        if consumed > entries.len() {
-            return Err(NtfsDiscoveryError::UnsupportedDataStorage {
-                reason: "$MFT $ATTRIBUTE_LIST $DATA continuations do not make forward progress",
-            });
-        }
-        budget.charge(boot.mft_record_size.bytes)?;
-        let host = read_mft_record_inner(
+    let mut detached: BTreeMap<u64, NtfsRunlist> = BTreeMap::new();
+    let mut resolved_vcns: BTreeSet<u64> = BTreeSet::new();
+    let mut list_continuations_followed = 0_usize;
+    loop {
+        let entries = known_mft_attribute_list_entries(image, boot, limits, budget, &list)?;
+
+        let mut progressed = false;
+        progressed |= decode_reachable_mft_data_extents(
             image,
             boot,
-            mft,
-            entry.file_reference.record_number,
-            record_size,
-        )?;
-        validate_record_identity(&host, entry.file_reference.record_number)?;
-        validate_mft_extension_host(&host, entry, expected_base)?;
-        let host_attributes = parse_mft_record_attributes(&host, boot, limits)?;
-        let extra = unnamed_mft_data_for_list_entry(
-            &host_attributes.attributes,
-            entry,
-            boot,
             limits,
-            mft.runlist.encoded_runs,
+            record_size,
+            budget,
+            mft,
+            &entries,
+            expected_base,
+            &mut detached,
+            &mut resolved_vcns,
         )?;
-        append_mft_runlist(&mut mft.runlist, extra)?;
+        while let Some(extra) = detached.remove(&mft.runlist.next_vcn) {
+            append_mft_runlist(&mut mft.runlist, extra)?;
+            progressed = true;
+        }
         if mft.runlist.sparse_clusters != 0 {
             return Err(NtfsDiscoveryError::UnsupportedDataStorage {
                 reason: "$MFT runlist contains sparse clusters",
             });
         }
         refresh_mft_mapping_complete(mft, boot)?;
+        if mft.mapping_complete && !detached.is_empty() {
+            return Err(NtfsDiscoveryError::UnsupportedDataStorage {
+                reason: "$MFT runlist maps more bytes than its allocation size",
+            });
+        }
+
+        // The list itself must stay well formed even once the mapping is complete, so its next
+        // continuation is checked before the outcome is decided.
+        let mut list_blocked = false;
+        if let MftAttributeList::Partial {
+            runlist,
+            data_bytes,
+        } = &mut list
+        {
+            let view = MftMappingView {
+                mft,
+                detached: &detached,
+            };
+            if follow_mft_attribute_list_continuation(
+                image,
+                boot,
+                limits,
+                record_size,
+                budget,
+                &view,
+                &entries,
+                expected_base,
+                runlist,
+                &mut list_continuations_followed,
+            )? {
+                progressed = true;
+                if mapped_byte_length(runlist, boot)? >= *data_bytes {
+                    list = MftAttributeList::Complete(read_runlist_prefix(
+                        image,
+                        boot,
+                        runlist,
+                        *data_bytes,
+                        budget,
+                        "$MFT $ATTRIBUTE_LIST",
+                    )?);
+                }
+            } else {
+                list_blocked = true;
+            }
+        }
+        if mft.mapping_complete {
+            if list_blocked {
+                // Every `$MFT` record is now readable, so the named host does not exist.
+                return Err(NtfsDiscoveryError::UnsupportedDataStorage {
+                    reason: "$MFT $ATTRIBUTE_LIST continuation host lies outside the initialized $MFT",
+                });
+            }
+            if matches!(list, MftAttributeList::Complete(_)) {
+                return Ok(());
+            }
+        }
+        if !progressed {
+            // Every remaining host lies outside the decoded extents: explicit incomplete evidence.
+            return Ok(());
+        }
     }
-    Ok(())
+}
+
+/// Decodes every listed unnamed `$DATA` extent whose host record is readable through the prefix
+/// or an already detached extent. Returns whether any new extent was decoded.
+#[allow(clippy::too_many_arguments)]
+fn decode_reachable_mft_data_extents(
+    image: &dyn BoundedImageReader,
+    boot: &NtfsBootSector,
+    limits: NtfsDiscoveryLimits,
+    record_size: usize,
+    budget: &mut ReadBudget,
+    mft: &MftBootstrap,
+    entries: &[AttributeListEntry],
+    expected_base: MftReference,
+    detached: &mut BTreeMap<u64, NtfsRunlist>,
+    resolved_vcns: &mut BTreeSet<u64>,
+) -> Result<bool, NtfsDiscoveryError> {
+    let mut candidates = entries
+        .iter()
+        .filter(|entry| {
+            entry.attribute_type == DATA_ATTRIBUTE_TYPE
+                && entry.name.is_empty()
+                && entry.lowest_vcn >= mft.runlist.next_vcn
+                && !resolved_vcns.contains(&entry.lowest_vcn)
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|entry| entry.lowest_vcn);
+    let mut progressed = false;
+    for entry in candidates {
+        if entry.file_reference.record_number == 0 {
+            return Err(NtfsDiscoveryError::UnsupportedDataStorage {
+                reason: "$MFT $ATTRIBUTE_LIST names a record-zero $DATA continuation that was not present",
+            });
+        }
+        let view = MftMappingView { mft, detached };
+        if !view.record_is_readable(boot, entry.file_reference.record_number)? {
+            continue;
+        }
+        budget.charge(boot.mft_record_size.bytes)?;
+        let host =
+            view.read_record(image, boot, entry.file_reference.record_number, record_size)?;
+        validate_record_identity(&host, entry.file_reference.record_number)?;
+        validate_mft_extension_host(&host, entry, expected_base)?;
+        let host_attributes = parse_mft_record_attributes(&host, boot, limits)?;
+        let encoded_runs = detached
+            .values()
+            .try_fold(mft.runlist.encoded_runs, |total, runlist| {
+                total.checked_add(runlist.encoded_runs)
+            });
+        let encoded_runs = encoded_runs.ok_or(NtfsDiscoveryError::GeometryOverflow {
+            calculation: "$MFT concatenated run count",
+        })?;
+        let extra = unnamed_mft_data_for_list_entry(
+            &host_attributes.attributes,
+            entry,
+            boot,
+            limits,
+            encoded_runs,
+        )?;
+        if extra.sparse_clusters != 0 {
+            return Err(NtfsDiscoveryError::UnsupportedDataStorage {
+                reason: "$MFT runlist contains sparse clusters",
+            });
+        }
+        if mapped_byte_length(&extra, boot)? > mft.allocated_bytes {
+            return Err(NtfsDiscoveryError::UnsupportedDataStorage {
+                reason: "$MFT runlist maps more bytes than its allocation size",
+            });
+        }
+        let overlaps = detached.iter().any(|(lowest_vcn, runlist)| {
+            *lowest_vcn < extra.next_vcn && runlist.next_vcn > entry.lowest_vcn
+        });
+        if overlaps {
+            return Err(NtfsDiscoveryError::UnsupportedDataStorage {
+                reason: "$MFT $DATA continuation overlaps a decoded VCN range",
+            });
+        }
+        detached.insert(entry.lowest_vcn, extra);
+        resolved_vcns.insert(entry.lowest_vcn);
+        progressed = true;
+    }
+    Ok(progressed)
 }
 
 /// Where record zero stores its unnamed `$ATTRIBUTE_LIST` value.
@@ -917,55 +1127,6 @@ enum MftAttributeListSource<'a> {
         runlist: NtfsRunlist,
         data_bytes: u64,
     },
-}
-
-/// Returns the complete `$ATTRIBUTE_LIST` value of record zero, or `None` when record zero has no
-/// list or a VCN-split list's continuation host is not yet inside the decoded `$MFT` mapping.
-///
-/// List clusters are volume LCNs, so a non-resident value is read directly from the image; only a
-/// continuation *attribute* hosted in an extension record depends on the `$MFT` map.
-fn mft_attribute_list_value(
-    image: &dyn BoundedImageReader,
-    boot: &NtfsBootSector,
-    limits: NtfsDiscoveryLimits,
-    record_zero: &NtfsFileRecord,
-    record_size: usize,
-    budget: &mut ReadBudget,
-    mft: &MftBootstrap,
-) -> Result<Option<Vec<u8>>, NtfsDiscoveryError> {
-    let attributes = parse_mft_record_attributes(record_zero, boot, limits)?;
-    let Some(source) = mft_attribute_list_source(&attributes.attributes, boot, limits)? else {
-        return Ok(None);
-    };
-    match source {
-        MftAttributeListSource::Resident(value) => Ok(Some(value.to_vec())),
-        MftAttributeListSource::NonResident {
-            mut runlist,
-            data_bytes,
-        } => {
-            if !complete_mft_attribute_list_runlist(
-                image,
-                boot,
-                limits,
-                record_zero,
-                record_size,
-                budget,
-                mft,
-                &mut runlist,
-                data_bytes,
-            )? {
-                return Ok(None);
-            }
-            Ok(Some(read_runlist_prefix(
-                image,
-                boot,
-                &runlist,
-                data_bytes,
-                budget,
-                "$MFT $ATTRIBUTE_LIST",
-            )?))
-        }
-    }
 }
 
 fn mft_attribute_list_source<'a>(
@@ -1096,93 +1257,67 @@ fn parse_mft_attribute_list_runlist(
     Ok(runlist)
 }
 
-/// Follows VCN-split `$ATTRIBUTE_LIST` continuation attributes hosted in already-mapped
-/// extension records until the list runlist covers `data_bytes`.
+/// Follows the next VCN-split `$ATTRIBUTE_LIST` continuation attribute when its host record is
+/// readable through `view`, appending its extent to `runlist`.
 ///
-/// Returns `Ok(false)` when the next continuation host is not yet inside the `$MFT` mapping.
+/// Returns `Ok(false)` when the continuation host is not yet readable.
 #[allow(clippy::too_many_arguments)]
-fn complete_mft_attribute_list_runlist(
+fn follow_mft_attribute_list_continuation(
     image: &dyn BoundedImageReader,
     boot: &NtfsBootSector,
     limits: NtfsDiscoveryLimits,
-    record_zero: &NtfsFileRecord,
     record_size: usize,
     budget: &mut ReadBudget,
-    mft: &MftBootstrap,
+    view: &MftMappingView<'_>,
+    entries: &[AttributeListEntry],
+    expected_base: MftReference,
     runlist: &mut NtfsRunlist,
-    data_bytes: u64,
+    followed: &mut usize,
 ) -> Result<bool, NtfsDiscoveryError> {
-    let expected_base = MftReference {
-        record_number: 0,
-        sequence_number: record_zero.sequence_number,
+    let Some(entry) = entries.iter().find(|entry| {
+        entry.attribute_type == ATTRIBUTE_LIST_TYPE
+            && entry.name.is_empty()
+            && entry.lowest_vcn == runlist.next_vcn
+    }) else {
+        return Err(NtfsDiscoveryError::UnsupportedDataStorage {
+            reason: "$MFT $ATTRIBUTE_LIST mapping does not cover its data and names no continuation",
+        });
     };
-    let mut followed = 0_usize;
-    while mapped_byte_length(runlist, boot)? < data_bytes {
-        followed = followed
-            .checked_add(1)
-            .ok_or(NtfsDiscoveryError::GeometryOverflow {
-                calculation: "$MFT $ATTRIBUTE_LIST continuation count",
-            })?;
-        if followed > limits.max_attributes {
-            return Err(NtfsDiscoveryError::UnsupportedDataStorage {
-                reason: "$MFT $ATTRIBUTE_LIST continuations exceed the caller attribute cap",
-            });
-        }
-        let mapped_bytes = mapped_byte_length(runlist, boot)?;
-        let prefix = read_runlist_prefix(
-            image,
-            boot,
-            runlist,
-            mapped_bytes.min(data_bytes),
-            budget,
-            "$MFT $ATTRIBUTE_LIST prefix",
-        )?;
-        let entries =
-            parse_attribute_list_prefix(&prefix, limits.max_attributes, limits.max_name_code_units)
-                .map_err(|_| NtfsDiscoveryError::UnsupportedDataStorage {
-                    reason: "$MFT $ATTRIBUTE_LIST is malformed",
-                })?;
-        let Some(entry) = entries.iter().find(|entry| {
-            entry.attribute_type == ATTRIBUTE_LIST_TYPE
-                && entry.name.is_empty()
-                && entry.lowest_vcn == runlist.next_vcn
-        }) else {
-            return Err(NtfsDiscoveryError::UnsupportedDataStorage {
-                reason: "$MFT $ATTRIBUTE_LIST mapping does not cover its data and names no continuation",
-            });
-        };
-        if entry.file_reference.record_number == 0 {
-            return Err(NtfsDiscoveryError::UnsupportedDataStorage {
-                reason: "$MFT $ATTRIBUTE_LIST names a record-zero continuation that was not present",
-            });
-        }
-        if !record_is_mapped(mft, boot, entry.file_reference.record_number)? {
-            return Ok(false);
-        }
-        budget.charge(boot.mft_record_size.bytes)?;
-        let host = read_mft_record_inner(
-            image,
-            boot,
-            mft,
-            entry.file_reference.record_number,
-            record_size,
-        )?;
-        validate_record_identity(&host, entry.file_reference.record_number)?;
-        validate_mft_extension_host(&host, entry, expected_base)?;
-        let host_attributes = parse_mft_record_attributes(&host, boot, limits)?;
-        let extra = mft_attribute_list_extent_for_entry(
-            &host_attributes.attributes,
-            entry,
-            boot,
-            limits,
-            runlist.encoded_runs,
-        )?;
-        append_mft_stream_runlist(
-            runlist,
-            extra,
-            "$MFT $ATTRIBUTE_LIST continuation is not VCN-contiguous",
-        )?;
+    if entry.file_reference.record_number == 0 {
+        return Err(NtfsDiscoveryError::UnsupportedDataStorage {
+            reason: "$MFT $ATTRIBUTE_LIST names a record-zero continuation that was not present",
+        });
     }
+    if !view.record_is_readable(boot, entry.file_reference.record_number)? {
+        return Ok(false);
+    }
+    *followed = followed
+        .checked_add(1)
+        .ok_or(NtfsDiscoveryError::GeometryOverflow {
+            calculation: "$MFT $ATTRIBUTE_LIST continuation count",
+        })?;
+    if *followed > limits.max_attributes {
+        return Err(NtfsDiscoveryError::UnsupportedDataStorage {
+            reason: "$MFT $ATTRIBUTE_LIST continuations exceed the caller attribute cap",
+        });
+    }
+    budget.charge(boot.mft_record_size.bytes)?;
+    let host = view.read_record(image, boot, entry.file_reference.record_number, record_size)?;
+    validate_record_identity(&host, entry.file_reference.record_number)?;
+    validate_mft_extension_host(&host, entry, expected_base)?;
+    let host_attributes = parse_mft_record_attributes(&host, boot, limits)?;
+    let extra = mft_attribute_list_extent_for_entry(
+        &host_attributes.attributes,
+        entry,
+        boot,
+        limits,
+        runlist.encoded_runs,
+    )?;
+    append_mft_stream_runlist(
+        runlist,
+        extra,
+        "$MFT $ATTRIBUTE_LIST continuation is not VCN-contiguous",
+    )?;
     Ok(true)
 }
 
@@ -1274,17 +1409,6 @@ fn read_runlist_prefix(
         });
     }
     Ok(output)
-}
-
-fn next_unnamed_mft_data_entry(
-    entries: &[AttributeListEntry],
-    next_vcn: u64,
-) -> Option<&AttributeListEntry> {
-    entries.iter().find(|entry| {
-        entry.attribute_type == DATA_ATTRIBUTE_TYPE
-            && entry.name.is_empty()
-            && entry.lowest_vcn == next_vcn
-    })
 }
 
 fn validate_mft_extension_host(
@@ -1671,27 +1795,111 @@ fn read_mft_record_bytes_inner(
     if !record_is_mapped(mft, boot, record_number)? {
         return Err(NtfsDiscoveryError::MftRecordOutsideMapping { record_number });
     }
+    read_mft_record_bytes_through(
+        image,
+        boot,
+        &mft.runlist.extents,
+        record_number,
+        record_size,
+    )
+}
+
+/// `$MFT` extents usable for record reads while the mapping is still being assembled: the
+/// VCN-contiguous prefix plus `$DATA` extents already decoded out of VCN order, keyed by lowest
+/// VCN and all lying beyond the prefix.
+struct MftMappingView<'a> {
+    mft: &'a MftBootstrap,
+    detached: &'a BTreeMap<u64, NtfsRunlist>,
+}
+
+impl MftMappingView<'_> {
+    fn extents(&self) -> impl Iterator<Item = &NtfsExtent> {
+        self.mft.runlist.extents.iter().chain(
+            self.detached
+                .values()
+                .flat_map(|runlist| runlist.extents.iter()),
+        )
+    }
+
+    /// Whether every byte of `record_number` is logically present, initialized, and covered by a
+    /// decoded extent.
+    fn record_is_readable(
+        &self,
+        boot: &NtfsBootSector,
+        record_number: u64,
+    ) -> Result<bool, NtfsDiscoveryError> {
+        let (start, end) = record_range(boot, record_number)?;
+        if end > self.mft.data_bytes || end > self.mft.initialized_bytes {
+            return Ok(false);
+        }
+        let mut logical = start;
+        for extent in self.extents() {
+            let (extent_start, extent_end) = extent_byte_range(extent, boot)?;
+            if logical >= end {
+                break;
+            }
+            if logical >= extent_start && logical < extent_end {
+                logical = end.min(extent_end);
+            }
+        }
+        Ok(logical == end)
+    }
+
+    fn read_record(
+        &self,
+        image: &dyn BoundedImageReader,
+        boot: &NtfsBootSector,
+        record_number: u64,
+        record_size: usize,
+    ) -> Result<NtfsFileRecord, NtfsDiscoveryError> {
+        if !self.record_is_readable(boot, record_number)? {
+            return Err(NtfsDiscoveryError::MftRecordOutsideMapping { record_number });
+        }
+        let extents = self.extents().copied().collect::<Vec<_>>();
+        let bytes =
+            read_mft_record_bytes_through(image, boot, &extents, record_number, record_size)?;
+        Ok(parse_file_record(&bytes)?)
+    }
+}
+
+fn extent_byte_range(
+    extent: &NtfsExtent,
+    boot: &NtfsBootSector,
+) -> Result<(u64, u64), NtfsDiscoveryError> {
+    let extent_start = extent.vcn.checked_mul(boot.cluster_size_bytes).ok_or(
+        NtfsDiscoveryError::GeometryOverflow {
+            calculation: "$MFT extent logical offset",
+        },
+    )?;
+    let extent_bytes = extent.length.checked_mul(boot.cluster_size_bytes).ok_or(
+        NtfsDiscoveryError::GeometryOverflow {
+            calculation: "$MFT extent byte length",
+        },
+    )?;
+    let extent_end =
+        extent_start
+            .checked_add(extent_bytes)
+            .ok_or(NtfsDiscoveryError::GeometryOverflow {
+                calculation: "$MFT extent logical end",
+            })?;
+    Ok((extent_start, extent_end))
+}
+
+/// Reads one record through VCN-sorted, non-overlapping extents; a gap inside the record range
+/// is reported as an unmapped record.
+fn read_mft_record_bytes_through(
+    image: &dyn BoundedImageReader,
+    boot: &NtfsBootSector,
+    extents: &[NtfsExtent],
+    record_number: u64,
+    record_size: usize,
+) -> Result<Vec<u8>, NtfsDiscoveryError> {
     let (start, end) = record_range(boot, record_number)?;
     let mut output = vec![0_u8; record_size];
     let mut logical = start;
     let mut output_offset = 0_usize;
-    for extent in &mft.runlist.extents {
-        let extent_start = extent.vcn.checked_mul(boot.cluster_size_bytes).ok_or(
-            NtfsDiscoveryError::GeometryOverflow {
-                calculation: "$MFT extent logical offset",
-            },
-        )?;
-        let extent_bytes = extent.length.checked_mul(boot.cluster_size_bytes).ok_or(
-            NtfsDiscoveryError::GeometryOverflow {
-                calculation: "$MFT extent byte length",
-            },
-        )?;
-        let extent_end =
-            extent_start
-                .checked_add(extent_bytes)
-                .ok_or(NtfsDiscoveryError::GeometryOverflow {
-                    calculation: "$MFT extent logical end",
-                })?;
+    for extent in extents {
+        let (extent_start, extent_end) = extent_byte_range(extent, boot)?;
         if logical >= end {
             break;
         }
@@ -2435,11 +2643,18 @@ mod tests {
         (image, list.len())
     }
 
-    /// Two-cluster list whose continuation extent is hosted in extension record `host`.
-    fn synthetic_image_with_split_list_hosted_in_extension(host: u64) -> (Vec<u8>, usize) {
+    /// Two-cluster list whose continuation extent is hosted in extension record `list_host`
+    /// while the `$DATA` extent for VCN 1 is hosted in extension record `data_host`.
+    ///
+    /// Records 0..4 lie in the first `$MFT` cluster (VCN 0); records 4..8 lie in VCN 1, which is
+    /// mapped only by that `$DATA` continuation.
+    fn synthetic_image_with_split_list_hosted_in_extension(
+        list_host: u64,
+        data_host: u64,
+    ) -> (Vec<u8>, usize) {
         let mut image = synthetic_image(MFT_LCN, 1, 2);
         let mft_offset = usize::from(MFT_LCN) * CLUSTER_SIZE;
-        let list = oversized_mft_list((host, 0), 1, (2, 1));
+        let list = oversized_mft_list((list_host, 0), 1, (data_host, 1));
         write_list_clusters(&mut image, &list);
         let mut record = empty_file_record(0, None);
         let mut offset = 56;
@@ -2455,15 +2670,93 @@ mod tests {
         finish_file_record(&mut record, offset, 2);
         image[mft_offset..mft_offset + RECORD_SIZE].copy_from_slice(&record);
 
-        let mut extension = empty_file_record(2, Some((0, 1)));
-        let mut end =
-            write_nonresident_attribute_list_extent(&mut extension, 56, 1, LIST_LCN + 1, None, 0);
-        end = write_unnamed_data(&mut extension, end, 1, (MFT_LCN + 1, 1), 2, 1);
-        finish_file_record(&mut extension, end, 2);
-        let record_two = mft_offset + 2 * RECORD_SIZE;
-        image[record_two..record_two + RECORD_SIZE].copy_from_slice(&extension);
+        let host_offset = |host: u64| mft_offset + usize::try_from(host).unwrap() * RECORD_SIZE;
+        if list_host == data_host {
+            let mut extension = empty_file_record(u32::try_from(list_host).unwrap(), Some((0, 1)));
+            let mut end = write_nonresident_attribute_list_extent(
+                &mut extension,
+                56,
+                1,
+                LIST_LCN + 1,
+                None,
+                0,
+            );
+            end = write_unnamed_data(&mut extension, end, 1, (MFT_LCN + 1, 1), 2, 1);
+            finish_file_record(&mut extension, end, 2);
+            let at = host_offset(list_host);
+            image[at..at + RECORD_SIZE].copy_from_slice(&extension);
+        } else {
+            let mut list_extension =
+                empty_file_record(u32::try_from(list_host).unwrap(), Some((0, 1)));
+            let end = write_nonresident_attribute_list_extent(
+                &mut list_extension,
+                56,
+                1,
+                LIST_LCN + 1,
+                None,
+                0,
+            );
+            finish_file_record(&mut list_extension, end, 1);
+            let at = host_offset(list_host);
+            image[at..at + RECORD_SIZE].copy_from_slice(&list_extension);
+
+            let mut data_extension =
+                empty_file_record(u32::try_from(data_host).unwrap(), Some((0, 1)));
+            let end = write_unnamed_data(&mut data_extension, 56, 1, (MFT_LCN + 1, 1), 2, 1);
+            finish_file_record(&mut data_extension, end, 2);
+            let at = host_offset(data_host);
+            image[at..at + RECORD_SIZE].copy_from_slice(&data_extension);
+        }
         refresh_mft_mirror(&mut image);
         (image, list.len())
+    }
+
+    /// Three-cluster `$MFT` whose VCN 1 extent is hosted in record 8 (inside VCN 2) while the
+    /// VCN 2 extent is hosted in record 2 (inside VCN 0): resolvable only out of VCN order.
+    fn synthetic_image_with_data_extent_hosted_beyond_prefix() -> Vec<u8> {
+        let mut image = synthetic_image(MFT_LCN, 1, 3);
+        let mft_offset = usize::from(MFT_LCN) * CLUSTER_SIZE;
+        let mut list = attribute_list_entry(DATA_ATTRIBUTE_TYPE, 0, 0, 1, 1);
+        list.extend(attribute_list_entry(DATA_ATTRIBUTE_TYPE, 1, 8, 1, 0));
+        list.extend(attribute_list_entry(DATA_ATTRIBUTE_TYPE, 2, 2, 1, 0));
+        let mut record_zero = empty_file_record(0, None);
+        let mut offset = 56;
+        offset = write_resident_attribute_list(&mut record_zero, offset, &list, 0);
+        offset = write_unnamed_data(&mut record_zero, offset, 0, (MFT_LCN, 1), 3, 1);
+        finish_file_record(&mut record_zero, offset, 2);
+        image[mft_offset..mft_offset + RECORD_SIZE].copy_from_slice(&record_zero);
+
+        for (host, hosted_vcn) in [(2_u32, 2_u64), (8, 1)] {
+            let mut extension = empty_file_record(host, Some((0, 1)));
+            let run_lcn = MFT_LCN + u8::try_from(hosted_vcn).unwrap();
+            let end = write_unnamed_data(&mut extension, 56, hosted_vcn, (run_lcn, 1), 3, 0);
+            finish_file_record(&mut extension, end, 1);
+            let at = mft_offset + usize::try_from(host).unwrap() * RECORD_SIZE;
+            image[at..at + RECORD_SIZE].copy_from_slice(&extension);
+        }
+        refresh_mft_mirror(&mut image);
+        image
+    }
+
+    /// Two-cluster `$MFT` whose VCN 1 extent is hosted in record 5, which itself lies in VCN 1.
+    fn synthetic_image_with_self_hosted_data_extent() -> Vec<u8> {
+        let mut image = synthetic_image(MFT_LCN, 1, 2);
+        let mft_offset = usize::from(MFT_LCN) * CLUSTER_SIZE;
+        let mut list = attribute_list_entry(DATA_ATTRIBUTE_TYPE, 0, 0, 1, 1);
+        list.extend(attribute_list_entry(DATA_ATTRIBUTE_TYPE, 1, 5, 1, 0));
+        let mut record_zero = empty_file_record(0, None);
+        let mut offset = 56;
+        offset = write_resident_attribute_list(&mut record_zero, offset, &list, 0);
+        offset = write_unnamed_data(&mut record_zero, offset, 0, (MFT_LCN, 1), 2, 1);
+        finish_file_record(&mut record_zero, offset, 2);
+        image[mft_offset..mft_offset + RECORD_SIZE].copy_from_slice(&record_zero);
+        let mut extension = empty_file_record(5, Some((0, 1)));
+        let end = write_unnamed_data(&mut extension, 56, 1, (MFT_LCN + 1, 1), 2, 0);
+        finish_file_record(&mut extension, end, 1);
+        let at = mft_offset + 5 * RECORD_SIZE;
+        image[at..at + RECORD_SIZE].copy_from_slice(&extension);
+        refresh_mft_mirror(&mut image);
+        image
     }
 
     /// Non-resident list whose first extent maps one of two allocated clusters while the list
@@ -3268,7 +3561,7 @@ mod tests {
 
     #[test]
     fn follows_split_mft_attribute_list_hosted_in_mapped_extension_record() {
-        let (bytes, list_len) = synthetic_image_with_split_list_hosted_in_extension(2);
+        let (bytes, list_len) = synthetic_image_with_split_list_hosted_in_extension(2, 2);
         let temp = TempImage::create(&bytes);
         let image = ImageFile::open_with_limit(&temp.0, 257).unwrap();
         let discovery = discover_system_records(&image, &boot(), NtfsDiscoveryLimits::default())
@@ -3285,15 +3578,93 @@ mod tests {
     }
 
     #[test]
-    fn leaves_mapping_incomplete_when_split_list_host_is_unmapped() {
-        let (bytes, _) = synthetic_image_with_split_list_hosted_in_extension(5);
+    fn follows_split_list_whose_host_becomes_readable_through_listed_data() {
+        // The list continuation sits in record 5 (VCN 1), which only the `$DATA` extent named
+        // by the list prefix and hosted in record 2 (VCN 0) can map.
+        let (bytes, list_len) = synthetic_image_with_split_list_hosted_in_extension(5, 2);
+        let temp = TempImage::create(&bytes);
+        let image = ImageFile::open_with_limit(&temp.0, 257).unwrap();
+        let discovery = discover_system_records(&image, &boot(), NtfsDiscoveryLimits::default())
+            .expect("list host mapped by a listed $DATA extent");
+
+        assert!(discovery.mft.mapping_complete);
+        assert_eq!(discovery.mft.runlist.next_vcn, 2);
+        // record 0 + one-cluster prefix + host record 2 ($DATA) + host record 5 (list) + full
+        // list + 3 system records + 4 mirrored pairs
+        assert_eq!(
+            discovery.bytes_read,
+            14 * RECORD_SIZE as u64 + CLUSTER_SIZE as u64 + list_len as u64
+        );
+        assert!(matches!(
+            discovery.system_records[2],
+            SystemRecordEvidence::Found(identifier)
+                if identifier.kind == SystemRecordKind::Bitmap && identifier.in_use
+        ));
+    }
+
+    #[test]
+    fn leaves_mapping_incomplete_when_split_list_and_data_hosts_are_unreachable() {
+        // Both continuations live in record 5, inside the very VCN they would map.
+        let (bytes, _) = synthetic_image_with_split_list_hosted_in_extension(5, 5);
         let temp = TempImage::create(&bytes);
         let image = ImageFile::open(&temp.0).unwrap();
         let discovery = discover_system_records(&image, &boot(), NtfsDiscoveryLimits::default())
-            .expect("unmapped $ATTRIBUTE_LIST continuation host stays incomplete");
+            .expect("unreachable continuation hosts stay incomplete");
 
         assert!(!discovery.mft.mapping_complete);
         assert_eq!(discovery.mft.runlist.next_vcn, 1);
+        assert!(matches!(
+            discovery.system_records[2],
+            SystemRecordEvidence::Incomplete {
+                kind: SystemRecordKind::Bitmap,
+                reason: IncompleteReason::MappingContinuationRequired
+            }
+        ));
+    }
+
+    #[test]
+    fn resolves_mft_data_extent_hosted_beyond_the_contiguous_prefix() {
+        let temp = TempImage::create(&synthetic_image_with_data_extent_hosted_beyond_prefix());
+        let image = ImageFile::open_with_limit(&temp.0, 257).unwrap();
+        let discovery = discover_system_records(&image, &boot(), NtfsDiscoveryLimits::default())
+            .expect("out-of-order $MFT $DATA hosts resolve to a fixpoint");
+
+        assert!(discovery.mft.mapping_complete);
+        assert_eq!(discovery.mft.runlist.next_vcn, 3);
+        assert_eq!(discovery.mft.runlist.extents.len(), 3);
+        let vcns = discovery
+            .mft
+            .runlist
+            .extents
+            .iter()
+            .map(|extent| (extent.vcn, extent.location))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            vcns,
+            vec![
+                (0, ExtentLocation::Physical { lcn: 4 }),
+                (1, ExtentLocation::Physical { lcn: 5 }),
+                (2, ExtentLocation::Physical { lcn: 6 }),
+            ]
+        );
+        // record 0 + host record 2 + host record 8 + 3 system records + 4 mirrored pairs
+        assert_eq!(discovery.bytes_read, 14 * RECORD_SIZE as u64);
+        assert!(discovery.system_records.iter().all(|item| {
+            matches!(item, SystemRecordEvidence::Found(identifier) if identifier.in_use)
+        }));
+    }
+
+    #[test]
+    fn leaves_mapping_incomplete_when_data_host_lies_in_its_own_extent() {
+        let temp = TempImage::create(&synthetic_image_with_self_hosted_data_extent());
+        let image = ImageFile::open(&temp.0).unwrap();
+        let discovery = discover_system_records(&image, &boot(), NtfsDiscoveryLimits::default())
+            .expect("self-hosted $DATA continuation stays incomplete");
+
+        assert!(!discovery.mft.mapping_complete);
+        assert_eq!(discovery.mft.runlist.next_vcn, 1);
+        // record 0 + 2 mapped system records + 4 mirrored pairs; record 5 is never read
+        assert_eq!(discovery.bytes_read, 11 * RECORD_SIZE as u64);
         assert!(matches!(
             discovery.system_records[2],
             SystemRecordEvidence::Incomplete {
