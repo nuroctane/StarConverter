@@ -2087,15 +2087,7 @@ fn plan_ntfs_destination_impl(
     )?;
     records[8] = badclus_record(8, &mandatory.badclus, inputs.timestamp)?;
     records[9] = secure_record(9, layout, &mandatory.secure, inputs.timestamp)?;
-    records[10] = system_data_record(
-        10,
-        "$UpCase",
-        layout.upcase_lcn,
-        layout.upcase_clusters,
-        65_536 * 2,
-        layout.cluster,
-        inputs.timestamp,
-    )?;
+    records[10] = upcase_record(10, layout, &upcase, inputs.timestamp)?;
     let extend = extend_metadata_with_reparse_index(&mandatory.extend, &reparse_index, cluster);
     let reparse_allocation = reparse_index
         .serialized
@@ -3039,7 +3031,7 @@ fn system_mft_record(
             3,
         )?,
     ];
-    finish_record(record_number, 0x0005, 1, attrs)
+    finish_record(record_number, FILE_RECORD_IN_USE, 1, attrs)
 }
 
 impl MetadataLayout {
@@ -3059,7 +3051,7 @@ fn system_data_record(
 ) -> Result<Vec<u8>, NtfsSerializeError> {
     finish_record(
         record_number,
-        0x0005,
+        FILE_RECORD_IN_USE,
         1,
         vec![
             standard_information(
@@ -3079,6 +3071,45 @@ fn system_data_record(
     )
 }
 
+fn upcase_record(
+    record_number: u64,
+    layout: MetadataLayout,
+    upcase: &NtfsUpcaseTable,
+    timestamp: u64,
+) -> Result<Vec<u8>, NtfsSerializeError> {
+    // Windows 8+ formatters and `mkntfs` add a resident `$Info` stream carrying the table CRC;
+    // without it Windows `chkdsk` reports "bad on-disk uppercase table" even for an identical
+    // table.
+    let info_name: Vec<u16> = "$Info".encode_utf16().collect();
+    let table_bytes = u64::try_from(upcase.little_endian_bytes().len())
+        .map_err(|_| NtfsSerializeError::ArithmeticOverflow)?;
+    let allocated = layout
+        .upcase_clusters
+        .checked_mul(layout.cluster)
+        .ok_or(NtfsSerializeError::ArithmeticOverflow)?;
+    finish_record(
+        record_number,
+        FILE_RECORD_IN_USE,
+        1,
+        vec![
+            standard_information(
+                NtfsObjectTimestamps::uniform(timestamp),
+                FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM,
+            )?,
+            system_file_name_attribute("$UpCase", allocated, table_bytes, timestamp, 1)?,
+            nonresident_attribute(
+                DATA,
+                (layout.upcase_lcn, layout.upcase_clusters),
+                table_bytes,
+                table_bytes,
+                allocated,
+                2,
+            )?,
+            resident_attribute(DATA, Some(&info_name), 3, &upcase.info_stream())?,
+        ],
+    )
+}
+
 fn badclus_record(
     record_number: u64,
     badclus: &EmptyBadClusPlan,
@@ -3089,7 +3120,7 @@ fn badclus_record(
     // d327833ec1d5eb1358b6f2c37139f10a3460944d and independently validated by ntfs_essential.
     finish_record(
         record_number,
-        0x0005,
+        FILE_RECORD_IN_USE,
         1,
         vec![
             standard_information(
@@ -3127,7 +3158,7 @@ fn secure_record(
     )?;
     finish_record(
         record_number,
-        0x0005,
+        FILE_RECORD_IN_USE,
         1,
         vec![
             standard_information(
@@ -3767,7 +3798,7 @@ fn volume_record(timestamp: u64, label: Option<&[u16]>) -> Result<Vec<u8>, NtfsS
         volume_information_id,
         &info,
     )?);
-    finish_record(3, 0x0005, 1, attributes)
+    finish_record(3, FILE_RECORD_IN_USE, 1, attributes)
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -5824,6 +5855,12 @@ fn resident_attribute(
         20,
         u16::try_from(value_offset).map_err(|_| NtfsSerializeError::ArithmeticOverflow)?,
     );
+    // `RESIDENT_ATTR_IS_INDEXED`: every `$FILE_NAME` is mirrored in a directory index. NTFS-3G
+    // tolerates a clear flag; `ntfs.sys` refuses to mount and `chkdsk` reports the attribute
+    // record as corrupt.
+    if attribute_type == FILE_NAME {
+        bytes[22] = 1;
+    }
     if !name.is_empty() {
         write_utf16(&mut bytes, usize::from(name_offset), name);
     }

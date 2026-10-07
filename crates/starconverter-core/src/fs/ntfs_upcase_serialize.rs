@@ -25,6 +25,17 @@ pub const NTFS_UPCASE_TABLE_UNITS: usize = 65_536;
 pub const NTFS_UPCASE_TABLE_BYTES: usize = NTFS_UPCASE_TABLE_UNITS * 2;
 /// NTFS filename-component limit, measured in UTF-16 code units.
 pub const NTFS_MAX_FILE_NAME_UNITS: usize = 255;
+/// Byte length of the resident `$UpCase:$Info` stream Windows 8+ formatters write beside the
+/// table: `len` (u32), `filler` (u32), `crc` (u64), then OS/build/pack version fields.
+pub const NTFS_UPCASE_INFO_BYTES: usize = 32;
+
+/// CRC-64 of the pinned table as `$UpCase:$Info` carries it.
+///
+/// Jones polynomial, reflected, all-ones init and xorout. Windows `chkdsk` compares this value
+/// with the on-disk table and reports "bad on-disk uppercase table" when the stream is missing or
+/// stale. The value was measured from the `$Info` stream of a Windows Server 2025 `format`
+/// control volume whose table is byte-identical to this profile.
+pub const NTFS3G_WINDOWS61_UPCASE_INFO_CRC64: u64 = 0xDADC_7E77_6B1B_690C;
 
 /// SHA-256 of the 131,072-byte table emitted by NTFS-3G 2022.10.3 `mkntfs`.
 pub const NTFS3G_WINDOWS61_UPCASE_SHA256: [u8; 32] = [
@@ -93,6 +104,18 @@ impl NtfsUpcaseTable {
     #[must_use]
     pub const fn little_endian_bytes(&self) -> &[u8] {
         &self.little_endian_bytes
+    }
+
+    /// Exact 32-byte resident `$UpCase:$Info` payload for this table.
+    ///
+    /// The OS, build, and pack version fields stay zero; both `mkntfs` and the Windows Server
+    /// 2025 formatter leave them zero and only the CRC is checked.
+    #[must_use]
+    pub fn info_stream(&self) -> [u8; NTFS_UPCASE_INFO_BYTES] {
+        let mut info = [0_u8; NTFS_UPCASE_INFO_BYTES];
+        info[..4].copy_from_slice(&32_u32.to_le_bytes());
+        info[8..16].copy_from_slice(&crc64_upcase_info(&self.little_endian_bytes).to_le_bytes());
+        info
     }
 
     /// Maps exactly one UTF-16 code unit with the pinned on-disk table.
@@ -337,6 +360,26 @@ const fn check_table_limit(actual: usize, limits: NtfsUpcaseLimits) -> Result<()
         });
     }
     Ok(())
+}
+
+/// Reflected CRC-64 over the Jones polynomial `0x9A6C9329AC4BC9B5` with all-ones initial value
+/// and final XOR: the rpm5 routine `mkntfs` adopted for `$UpCase:$Info` (its source labels the
+/// polynomial ECMA-182, but the check value differs from CRC-64/XZ). Windows writes the same
+/// value for the same table.
+fn crc64_upcase_info(bytes: &[u8]) -> u64 {
+    const POLYNOMIAL: u64 = 0x9A6C_9329_AC4B_C9B5;
+    let mut crc = u64::MAX;
+    for byte in bytes {
+        crc ^= u64::from(*byte);
+        for _ in 0..8 {
+            crc = if crc & 1 == 1 {
+                POLYNOMIAL ^ (crc >> 1)
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
 }
 
 fn check_name_limit(name: &[u16], limits: NtfsUpcaseLimits) -> Result<(), NtfsUpcaseError> {
@@ -1192,6 +1235,31 @@ mod tests {
         assert_eq!(
             NTFS3G_WINDOWS61_UPCASE_PROFILE.golden_md5,
             "7ff498a44e45e77374cc7c962b1b92f2"
+        );
+    }
+
+    #[test]
+    fn info_stream_carries_the_windows_measured_crc64() {
+        // Check value of this exact variant (Jones polynomial, reflected, all-ones init and
+        // xorout) for "123456789"; it is not CRC-64/XZ despite the ECMA-182 label in mkntfs.
+        assert_eq!(crc64_upcase_info(b"123456789"), 0xAE8B_1486_0A79_9888);
+        let info = table().info_stream();
+        assert_eq!(info.len(), NTFS_UPCASE_INFO_BYTES);
+        assert_eq!(u32::from_le_bytes(info[..4].try_into().unwrap()), 32);
+        assert_eq!(&info[4..8], &[0; 4]);
+        assert_eq!(
+            u64::from_le_bytes(info[8..16].try_into().unwrap()),
+            NTFS3G_WINDOWS61_UPCASE_INFO_CRC64
+        );
+        assert!(info[16..].iter().all(|byte| *byte == 0));
+        // Exact bytes Windows Server 2025 `format` wrote for the identical table.
+        assert_eq!(
+            info,
+            [
+                0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x69, 0x1b, 0x6b, 0x77, 0x7e,
+                0xdc, 0xda, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00,
+            ]
         );
     }
 

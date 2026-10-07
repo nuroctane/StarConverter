@@ -15,7 +15,7 @@ hashes. The non-elevated preflight therefore refused the regenerated candidates.
 Both pins were refreshed from the regenerated fixtures and now read:
 
 ```text
-converted Windows NTFS VHD   D54A2114D8CA460B165F87D033B41D0402A5089E27634F4DE7D0EC752427065F
+converted Windows NTFS VHD   C1E66A7B355CA51A047AE302FF802EE0ACFDC34CA46FC48A382C953C15C9326C
 converted Windows exFAT VHD  3F52FE1A6997A5DAFBA4B66D4C7947E9DFAEAB801A578E597775D9C3F3F0EA41
 ```
 
@@ -61,18 +61,32 @@ tolerates that; Windows does not. The option is now `Option<u64>`: `None` derive
 latest mapped source object timestamp (floored at the exFAT epoch, 1980-01-01Z), an explicit
 `Some(0)` is refused with `ExfatToNtfsError::ZeroSystemTimestamp`, and `export_external_fixtures`
 walks records 0 through 11 of the generated VHD asserting every resident FILETIME is nonzero. That
-byte change is what moved the NTFS pin to `D54A...065F`; the exFAT pin was unaffected.
+byte change moved the NTFS pin to `D54A...065F`; the exFAT pin was unaffected.
 
-The same `chkdsk` transcript also reported "found bad on-disk uppercase table - using system
-table" for both the converted and the structural NTFS images, while a diskpart-formatted control
-VHD on the same runner mounted cleanly without that warning. The pinned NTFS-3G Windows 6.1
-`$UpCase` profile therefore differs from the table that Windows 11 / Server 2025 considers
-current. `scripts/probe-windows-vhd-mount.ps1` (never gating) now dumps the boot sector, attaches
-each candidate, records `fsutil`, `chkdsk`, and event-log output, round-trips a writable copy
-through a block diff, and keeps the diskpart control VHDs under `target/windows-control/` so they
-are published with `windows-vhd-evidence` for byte-level comparison. Whether the uppercase table
-alone blocks the mount once the timestamps are fixed is the open question the next lane run
-answers.
+CI run 37586158142 showed the timestamps were necessary but not sufficient: `ntfs.sys` still
+refused the volume and `chkdsk` still reported `Attribute record (30, "")` corruption on records 0
+through 9 plus "bad on-disk uppercase table". `scripts/probe-windows-vhd-mount.ps1` (never
+gating) now keeps its diskpart-formatted control VHDs under `target/windows-control/` and
+publishes them with `windows-vhd-evidence`, so the Windows Server 2025 `format` output could be
+compared record by record against the candidate. Three divergences from both Windows and the
+pinned `mkntfs` source surfaced, all now corrected in the serializer:
+
+- Every `$FILE_NAME` resident header lacked `RESIDENT_ATTR_IS_INDEXED` (byte 0x16). `mkntfs`
+  sets it on every `$FILE_NAME`; Windows treats a clear flag as a corrupt attribute record. This
+  is the defect behind the attribute-0x30 messages.
+- System records 0 through 10 carried MFT record flag `0x4` (`FILE_SYSTEM_FILE`). Windows and
+  `mkntfs` set it only on the `$Extend` view-index children (24 through 26).
+- `$UpCase` had no `$Info` stream. The pinned table is byte-identical to the one Windows Server
+  2025 writes, so the "bad on-disk uppercase table" message came from the missing 32-byte
+  `$Info` record (length, filler, CRC-64 with the Jones polynomial, zero version fields). The
+  serializer now emits it, and the CRC `0xDADC7E776B1B690C` is pinned against the control
+  volume's own `$Info` bytes.
+
+`export_external_fixtures` now applies the record fixups and asserts all four Windows-facing
+invariants (nonzero FILETIMEs, indexed `$FILE_NAME`, no `0x4` flag on records 0 through 11, and
+the `$UpCase:$Info` CRC) on every regenerated candidate. These byte changes moved the NTFS pin to
+`C1E6...326C`; the exFAT pin was again unaffected. Whether the Windows driver now mounts the
+candidate is answered by the next `windows-vhd` lane run.
 
 ## 2026-09-01 forced NTFS-to-exFAT relocation qualification
 

@@ -31,6 +31,7 @@ use starconverter_core::fs::ntfs_index::{NtfsIndexLimits, parse_index_block};
 use starconverter_core::fs::ntfs_serialize::{
     NtfsDestinationInputs, NtfsSerializeLimits, plan_ntfs_destination,
 };
+use starconverter_core::fs::ntfs_upcase_serialize;
 use starconverter_core::geometry::LayoutLimits;
 use starconverter_core::inspect::BootSector;
 use starconverter_core::object::{
@@ -793,74 +794,117 @@ fn export_windows_vhd_candidates(
         );
         println!("pinned Windows VHD identity: {actual} {}", path.display());
     }
-    assert_ntfs_system_records_carry_nonzero_timestamps(&fs::read(&ntfs_path).unwrap());
+    assert_ntfs_system_records_satisfy_windows_driver_invariants(&fs::read(&ntfs_path).unwrap());
     (ntfs_path, exfat_path)
 }
 
-/// Windows `chkdsk` reports `$FILE_NAME` attributes with zero FILETIMEs as corrupt and `ntfs.sys`
-/// refuses the volume, so every system record in the Windows VHD candidate must carry a real
-/// timestamp in both `$STANDARD_INFORMATION` and `$FILE_NAME`.
-fn assert_ntfs_system_records_carry_nonzero_timestamps(vhd: &[u8]) {
+/// Invariants the Windows NTFS driver and `chkdsk` enforce on the system records but NTFS-3G
+/// tolerates, each learned from an elevated `windows-vhd` lane failure:
+///
+/// - every `$STANDARD_INFORMATION` and `$FILE_NAME` FILETIME is nonzero;
+/// - every resident `$FILE_NAME` carries `RESIDENT_ATTR_IS_INDEXED`;
+/// - no record 0–11 carries `FILE_SYSTEM_FILE` (`0x4`), which Windows and `mkntfs` reserve for
+///   the `$Extend` view-index children;
+/// - `$UpCase` carries the resident `$Info` stream with the pinned table CRC.
+fn assert_ntfs_system_records_satisfy_windows_driver_invariants(vhd: &[u8]) {
     const PARTITION_BYTES: usize = 1024 * 1024;
     const CLUSTER_BYTES: usize = 4096;
     const RECORD_BYTES: usize = 1024;
     const MFT_LCN: usize = 4;
+    let u16_at = |bytes: &[u8], at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+    let u32_at =
+        |bytes: &[u8], at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+    let u64_at =
+        |bytes: &[u8], at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
     // Records 12–15 are free formatted reserved records in this profile and carry no attributes.
     for record_number in 0..12 {
         let start = PARTITION_BYTES + MFT_LCN * CLUSTER_BYTES + record_number * RECORD_BYTES;
-        let record = &vhd[start..start + RECORD_BYTES];
+        let mut record = vhd[start..start + RECORD_BYTES].to_vec();
         assert_eq!(&record[..4], b"FILE", "record {record_number} magic");
-        let mut offset = usize::from(u16::from_le_bytes([record[0x14], record[0x15]]));
+        // Undo the update-sequence fixups so attribute headers that straddle a sector end parse.
+        let usa_offset = usize::from(u16_at(&record, 4));
+        let usa_count = usize::from(u16_at(&record, 6));
+        for sector in 1..usa_count {
+            let original = u16_at(&record, usa_offset + 2 * sector);
+            record[sector * 512 - 2..sector * 512].copy_from_slice(&original.to_le_bytes());
+        }
+        let record_flags = u16_at(&record, 0x16);
+        assert_eq!(
+            record_flags & 0x4,
+            0,
+            "record {record_number} carries FILE_SYSTEM_FILE"
+        );
+
+        let mut offset = usize::from(u16_at(&record, 0x14));
         let mut saw_standard_information = false;
         let mut saw_file_name = false;
+        let mut saw_upcase_info = false;
         loop {
-            let attribute_type = u32::from_le_bytes(record[offset..offset + 4].try_into().unwrap());
+            let attribute_type = u32_at(&record, offset);
             if attribute_type == u32::MAX {
                 break;
             }
-            let length = usize::try_from(u32::from_le_bytes(
-                record[offset + 4..offset + 8].try_into().unwrap(),
-            ))
-            .unwrap();
-            assert_eq!(
-                record[offset + 8],
-                0,
-                "record {record_number} resident header"
-            );
-            let value_offset = usize::from(u16::from_le_bytes([
-                record[offset + 0x14],
-                record[offset + 0x15],
-            ]));
-            let value = &record[offset + value_offset..offset + length];
-            match attribute_type {
-                0x10 => {
-                    saw_standard_information = true;
-                    for field in 0..4 {
-                        let stamp =
-                            u64::from_le_bytes(value[field * 8..field * 8 + 8].try_into().unwrap());
-                        assert_ne!(stamp, 0, "record {record_number} $STANDARD_INFORMATION");
+            let length = usize::try_from(u32_at(&record, offset + 4)).unwrap();
+            let non_resident = record[offset + 8] != 0;
+            let name_len = usize::from(record[offset + 9]);
+            let name_offset = usize::from(u16_at(&record, offset + 10));
+            let name: Vec<u16> = (0..name_len)
+                .map(|unit| u16_at(&record, offset + name_offset + 2 * unit))
+                .collect();
+            if !non_resident {
+                let value_offset = usize::from(u16_at(&record, offset + 0x14));
+                let value_len = usize::try_from(u32_at(&record, offset + 0x10)).unwrap();
+                let value = &record[offset + value_offset..offset + value_offset + value_len];
+                match attribute_type {
+                    0x10 => {
+                        saw_standard_information = true;
+                        for field in 0..4 {
+                            assert_ne!(
+                                u64_at(value, field * 8),
+                                0,
+                                "record {record_number} $STANDARD_INFORMATION"
+                            );
+                        }
                     }
-                }
-                0x30 => {
-                    saw_file_name = true;
-                    for field in 0..4 {
-                        let stamp = u64::from_le_bytes(
-                            value[8 + field * 8..16 + field * 8].try_into().unwrap(),
+                    0x30 => {
+                        saw_file_name = true;
+                        assert_eq!(
+                            record[offset + 0x16],
+                            1,
+                            "record {record_number} $FILE_NAME lacks RESIDENT_ATTR_IS_INDEXED"
                         );
-                        assert_ne!(stamp, 0, "record {record_number} $FILE_NAME");
+                        for field in 0..4 {
+                            assert_ne!(
+                                u64_at(value, 8 + field * 8),
+                                0,
+                                "record {record_number} $FILE_NAME"
+                            );
+                        }
                     }
+                    0x80 if record_number == 10
+                        && name == "$Info".encode_utf16().collect::<Vec<_>>() =>
+                    {
+                        saw_upcase_info = true;
+                        assert_eq!(value.len(), ntfs_upcase_serialize::NTFS_UPCASE_INFO_BYTES);
+                        assert_eq!(u32_at(value, 0), 32, "$UpCase:$Info length field");
+                        assert_eq!(
+                            u64_at(value, 8),
+                            ntfs_upcase_serialize::NTFS3G_WINDOWS61_UPCASE_INFO_CRC64,
+                            "$UpCase:$Info CRC-64"
+                        );
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
-            // Only the leading resident attributes matter here; stop at the first non-resident one.
             offset += length;
-            if record[offset + 8] != 0 {
-                break;
-            }
         }
         assert!(
             saw_standard_information && saw_file_name,
             "system record {record_number} lacks $STANDARD_INFORMATION or $FILE_NAME"
+        );
+        assert!(
+            record_number != 10 || saw_upcase_info,
+            "$UpCase lacks the resident $Info stream"
         );
     }
 }
