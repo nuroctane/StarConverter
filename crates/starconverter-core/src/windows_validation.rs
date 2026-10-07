@@ -28,7 +28,7 @@ pub const NTFS_CASE_HASH: &str = "4F537D4F171B530E6D5F7491466B38CC2888D7C63F90CD
 pub const EXFAT_CASE_NAME: &str = "NTFS-to-exFAT rich conversion";
 /// Pinned upper-case SHA-256 of `converted-rich-ntfs-to-exfat-windows.vhd`.
 pub const EXFAT_CASE_HASH: &str =
-    "BC6301CEE56057A1AFD6B5BEF6D0A44770A9AF8093AF1A7D511240F4D53FCEF3";
+    "5568BF7289D487EF23A06ED278E951F9AA50A937972902FE170F5826FC56F5FF";
 /// Pinned case name for the exFAT-to-NTFS 128-entry long-Unicode-name directory candidate.
 pub const LARGE_DIRECTORY_CASE_NAME: &str = "exFAT-to-NTFS large-directory conversion";
 /// Pinned upper-case SHA-256 of `converted-large-directory-exfat-to-ntfs-windows.vhd`.
@@ -43,12 +43,12 @@ pub const EDGE_NTFS_CASE_HASH: &str =
 pub const EDGE_EXFAT_CASE_NAME: &str = "NTFS-to-exFAT edge conversion";
 /// Pinned upper-case SHA-256 of `converted-edge-ntfs-to-exfat-windows.vhd`.
 pub const EDGE_EXFAT_CASE_HASH: &str =
-    "7EE631DA81390B50E7D74FBE80FEAD1D8D05BBC6244DD7EAF8A959270934C093";
+    "C137C2F4E4B69C656B8BFA1CCB0422A6A32C519054990C0D34B60785C4A9E14B";
 /// Pinned case name for the NTFS-to-exFAT misaligned-relocation Windows VHD candidate.
 pub const RELOCATION_CASE_NAME: &str = "NTFS-to-exFAT misaligned relocation conversion";
 /// Pinned upper-case SHA-256 of `converted-misaligned-ntfs-to-exfat-windows.vhd`.
 pub const RELOCATION_CASE_HASH: &str =
-    "347C89B7F09E73714D06460CDFAC7F1CEE414FCBB0B99D55C49782C5BAA44E3E";
+    "3BA1E48F654438FBB23CB169E91ACB7F5E6CA259465677C9AF38654D8D3567B5";
 /// Exact regular-file length of every pinned fixed VHD candidate.
 pub const PINNED_VHD_BYTES: u64 = VHD_BYTES;
 /// Number of pinned cases a schema-v1 report must carry.

@@ -51,6 +51,7 @@ use crate::fs::ntfs_volume::{
     NtfsBitmapEvidence, NtfsMetadataIncompleteReason, NtfsMftBitmapEvidence, NtfsVolumeDiscovery,
     NtfsVolumeError, NtfsVolumeEvidence, NtfsVolumeLimits, discover_volume_and_bitmap_with_reader,
 };
+use crate::geometry::ByteRange;
 use crate::image::{BoundedImageReader, ImageError, ImageFile, ImageIdentity};
 use crate::object::ObjectGraphLimits;
 use crate::overlay::OverlayPlan;
@@ -600,6 +601,10 @@ fn inspect_ntfs(
         .map_err(InspectionError::InvalidNtfsNormalization)?;
         normalized.preservation.security_descriptors =
             inspect_ntfs_security_descriptors(image, &inventory)?;
+        normalized.preservation.backup_boot_sector = Some(ByteRange {
+            offset: backup_offset,
+            length: u64::from(boot.bytes_per_sector),
+        });
         Some(Box::new(normalized))
     } else {
         None

@@ -64,6 +64,11 @@ pub struct ExfatVolumeProfile<'a> {
     pub allocated_bad_clusters: u64,
     /// Source-absolute byte ranges that must stay unusable on the destination heap.
     pub bad_cluster_ranges: &'a [ByteRange],
+    /// Sector-aligned ranges holding copies of the source filesystem's boot sector (for NTFS,
+    /// the backup at sector `declared_sectors`) that a foreign recognizer could still find after
+    /// the conversion. The serializer zeroes each one that no destination metadata write already
+    /// covers and keeps the surrounding heap cluster free so nothing else can claim it.
+    pub stale_boot_sectors: &'a [ByteRange],
 }
 
 /// Deterministic destination geometry and stable formatting choices.
@@ -235,6 +240,7 @@ struct OwnedExfatVolumeProfile {
     source_preservation: ExfatPreservationEvidence,
     allocated_bad_clusters: u64,
     bad_cluster_ranges: Vec<ByteRange>,
+    stale_boot_sectors: Vec<ByteRange>,
 }
 
 impl OwnedExfatVolumeProfile {
@@ -246,8 +252,17 @@ impl OwnedExfatVolumeProfile {
             source_preservation: self.source_preservation,
             allocated_bad_clusters: self.allocated_bad_clusters,
             bad_cluster_ranges: &self.bad_cluster_ranges,
+            stale_boot_sectors: &self.stale_boot_sectors,
         }
     }
+}
+
+/// A stale source boot-sector copy the destination must zero, with the heap cluster (if any)
+/// pinned free so the zero write and its reservation own that space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StaleBootSectorScrub {
+    range: ByteRange,
+    heap_cluster: Option<u32>,
 }
 
 impl ExfatSerializationPlan {
@@ -561,6 +576,7 @@ pub fn draft_exfat_destination(
         source_preservation: profile.source_preservation,
         allocated_bad_clusters: profile.allocated_bad_clusters,
         bad_cluster_ranges: profile.bad_cluster_ranges.to_vec(),
+        stale_boot_sectors: profile.stale_boot_sectors.to_vec(),
     };
     let output = serialize_exfat_destination_impl(
         graph,
@@ -769,6 +785,14 @@ fn serialize_exfat_destination_impl(
         }
         occupied[slot] = true;
     }
+    let scrubs = plan_stale_boot_sector_scrubs(&geometry, profile.stale_boot_sectors, &occupied)?;
+    for scrub in &scrubs {
+        if let Some(cluster) = scrub.heap_cluster {
+            let slot = usize::try_from(cluster.saturating_sub(2))
+                .map_err(|_| ExfatSerializeError::ArithmeticOverflow("scrub cluster index"))?;
+            occupied[slot] = true;
+        }
+    }
     let (source_allocations, reused_payloads) = map_payloads(
         graph,
         &geometry,
@@ -968,6 +992,14 @@ fn serialize_exfat_destination_impl(
         let allocation = allocation_from_clusters(&layouts[object].directory_clusters)?;
         writes.push(allocation_write(&geometry, allocation, bytes)?);
     }
+    for scrub in &scrubs {
+        let length = usize::try_from(scrub.range.length)
+            .map_err(|_| ExfatSerializeError::ArithmeticOverflow("scrub length"))?;
+        writes.push(OverlayWrite {
+            offset: scrub.range.offset,
+            bytes: vec![0_u8; length],
+        });
+    }
     let metadata_bytes = writes
         .iter()
         .try_fold(0_u64, |sum, write| {
@@ -991,6 +1023,7 @@ fn serialize_exfat_destination_impl(
         &directory_order,
         &layouts,
         &bad_clusters,
+        &scrubs,
     )?;
     let overlay = OverlayPlan::build(
         geometry.volume_bytes,
@@ -2066,6 +2099,7 @@ fn reservations_for(
     directories: &[ObjectId],
     layouts: &BTreeMap<ObjectId, ObjectLayout>,
     bad_clusters: &[u32],
+    scrubs: &[StaleBootSectorScrub],
 ) -> Result<Vec<DestinationReservation>, ExfatSerializeError> {
     let sector = u64::from(geometry.bytes_per_sector);
     let mut output = vec![
@@ -2109,8 +2143,119 @@ fn reservations_for(
             kind: ReservationKind::Other,
         });
     }
+    for scrub in scrubs {
+        let range = match scrub.heap_cluster {
+            Some(cluster) => ByteRange {
+                offset: cluster_offset(geometry, cluster)?,
+                length: u64::from(geometry.bytes_per_cluster),
+            },
+            None => scrub.range,
+        };
+        output.push(DestinationReservation {
+            range,
+            kind: ReservationKind::Other,
+        });
+    }
     output.sort_unstable_by_key(|item| item.range.offset);
     Ok(output)
+}
+
+/// Decides which stale source boot-sector copies need an explicit zero write.
+///
+/// Ranges inside the destination boot regions or FAT are already replaced by metadata writes and
+/// are dropped. Ranges inside the cluster heap pin their cluster free and are scrubbed unless
+/// that cluster is already bad. Ranges in the unwritten gaps (FAT alignment padding, the tail
+/// after the heap) are scrubbed in place. Anything not sector-aligned, outside the volume, or
+/// straddling a region boundary is refused rather than guessed at.
+fn plan_stale_boot_sector_scrubs(
+    geometry: &ExfatDestinationGeometry,
+    ranges: &[ByteRange],
+    occupied: &[bool],
+) -> Result<Vec<StaleBootSectorScrub>, ExfatSerializeError> {
+    const INVALID: ExfatSerializeError = ExfatSerializeError::InvalidGeometry(
+        "stale boot-sector range is not a sector-aligned run inside one destination region",
+    );
+    let sector = u64::from(geometry.bytes_per_sector);
+    let cluster = u64::from(geometry.bytes_per_cluster);
+    let boot_end = 24 * sector;
+    let fat_start = u64::from(geometry.fat_offset_sectors) * sector;
+    let fat_end = fat_start
+        .checked_add(u64::from(geometry.fat_length_sectors) * sector)
+        .ok_or(ExfatSerializeError::ArithmeticOverflow("FAT end"))?;
+    let heap_start = u64::from(geometry.cluster_heap_offset_sectors) * sector;
+    let heap_end = heap_start
+        .checked_add(u64::from(geometry.cluster_count) * cluster)
+        .ok_or(ExfatSerializeError::ArithmeticOverflow("heap end"))?;
+    let within = |range: ByteRange, start: u64, end: u64| -> Result<bool, ExfatSerializeError> {
+        let range_end = range
+            .offset
+            .checked_add(range.length)
+            .ok_or(ExfatSerializeError::ArithmeticOverflow("scrub range end"))?;
+        if range_end <= start || range.offset >= end {
+            return Ok(false);
+        }
+        if range.offset < start || range_end > end {
+            return Err(INVALID);
+        }
+        Ok(true)
+    };
+
+    let mut scrubs: Vec<StaleBootSectorScrub> = Vec::new();
+    scrubs
+        .try_reserve_exact(ranges.len())
+        .map_err(|_| ExfatSerializeError::AllocationFailed)?;
+    for range in ranges {
+        let range = *range;
+        let end = range
+            .offset
+            .checked_add(range.length)
+            .ok_or(ExfatSerializeError::ArithmeticOverflow("scrub range end"))?;
+        if range.length == 0
+            || range.length > boot_end
+            || range.offset % sector != 0
+            || range.length % sector != 0
+            || end > geometry.volume_bytes
+        {
+            return Err(INVALID);
+        }
+        if scrubs.iter().any(|existing| {
+            let existing_end = existing.range.offset + existing.range.length;
+            range.offset < existing_end && existing.range.offset < end
+        }) {
+            return Err(INVALID);
+        }
+        if within(range, 0, boot_end)? || within(range, fat_start, fat_end)? {
+            continue;
+        }
+        let heap_cluster = if within(range, heap_start, heap_end)? {
+            let first = (range.offset - heap_start) / cluster;
+            if (end - 1 - heap_start) / cluster != first {
+                return Err(INVALID);
+            }
+            let slot = usize::try_from(first)
+                .map_err(|_| ExfatSerializeError::ArithmeticOverflow("scrub cluster index"))?;
+            if occupied[slot] {
+                // Already a bad cluster: nothing can be written there, and the FAT marks it.
+                continue;
+            }
+            let cluster_number = u32::try_from(first + 2)
+                .map_err(|_| ExfatSerializeError::ArithmeticOverflow("scrub cluster"))?;
+            if scrubs
+                .iter()
+                .any(|existing| existing.heap_cluster == Some(cluster_number))
+            {
+                return Err(INVALID);
+            }
+            Some(cluster_number)
+        } else {
+            None
+        };
+        scrubs.push(StaleBootSectorScrub {
+            range,
+            heap_cluster,
+        });
+    }
+    Ok(scrubs)
 }
 
 fn allocation_reservation(
@@ -2392,6 +2537,7 @@ mod tests {
             source_preservation: ExfatPreservationEvidence::default(),
             allocated_bad_clusters: 0,
             bad_cluster_ranges: &[],
+            stale_boot_sectors: &[],
         }
     }
 
@@ -2941,6 +3087,7 @@ mod tests {
                 source_preservation: ExfatPreservationEvidence::default(),
                 allocated_bad_clusters: 0,
                 bad_cluster_ranges: &[],
+                stale_boot_sectors: &[],
             },
             ExfatSerializeOptions::default(),
             ExfatSerializeLimits::default(),
@@ -3067,6 +3214,181 @@ mod tests {
             u32::from_le_bytes(image[fat_offset..fat_offset + 4].try_into().unwrap()),
             FAT_BAD_CLUSTER
         );
+    }
+
+    #[test]
+    fn stale_source_boot_sector_in_the_heap_is_zeroed_and_kept_free() {
+        let graph = graph(vec![root()], Vec::new(), Vec::new());
+        let upcase = complete_upcase_with_non_ascii_mapping();
+        let stale = ByteRange {
+            offset: VOLUME_BYTES - 512,
+            length: 512,
+        };
+        let plan = serialize_exfat_destination(
+            &graph,
+            &[],
+            ExfatVolumeProfile {
+                stale_boot_sectors: &[stale],
+                ..profile(&upcase)
+            },
+            ExfatSerializeOptions::default(),
+            ExfatSerializeLimits::default(),
+        )
+        .expect("a stale NTFS backup boot sector is scrubbed");
+        let geometry = &plan.geometry;
+        let sector = u64::from(geometry.bytes_per_sector);
+        let heap = u64::from(geometry.cluster_heap_offset_sectors) * sector;
+        let heap_end =
+            heap + u64::from(geometry.cluster_count) * u64::from(geometry.bytes_per_cluster);
+        assert!(
+            stale.offset >= heap && stale.offset + stale.length <= heap_end,
+            "test premise: the last sector sits inside the cluster heap"
+        );
+        let cluster_offset = heap
+            + ((stale.offset - heap) / u64::from(geometry.bytes_per_cluster))
+                * u64::from(geometry.bytes_per_cluster);
+        assert!(
+            plan.overlay.writes().iter().any(|write| {
+                write.offset == stale.offset
+                    && write.bytes.len() == 512
+                    && write.bytes.iter().all(|byte| *byte == 0)
+            }),
+            "the stale sector gets an explicit zero write"
+        );
+        assert!(plan.reservations.iter().any(|reservation| {
+            reservation.kind == ReservationKind::Other
+                && reservation.range.offset == cluster_offset
+                && reservation.range.length == u64::from(geometry.bytes_per_cluster)
+        }));
+        let slot = usize::try_from((cluster_offset - heap) / u64::from(geometry.bytes_per_cluster))
+            .unwrap();
+        let image = candidate(&plan);
+        // Locate the allocation bitmap through the root directory's 0x81 entry.
+        let root_cluster = u64::from(u32::from_le_bytes(image[96..100].try_into().unwrap()));
+        let root_offset =
+            usize::try_from(heap + (root_cluster - 2) * u64::from(geometry.bytes_per_cluster))
+                .unwrap();
+        let bitmap_cluster = image[root_offset..root_offset + 32 * 16]
+            .chunks_exact(32)
+            .find(|entry| entry[0] == 0x81)
+            .map(|entry| u64::from(u32::from_le_bytes(entry[20..24].try_into().unwrap())))
+            .expect("root directory carries an allocation bitmap entry");
+        let bitmap_offset =
+            usize::try_from(heap + (bitmap_cluster - 2) * u64::from(geometry.bytes_per_cluster))
+                .unwrap();
+        assert_eq!(
+            image[bitmap_offset + slot / 8] & (1 << (slot % 8)),
+            0,
+            "the scrubbed cluster stays free in the allocation bitmap"
+        );
+    }
+
+    #[test]
+    fn stale_boot_sectors_under_destination_metadata_need_no_scrub() {
+        let graph = graph(vec![root()], Vec::new(), Vec::new());
+        let upcase = complete_upcase_with_non_ascii_mapping();
+        let plan = serialize_exfat_destination(
+            &graph,
+            &[],
+            ExfatVolumeProfile {
+                stale_boot_sectors: &[ByteRange {
+                    offset: 0,
+                    length: 512,
+                }],
+                ..profile(&upcase)
+            },
+            ExfatSerializeOptions::default(),
+            ExfatSerializeLimits::default(),
+        )
+        .expect("the primary boot sector is rewritten anyway");
+        assert!(
+            !plan
+                .reservations
+                .iter()
+                .any(|reservation| reservation.kind == ReservationKind::Other)
+        );
+    }
+
+    #[test]
+    fn malformed_stale_boot_sector_ranges_are_refused() {
+        let graph = graph(vec![root()], Vec::new(), Vec::new());
+        let upcase = complete_upcase_with_non_ascii_mapping();
+        let geometry = choose_geometry(
+            VOLUME_BYTES,
+            ExfatSerializeOptions::default(),
+            ExfatSerializeLimits::default(),
+        )
+        .expect("test geometry");
+        let heap =
+            u64::from(geometry.cluster_heap_offset_sectors) * u64::from(geometry.bytes_per_sector);
+        let cluster = u64::from(geometry.bytes_per_cluster);
+        let cases: [ByteRange; 6] = [
+            // zero length
+            ByteRange {
+                offset: VOLUME_BYTES - 512,
+                length: 0,
+            },
+            // not sector aligned
+            ByteRange {
+                offset: VOLUME_BYTES - 500,
+                length: 500,
+            },
+            // past the end of the volume
+            ByteRange {
+                offset: VOLUME_BYTES,
+                length: 512,
+            },
+            // straddles two heap clusters
+            ByteRange {
+                offset: heap + cluster - 512,
+                length: 1024,
+            },
+            // straddles the boot region / FAT gap boundary
+            ByteRange {
+                offset: 23 * 512,
+                length: 1024,
+            },
+            // longer than the whole boot region pair
+            ByteRange {
+                offset: heap,
+                length: 25 * 512,
+            },
+        ];
+        for stale in cases {
+            assert!(
+                matches!(
+                    serialize_exfat_destination(
+                        &graph,
+                        &[],
+                        ExfatVolumeProfile {
+                            stale_boot_sectors: std::slice::from_ref(&stale),
+                            ..profile(&upcase)
+                        },
+                        ExfatSerializeOptions::default(),
+                        ExfatSerializeLimits::default(),
+                    ),
+                    Err(ExfatSerializeError::InvalidGeometry(_))
+                ),
+                "{stale:?} must be refused"
+            );
+        }
+        let duplicate = ByteRange {
+            offset: VOLUME_BYTES - 512,
+            length: 512,
+        };
+        assert!(matches!(
+            serialize_exfat_destination(
+                &graph,
+                &[],
+                ExfatVolumeProfile {
+                    stale_boot_sectors: &[duplicate, duplicate],
+                    ..profile(&upcase)
+                },
+                ExfatSerializeOptions::default(),
+                ExfatSerializeLimits::default(),
+            ),
+            Err(ExfatSerializeError::InvalidGeometry(_))
+        ));
     }
 
     fn relocation_graph(offsets: [u64; 2]) -> ObjectGraph {

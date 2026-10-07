@@ -561,6 +561,7 @@ fn exfat_image(
             source_preservation: ExfatPreservationEvidence::default(),
             allocated_bad_clusters: 0,
             bad_cluster_ranges: &[],
+            stale_boot_sectors: &[],
         },
         ExfatSerializeOptions {
             partition_offset_sectors,

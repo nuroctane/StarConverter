@@ -1144,6 +1144,7 @@ pub fn plan_lossless_ntfs_to_exfat(
             source_preservation: ExfatPreservationEvidence::default(),
             allocated_bad_clusters: u64::try_from(bad_cluster_ranges.len()).unwrap_or(u64::MAX),
             bad_cluster_ranges: &bad_cluster_ranges,
+            stale_boot_sectors: normalized.preservation.backup_boot_sector.as_slice(),
         },
         ExfatSerializeOptions {
             bytes_per_sector: options.bytes_per_sector,
@@ -1217,6 +1218,7 @@ pub fn draft_lossless_ntfs_to_exfat(
             source_preservation: ExfatPreservationEvidence::default(),
             allocated_bad_clusters: u64::try_from(bad_cluster_ranges.len()).unwrap_or(u64::MAX),
             bad_cluster_ranges: &bad_cluster_ranges,
+            stale_boot_sectors: normalized.preservation.backup_boot_sector.as_slice(),
         },
         ExfatSerializeOptions {
             bytes_per_sector: options.bytes_per_sector,
@@ -2529,6 +2531,7 @@ mod tests {
                 volume_label: None,
                 security_descriptors:
                     crate::fs::ntfs_normalize::NtfsSecurityDescriptorEvidence::Unavailable,
+                backup_boot_sector: None,
                 root_reference: NtfsObjectReference {
                     record_number: 5,
                     sequence_number: 1,
@@ -3405,6 +3408,52 @@ mod tests {
             Placement::Physical {
                 byte_offset: solved.layout().relocations[0].destination.offset
             }
+        );
+    }
+
+    #[test]
+    fn ntfs_backup_boot_sector_is_scrubbed_from_the_exfat_candidate() {
+        let mut normalized = normalized_ntfs();
+        let volume_bytes = 64 * 1024 * 1024;
+        let stale = ByteRange {
+            offset: volume_bytes - 512,
+            length: 512,
+        };
+        normalized.preservation.backup_boot_sector = Some(stale);
+        let plan = plan_lossless_ntfs_to_exfat(
+            &normalized,
+            GuaranteeMode::Escrow,
+            NtfsToExfatOptions::default(),
+            NtfsToExfatLimits::default(),
+        )
+        .unwrap();
+        assert!(
+            plan.destination.overlay.writes().iter().any(|write| {
+                write.offset == stale.offset
+                    && write.bytes.len() == 512
+                    && write.bytes.iter().all(|byte| *byte == 0)
+            }),
+            "the NTFS backup boot sector must be zeroed so no recognizer finds it"
+        );
+        let draft = draft_lossless_ntfs_to_exfat(
+            &normalized,
+            GuaranteeMode::Escrow,
+            NtfsToExfatOptions::default(),
+            NtfsToExfatLimits::default(),
+        )
+        .unwrap();
+        let solved = solve_lossless_ntfs_to_exfat(draft, LayoutLimits::default()).unwrap();
+        assert!(solved.destination.overlay.writes().iter().any(|write| {
+            write.offset == stale.offset && write.bytes.iter().all(|byte| *byte == 0)
+        }));
+        assert!(solved.destination.reservations.iter().any(|reservation| {
+            reservation.kind == crate::geometry::ReservationKind::Other
+                && reservation.range.offset <= stale.offset
+                && reservation.range.offset + reservation.range.length >= stale.offset + 512
+        }));
+        assert_eq!(
+            plan.destination.reservations,
+            solved.destination.reservations
         );
     }
 

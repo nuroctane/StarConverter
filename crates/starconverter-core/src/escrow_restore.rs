@@ -1166,6 +1166,7 @@ mod tests {
             volume_label: None,
             security_descriptors:
                 crate::fs::ntfs_normalize::NtfsSecurityDescriptorEvidence::Unavailable,
+            backup_boot_sector: None,
             root_reference: reference(1),
             objects: vec![
                 NtfsObjectPreservation {

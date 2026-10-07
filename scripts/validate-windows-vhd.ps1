@@ -215,7 +215,7 @@ $cases = @(
         Name = "NTFS-to-exFAT rich conversion"
         File = "converted-rich-ntfs-to-exfat-windows.vhd"
         FileSystem = "exFAT"
-        Sha256 = "BC6301CEE56057A1AFD6B5BEF6D0A44770A9AF8093AF1A7D511240F4D53FCEF3"
+        Sha256 = "5568BF7289D487EF23A06ED278E951F9AA50A937972902FE170F5826FC56F5FF"
         Payloads = $richPayloads
         Directory = $null
     },
@@ -241,7 +241,7 @@ $cases = @(
         Name = "NTFS-to-exFAT edge conversion"
         File = "converted-edge-ntfs-to-exfat-windows.vhd"
         FileSystem = "exFAT"
-        Sha256 = "7EE631DA81390B50E7D74FBE80FEAD1D8D05BBC6244DD7EAF8A959270934C093"
+        Sha256 = "C137C2F4E4B69C656B8BFA1CCB0422A6A32C519054990C0D34B60785C4A9E14B"
         Payloads = $edgePayloads
         Directory = $null
     },
@@ -249,7 +249,7 @@ $cases = @(
         Name = "NTFS-to-exFAT misaligned relocation conversion"
         File = "converted-misaligned-ntfs-to-exfat-windows.vhd"
         FileSystem = "exFAT"
-        Sha256 = "347C89B7F09E73714D06460CDFAC7F1CEE414FCBB0B99D55C49782C5BAA44E3E"
+        Sha256 = "3BA1E48F654438FBB23CB169E91ACB7F5E6CA259465677C9AF38654D8D3567B5"
         # The 4 KiB-aligned NTFS payload had to move to satisfy the 8 KiB exFAT cluster grid;
         # the driver must serve the relocated bytes, not the original location.
         Payloads = @(

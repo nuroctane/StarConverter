@@ -17,6 +17,7 @@ use super::ntfs_inventory::{
     NtfsVolumeLabelEvidence,
 };
 use crate::extent::{Extent, ExtentGraph, ExtentGraphError, ExtentKind, Placement, StreamId};
+use crate::geometry::ByteRange;
 use crate::object::{
     NamespaceEntry, ObjectGraph, ObjectGraphError, ObjectGraphLimits, ObjectId, ObjectKind,
     ObjectRecord, ObjectSemantics, ObjectStream, StreamFlags, StreamStorage,
@@ -94,6 +95,10 @@ pub struct NtfsPreservationSidecar {
     pub volume_serial_number: u64,
     pub volume_label: Option<Vec<u16>>,
     pub security_descriptors: NtfsSecurityDescriptorEvidence,
+    /// The backup boot sector at sector `declared_sectors`, which lies outside every NTFS cluster
+    /// and which ntfs.sys and `chkdsk` consult when sector 0 is not NTFS. A destination writer
+    /// that keeps the volume's bytes in place must zero it or Windows may still see NTFS there.
+    pub backup_boot_sector: Option<ByteRange>,
     pub root_reference: NtfsObjectReference,
     pub objects: Vec<NtfsObjectPreservation>,
     pub source_extents: Vec<NtfsInventoryExtent>,
@@ -555,6 +560,7 @@ pub fn normalize_inventory(
             volume_serial_number: inventory.volume_serial_number,
             volume_label,
             security_descriptors: NtfsSecurityDescriptorEvidence::Unavailable,
+            backup_boot_sector: None,
             root_reference: root_source.reference,
             objects: preservation,
             source_extents: inventory.extents.clone(),

@@ -134,6 +134,7 @@ fn exfat_plan(graph: &ObjectGraph, metadata: &[ExfatObjectMetadata]) -> ExfatSer
             source_preservation: ExfatPreservationEvidence::default(),
             allocated_bad_clusters: 0,
             bad_cluster_ranges: &[],
+            stale_boot_sectors: &[],
         },
         ExfatSerializeOptions::default(),
         ExfatSerializeLimits::default(),

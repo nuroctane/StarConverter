@@ -1461,6 +1461,8 @@ pub fn decode_ntfs_preservation_sidecar(
         volume_serial_number,
         volume_label,
         security_descriptors,
+        // The snapshot restores NTFS, whose writer regenerates its own backup boot sector.
+        backup_boot_sector: None,
         root_reference,
         objects,
         source_extents,
@@ -3346,6 +3348,7 @@ mod tests {
                 volume_serial_number: 0x0123_4567_89ab_cdef,
                 volume_label: None,
                 security_descriptors: NtfsSecurityDescriptorEvidence::Unavailable,
+                backup_boot_sector: None,
                 root_reference: object.reference,
                 objects: vec![
                     NtfsObjectPreservation {

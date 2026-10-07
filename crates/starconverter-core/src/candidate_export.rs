@@ -3239,6 +3239,7 @@ mod tests {
             source_preservation: ExfatPreservationEvidence::default(),
             allocated_bad_clusters: 0,
             bad_cluster_ranges: &[],
+            stale_boot_sectors: &[],
         };
         let options = ExfatSerializeOptions {
             bytes_per_cluster: CLUSTER_BYTES,
@@ -3367,6 +3368,7 @@ mod tests {
             source_preservation: ExfatPreservationEvidence::default(),
             allocated_bad_clusters: 0,
             bad_cluster_ranges: &[],
+            stale_boot_sectors: &[],
         };
         let options = ExfatSerializeOptions {
             bytes_per_cluster: CLUSTER_BYTES,
@@ -3497,6 +3499,7 @@ mod tests {
             source_preservation: ExfatPreservationEvidence::default(),
             allocated_bad_clusters: 0,
             bad_cluster_ranges: &[],
+            stale_boot_sectors: &[],
         };
         let options = ExfatSerializeOptions {
             bytes_per_cluster: CLUSTER_BYTES,
@@ -3721,6 +3724,7 @@ mod tests {
                 volume_serial_number: 7,
                 volume_label: None,
                 security_descriptors: NtfsSecurityDescriptorEvidence::Unavailable,
+                backup_boot_sector: None,
                 root_reference: NtfsObjectReference {
                     record_number: 5,
                     sequence_number: 1,

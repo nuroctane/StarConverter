@@ -307,9 +307,9 @@ installed. CI always tests both language stacks.
 - [ ] In-place image conversion with durable recovery/finalize workflow
 - [x] Elevated Windows `ntfs.sys`/`exfat.sys` read-only mount, payload, and `chkdsk` validation of the
       converted VHD candidates in CI (`windows-vhd` lane, evidence in `docs/EXTERNAL_VALIDATION.md`)
-- [ ] Windows `chkdsk`/mount validation of Windows-formatted, Windows-populated sources converted
+- [x] Windows `chkdsk`/mount validation of Windows-formatted, Windows-populated sources converted
       both ways and round-tripped, with escrow restore and exact SDDL equality on the NTFS round
-      trip (`windows-origin` lane)
+      trip (`windows-origin` lane, first green run recorded in `docs/EXTERNAL_VALIDATION.md`)
 - [ ] Escrow restore for the NTFS -> exFAT direction (exFAT serial, label, timestamps, up-case and
       benign entries are escrowed in sidecar v3 but not yet replayed)
 - [ ] Windows `chkdsk`/mount validation of recovered images
