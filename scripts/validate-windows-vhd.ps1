@@ -35,6 +35,40 @@ function Test-HasDriveLetter {
     return -not [string]::IsNullOrWhiteSpace($text)
 }
 
+function Write-StorageDiagnostics {
+    param($Disk, $Partition, $Volume)
+    Write-Host ("[DIAG] disk: Number={0} Size={1} LogicalSector={2} PhysicalSector={3} Style={4} ReadOnly={5} Offline={6} OfflineReason={7} Operational={8} Health={9} BusType={10}" -f `
+        $Disk.Number, $Disk.Size, $Disk.LogicalSectorSize, $Disk.PhysicalSectorSize, $Disk.PartitionStyle, `
+        $Disk.IsReadOnly, $Disk.IsOffline, $Disk.OfflineReason, $Disk.OperationalStatus, $Disk.HealthStatus, $Disk.BusType)
+    if ($null -ne $Partition) {
+        Write-Host ("[DIAG] partition: Offset={0} Size={1} MbrType={2} Type={3} Active={4} Hidden={5} Operational={6} AccessPaths={7}" -f `
+            $Partition.Offset, $Partition.Size, $Partition.MbrType, $Partition.Type, $Partition.IsActive, `
+            $Partition.IsHidden, $Partition.OperationalStatus, ($Partition.AccessPaths -join ';'))
+    }
+    if ($null -ne $Volume) {
+        Write-Host ("[DIAG] volume: Path={0} FileSystem='{1}' FileSystemType={2} Label='{3}' Size={4} Remaining={5} Health={6} Operational={7} DriveType={8}" -f `
+            $Volume.Path, $Volume.FileSystem, $Volume.FileSystemType, $Volume.FileSystemLabel, $Volume.Size, `
+            $Volume.SizeRemaining, $Volume.HealthStatus, $Volume.OperationalStatus, $Volume.DriveType)
+        if (-not [string]::IsNullOrWhiteSpace($Volume.Path)) {
+            $previous = $ErrorActionPreference
+            $ErrorActionPreference = "Continue"
+            try {
+                & "$env:SystemRoot\System32\fsutil.exe" fsinfo volumeinfo $Volume.Path 2>&1 | ForEach-Object { Write-Host "[DIAG] fsutil: $_" }
+                try {
+                    $rootEntries = @(Get-ChildItem -LiteralPath $Volume.Path -Force -ErrorAction Stop | Select-Object -First 16)
+                    Write-Host ("[DIAG] root entries: {0}" -f (($rootEntries | ForEach-Object { $_.Name }) -join ', '))
+                }
+                catch {
+                    Write-Host "[DIAG] root listing failed: $($_.Exception.Message)"
+                }
+            }
+            finally {
+                $ErrorActionPreference = $previous
+            }
+        }
+    }
+}
+
 if (-not $PreflightOnly -and -not (Test-IsAdministrator)) {
     throw "Windows VHD validation requires an elevated PowerShell 5.1 prompt."
 }
@@ -113,6 +147,7 @@ $payloads = @(
     }
 )
 $results = @()
+$failures = @()
 
 foreach ($case in $cases) {
     $candidatePath = Join-Path $fixtureDirectory $case.File
@@ -171,120 +206,147 @@ foreach ($case in $cases) {
     $chkdskOutput = @()
     $chkdskExit = $null
     $volumePath = $null
+    # Each case detaches in its own finally block, so a failed case is recorded and the next case
+    # still runs; the aggregated failure below keeps the run and the report fail-closed.
     try {
-        $null = Mount-DiskImage -ImagePath $vhdPath -StorageType VHD -Access ReadOnly -NoDriveLetter -PassThru
-        $attached = $true
-
-        $image = Get-DiskImage -ImagePath $vhdPath -StorageType VHD
-        if (-not $image.Attached) {
-            throw "Storage provider did not report the exact VHD as attached."
-        }
-        $disk = Assert-One -Values @($image | Get-Disk) -Description "associated virtual disk"
-        if (-not $disk.IsReadOnly) {
-            throw "Associated virtual disk is not read-only."
-        }
-        if ($disk.IsBoot -or $disk.IsSystem) {
-            throw "Boot or system disks are categorically refused."
-        }
-        if ($disk.PartitionStyle -ne "MBR") {
-            throw "Expected an MBR validation wrapper, found $($disk.PartitionStyle)."
-        }
-
-        $partition = Assert-One -Values @($disk | Get-Partition) -Description "associated partition"
-        if ($partition.Offset -ne 1MB) {
-            throw "Expected a 1 MiB partition offset, found $($partition.Offset) bytes."
-        }
-        if (Test-HasDriveLetter -Letter $partition.DriveLetter) {
-            throw "No drive letter may be assigned during validation (partition letter $($partition.DriveLetter))."
-        }
-
-        $volume = Assert-One -Values @($partition | Get-Volume) -Description "associated volume"
-        if (Test-HasDriveLetter -Letter $volume.DriveLetter) {
-            throw "No drive letter may be assigned during validation (volume letter $($volume.DriveLetter))."
-        }
-        if ($volume.FileSystem -ine $case.FileSystem) {
-            throw "Expected $($case.FileSystem), found $($volume.FileSystem)."
-        }
-        if ($volume.Path -notmatch '^\\\\\?\\Volume\{[0-9A-Fa-f-]+\}\\$') {
-            throw "Expected a volume GUID path, found $($volume.Path)."
-        }
-
-        $roundTrip = Assert-One -Values @(Get-DiskImage -Volume $volume) -Description "round-trip disk image"
-        if ([IO.Path]::GetFullPath($roundTrip.ImagePath) -ine [IO.Path]::GetFullPath($vhdPath)) {
-            throw "Volume association did not round-trip to the exact VHD path."
-        }
-
-        foreach ($payload in $payloads) {
-            $payloadPath = Join-Path $volume.Path $payload.Path
-            $payloadItem = Get-Item -LiteralPath $payloadPath -Force
-            if (-not ($payloadItem -is [IO.FileInfo]) -or $payloadItem.Length -ne $payload.Length) {
-                throw "Payload type or length mismatch: $($payload.Path)"
-            }
-            $payloadHash = (Get-FileHash -LiteralPath $payloadPath -Algorithm SHA256).Hash
-            if ($payloadHash -ne $payload.Sha256) {
-                throw "Payload hash mismatch: $($payload.Path)"
-            }
-            $payloadResults += [pscustomobject]@{
-                Path = $payload.Path
-                Length = $payloadItem.Length
-                Sha256 = $payloadHash
-            }
-        }
-
-        Write-Host "[CHECK] $($case.Name) at $($volume.Path)"
-        $volumePath = $volume.Path
-        # Windows PowerShell 5.1 turns redirected native stderr into terminating errors under
-        # Stop; the exit code, not stderr presence, is the CHKDSK verdict.
-        $previousPreference = $ErrorActionPreference
-        $ErrorActionPreference = "Continue"
         try {
-            $chkdskOutput = @(& "$env:SystemRoot\System32\chkdsk.exe" $volume.Path 2>&1 | ForEach-Object {
-                Write-Host $_
-                $_.ToString()
-            })
-            $chkdskExit = $LASTEXITCODE
+            $null = Mount-DiskImage -ImagePath $vhdPath -StorageType VHD -Access ReadOnly -NoDriveLetter -PassThru
+            $attached = $true
+
+            $image = Get-DiskImage -ImagePath $vhdPath -StorageType VHD
+            if (-not $image.Attached) {
+                throw "Storage provider did not report the exact VHD as attached."
+            }
+            $disk = Assert-One -Values @($image | Get-Disk) -Description "associated virtual disk"
+            if (-not $disk.IsReadOnly) {
+                throw "Associated virtual disk is not read-only."
+            }
+            if ($disk.IsBoot -or $disk.IsSystem) {
+                throw "Boot or system disks are categorically refused."
+            }
+            if ($disk.PartitionStyle -ne "MBR") {
+                throw "Expected an MBR validation wrapper, found $($disk.PartitionStyle)."
+            }
+
+            $partition = Assert-One -Values @($disk | Get-Partition) -Description "associated partition"
+            if ($partition.Offset -ne 1MB) {
+                throw "Expected a 1 MiB partition offset, found $($partition.Offset) bytes."
+            }
+            if (Test-HasDriveLetter -Letter $partition.DriveLetter) {
+                throw "No drive letter may be assigned during validation (partition letter $($partition.DriveLetter))."
+            }
+
+            $volume = Assert-One -Values @($partition | Get-Volume) -Description "associated volume"
+            if (Test-HasDriveLetter -Letter $volume.DriveLetter) {
+                throw "No drive letter may be assigned during validation (volume letter $($volume.DriveLetter))."
+            }
+            # Windows mounts a filesystem lazily on first access; a read-only root listing through the
+            # volume GUID path triggers that mount without assigning a letter or writing anything.
+            $attempt = 0
+            while ([string]::IsNullOrWhiteSpace($volume.FileSystem) -and $attempt -lt 5) {
+                $attempt++
+                try {
+                    $null = Get-ChildItem -LiteralPath $volume.Path -Force -ErrorAction Stop
+                }
+                catch {
+                    Write-Host "[DIAG] mount-trigger listing attempt $attempt failed: $($_.Exception.Message)"
+                }
+                Start-Sleep -Milliseconds 500
+                $volume = Assert-One -Values @($partition | Get-Volume) -Description "associated volume"
+            }
+            if ($volume.FileSystem -ine $case.FileSystem) {
+                Write-StorageDiagnostics -Disk $disk -Partition $partition -Volume $volume
+                throw "Expected $($case.FileSystem), found '$($volume.FileSystem)' (FileSystemType $($volume.FileSystemType))."
+            }
+            if ($volume.Path -notmatch '^\\\\\?\\Volume\{[0-9A-Fa-f-]+\}\\$') {
+                throw "Expected a volume GUID path, found $($volume.Path)."
+            }
+
+            $roundTrip = Assert-One -Values @(Get-DiskImage -Volume $volume) -Description "round-trip disk image"
+            if ([IO.Path]::GetFullPath($roundTrip.ImagePath) -ine [IO.Path]::GetFullPath($vhdPath)) {
+                throw "Volume association did not round-trip to the exact VHD path."
+            }
+
+            foreach ($payload in $payloads) {
+                $payloadPath = Join-Path $volume.Path $payload.Path
+                $payloadItem = Get-Item -LiteralPath $payloadPath -Force
+                if (-not ($payloadItem -is [IO.FileInfo]) -or $payloadItem.Length -ne $payload.Length) {
+                    throw "Payload type or length mismatch: $($payload.Path)"
+                }
+                $payloadHash = (Get-FileHash -LiteralPath $payloadPath -Algorithm SHA256).Hash
+                if ($payloadHash -ne $payload.Sha256) {
+                    throw "Payload hash mismatch: $($payload.Path)"
+                }
+                $payloadResults += [pscustomobject]@{
+                    Path = $payload.Path
+                    Length = $payloadItem.Length
+                    Sha256 = $payloadHash
+                }
+            }
+
+            Write-Host "[CHECK] $($case.Name) at $($volume.Path)"
+            $volumePath = $volume.Path
+            # Windows PowerShell 5.1 turns redirected native stderr into terminating errors under
+            # Stop; the exit code, not stderr presence, is the CHKDSK verdict.
+            $previousPreference = $ErrorActionPreference
+            $ErrorActionPreference = "Continue"
+            try {
+                $chkdskOutput = @(& "$env:SystemRoot\System32\chkdsk.exe" $volume.Path 2>&1 | ForEach-Object {
+                    Write-Host $_
+                    $_.ToString()
+                })
+                $chkdskExit = $LASTEXITCODE
+            }
+            finally {
+                $ErrorActionPreference = $previousPreference
+            }
+            if ($chkdskExit -ne 0) {
+                throw "CHKDSK reported exit code $chkdskExit; no repair was attempted."
+            }
         }
         finally {
-            $ErrorActionPreference = $previousPreference
+            if ($attached) {
+                $null = Dismount-DiskImage -ImagePath $vhdPath -StorageType VHD -ErrorAction Continue
+            }
         }
-        if ($chkdskExit -ne 0) {
-            throw "CHKDSK reported exit code $chkdskExit; no repair was attempted."
-        }
-    }
-    finally {
-        if ($attached) {
-            $null = Dismount-DiskImage -ImagePath $vhdPath -StorageType VHD -ErrorAction Continue
-        }
-    }
 
-    $finalImage = Get-DiskImage -ImagePath $vhdPath -StorageType VHD
-    if ($finalImage.Attached) {
-        throw "VHD remained attached after validation: $vhdPath"
+        $finalImage = Get-DiskImage -ImagePath $vhdPath -StorageType VHD
+        if ($finalImage.Attached) {
+            throw "VHD remained attached after validation: $vhdPath"
+        }
+        $afterItem = Get-Item -LiteralPath $vhdPath -Force
+        $afterHash = (Get-FileHash -LiteralPath $vhdPath -Algorithm SHA256).Hash
+        if ($afterItem.Length -ne $beforeLength -or $afterHash -ne $beforeHash) {
+            throw "Read-only Windows validation changed VHD bytes: $vhdPath"
+        }
+        $results += [pscustomobject]@{
+            Name = $case.Name
+            FileSystem = $case.FileSystem
+            VhdPath = $vhdPath
+            VhdBytes = $afterItem.Length
+            VirtualBytes = $finalImage.Size
+            Sha256Before = $beforeHash
+            Sha256After = $afterHash
+            DetachedBefore = $true
+            DetachedAfter = $true
+            ReadOnlyAttached = $true
+            NoDriveLetter = $true
+            PartitionOffsetBytes = 1MB
+            VolumeGuidPath = $volumePath
+            Payloads = $payloadResults
+            ChkdskExitCode = $chkdskExit
+            ChkdskOutput = $chkdskOutput
+        }
+        Write-Host "[PASS] $($case.Name) / SHA256 $afterHash / detached / no drive letter"
     }
-    $afterItem = Get-Item -LiteralPath $vhdPath -Force
-    $afterHash = (Get-FileHash -LiteralPath $vhdPath -Algorithm SHA256).Hash
-    if ($afterItem.Length -ne $beforeLength -or $afterHash -ne $beforeHash) {
-        throw "Read-only Windows validation changed VHD bytes: $vhdPath"
+    catch {
+        Write-Host "[FAIL] $($case.Name): $($_.Exception.Message)"
+        $failures += "$($case.Name): $($_.Exception.Message)"
     }
-    $results += [pscustomobject]@{
-        Name = $case.Name
-        FileSystem = $case.FileSystem
-        VhdPath = $vhdPath
-        VhdBytes = $afterItem.Length
-        VirtualBytes = $finalImage.Size
-        Sha256Before = $beforeHash
-        Sha256After = $afterHash
-        DetachedBefore = $true
-        DetachedAfter = $true
-        ReadOnlyAttached = $true
-        NoDriveLetter = $true
-        PartitionOffsetBytes = 1MB
-        VolumeGuidPath = $volumePath
-        Payloads = $payloadResults
-        ChkdskExitCode = $chkdskExit
-        ChkdskOutput = $chkdskOutput
-    }
-    Write-Host "[PASS] $($case.Name) / SHA256 $afterHash / detached / no drive letter"
+}
+
+if ($failures.Count -gt 0) {
+    throw "Windows VHD validation failed for $($failures.Count) case(s): $($failures -join ' | ')"
 }
 
 if ($null -ne $reportFullPath) {
