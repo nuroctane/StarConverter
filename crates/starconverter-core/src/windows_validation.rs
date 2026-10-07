@@ -34,10 +34,20 @@ pub const LARGE_DIRECTORY_CASE_NAME: &str = "exFAT-to-NTFS large-directory conve
 /// Pinned upper-case SHA-256 of `converted-large-directory-exfat-to-ntfs-windows.vhd`.
 pub const LARGE_DIRECTORY_CASE_HASH: &str =
     "FAE2D7B9626CCA21980BCB5716A8ED8CB7F03485F98EDD9032DEE3652CF1BC59";
+/// Pinned case name for the exFAT-to-NTFS edge-corpus Windows VHD candidate.
+pub const EDGE_NTFS_CASE_NAME: &str = "exFAT-to-NTFS edge conversion";
+/// Pinned upper-case SHA-256 of `converted-edge-exfat-to-ntfs-windows.vhd`.
+pub const EDGE_NTFS_CASE_HASH: &str =
+    "6A5232AF192FB06FA58730DC7CA0480324225FB43DA6F87C3E5FB7F8EB28DD19";
+/// Pinned case name for the NTFS-to-exFAT edge-corpus Windows VHD candidate.
+pub const EDGE_EXFAT_CASE_NAME: &str = "NTFS-to-exFAT edge conversion";
+/// Pinned upper-case SHA-256 of `converted-edge-ntfs-to-exfat-windows.vhd`.
+pub const EDGE_EXFAT_CASE_HASH: &str =
+    "7EE631DA81390B50E7D74FBE80FEAD1D8D05BBC6244DD7EAF8A959270934C093";
 /// Exact regular-file length of every pinned fixed VHD candidate.
 pub const PINNED_VHD_BYTES: u64 = VHD_BYTES;
 /// Number of pinned cases a schema-v1 report must carry.
-const PINNED_CASE_COUNT: usize = 3;
+const PINNED_CASE_COUNT: usize = 5;
 
 /// Number of entries in the large-directory case's single `alpha` directory; the count that
 /// forces the serializer to spill `$I30` into a nonresident allocation with internal nodes.
@@ -45,6 +55,65 @@ pub const LARGE_DIRECTORY_ENTRY_COUNT: usize = 128;
 const LARGE_DIRECTORY_NAME_PADDING: usize = 96;
 const EMPTY_PAYLOAD_SHA256: &str =
     "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855";
+
+/// The edge corpus: sizes one byte either side of a sector and a cluster, a three-way fragmented
+/// stream, a 255-code-unit name, `Straße` (whose up-case form differs in length), and an
+/// astral-plane emoji inside nested Unicode directories. Payload bytes are
+/// `(stream + offset) % 251`, matching `edge-corpus-manifest.tsv`.
+const EDGE_LONG_NAME_PADDING: usize = 251;
+const EDGE_PAYLOADS: [(&str, u64, &str); 10] = [
+    (
+        "empty.zero",
+        0,
+        "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855",
+    ),
+    (
+        "δelta\\one.bin",
+        1,
+        "D4735E3A265E16EEE03F59718B9B5D03019C07D8B6C51F90DA3A666EEC13AB35",
+    ),
+    (
+        "δelta\\sector-minus-one.bin",
+        4095,
+        "D646D75877A9637E122736A961A133A3311D8851F8AF704619EF4F72D8285F30",
+    ),
+    (
+        "δelta\\sector.bin",
+        4096,
+        "C1E069FAA3DB3969DD31B1831835C1D7309CD86E1A2A622DBBE2193498A34C22",
+    ),
+    (
+        "δelta\\cluster-plus-one.bin",
+        4097,
+        "6550ED86F0079033107B7A389058A78C501D342248432F67EC289DE5DFE8EDF1",
+    ),
+    (
+        "δelta\\深度\\two-cluster-minus-one.bin",
+        8191,
+        "669E5887F7AAE41A3D24BF6E7005F155B7B5FFDC7AB86507AD869BE033580962",
+    ),
+    (
+        "δelta\\深度\\three-way-fragmented.bin",
+        9000,
+        "D9727D9EEAEFFF81EAC493081213C41797918CE21D93CFE128A68DFC7D6BCBDB",
+    ),
+    (
+        // Placeholder: replaced by the 255-code-unit `n…n.bin` name in `expected_payloads`.
+        "",
+        17,
+        "FD88E0F0FDBD59876B9A7A3E42C43B2A6261315764891E101A09D4C723FED773",
+    ),
+    (
+        "δelta\\深度\\rocket-🚀.bin",
+        33,
+        "A2F0B89B83B57D01ADA41A46A4654A685FF82951314C0E7E46881C473E1651F5",
+    ),
+    (
+        "Straße.txt",
+        65,
+        "CCEC56A3E701A9EA5BE5F26C2463499BA80ECD1F35110707CDAD9774BAB80002",
+    ),
+];
 
 const EXPECTED_PAYLOADS: [(&str, u64, &str); 3] = [
     (
@@ -520,6 +589,8 @@ pub fn verify_windows_vhd_validation_report(
             NTFS_CASE_NAME => 0,
             EXFAT_CASE_NAME => 1,
             LARGE_DIRECTORY_CASE_NAME => 2,
+            EDGE_NTFS_CASE_NAME => 3,
+            EDGE_EXFAT_CASE_NAME => 4,
             _ => {
                 return Err(WindowsValidationError::InvalidEvidence(
                     "duplicate or unexpected pinned case",
@@ -710,6 +781,8 @@ fn validate_common_case(
         NTFS_CASE_NAME => ("NTFS", NTFS_CASE_HASH),
         EXFAT_CASE_NAME => ("exFAT", EXFAT_CASE_HASH),
         LARGE_DIRECTORY_CASE_NAME => ("NTFS", LARGE_DIRECTORY_CASE_HASH),
+        EDGE_NTFS_CASE_NAME => ("NTFS", EDGE_NTFS_CASE_HASH),
+        EDGE_EXFAT_CASE_NAME => ("exFAT", EDGE_EXFAT_CASE_HASH),
         _ => {
             return Err(WindowsValidationError::InvalidEvidence(
                 "unexpected validation case",
@@ -761,9 +834,16 @@ pub fn large_directory_payload_path(ordinal: usize) -> String {
     )
 }
 
+/// The edge corpus's maximum-length name: 251 `n` plus `.bin`, the 255-code-unit limit both
+/// filesystems share.
+#[must_use]
+pub fn edge_long_payload_path() -> String {
+    format!("{}.bin", "n".repeat(EDGE_LONG_NAME_PADDING))
+}
+
 fn expected_payloads(case_name: &str) -> Vec<ExpectedPayload> {
-    if case_name == LARGE_DIRECTORY_CASE_NAME {
-        (0..LARGE_DIRECTORY_ENTRY_COUNT)
+    match case_name {
+        LARGE_DIRECTORY_CASE_NAME => (0..LARGE_DIRECTORY_ENTRY_COUNT)
             .map(|ordinal| {
                 (
                     large_directory_payload_path(ordinal),
@@ -771,12 +851,22 @@ fn expected_payloads(case_name: &str) -> Vec<ExpectedPayload> {
                     EMPTY_PAYLOAD_SHA256,
                 )
             })
-            .collect()
-    } else {
-        EXPECTED_PAYLOADS
+            .collect(),
+        EDGE_NTFS_CASE_NAME | EDGE_EXFAT_CASE_NAME => EDGE_PAYLOADS
+            .iter()
+            .map(|(path, length, hash)| {
+                let path = if path.is_empty() {
+                    edge_long_payload_path()
+                } else {
+                    (*path).to_owned()
+                };
+                (path, *length, *hash)
+            })
+            .collect(),
+        _ => EXPECTED_PAYLOADS
             .iter()
             .map(|(path, length, hash)| ((*path).to_owned(), *length, *hash))
-            .collect()
+            .collect(),
     }
 }
 
@@ -1002,20 +1092,45 @@ mod tests {
         )
     }
 
-    fn large_directory_driver_case() -> String {
-        let payloads = (0..LARGE_DIRECTORY_ENTRY_COUNT)
-            .map(|ordinal| {
+    /// Driver case whose payload list is derived from the parser's own expectations; the rich
+    /// cases keep the literal `driver_case` fixture so the pinned table is also spelled out once.
+    fn generated_driver_case(name: &str, filesystem: &str, hash: &str, path: &str) -> String {
+        let payloads = expected_payloads(name)
+            .into_iter()
+            .map(|(path, length, sha256)| {
                 format!(
-                    r#"{{"Path":{},"Length":0,"Sha256":"{EMPTY_PAYLOAD_SHA256}"}}"#,
-                    serde_json::to_string(&large_directory_payload_path(ordinal)).unwrap()
+                    r#"{{"Path":{},"Length":{length},"Sha256":"{sha256}"}}"#,
+                    serde_json::to_string(&path).unwrap()
                 )
             })
             .collect::<Vec<_>>()
             .join(",");
+        let path = serde_json::to_string(path).unwrap();
         format!(
-            r#"{{"Name":"{LARGE_DIRECTORY_CASE_NAME}","FileSystem":"NTFS","VhdPath":"C:\\fixtures\\large.vhd","VhdBytes":34603520,"VirtualBytes":34603008,"Sha256Before":"{LARGE_DIRECTORY_CASE_HASH}","Sha256After":"{LARGE_DIRECTORY_CASE_HASH}","DetachedBefore":true,"DetachedAfter":true,"ReadOnlyAttached":true,"NoDriveLetter":true,"PartitionOffsetBytes":1048576,"VolumeGuidPath":"\\\\?\\Volume{{5343574c-0000-0000-0000-100000000000}}\\","Payloads":[{payloads}],"ChkdskExitCode":0,"ChkdskOutput":["Windows has scanned the file system and found no problems."]}}"#
+            r#"{{"Name":"{name}","FileSystem":"{filesystem}","VhdPath":{path},"VhdBytes":34603520,"VirtualBytes":34603008,"Sha256Before":"{hash}","Sha256After":"{hash}","DetachedBefore":true,"DetachedAfter":true,"ReadOnlyAttached":true,"NoDriveLetter":true,"PartitionOffsetBytes":1048576,"VolumeGuidPath":"\\\\?\\Volume{{5343574c-0000-0000-0000-100000000000}}\\","Payloads":[{payloads}],"ChkdskExitCode":0,"ChkdskOutput":["Windows has scanned the file system and found no problems."]}}"#
         )
     }
+
+    const EXTRA_CASES: [(&str, &str, &str, &str); 3] = [
+        (
+            LARGE_DIRECTORY_CASE_NAME,
+            "NTFS",
+            LARGE_DIRECTORY_CASE_HASH,
+            r"C:\fixtures\large.vhd",
+        ),
+        (
+            EDGE_NTFS_CASE_NAME,
+            "NTFS",
+            EDGE_NTFS_CASE_HASH,
+            r"C:\fixtures\edge-ntfs.vhd",
+        ),
+        (
+            EDGE_EXFAT_CASE_NAME,
+            "exFAT",
+            EDGE_EXFAT_CASE_HASH,
+            r"D:\fixtures\edge-exfat.vhd",
+        ),
+    ];
 
     fn report(mode: &str, cases: &str) -> String {
         format!(
@@ -1024,52 +1139,47 @@ mod tests {
     }
 
     fn preflight_report() -> String {
-        report(
-            "detached-preflight",
-            &format!(
-                "{},{},{}",
-                preflight_case(
-                    NTFS_CASE_NAME,
-                    "NTFS",
-                    NTFS_CASE_HASH,
-                    r"C:\fixtures\ntfs.vhd"
-                ),
-                preflight_case(
-                    EXFAT_CASE_NAME,
-                    "exFAT",
-                    EXFAT_CASE_HASH,
-                    r"D:\fixtures\exfat.vhd"
-                ),
-                preflight_case(
-                    LARGE_DIRECTORY_CASE_NAME,
-                    "NTFS",
-                    LARGE_DIRECTORY_CASE_HASH,
-                    r"C:\fixtures\large.vhd"
-                ),
+        let mut cases = vec![
+            preflight_case(
+                NTFS_CASE_NAME,
+                "NTFS",
+                NTFS_CASE_HASH,
+                r"C:\fixtures\ntfs.vhd",
             ),
-        )
+            preflight_case(
+                EXFAT_CASE_NAME,
+                "exFAT",
+                EXFAT_CASE_HASH,
+                r"D:\fixtures\exfat.vhd",
+            ),
+        ];
+        cases.extend(
+            EXTRA_CASES
+                .iter()
+                .map(|(name, filesystem, hash, path)| preflight_case(name, filesystem, hash, path)),
+        );
+        report("detached-preflight", &cases.join(","))
     }
 
     fn driver_report() -> String {
-        report(
-            "read-only-windows-driver",
-            &format!(
-                "{},{},{}",
-                driver_case(
-                    NTFS_CASE_NAME,
-                    "NTFS",
-                    NTFS_CASE_HASH,
-                    r"C:\fixtures\ntfs.vhd"
-                ),
-                driver_case(
-                    EXFAT_CASE_NAME,
-                    "exFAT",
-                    EXFAT_CASE_HASH,
-                    r"D:\fixtures\exfat.vhd"
-                ),
-                large_directory_driver_case(),
+        let mut cases = vec![
+            driver_case(
+                NTFS_CASE_NAME,
+                "NTFS",
+                NTFS_CASE_HASH,
+                r"C:\fixtures\ntfs.vhd",
             ),
-        )
+            driver_case(
+                EXFAT_CASE_NAME,
+                "exFAT",
+                EXFAT_CASE_HASH,
+                r"D:\fixtures\exfat.vhd",
+            ),
+        ];
+        cases.extend(EXTRA_CASES.iter().map(|(name, filesystem, hash, path)| {
+            generated_driver_case(name, filesystem, hash, path)
+        }));
+        report("read-only-windows-driver", &cases.join(","))
     }
 
     fn verify(json: &str) -> Result<WindowsVhdValidationEvidence, WindowsValidationError> {
@@ -1101,14 +1211,61 @@ mod tests {
         for case in evidence.cases() {
             let driver = case.driver_evidence().unwrap();
             assert_eq!(driver.partition_offset_bytes(), PARTITION_OFFSET_BYTES);
-            let expected_payloads = if case.name() == LARGE_DIRECTORY_CASE_NAME {
-                LARGE_DIRECTORY_ENTRY_COUNT
-            } else {
-                EXPECTED_PAYLOADS.len()
+            let expected_payloads = match case.name() {
+                LARGE_DIRECTORY_CASE_NAME => LARGE_DIRECTORY_ENTRY_COUNT,
+                EDGE_NTFS_CASE_NAME | EDGE_EXFAT_CASE_NAME => EDGE_PAYLOADS.len(),
+                _ => EXPECTED_PAYLOADS.len(),
             };
             assert_eq!(driver.payloads().len(), expected_payloads);
             assert_eq!(driver.chkdsk_exit_code(), 0);
             assert_ne!(driver.chkdsk_output(), &[] as &[String]);
+        }
+    }
+
+    #[test]
+    fn edge_payloads_pin_the_edge_corpus_manifest() {
+        let expected = expected_payloads(EDGE_NTFS_CASE_NAME);
+        assert_eq!(expected, expected_payloads(EDGE_EXFAT_CASE_NAME));
+        assert_eq!(expected.len(), 10);
+        let long = edge_long_payload_path();
+        assert_eq!(long.encode_utf16().count(), 255);
+        assert!(
+            expected
+                .iter()
+                .any(|(path, length, _)| *path == long && *length == 17)
+        );
+        assert!(expected.iter().all(|(path, _, _)| !path.is_empty()));
+        let lengths: Vec<u64> = expected.iter().map(|(_, length, _)| *length).collect();
+        assert_eq!(
+            lengths,
+            [0, 1, 4095, 4096, 4097, 8191, 9000, 17, 33, 65],
+            "sizes one byte either side of a sector and a cluster, plus the fragmented stream"
+        );
+        assert!(
+            expected
+                .iter()
+                .any(|(path, _, _)| path == "δelta\\深度\\rocket-🚀.bin")
+        );
+        assert!(expected.iter().any(|(path, _, _)| path == "Straße.txt"));
+    }
+
+    #[test]
+    fn rejects_edge_case_with_rich_payloads_or_truncated_long_name() {
+        let valid = driver_report();
+        let long = serde_json::to_string(&edge_long_payload_path()).unwrap();
+        let truncated = valid.replacen(&long, &long.replacen("nnnn", "nnn", 1), 1);
+        assert_ne!(truncated, valid);
+        let rich_payloads = valid.replacen(
+            &format!(r#""Name":"{EDGE_NTFS_CASE_NAME}""#),
+            &format!(r#""Name":"{NTFS_CASE_NAME}""#),
+            1,
+        );
+        assert_ne!(rich_payloads, valid);
+        for invalid in [truncated, rich_payloads] {
+            assert!(matches!(
+                verify(&invalid),
+                Err(WindowsValidationError::InvalidEvidence(_))
+            ));
         }
     }
 
@@ -1380,6 +1537,8 @@ mod tests {
             (NTFS_CASE_NAME, NTFS_CASE_HASH),
             (EXFAT_CASE_NAME, EXFAT_CASE_HASH),
             (LARGE_DIRECTORY_CASE_NAME, LARGE_DIRECTORY_CASE_HASH),
+            (EDGE_NTFS_CASE_NAME, EDGE_NTFS_CASE_HASH),
+            (EDGE_EXFAT_CASE_NAME, EDGE_EXFAT_CASE_HASH),
         ] {
             let name_line = format!("Name = \"{name}\"");
             let hash_line = format!("Sha256 = \"{hash}\"");
@@ -1396,11 +1555,17 @@ mod tests {
         }
         assert_eq!(
             script.matches("Sha256 = \"").count(),
-            PINNED_CASE_COUNT + EXPECTED_PAYLOADS.len() + 1
+            PINNED_CASE_COUNT + EXPECTED_PAYLOADS.len() + 1 + EDGE_PAYLOADS.len()
         );
-        for (path, length, hash) in EXPECTED_PAYLOADS {
+        for (path, length, hash) in EXPECTED_PAYLOADS.iter().chain(EDGE_PAYLOADS.iter()) {
             assert!(script.contains(&format!("Length = {length}")), "{path}");
             assert!(script.contains(&format!("Sha256 = \"{hash}\"")), "{path}");
+        }
+        // The edge names are also spelled from code points; the 255-code-unit name is built
+        // from the same padding constant.
+        assert!(script.contains(&format!("('n' * {EDGE_LONG_NAME_PADDING}) + '.bin'")));
+        for code_point in ["0x03B4", "0x00DF"] {
+            assert!(script.contains(code_point), "{code_point}");
         }
         // The script spells the large-directory names from code points so the file stays ASCII;
         // every piece of the generator must agree with `large_directory_payload_path`.

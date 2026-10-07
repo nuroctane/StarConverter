@@ -145,6 +145,63 @@ $largeDirectoryPayloads = @(
         }
     }
 )
+# The edge corpus: sizes one byte either side of a sector and a cluster, a three-way fragmented
+# stream, a 255-code-unit name, Strasse with a sharp s, and an emoji inside nested Unicode
+# directories. Bytes are (stream + offset) % 251, matching edge-corpus-manifest.tsv.
+$delta = "$([char]0x03B4)elta"
+$depth = "$([char]0x6DF1)$([char]0x5EA6)"
+$edgePayloads = @(
+    [pscustomobject]@{
+        Path = "empty.zero"
+        Length = 0
+        Sha256 = "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855"
+    },
+    [pscustomobject]@{
+        Path = "$delta\one.bin"
+        Length = 1
+        Sha256 = "D4735E3A265E16EEE03F59718B9B5D03019C07D8B6C51F90DA3A666EEC13AB35"
+    },
+    [pscustomobject]@{
+        Path = "$delta\sector-minus-one.bin"
+        Length = 4095
+        Sha256 = "D646D75877A9637E122736A961A133A3311D8851F8AF704619EF4F72D8285F30"
+    },
+    [pscustomobject]@{
+        Path = "$delta\sector.bin"
+        Length = 4096
+        Sha256 = "C1E069FAA3DB3969DD31B1831835C1D7309CD86E1A2A622DBBE2193498A34C22"
+    },
+    [pscustomobject]@{
+        Path = "$delta\cluster-plus-one.bin"
+        Length = 4097
+        Sha256 = "6550ED86F0079033107B7A389058A78C501D342248432F67EC289DE5DFE8EDF1"
+    },
+    [pscustomobject]@{
+        Path = "$delta\$depth\two-cluster-minus-one.bin"
+        Length = 8191
+        Sha256 = "669E5887F7AAE41A3D24BF6E7005F155B7B5FFDC7AB86507AD869BE033580962"
+    },
+    [pscustomobject]@{
+        Path = "$delta\$depth\three-way-fragmented.bin"
+        Length = 9000
+        Sha256 = "D9727D9EEAEFFF81EAC493081213C41797918CE21D93CFE128A68DFC7D6BCBDB"
+    },
+    [pscustomobject]@{
+        Path = ('n' * 251) + '.bin'
+        Length = 17
+        Sha256 = "FD88E0F0FDBD59876B9A7A3E42C43B2A6261315764891E101A09D4C723FED773"
+    },
+    [pscustomobject]@{
+        Path = "$delta\$depth\rocket-$([char]::ConvertFromUtf32(0x1F680)).bin"
+        Length = 33
+        Sha256 = "A2F0B89B83B57D01ADA41A46A4654A685FF82951314C0E7E46881C473E1651F5"
+    },
+    [pscustomobject]@{
+        Path = "Stra$([char]0x00DF)e.txt"
+        Length = 65
+        Sha256 = "CCEC56A3E701A9EA5BE5F26C2463499BA80ECD1F35110707CDAD9774BAB80002"
+    }
+)
 $cases = @(
     [pscustomobject]@{
         Name = "exFAT-to-NTFS rich conversion"
@@ -171,6 +228,22 @@ $cases = @(
         # The driver must enumerate exactly these entries through the nonresident $I30 B-tree,
         # not merely resolve each name by lookup.
         Directory = "alpha"
+    },
+    [pscustomobject]@{
+        Name = "exFAT-to-NTFS edge conversion"
+        File = "converted-edge-exfat-to-ntfs-windows.vhd"
+        FileSystem = "NTFS"
+        Sha256 = "6A5232AF192FB06FA58730DC7CA0480324225FB43DA6F87C3E5FB7F8EB28DD19"
+        Payloads = $edgePayloads
+        Directory = $null
+    },
+    [pscustomobject]@{
+        Name = "NTFS-to-exFAT edge conversion"
+        File = "converted-edge-ntfs-to-exfat-windows.vhd"
+        FileSystem = "exFAT"
+        Sha256 = "7EE631DA81390B50E7D74FBE80FEAD1D8D05BBC6244DD7EAF8A959270934C093"
+        Payloads = $edgePayloads
+        Directory = $null
     }
 )
 $results = @()

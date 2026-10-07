@@ -229,6 +229,29 @@ Both rich cases passed again, the report verified, and all nine CI jobs were gre
 first Windows filesystem-driver acceptance of a StarConverter nonresident NTFS directory index
 with internal `INDX` nodes.**
 
+### Fourth and fifth Windows cases: the edge corpus in both directions
+
+The edge corpus (`exfat-edge-corpus.img` / `ntfs-edge-corpus.img`) carries what the rich corpus
+does not: payloads of 1, 4095, 4096, 4097, 8191, and 9000 bytes (one byte either side of a sector
+and a cluster, plus a three-way fragmented stream), a 255-code-unit name (`n` × 251 + `.bin`),
+`Straße.txt` (whose up-case form changes length), `rocket-🚀.bin`, and nested `δelta/深度`
+directories. Both conversions are now also exported as Windows VHDs at the 1 MiB partition offset
+and pinned as the fourth and fifth cases:
+
+```text
+converted Windows edge NTFS VHD   6A5232AF192FB06FA58730DC7CA0480324225FB43DA6F87C3E5FB7F8EB28DD19
+converted Windows edge exFAT VHD  7EE631DA81390B50E7D74FBE80FEAD1D8D05BBC6244DD7EAF8A959270934C093
+```
+
+The ten expected payloads are pinned as literal lengths and SHA-256 values in both the harness
+and the verifier (the hashes were cross-checked against `edge-corpus-manifest.tsv`); the harness
+spells `δ`, `深度`, `ß`, and the emoji from code points. A local check confirmed that Windows
+PowerShell 5.1 resolves a 352-character `\\?\Volume{…}\…\n…n.bin` path through `Get-Item`,
+`Get-FileHash`, and `Get-ChildItem`, so the maximum-length name does not trip `MAX_PATH`. The
+verifier now requires exactly five pinned cases and rejects an edge case whose long name is
+truncated or whose payload list belongs to another case. The non-elevated preflight passed
+against all five pins and its report verified through the CLI.
+
 ## 2026-09-01 forced NTFS-to-exFAT relocation qualification
 
 A dedicated 32 MiB NTFS 3.1 regular image placed one 8,192-byte file at byte

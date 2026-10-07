@@ -733,46 +733,119 @@ fn export_exfat_candidate(
     evidence
 }
 
+/// One Windows VHD case: which converter produces the partition image, how the MBR wrapper is
+/// identified, and which pinned hash the harness and the report parser expect.
+struct WindowsVhdCase {
+    partition_name: &'static str,
+    vhd_name: &'static str,
+    unique_id: [u8; 16],
+    disk_signature: u32,
+    pinned_hash: &'static str,
+    target: WindowsVhdTarget,
+}
+
+enum WindowsVhdTarget {
+    Ntfs,
+    Exfat,
+}
+
+fn export_windows_vhd_case(directory: &Path, source_path: &Path, case: &WindowsVhdCase) -> PathBuf {
+    let partition = match case.target {
+        WindowsVhdTarget::Ntfs => export_ntfs_candidate(
+            directory,
+            source_path,
+            case.partition_name,
+            ONE_MIB_PARTITION_ALIGNMENT_SECTORS,
+        ),
+        WindowsVhdTarget::Exfat => export_exfat_candidate(
+            directory,
+            source_path,
+            case.partition_name,
+            ONE_MIB_PARTITION_ALIGNMENT_SECTORS,
+            4096,
+            0,
+        ),
+    };
+    let vhd = wrap_fixed_vhd(
+        &fs::read(&partition.output_path).unwrap(),
+        vhd_config(case.unique_id, case.disk_signature),
+        FixedVhdLimits::default(),
+    )
+    .unwrap();
+    let path = directory.join(case.vhd_name);
+    fs::write(&path, vhd.bytes).unwrap();
+    assert_pinned_windows_vhd_identity(&path, case.pinned_hash);
+    if matches!(case.target, WindowsVhdTarget::Ntfs) {
+        assert_ntfs_system_records_satisfy_windows_driver_invariants(&fs::read(&path).unwrap());
+    }
+    path
+}
+
 fn export_windows_vhd_candidates(
     directory: &Path,
     rich_exfat_path: &Path,
     rich_ntfs_path: &Path,
 ) -> (PathBuf, PathBuf) {
-    let ntfs_partition = export_ntfs_candidate(
+    let ntfs_path = export_windows_vhd_case(
         directory,
         rich_exfat_path,
-        "converted-rich-exfat-to-ntfs-windows-partition.img",
-        ONE_MIB_PARTITION_ALIGNMENT_SECTORS,
+        &WindowsVhdCase {
+            partition_name: "converted-rich-exfat-to-ntfs-windows-partition.img",
+            vhd_name: "converted-rich-exfat-to-ntfs-windows.vhd",
+            unique_id: *b"StarCvNtfsWin001",
+            disk_signature: 0x5343_5754,
+            pinned_hash: windows_validation::NTFS_CASE_HASH,
+            target: WindowsVhdTarget::Ntfs,
+        },
     );
-    let ntfs_vhd = wrap_fixed_vhd(
-        &fs::read(&ntfs_partition.output_path).unwrap(),
-        vhd_config(*b"StarCvNtfsWin001", 0x5343_5754),
-        FixedVhdLimits::default(),
-    )
-    .unwrap();
-    let ntfs_path = directory.join("converted-rich-exfat-to-ntfs-windows.vhd");
-    fs::write(&ntfs_path, ntfs_vhd.bytes).unwrap();
-
-    let exfat_partition = export_exfat_candidate(
+    let exfat_path = export_windows_vhd_case(
         directory,
         rich_ntfs_path,
-        "converted-rich-ntfs-to-exfat-windows-partition.img",
-        ONE_MIB_PARTITION_ALIGNMENT_SECTORS,
-        4096,
-        0,
+        &WindowsVhdCase {
+            partition_name: "converted-rich-ntfs-to-exfat-windows-partition.img",
+            vhd_name: "converted-rich-ntfs-to-exfat-windows.vhd",
+            unique_id: *b"StarCvExfatWin01",
+            disk_signature: 0x5343_5758,
+            pinned_hash: windows_validation::EXFAT_CASE_HASH,
+            target: WindowsVhdTarget::Exfat,
+        },
     );
-    let exfat_vhd = wrap_fixed_vhd(
-        &fs::read(&exfat_partition.output_path).unwrap(),
-        vhd_config(*b"StarCvExfatWin01", 0x5343_5758),
-        FixedVhdLimits::default(),
-    )
-    .unwrap();
-    let exfat_path = directory.join("converted-rich-ntfs-to-exfat-windows.vhd");
-    fs::write(&exfat_path, exfat_vhd.bytes).unwrap();
+    (ntfs_path, exfat_path)
+}
 
-    assert_pinned_windows_vhd_identity(&ntfs_path, windows_validation::NTFS_CASE_HASH);
-    assert_pinned_windows_vhd_identity(&exfat_path, windows_validation::EXFAT_CASE_HASH);
-    assert_ntfs_system_records_satisfy_windows_driver_invariants(&fs::read(&ntfs_path).unwrap());
+/// Converts the edge corpus (255-code-unit name, sector and cluster boundary sizes, three-way
+/// fragmentation, `Straße`, an astral-plane emoji, nested Unicode directories) in both
+/// directions so the Windows drivers judge name-length, up-case, and boundary handling that the
+/// rich corpus never reaches.
+fn export_edge_windows_vhd_candidates(
+    directory: &Path,
+    edge_exfat_path: &Path,
+    edge_ntfs_path: &Path,
+) -> (PathBuf, PathBuf) {
+    let ntfs_path = export_windows_vhd_case(
+        directory,
+        edge_exfat_path,
+        &WindowsVhdCase {
+            partition_name: "converted-edge-exfat-to-ntfs-windows-partition.img",
+            vhd_name: "converted-edge-exfat-to-ntfs-windows.vhd",
+            unique_id: *b"StarCvNtfsWinEd1",
+            disk_signature: 0x5343_5745,
+            pinned_hash: windows_validation::EDGE_NTFS_CASE_HASH,
+            target: WindowsVhdTarget::Ntfs,
+        },
+    );
+    let exfat_path = export_windows_vhd_case(
+        directory,
+        edge_ntfs_path,
+        &WindowsVhdCase {
+            partition_name: "converted-edge-ntfs-to-exfat-windows-partition.img",
+            vhd_name: "converted-edge-ntfs-to-exfat-windows.vhd",
+            unique_id: *b"StarCvExfatWinE1",
+            disk_signature: 0x5343_5746,
+            pinned_hash: windows_validation::EDGE_EXFAT_CASE_HASH,
+            target: WindowsVhdTarget::Exfat,
+        },
+    );
     (ntfs_path, exfat_path)
 }
 
@@ -780,26 +853,21 @@ fn export_windows_vhd_candidates(
 /// judges the nonresident `$INDEX_ALLOCATION:$I30` B-tree with internal `INDX` nodes, which
 /// the rich candidate never exercises.
 fn export_large_directory_windows_vhd_candidate(directory: &Path, source_path: &Path) -> PathBuf {
-    let partition = export_ntfs_candidate(
+    let path = export_windows_vhd_case(
         directory,
         source_path,
-        "converted-large-directory-exfat-to-ntfs-windows-partition.img",
-        ONE_MIB_PARTITION_ALIGNMENT_SECTORS,
+        &WindowsVhdCase {
+            partition_name: "converted-large-directory-exfat-to-ntfs-windows-partition.img",
+            vhd_name: "converted-large-directory-exfat-to-ntfs-windows.vhd",
+            unique_id: *b"StarCvNtfsWinLD1",
+            disk_signature: 0x5343_574c,
+            pinned_hash: windows_validation::LARGE_DIRECTORY_CASE_HASH,
+            target: WindowsVhdTarget::Ntfs,
+        },
     );
-    {
-        let image = ImageFile::open(&partition.output_path).unwrap();
-        assert_large_directory_index(&image);
-    }
-    let vhd = wrap_fixed_vhd(
-        &fs::read(&partition.output_path).unwrap(),
-        vhd_config(*b"StarCvNtfsWinLD1", 0x5343_574c),
-        FixedVhdLimits::default(),
-    )
-    .unwrap();
-    let path = directory.join("converted-large-directory-exfat-to-ntfs-windows.vhd");
-    fs::write(&path, vhd.bytes).unwrap();
-    assert_pinned_windows_vhd_identity(&path, windows_validation::LARGE_DIRECTORY_CASE_HASH);
-    assert_ntfs_system_records_satisfy_windows_driver_invariants(&fs::read(&path).unwrap());
+    let partition = directory.join("converted-large-directory-exfat-to-ntfs-windows-partition.img");
+    let image = ImageFile::open(&partition).unwrap();
+    assert_large_directory_index(&image);
     path
 }
 
@@ -1318,6 +1386,8 @@ fn export_structural_candidate_images() {
         exported_edge_exfat,
         edge_manifest_path,
     ) = export_edge_corpus(&directory, upcase.encoded_bytes());
+    let (windows_edge_ntfs_vhd_path, windows_edge_exfat_vhd_path) =
+        export_edge_windows_vhd_candidates(&directory, &edge_exfat_path, &edge_ntfs_path);
 
     print_structural_paths([
         &exfat_path,
@@ -1350,6 +1420,14 @@ fn export_structural_candidate_images() {
     println!("converted edge NTFS candidate: {exported_edge_ntfs:?}");
     println!("converted edge exFAT candidate: {exported_edge_exfat:?}");
     println!("edge manifest: {}", edge_manifest_path.display());
+    println!(
+        "Windows edge NTFS VHD candidate: {}",
+        windows_edge_ntfs_vhd_path.display()
+    );
+    println!(
+        "Windows edge exFAT VHD candidate: {}",
+        windows_edge_exfat_vhd_path.display()
+    );
 }
 
 fn large_directory_graph() -> (ObjectGraph, Vec<ExfatObjectMetadata>, String) {
