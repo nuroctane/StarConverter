@@ -770,32 +770,59 @@ fn export_windows_vhd_candidates(
     let exfat_path = directory.join("converted-rich-ntfs-to-exfat-windows.vhd");
     fs::write(&exfat_path, exfat_vhd.bytes).unwrap();
 
-    // The Windows harness and the report parser both pin these exact VHD identities. Asserting
-    // them here turns every serializer byte change into a visible, deliberate pin refresh instead
-    // of a silent drift that the elevated gate would only discover later.
-    for (path, expected) in [
-        (&ntfs_path, windows_validation::NTFS_CASE_HASH),
-        (&exfat_path, windows_validation::EXFAT_CASE_HASH),
-    ] {
-        let bytes = fs::read(path).unwrap();
-        assert_eq!(
-            u64::try_from(bytes.len()).unwrap(),
-            windows_validation::PINNED_VHD_BYTES,
-            "{}",
-            path.display()
-        );
-        let actual = upper_hex(&Sha256::digest(&bytes));
-        assert_eq!(
-            actual,
-            expected,
-            "pinned Windows VHD identity drifted for {}; refresh windows_validation.rs, \
-             scripts/validate-windows-vhd.ps1, and docs/EXTERNAL_VALIDATION.md together",
-            path.display()
-        );
-        println!("pinned Windows VHD identity: {actual} {}", path.display());
-    }
+    assert_pinned_windows_vhd_identity(&ntfs_path, windows_validation::NTFS_CASE_HASH);
+    assert_pinned_windows_vhd_identity(&exfat_path, windows_validation::EXFAT_CASE_HASH);
     assert_ntfs_system_records_satisfy_windows_driver_invariants(&fs::read(&ntfs_path).unwrap());
     (ntfs_path, exfat_path)
+}
+
+/// Converts the 128-entry long-Unicode-name directory corpus into a Windows VHD so `ntfs.sys`
+/// judges the nonresident `$INDEX_ALLOCATION:$I30` B-tree with internal `INDX` nodes, which
+/// the rich candidate never exercises.
+fn export_large_directory_windows_vhd_candidate(directory: &Path, source_path: &Path) -> PathBuf {
+    let partition = export_ntfs_candidate(
+        directory,
+        source_path,
+        "converted-large-directory-exfat-to-ntfs-windows-partition.img",
+        ONE_MIB_PARTITION_ALIGNMENT_SECTORS,
+    );
+    {
+        let image = ImageFile::open(&partition.output_path).unwrap();
+        assert_large_directory_index(&image);
+    }
+    let vhd = wrap_fixed_vhd(
+        &fs::read(&partition.output_path).unwrap(),
+        vhd_config(*b"StarCvNtfsWinLD1", 0x5343_574c),
+        FixedVhdLimits::default(),
+    )
+    .unwrap();
+    let path = directory.join("converted-large-directory-exfat-to-ntfs-windows.vhd");
+    fs::write(&path, vhd.bytes).unwrap();
+    assert_pinned_windows_vhd_identity(&path, windows_validation::LARGE_DIRECTORY_CASE_HASH);
+    assert_ntfs_system_records_satisfy_windows_driver_invariants(&fs::read(&path).unwrap());
+    path
+}
+
+/// The Windows harness and the report parser both pin these exact VHD identities. Asserting
+/// them here turns every serializer byte change into a visible, deliberate pin refresh instead
+/// of a silent drift that the elevated gate would only discover later.
+fn assert_pinned_windows_vhd_identity(path: &Path, expected: &str) {
+    let bytes = fs::read(path).unwrap();
+    assert_eq!(
+        u64::try_from(bytes.len()).unwrap(),
+        windows_validation::PINNED_VHD_BYTES,
+        "{}",
+        path.display()
+    );
+    let actual = upper_hex(&Sha256::digest(&bytes));
+    assert_eq!(
+        actual,
+        expected,
+        "pinned Windows VHD identity drifted for {}; refresh windows_validation.rs, \
+         scripts/validate-windows-vhd.ps1, and docs/EXTERNAL_VALIDATION.md together",
+        path.display()
+    );
+    println!("pinned Windows VHD identity: {actual} {}", path.display());
 }
 
 /// Invariants the Windows NTFS driver and `chkdsk` enforce on the system records but NTFS-3G
@@ -1163,9 +1190,13 @@ fn print_structural_paths(paths: [&Path; 5]) {
     }
 }
 
-fn print_windows_vhd_paths(ntfs: &Path, exfat: &Path) {
+fn print_windows_vhd_paths(ntfs: &Path, exfat: &Path, large_directory: &Path) {
     println!("Windows NTFS VHD candidate: {}", ntfs.display());
     println!("Windows exFAT VHD candidate: {}", exfat.display());
+    println!(
+        "Windows large-directory NTFS VHD candidate: {}",
+        large_directory.display()
+    );
 }
 
 #[test]
@@ -1240,6 +1271,20 @@ fn export_structural_candidate_images() {
     );
     let (windows_ntfs_vhd_path, windows_exfat_vhd_path) =
         export_windows_vhd_candidates(&directory, &rich_exfat_path, &rich_ntfs_path);
+    let (large_directory_graph, large_directory_metadata, _) = large_directory_graph();
+    let large_directory_source_path = directory.join("exfat-large-directory.img");
+    fs::write(
+        &large_directory_source_path,
+        exfat_image(
+            &large_directory_graph,
+            &large_directory_metadata,
+            upcase.encoded_bytes(),
+            0,
+        ),
+    )
+    .unwrap();
+    let windows_large_directory_vhd_path =
+        export_large_directory_windows_vhd_candidate(&directory, &large_directory_source_path);
     let manifest_path = directory.join("rich-fixture-manifest.txt");
     fs::write(
         &manifest_path,
@@ -1285,7 +1330,11 @@ fn export_structural_candidate_images() {
     println!("rich NTFS fixture: {}", rich_ntfs_path.display());
     println!("converted NTFS candidate: {exported_ntfs:?}");
     println!("converted exFAT candidate: {exported_exfat:?}");
-    print_windows_vhd_paths(&windows_ntfs_vhd_path, &windows_exfat_vhd_path);
+    print_windows_vhd_paths(
+        &windows_ntfs_vhd_path,
+        &windows_exfat_vhd_path,
+        &windows_large_directory_vhd_path,
+    );
     println!("rich manifest: {}", manifest_path.display());
     println!(
         "misaligned NTFS source: {}",

@@ -115,21 +115,7 @@ if (-not [string]::IsNullOrWhiteSpace($ReportPath)) {
     }
 }
 
-$cases = @(
-    [pscustomobject]@{
-        Name = "exFAT-to-NTFS rich conversion"
-        File = "converted-rich-exfat-to-ntfs-windows.vhd"
-        FileSystem = "NTFS"
-        Sha256 = "4F537D4F171B530E6D5F7491466B38CC2888D7C63F90CD3D6275775D949B6387"
-    },
-    [pscustomobject]@{
-        Name = "NTFS-to-exFAT rich conversion"
-        File = "converted-rich-ntfs-to-exfat-windows.vhd"
-        FileSystem = "exFAT"
-        Sha256 = "BC6301CEE56057A1AFD6B5BEF6D0A44770A9AF8093AF1A7D511240F4D53FCEF3"
-    }
-)
-$payloads = @(
+$richPayloads = @(
     [pscustomobject]@{
         Path = "readme.txt"
         Length = 14
@@ -144,6 +130,47 @@ $payloads = @(
         Path = "alpha\$([char]0x03A9)mega\fragmented.bin"
         Length = 6000
         Sha256 = "6F5B3BEF759FFD6505BEB8112B023A869B1B771946F88BAEC7F016CCFB1035D6"
+    }
+)
+# 128 empty files whose names mix Greek, CJK, an astral-plane emoji, and a 96-character tail;
+# spelled from code points so this script stays ASCII and PowerShell 5.1 cannot mis-decode it.
+$largeDirectoryPayloads = @(
+    foreach ($ordinal in 0..(128 - 1)) {
+        $name = "entry-{0:D3}-{1}mega-{2}{3}-rocket-{4}-{5}.bin" -f `
+            $ordinal, [char]0x03A9, [char]0x6DF1, [char]0x5EA6, [char]::ConvertFromUtf32(0x1F680), ('n' * 96)
+        [pscustomobject]@{
+            Path = "alpha\$name"
+            Length = 0
+            Sha256 = "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855"
+        }
+    }
+)
+$cases = @(
+    [pscustomobject]@{
+        Name = "exFAT-to-NTFS rich conversion"
+        File = "converted-rich-exfat-to-ntfs-windows.vhd"
+        FileSystem = "NTFS"
+        Sha256 = "4F537D4F171B530E6D5F7491466B38CC2888D7C63F90CD3D6275775D949B6387"
+        Payloads = $richPayloads
+        Directory = $null
+    },
+    [pscustomobject]@{
+        Name = "NTFS-to-exFAT rich conversion"
+        File = "converted-rich-ntfs-to-exfat-windows.vhd"
+        FileSystem = "exFAT"
+        Sha256 = "BC6301CEE56057A1AFD6B5BEF6D0A44770A9AF8093AF1A7D511240F4D53FCEF3"
+        Payloads = $richPayloads
+        Directory = $null
+    },
+    [pscustomobject]@{
+        Name = "exFAT-to-NTFS large-directory conversion"
+        File = "converted-large-directory-exfat-to-ntfs-windows.vhd"
+        FileSystem = "NTFS"
+        Sha256 = "FAE2D7B9626CCA21980BCB5716A8ED8CB7F03485F98EDD9032DEE3652CF1BC59"
+        Payloads = $largeDirectoryPayloads
+        # The driver must enumerate exactly these entries through the nonresident $I30 B-tree,
+        # not merely resolve each name by lookup.
+        Directory = "alpha"
     }
 )
 $results = @()
@@ -267,7 +294,24 @@ foreach ($case in $cases) {
                 throw "Volume association did not round-trip to the exact VHD path."
             }
 
-            foreach ($payload in $payloads) {
+            if ($null -ne $case.Directory) {
+                $directoryPath = Join-Path $volume.Path $case.Directory
+                [string[]]$expectedNames = @($case.Payloads | ForEach-Object { [IO.Path]::GetFileName($_.Path) })
+                [string[]]$actualNames = @(Get-ChildItem -LiteralPath $directoryPath -Force | ForEach-Object { $_.Name })
+                [Array]::Sort($expectedNames, [StringComparer]::Ordinal)
+                [Array]::Sort($actualNames, [StringComparer]::Ordinal)
+                if ($actualNames.Count -ne $expectedNames.Count) {
+                    throw "Directory enumeration returned $($actualNames.Count) entries, expected $($expectedNames.Count): $($case.Directory)"
+                }
+                for ($index = 0; $index -lt $expectedNames.Count; $index++) {
+                    if (-not [string]::Equals($actualNames[$index], $expectedNames[$index], [StringComparison]::Ordinal)) {
+                        throw "Directory enumeration name mismatch at sorted index $index`: $($case.Directory)"
+                    }
+                }
+                Write-Host "[CHECK] $($case.Name) enumerated $($actualNames.Count) entries in $($case.Directory)"
+            }
+
+            foreach ($payload in $case.Payloads) {
                 $payloadPath = Join-Path $volume.Path $payload.Path
                 $payloadItem = Get-Item -LiteralPath $payloadPath -Force
                 if (-not ($payloadItem -is [IO.FileInfo]) -or $payloadItem.Length -ne $payload.Length) {

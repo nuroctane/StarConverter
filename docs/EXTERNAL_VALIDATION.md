@@ -19,6 +19,8 @@ converted Windows NTFS VHD   4F537D4F171B530E6D5F7491466B38CC2888D7C63F90CD3D627
 converted Windows exFAT VHD  BC6301CEE56057A1AFD6B5BEF6D0A44770A9AF8093AF1A7D511240F4D53FCEF3
 ```
 
+(A third pin, the large-directory NTFS VHD, was added later in this section.)
+
 Two guards now keep the three pin sites in lockstep:
 
 - `export_external_fixtures` re-hashes both generated VHDs and asserts the public
@@ -191,7 +193,32 @@ had never reached the verifier with a passing NTFS case before. The prefix is no
 `\\?\Volume{`, the fixture matches, and a unit test pins the exact path the Windows mount manager
 reported (`\\?\Volume{53435754-0000-0000-0000-100000000000}\`) alongside the malformed variants.
 The downloaded `windows-vhd-report.json` from run 37602490520 verifies through the corrected CLI
-locally: mode `read-only-windows-driver`, two cases, `payloads=3 / chkdsk-exit=0` on each.
+locally: mode `read-only-windows-driver`, two cases, `payloads=3 / chkdsk-exit=0` on each. CI run
+37604213992 on the corrected verifier was the first fully green `windows-vhd` lane: both cases
+`[PASS]`, `[VERIFIED]` report, all nine CI jobs green.
+
+### Third Windows case: the 128-entry long-Unicode-name directory
+
+The rich candidates keep every directory index resident in `$INDEX_ROOT`, so `ntfs.sys` had never
+judged a StarConverter nonresident `$INDEX_ALLOCATION:$I30` B-tree. The large-directory corpus
+(128 empty files under `alpha`, names mixing Greek, CJK, an astral-plane emoji, and a 96-character
+tail) already passes NTFS-3G enumeration and all 128 lookups on Linux; it is now also exported as
+`converted-large-directory-exfat-to-ntfs-windows.vhd` (1 MiB partition offset, disk signature
+`SCWL`) and pinned as the third Windows case:
+
+```text
+converted Windows large-directory NTFS VHD  FAE2D7B9626CCA21980BCB5716A8ED8CB7F03485F98EDD9032DEE3652CF1BC59
+```
+
+The harness carries per-case payload sets, builds the 128 names from code points so the script
+stays ASCII, and for this case additionally enumerates `alpha` through the driver and requires the
+ordinal-sorted name list to equal the pinned 128 names exactly, so a B-tree that resolves lookups
+but drops or duplicates entries during enumeration fails. The verifier requires exactly three
+pinned cases, derives the 128 expected payloads (`alpha\entry-NNN-…bin`, length 0, empty SHA-256)
+from the same generator the exporter uses, and rejects a missing, renamed, or nonempty entry. The
+exporter asserts the nonresident `$I30` allocation with internal `INDX` nodes on the partition
+image before wrapping it, and runs the same Windows system-record invariants on the new VHD. The
+non-elevated preflight passed against all three pins and its report verified through the CLI.
 
 ## 2026-09-01 forced NTFS-to-exFAT relocation qualification
 

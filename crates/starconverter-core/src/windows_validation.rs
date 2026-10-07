@@ -29,8 +29,22 @@ pub const EXFAT_CASE_NAME: &str = "NTFS-to-exFAT rich conversion";
 /// Pinned upper-case SHA-256 of `converted-rich-ntfs-to-exfat-windows.vhd`.
 pub const EXFAT_CASE_HASH: &str =
     "BC6301CEE56057A1AFD6B5BEF6D0A44770A9AF8093AF1A7D511240F4D53FCEF3";
-/// Exact regular-file length of both pinned fixed VHD candidates.
+/// Pinned case name for the exFAT-to-NTFS 128-entry long-Unicode-name directory candidate.
+pub const LARGE_DIRECTORY_CASE_NAME: &str = "exFAT-to-NTFS large-directory conversion";
+/// Pinned upper-case SHA-256 of `converted-large-directory-exfat-to-ntfs-windows.vhd`.
+pub const LARGE_DIRECTORY_CASE_HASH: &str =
+    "FAE2D7B9626CCA21980BCB5716A8ED8CB7F03485F98EDD9032DEE3652CF1BC59";
+/// Exact regular-file length of every pinned fixed VHD candidate.
 pub const PINNED_VHD_BYTES: u64 = VHD_BYTES;
+/// Number of pinned cases a schema-v1 report must carry.
+const PINNED_CASE_COUNT: usize = 3;
+
+/// Number of entries in the large-directory case's single `alpha` directory; the count that
+/// forces the serializer to spill `$I30` into a nonresident allocation with internal nodes.
+pub const LARGE_DIRECTORY_ENTRY_COUNT: usize = 128;
+const LARGE_DIRECTORY_NAME_PADDING: usize = 96;
+const EMPTY_PAYLOAD_SHA256: &str =
+    "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855";
 
 const EXPECTED_PAYLOADS: [(&str, u64, &str); 3] = [
     (
@@ -476,9 +490,9 @@ pub fn verify_windows_vhd_validation_report(
         check_nonempty_string(field, value, limits)?;
     }
     check_array("Cases", raw.cases.len(), limits.max_cases)?;
-    if raw.cases.len() != 2 {
+    if raw.cases.len() != PINNED_CASE_COUNT {
         return Err(WindowsValidationError::InvalidEvidence(
-            "schema v1 requires exactly two pinned cases",
+            "schema v1 requires exactly the three pinned cases",
         ));
     }
 
@@ -486,8 +500,7 @@ pub fn verify_windows_vhd_validation_report(
         RawMode::DetachedPreflight => WindowsValidationMode::DetachedPreflight,
         RawMode::ReadOnlyWindowsDriver => WindowsValidationMode::ReadOnlyWindowsDriver,
     };
-    let mut saw_ntfs = false;
-    let mut saw_exfat = false;
+    let mut seen = [false; PINNED_CASE_COUNT];
     let mut cases = Vec::with_capacity(raw.cases.len());
     for case in raw.cases {
         let evidence = match (mode, case) {
@@ -503,18 +516,25 @@ pub fn verify_windows_vhd_validation_report(
                 ));
             }
         };
-        match evidence.name.as_str() {
-            NTFS_CASE_NAME if !saw_ntfs => saw_ntfs = true,
-            EXFAT_CASE_NAME if !saw_exfat => saw_exfat = true,
+        let index = match evidence.name.as_str() {
+            NTFS_CASE_NAME => 0,
+            EXFAT_CASE_NAME => 1,
+            LARGE_DIRECTORY_CASE_NAME => 2,
             _ => {
                 return Err(WindowsValidationError::InvalidEvidence(
                     "duplicate or unexpected pinned case",
                 ));
             }
+        };
+        if seen[index] {
+            return Err(WindowsValidationError::InvalidEvidence(
+                "duplicate or unexpected pinned case",
+            ));
         }
+        seen[index] = true;
         cases.push(evidence);
     }
-    if !saw_ntfs || !saw_exfat {
+    if seen.iter().any(|seen| !seen) {
         return Err(WindowsValidationError::InvalidEvidence(
             "required pinned case is absent",
         ));
@@ -639,7 +659,7 @@ fn validate_driver_case(
             "invalid volume GUID path",
         ));
     }
-    let payloads = validate_payloads(case.payloads, limits)?;
+    let payloads = validate_payloads(&case.name, case.payloads, limits)?;
     if case.chkdsk_exit_code != 0 {
         return Err(WindowsValidationError::InvalidEvidence(
             "CHKDSK did not report success",
@@ -689,6 +709,7 @@ fn validate_common_case(
     let (expected_filesystem, expected_hash) = match name {
         NTFS_CASE_NAME => ("NTFS", NTFS_CASE_HASH),
         EXFAT_CASE_NAME => ("exFAT", EXFAT_CASE_HASH),
+        LARGE_DIRECTORY_CASE_NAME => ("NTFS", LARGE_DIRECTORY_CASE_HASH),
         _ => {
             return Err(WindowsValidationError::InvalidEvidence(
                 "unexpected validation case",
@@ -724,22 +745,59 @@ fn validate_common_case(
     Ok(())
 }
 
+/// Payload path, exact length, and upper-case SHA-256 the Windows driver must serve.
+type ExpectedPayload = (String, u64, &'static str);
+
+/// Relative path of one entry in the large-directory case.
+///
+/// The case is a 128-entry `alpha` directory of empty files whose names mix Greek, CJK, an
+/// astral-plane emoji, and a 96-character ASCII tail, so every name needs a long `$FILE_NAME`
+/// and the index cannot stay resident.
+#[must_use]
+pub fn large_directory_payload_path(ordinal: usize) -> String {
+    format!(
+        "alpha\\entry-{ordinal:03}-Ωmega-深度-rocket-🚀-{}.bin",
+        "n".repeat(LARGE_DIRECTORY_NAME_PADDING)
+    )
+}
+
+fn expected_payloads(case_name: &str) -> Vec<ExpectedPayload> {
+    if case_name == LARGE_DIRECTORY_CASE_NAME {
+        (0..LARGE_DIRECTORY_ENTRY_COUNT)
+            .map(|ordinal| {
+                (
+                    large_directory_payload_path(ordinal),
+                    0,
+                    EMPTY_PAYLOAD_SHA256,
+                )
+            })
+            .collect()
+    } else {
+        EXPECTED_PAYLOADS
+            .iter()
+            .map(|(path, length, hash)| ((*path).to_owned(), *length, *hash))
+            .collect()
+    }
+}
+
 fn validate_payloads(
+    case_name: &str,
     payloads: Vec<RawPayload>,
     limits: WindowsValidationLimits,
 ) -> Result<Vec<WindowsPayloadEvidence>, WindowsValidationError> {
     check_array("Payloads", payloads.len(), limits.max_payloads_per_case)?;
-    if payloads.len() != EXPECTED_PAYLOADS.len() {
+    let expected_set = expected_payloads(case_name);
+    if payloads.len() != expected_set.len() {
         return Err(WindowsValidationError::InvalidEvidence(
             "driver validation lacks the complete pinned payload set",
         ));
     }
-    let mut seen = [false; EXPECTED_PAYLOADS.len()];
+    let mut seen = vec![false; expected_set.len()];
     let mut evidence = Vec::with_capacity(payloads.len());
     for payload in payloads {
         check_nonempty_string("Payload.Path", &payload.path, limits)?;
         check_nonempty_string("Payload.Sha256", &payload.sha256, limits)?;
-        let Some((index, expected)) = EXPECTED_PAYLOADS
+        let Some((index, expected)) = expected_set
             .iter()
             .enumerate()
             .find(|(_, expected)| expected.0 == payload.path)
@@ -944,6 +1002,21 @@ mod tests {
         )
     }
 
+    fn large_directory_driver_case() -> String {
+        let payloads = (0..LARGE_DIRECTORY_ENTRY_COUNT)
+            .map(|ordinal| {
+                format!(
+                    r#"{{"Path":{},"Length":0,"Sha256":"{EMPTY_PAYLOAD_SHA256}"}}"#,
+                    serde_json::to_string(&large_directory_payload_path(ordinal)).unwrap()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            r#"{{"Name":"{LARGE_DIRECTORY_CASE_NAME}","FileSystem":"NTFS","VhdPath":"C:\\fixtures\\large.vhd","VhdBytes":34603520,"VirtualBytes":34603008,"Sha256Before":"{LARGE_DIRECTORY_CASE_HASH}","Sha256After":"{LARGE_DIRECTORY_CASE_HASH}","DetachedBefore":true,"DetachedAfter":true,"ReadOnlyAttached":true,"NoDriveLetter":true,"PartitionOffsetBytes":1048576,"VolumeGuidPath":"\\\\?\\Volume{{5343574c-0000-0000-0000-100000000000}}\\","Payloads":[{payloads}],"ChkdskExitCode":0,"ChkdskOutput":["Windows has scanned the file system and found no problems."]}}"#
+        )
+    }
+
     fn report(mode: &str, cases: &str) -> String {
         format!(
             r#"{{"Schema":"starconverter.windows-vhd-validation","Version":1,"Complete":true,"Mode":"{mode}","GeneratedUtc":"2026-08-21T12:34:56.1234567Z","WindowsVersion":"Microsoft Windows NT 10.0","PowerShellVersion":"5.1","ChkdskVersion":"10.0","NtfsDriverVersion":"10.0","ExfatDriverVersion":"10.0","Cases":[{cases}]}}"#
@@ -954,7 +1027,7 @@ mod tests {
         report(
             "detached-preflight",
             &format!(
-                "{},{}",
+                "{},{},{}",
                 preflight_case(
                     NTFS_CASE_NAME,
                     "NTFS",
@@ -966,6 +1039,12 @@ mod tests {
                     "exFAT",
                     EXFAT_CASE_HASH,
                     r"D:\fixtures\exfat.vhd"
+                ),
+                preflight_case(
+                    LARGE_DIRECTORY_CASE_NAME,
+                    "NTFS",
+                    LARGE_DIRECTORY_CASE_HASH,
+                    r"C:\fixtures\large.vhd"
                 ),
             ),
         )
@@ -975,7 +1054,7 @@ mod tests {
         report(
             "read-only-windows-driver",
             &format!(
-                "{},{}",
+                "{},{},{}",
                 driver_case(
                     NTFS_CASE_NAME,
                     "NTFS",
@@ -988,6 +1067,7 @@ mod tests {
                     EXFAT_CASE_HASH,
                     r"D:\fixtures\exfat.vhd"
                 ),
+                large_directory_driver_case(),
             ),
         )
     }
@@ -1000,7 +1080,7 @@ mod tests {
     fn accepts_complete_detached_preflight_as_non_driver_evidence() {
         let evidence = verify(&preflight_report()).unwrap();
         assert_eq!(evidence.mode(), WindowsValidationMode::DetachedPreflight);
-        assert_eq!(evidence.cases().len(), 2);
+        assert_eq!(evidence.cases().len(), PINNED_CASE_COUNT);
         assert!(
             evidence
                 .cases()
@@ -1017,12 +1097,77 @@ mod tests {
             evidence.mode(),
             WindowsValidationMode::ReadOnlyWindowsDriver
         );
+        assert_eq!(evidence.cases().len(), PINNED_CASE_COUNT);
         for case in evidence.cases() {
             let driver = case.driver_evidence().unwrap();
             assert_eq!(driver.partition_offset_bytes(), PARTITION_OFFSET_BYTES);
-            assert_eq!(driver.payloads().len(), 3);
+            let expected_payloads = if case.name() == LARGE_DIRECTORY_CASE_NAME {
+                LARGE_DIRECTORY_ENTRY_COUNT
+            } else {
+                EXPECTED_PAYLOADS.len()
+            };
+            assert_eq!(driver.payloads().len(), expected_payloads);
             assert_eq!(driver.chkdsk_exit_code(), 0);
             assert_ne!(driver.chkdsk_output(), &[] as &[String]);
+        }
+    }
+
+    #[test]
+    fn large_directory_payload_paths_are_the_pinned_corpus_names() {
+        // Spelled out so the generator cannot drift from the exporter and the Linux validator.
+        assert_eq!(
+            large_directory_payload_path(0),
+            format!(
+                "alpha\\entry-000-Ωmega-深度-rocket-🚀-{}.bin",
+                "n".repeat(96)
+            )
+        );
+        assert_eq!(
+            large_directory_payload_path(127),
+            format!(
+                "alpha\\entry-127-Ωmega-深度-rocket-🚀-{}.bin",
+                "n".repeat(96)
+            )
+        );
+        let expected = expected_payloads(LARGE_DIRECTORY_CASE_NAME);
+        assert_eq!(expected.len(), LARGE_DIRECTORY_ENTRY_COUNT);
+        assert!(
+            expected
+                .iter()
+                .all(|(_, length, hash)| *length == 0 && *hash == EMPTY_PAYLOAD_SHA256)
+        );
+        assert_eq!(
+            expected_payloads(NTFS_CASE_NAME).len(),
+            EXPECTED_PAYLOADS.len()
+        );
+        assert_eq!(
+            expected_payloads(EXFAT_CASE_NAME).len(),
+            EXPECTED_PAYLOADS.len()
+        );
+    }
+
+    #[test]
+    fn rejects_large_directory_case_with_missing_renamed_or_nonempty_payloads() {
+        let valid = driver_report();
+        let last = serde_json::to_string(&large_directory_payload_path(127)).unwrap();
+        let missing = valid.replacen(
+            &format!(r#",{{"Path":{last},"Length":0,"Sha256":"{EMPTY_PAYLOAD_SHA256}"}}"#),
+            "",
+            1,
+        );
+        assert_ne!(missing, valid);
+        let renamed = valid.replacen("entry-127-", "entry-128-", 1);
+        let nonempty = valid.replacen(
+            &format!(r#"{{"Path":{last},"Length":0,"#),
+            &format!(r#"{{"Path":{last},"Length":1,"#),
+            1,
+        );
+        assert_ne!(nonempty, valid);
+        for invalid in [missing, renamed, nonempty] {
+            assert!(matches!(
+                verify(&invalid),
+                Err(WindowsValidationError::InvalidEvidence(_))
+            ));
         }
     }
 
@@ -1220,6 +1365,8 @@ mod tests {
     }
 
     #[test]
+    // The asserted `{0:D3}` template is a PowerShell `-f` placeholder, not a Rust format string.
+    #[allow(clippy::literal_string_with_formatting_args)]
     fn powershell_harness_pins_the_same_fixture_identities_as_this_parser() {
         let script_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
@@ -1232,6 +1379,7 @@ mod tests {
         for (name, hash) in [
             (NTFS_CASE_NAME, NTFS_CASE_HASH),
             (EXFAT_CASE_NAME, EXFAT_CASE_HASH),
+            (LARGE_DIRECTORY_CASE_NAME, LARGE_DIRECTORY_CASE_HASH),
         ] {
             let name_line = format!("Name = \"{name}\"");
             let hash_line = format!("Sha256 = \"{hash}\"");
@@ -1248,11 +1396,20 @@ mod tests {
         }
         assert_eq!(
             script.matches("Sha256 = \"").count(),
-            2 + EXPECTED_PAYLOADS.len()
+            PINNED_CASE_COUNT + EXPECTED_PAYLOADS.len() + 1
         );
         for (path, length, hash) in EXPECTED_PAYLOADS {
             assert!(script.contains(&format!("Length = {length}")), "{path}");
             assert!(script.contains(&format!("Sha256 = \"{hash}\"")), "{path}");
+        }
+        // The script spells the large-directory names from code points so the file stays ASCII;
+        // every piece of the generator must agree with `large_directory_payload_path`.
+        assert!(script.contains(&format!("Sha256 = \"{EMPTY_PAYLOAD_SHA256}\"")));
+        assert!(script.contains(&format!("0..({LARGE_DIRECTORY_ENTRY_COUNT} - 1)")));
+        assert!(script.contains(&format!("'n' * {LARGE_DIRECTORY_NAME_PADDING}")));
+        assert!(script.contains("\"entry-{0:D3}-{1}mega-{2}{3}-rocket-{4}-{5}.bin\""));
+        for code_point in ["0x03A9", "0x6DF1", "0x5EA6", "0x1F680"] {
+            assert!(script.contains(code_point), "{code_point}");
         }
         assert!(script.contains(&format!("-ne {PINNED_VHD_BYTES} -or")));
         assert!(script.contains(&format!("Size -ne {VIRTUAL_BYTES}")));
