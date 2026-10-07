@@ -3024,6 +3024,7 @@ fn system_file_name_attribute(
         system_file_name_attributes(record_number),
         NtfsObjectTimestamps::uniform(timestamp),
         0,
+        SYSTEM_FILE_NAME_NAMESPACE,
     )?;
     resident_attribute(FILE_NAME, None, id, &value)
 }
@@ -3314,6 +3315,7 @@ fn extend_records(
             child.file_name_attributes,
             NtfsObjectTimestamps::uniform(timestamp),
             0,
+            SYSTEM_FILE_NAME_NAMESPACE,
         )?;
         append_extend_i30_entry(
             &mut i30_entries,
@@ -3524,6 +3526,7 @@ fn extend_record_prefix_attributes(
         spec.file_name_attributes,
         NtfsObjectTimestamps::uniform(timestamp),
         0,
+        SYSTEM_FILE_NAME_NAMESPACE,
     )?;
     Ok(vec![
         standard_information_with_security_id(
@@ -3647,6 +3650,7 @@ fn extend_directory_record(
         spec.file_name_attributes,
         NtfsObjectTimestamps::uniform(timestamp),
         0,
+        SYSTEM_FILE_NAME_NAMESPACE,
     )?;
     let root = extend_index_root_value(layout.cluster, index, index_entries, false)?;
     finish_record_with_sequence(
@@ -3682,6 +3686,7 @@ fn extend_child_record(
         spec.file_name_attributes,
         NtfsObjectTimestamps::uniform(timestamp),
         0,
+        SYSTEM_FILE_NAME_NAMESPACE,
     )?;
     let mut attributes = vec![
         standard_information_with_security_id(
@@ -4305,6 +4310,11 @@ fn directory_prefix_attributes(
             file_name_attributes(dos_file_attributes, ObjectKind::Directory),
             object_metadata.timestamps,
             reparse_tag,
+            if record_number == 5 {
+                SYSTEM_FILE_NAME_NAMESPACE
+            } else {
+                USER_FILE_NAME_NAMESPACE
+            },
         )?;
         attributes.push(resident_attribute(FILE_NAME, None, id, &value)?);
     }
@@ -4327,7 +4337,12 @@ fn directory_index_entries(
     upcase: &NtfsUpcaseTable,
 ) -> Result<Vec<NtfsDirectoryIndexEntry>, NtfsSerializeError> {
     let mut entries = if directory == graph.root() {
-        system_directory_index_entries(layout, timestamp)?
+        let mut entries = system_directory_index_entries(layout, timestamp)?;
+        entries.push(root_self_index_entry(
+            metadata_by_object[&directory],
+            reparse_by_object.get(&directory).copied(),
+        ));
+        entries
     } else {
         Vec::new()
     };
@@ -4376,11 +4391,43 @@ fn directory_index_entries(
             data_size: stream.map_or(0, |value| value.logical_bytes),
             file_attributes,
             reparse_tag_or_ea_size,
-            namespace: FileNameNamespace::Win32,
+            namespace: USER_FILE_NAME_NAMESPACE,
             name: child.name.clone(),
         });
     }
     Ok(entries)
+}
+
+/// The root directory's self-parented `.` entry that `mkntfs` and the Windows formatter both
+/// index; it must mirror the root's own `$FILE_NAME` exactly, which `ntfs_normalize` verifies.
+fn root_self_index_entry(
+    root_metadata: NtfsObjectMetadata,
+    reparse_point: Option<&[u8]>,
+) -> NtfsDirectoryIndexEntry {
+    let dos_file_attributes = root_metadata.dos_file_attributes
+        | FILE_ATTRIBUTE_HIDDEN
+        | FILE_ATTRIBUTE_SYSTEM
+        | reparse_point.map_or(0, |_| FILE_ATTRIBUTE_REPARSE_POINT);
+    NtfsDirectoryIndexEntry {
+        file_reference: NtfsFileReference {
+            record_number: 5,
+            sequence_number: 5,
+        },
+        parent_directory: NtfsFileReference {
+            record_number: 5,
+            sequence_number: 5,
+        },
+        creation_time: root_metadata.timestamps.creation_time,
+        modification_time: root_metadata.timestamps.modification_time,
+        mft_change_time: root_metadata.timestamps.mft_change_time,
+        access_time: root_metadata.timestamps.access_time,
+        allocated_size: 0,
+        data_size: 0,
+        file_attributes: file_name_attributes(dos_file_attributes, ObjectKind::Directory),
+        reparse_tag_or_ea_size: reparse_point.map_or(0, reparse_tag),
+        namespace: SYSTEM_FILE_NAME_NAMESPACE,
+        name: vec![u16::from(b'.')],
+    }
 }
 
 fn system_directory_index_entries(
@@ -4467,7 +4514,7 @@ fn system_directory_index_entries(
                 _ => attributes,
             },
             reparse_tag_or_ea_size: 0,
-            namespace: FileNameNamespace::Win32,
+            namespace: SYSTEM_FILE_NAME_NAMESPACE,
             name: name.encode_utf16().collect(),
         });
     }
@@ -5682,6 +5729,7 @@ fn file_attributes(
             file_name_attributes(dos_file_attributes, object.kind),
             metadata.timestamps,
             reparse_tag,
+            USER_FILE_NAME_NAMESPACE,
         )?;
         attrs.push(resident_attribute(FILE_NAME, None, next_id, &value)?);
         next_id = next_id
@@ -6412,6 +6460,7 @@ fn signed_bytes(value: i64) -> Vec<u8> {
     raw[..length].to_vec()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn file_name_value(
     parent_record: u64,
     name: &[u16],
@@ -6420,6 +6469,7 @@ fn file_name_value(
     attributes: u32,
     timestamps: NtfsObjectTimestamps,
     reparse_tag_or_ea_size: u32,
+    namespace: FileNameNamespace,
 ) -> Result<Vec<u8>, NtfsSerializeError> {
     file_name_value_with_parent_sequence(
         parent_record,
@@ -6430,6 +6480,7 @@ fn file_name_value(
         attributes,
         timestamps,
         reparse_tag_or_ea_size,
+        namespace,
     )
 }
 
@@ -6443,6 +6494,7 @@ fn file_name_value_with_parent_sequence(
     attributes: u32,
     timestamps: NtfsObjectTimestamps,
     reparse_tag_or_ea_size: u32,
+    namespace: FileNameNamespace,
 ) -> Result<Vec<u8>, NtfsSerializeError> {
     let mut bytes = vec![0_u8; 66 + name.len() * 2];
     put_u64(
@@ -6466,7 +6518,7 @@ fn file_name_value_with_parent_sequence(
     put_u32(&mut bytes, 56, attributes);
     put_u32(&mut bytes, 60, reparse_tag_or_ea_size);
     bytes[64] = u8::try_from(name.len()).map_err(|_| NtfsSerializeError::ArithmeticOverflow)?;
-    bytes[65] = 1;
+    bytes[65] = file_name_namespace_id(namespace);
     write_utf16(&mut bytes, 66, name);
     Ok(bytes)
 }
@@ -6610,6 +6662,24 @@ fn write_mft_bitmap(metadata: &mut [u8], layout: MetadataLayout) -> Result<(), N
 const fn mft_reference_with_sequence(record_number: u64, sequence_number: u16) -> u64 {
     ((sequence_number as u64) << 48) | record_number
 }
+
+const fn file_name_namespace_id(namespace: FileNameNamespace) -> u8 {
+    match namespace {
+        FileNameNamespace::Posix => 0,
+        FileNameNamespace::Win32 => 1,
+        FileNameNamespace::Dos => 2,
+        FileNameNamespace::Win32AndDos => 3,
+    }
+}
+
+/// Namespace of a converted object's single `$FILE_NAME`. NTFS-3G creates every name as
+/// `FILE_NAME_POSIX`; Windows `chkdsk` treats a lone `FILE_NAME_WIN32` name as a missing DOS
+/// companion ("minor file name errors"), so the Win32 namespace is never emitted without one.
+const USER_FILE_NAME_NAMESPACE: FileNameNamespace = FileNameNamespace::Posix;
+
+/// Namespace `mkntfs` and the Windows formatter give every system file name, including the
+/// root `.` entry and the `$Extend` children.
+const SYSTEM_FILE_NAME_NAMESPACE: FileNameNamespace = FileNameNamespace::Win32AndDos;
 
 /// Sequence number of a freshly formatted record. `ntfs.sys` opens every system file through a
 /// fixed `{record, sequence = record}` reference (`$MFT` uses 1) and treats a mismatch as
@@ -7569,7 +7639,8 @@ mod tests {
         assert_eq!(parsed.entry_count(), 1);
         assert_eq!(parsed.entries().next().unwrap().child_vcn, Some(0));
         let block = parse_index_block(root_index_block(&plan), Some(0), index_limits()).unwrap();
-        assert_eq!(block.entry_count(), 13);
+        // Eleven system names, the root's own `.` entry, `hello.txt`, and the end marker.
+        assert_eq!(block.entry_count(), 14);
         let names: BTreeSet<Vec<u16>> = block
             .entries()
             .filter_map(|entry| entry.file_name)
@@ -7587,6 +7658,7 @@ mod tests {
             "$Secure",
             "$UpCase",
             "$Extend",
+            ".",
             "hello.txt",
         ] {
             assert!(names.contains(&expected.encode_utf16().collect::<Vec<_>>()));

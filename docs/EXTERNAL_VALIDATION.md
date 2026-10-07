@@ -15,7 +15,7 @@ hashes. The non-elevated preflight therefore refused the regenerated candidates.
 Both pins were refreshed from the regenerated fixtures and now read:
 
 ```text
-converted Windows NTFS VHD   1A51438BFD762272F4367A0411D4E14DC32F01F28A5E3B1B309AC094F69CEA36
+converted Windows NTFS VHD   74F3C3B530BE07D2AAA46882D30C31DF2E1752774DEBB9EE1A7C2C38977FCE08
 converted Windows exFAT VHD  3F52FE1A6997A5DAFBA4B66D4C7947E9DFAEAB801A578E597775D9C3F3F0EA41
 ```
 
@@ -114,6 +114,18 @@ serializer now matches Windows and `mkntfs` on each point:
 
 `export_external_fixtures` asserts each of these on every regenerated candidate alongside the
 earlier four invariants. The NTFS pin moved to `1A51...EA36`; the exFAT pin was unaffected.
+
+CI run 37593390310 then cleared Stage 1 entirely ("0 bad file records processed") and failed in
+Stage 2: "Deleting invalid system file name" for every system record, "Minor file name errors"
+on every other file, and "Index entry ... is incorrect" for every index entry. A byte comparison
+of the root `$I30` entries against the control showed the entries identical except for one byte:
+the `$FILE_NAME` namespace. The candidate wrote `FILE_NAME_WIN32` (1) on every name, which to
+`ntfs.sys` and `chkdsk` means "a DOS companion name exists" and is therefore invalid alone.
+Windows and `mkntfs` write `FILE_NAME_WIN32_AND_DOS` (3) on every system name including the
+root `.` and the `$Extend` children; NTFS-3G creates user names as `FILE_NAME_POSIX` (0). The
+serializer now follows both: system names and the root `.` are namespace 3, converted object
+names are namespace 0, and the root index gains the self-parented `.` entry that both formatters
+index (the normalizer already accepted and verified it). The NTFS pin moved to `74F3...CE08`.
 Whether the Windows driver now mounts the candidate is answered by the next `windows-vhd` lane run.
 
 ## 2026-09-01 forced NTFS-to-exFAT relocation qualification

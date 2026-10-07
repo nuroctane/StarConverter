@@ -812,7 +812,9 @@ fn export_windows_vhd_candidates(
 ///   `FILE_ATTRIBUTE_VIEW_INDEX_PRESENT`;
 /// - no `$STANDARD_INFORMATION` carries `FILE_ATTRIBUTE_DIRECTORY`; directories instead carry
 ///   `FILE_ATTRIBUTE_I30_INDEX_PRESENT` in `$FILE_NAME` and the directory FILE record flag;
-/// - `$Volume` carries an empty unnamed `$DATA` stream.
+/// - `$Volume` carries an empty unnamed `$DATA` stream;
+/// - every system `$FILE_NAME` is `FILE_NAME_WIN32_AND_DOS`; a lone `FILE_NAME_WIN32` name is
+///   a missing DOS companion to `chkdsk`.
 fn assert_ntfs_system_records_satisfy_windows_driver_invariants(vhd: &[u8]) {
     const PARTITION_BYTES: usize = 1024 * 1024;
     const CLUSTER_BYTES: usize = 4096;
@@ -1002,6 +1004,10 @@ impl SystemRecordView {
                     attributes & FILE_ATTRIBUTE_I30_INDEX_PRESENT != 0,
                     self.is_directory(),
                     "record {record_number} $FILE_NAME I30 bit"
+                );
+                assert_eq!(
+                    value[65], 3,
+                    "record {record_number} $FILE_NAME is not FILE_NAME_WIN32_AND_DOS"
                 );
             }
             0x80 if record_number == 3 && attribute.name.is_empty() => {
