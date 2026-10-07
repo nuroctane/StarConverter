@@ -352,6 +352,165 @@ pub fn ntfs_security_descriptor_hash(descriptor: &[u8]) -> Result<u32, NtfsSecur
     Ok(hash)
 }
 
+/// One descriptor recovered from a live `$Secure:$SDS` stream by [`parse_ntfs_sds_stream`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NtfsSdsEntry {
+    pub security_id: u32,
+    pub hash: u32,
+    /// Stream offset of the entry header in the primary (even) 256 KiB block.
+    pub offset: u64,
+    /// Exact self-relative descriptor bytes, header excluded.
+    pub descriptor: Vec<u8>,
+}
+
+/// Parses every descriptor out of a complete `$Secure:$SDS` stream of any origin.
+///
+/// The stream is a sequence of 512 KiB pairs: descriptors live in the even 256 KiB block and the
+/// odd block is a byte-for-byte mirror of it. Entries start 16-byte aligned, carry
+/// `(hash, security_id, offset, length)` headers, never straddle a block boundary, and a zero
+/// header ends the entries of a block. This mirrors how `ntfs.sys` and NTFS-3G's
+/// `ntfs_security_init` walk the stream; nothing is assumed about descriptor count, size, or
+/// content beyond the header invariants. Zero padding between entries, matching mirrors, a
+/// recomputed hash, and unique ascending security identifiers are all required.
+///
+/// # Errors
+///
+/// Returns [`NtfsSecureError::LimitExceeded`] when a bound is exceeded,
+/// [`NtfsSecureError::AllocationFailed`] if output allocation fails, or
+/// [`NtfsSecureError::Malformed`] for any header, padding, mirror, hash, or ordering violation.
+pub fn parse_ntfs_sds_stream(
+    sds: &[u8],
+    limits: NtfsSecureLimits,
+) -> Result<Vec<NtfsSdsEntry>, NtfsSecureError> {
+    require_limit("SDS bytes", sds.len(), limits.max_sds_bytes)?;
+    let mut entries: Vec<NtfsSdsEntry> = Vec::new();
+    let mut pair_start = 0_usize;
+    while pair_start < sds.len() {
+        let primary_end = pair_start
+            .checked_add(SDS_COPY_DISTANCE)
+            .ok_or_else(|| malformed_error("$SDS", pair_start, "block offset overflows"))?
+            .min(sds.len());
+        let mut cursor = pair_start;
+        let mut used_end = pair_start;
+        while cursor + SDS_HEADER_BYTES <= primary_end {
+            if sds[cursor..cursor + SDS_HEADER_BYTES]
+                .iter()
+                .all(|byte| *byte == 0)
+            {
+                break;
+            }
+            if entries.len() == limits.max_descriptors {
+                return Err(NtfsSecureError::LimitExceeded {
+                    what: "security descriptors",
+                    actual: entries.len() + 1,
+                    limit: limits.max_descriptors,
+                });
+            }
+            let previous_id = entries.last().map(|previous| previous.security_id);
+            let (entry, entry_end) =
+                parse_live_sds_entry(sds, cursor, primary_end, previous_id, limits)?;
+            entries
+                .try_reserve(1)
+                .map_err(|_| NtfsSecureError::AllocationFailed {
+                    what: "parsed $SDS entries",
+                })?;
+            entries.push(entry);
+            used_end = entry_end;
+            let next = align_up(entry_end, SDS_ALIGNMENT)
+                .ok_or_else(|| malformed_error("$SDS", cursor + 16, "next entry overflows"))?;
+            if next > primary_end {
+                break;
+            }
+            if sds[entry_end..next].iter().any(|byte| *byte != 0) {
+                return malformed("$SDS", entry_end, "non-zero alignment padding");
+            }
+            cursor = next;
+        }
+        if sds[used_end..primary_end].iter().any(|byte| *byte != 0) {
+            return malformed("$SDS", used_end, "non-zero bytes after the last entry");
+        }
+        let mirror_start = primary_end;
+        if mirror_start < sds.len() {
+            let mirror_end = pair_start
+                .checked_add(2 * SDS_COPY_DISTANCE)
+                .ok_or_else(|| malformed_error("$SDS", mirror_start, "mirror offset overflows"))?
+                .min(sds.len());
+            let mirrored = mirror_end - mirror_start;
+            if sds[pair_start..pair_start + mirrored] != sds[mirror_start..mirror_end] {
+                return malformed("$SDS", mirror_start, "mirror block differs from primary");
+            }
+        }
+        pair_start = pair_start
+            .checked_add(2 * SDS_COPY_DISTANCE)
+            .ok_or_else(|| malformed_error("$SDS", pair_start, "next pair offset overflows"))?;
+    }
+    Ok(entries)
+}
+
+/// Parses one live `$SDS` entry whose header starts at `cursor`, returning it with its end.
+fn parse_live_sds_entry(
+    sds: &[u8],
+    cursor: usize,
+    primary_end: usize,
+    previous_id: Option<u32>,
+    limits: NtfsSecureLimits,
+) -> Result<(NtfsSdsEntry, usize), NtfsSecureError> {
+    let header = &sds[cursor..cursor + SDS_HEADER_BYTES];
+    let hash = read_u32(header, 0, "$SDS", cursor)?;
+    let security_id = read_u32(header, 4, "$SDS", cursor)?;
+    let offset = read_u64(header, 8, "$SDS", cursor)?;
+    let length = read_u32(header, 16, "$SDS", cursor)?;
+    let length = usize::try_from(length)
+        .map_err(|_| malformed_error("$SDS", cursor + 16, "entry length overflows"))?;
+    if length < SDS_HEADER_BYTES {
+        return malformed("$SDS", cursor + 16, "entry shorter than its header");
+    }
+    require_limit(
+        "security descriptor bytes",
+        length - SDS_HEADER_BYTES,
+        limits.max_descriptor_bytes,
+    )?;
+    let entry_end = cursor
+        .checked_add(length)
+        .ok_or_else(|| malformed_error("$SDS", cursor + 16, "entry end overflows"))?;
+    if entry_end > primary_end {
+        return malformed("$SDS", cursor + 16, "entry crosses its 256 KiB block");
+    }
+    if offset != cursor as u64 {
+        return malformed("$SDS", cursor + 8, "header offset is not the entry offset");
+    }
+    if security_id == 0 {
+        return malformed("$SDS", cursor + 4, "security identifier zero is reserved");
+    }
+    if previous_id.is_some_and(|previous| previous >= security_id) {
+        return malformed(
+            "$SDS",
+            cursor + 4,
+            "security identifiers are not strictly ascending",
+        );
+    }
+    let descriptor = &sds[cursor + SDS_HEADER_BYTES..entry_end];
+    if ntfs_security_descriptor_hash(descriptor)? != hash {
+        return malformed("$SDS", cursor, "descriptor hash mismatch");
+    }
+    let mut owned = Vec::new();
+    owned
+        .try_reserve_exact(descriptor.len())
+        .map_err(|_| NtfsSecureError::AllocationFailed {
+            what: "parsed $SDS descriptor",
+        })?;
+    owned.extend_from_slice(descriptor);
+    Ok((
+        NtfsSdsEntry {
+            security_id,
+            hash,
+            offset,
+            descriptor: owned,
+        },
+        entry_end,
+    ))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ParsedSdsEntry<'a> {
     hash: u32,
@@ -1007,8 +1166,80 @@ const fn malformed_error(
     }
 }
 
+/// Windows-`format` `$Secure:$SDS` bytes shared by the parser, inspection, and policy tests.
+#[cfg(test)]
+pub(crate) mod windows_format_fixture {
+    use super::*;
+
+    /// The six descriptors Windows Server 2025 `format` writes into `$Secure:$SDS`, captured
+    /// from the 40 MiB control partition (`control-ntfs.vhd`). Each is DACL-only, self-relative.
+    pub const WINDOWS_FORMAT_DESCRIPTORS: [(u32, u32, &str); 6] = [
+        (
+            0x100,
+            0x32fe_c6cb,
+            "01000480480000005400000000000000140000000200340002000000000014008900120001010000000000051200000000001800890012000102000000000005200000002002000001010000000000051200000001020000000000052000000020020000",
+        ),
+        (
+            0x101,
+            0x3414_c8f7,
+            "01000480480000005400000000000000140000000200340002000000000014009f011200010100000000000512000000000018009f0112000102000000000005200000002002000001010000000000051200000001020000000000052000000020020000",
+        ),
+        (
+            0x102,
+            0x2076_2219,
+            "0100048048000000580000000000000014000000020034000200000000001400ff011f0001010000000000051200000000001800890012000102000000000005200000002002000001020000000000052000000020020000010100000000000512000000",
+        ),
+        (
+            0x103,
+            0x2076_2259,
+            "0100048048000000580000000000000014000000020034000200000000001400ff011f0001010000000000051200000000001800a90012000102000000000005200000002002000001020000000000052000000020020000010100000000000512000000",
+        ),
+        (
+            0x104,
+            0x068e_5891,
+            "0100048048000000540000000000000014000000020034000200000000001400ff011f0001010000000000051200000000001800a900120001020000000000052000000020020000010100000000000512000000010100000000000512000000",
+        ),
+        (
+            0x105,
+            0x0a9f_9b62,
+            "010004803000000040000000000000001400000002001c000100000000031400ff011f0001010000000000051200000001020000000000052000000020020000010100000000000512000000",
+        ),
+    ];
+
+    pub fn hex(text: &str) -> Vec<u8> {
+        (0..text.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&text[index..index + 2], 16).expect("hex"))
+            .collect()
+    }
+
+    /// Lays the Windows descriptors out exactly as `format` does: entries from offset 0 in the
+    /// first 256 KiB block, a zero header after the last one, and the primary block mirrored at
+    /// 256 KiB with the stream ending as soon as the mirror covers the used bytes.
+    pub fn windows_format_sds() -> Vec<u8> {
+        let mut primary = vec![0_u8; SDS_COPY_DISTANCE];
+        let mut cursor = 0;
+        for (security_id, hash, descriptor) in WINDOWS_FORMAT_DESCRIPTORS {
+            let descriptor = hex(descriptor);
+            let length = SDS_HEADER_BYTES + descriptor.len();
+            put_u32(&mut primary, cursor, hash);
+            put_u32(&mut primary, cursor + 4, security_id);
+            put_u64(&mut primary, cursor + 8, cursor as u64);
+            put_u32(&mut primary, cursor + 16, u32::try_from(length).unwrap());
+            primary[cursor + SDS_HEADER_BYTES..cursor + length].copy_from_slice(&descriptor);
+            cursor = align_up(cursor + length, SDS_ALIGNMENT).unwrap();
+        }
+        assert_eq!(cursor, 0x2e0);
+        let mut sds = primary.clone();
+        sds.extend_from_slice(&primary[..cursor]);
+        assert_eq!(sds.len(), 262_880);
+        sds
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::windows_format_fixture::{WINDOWS_FORMAT_DESCRIPTORS, hex, windows_format_sds};
     use super::*;
 
     // Exact bytes from ntfsprogs/sd.c:init_secure_sds at the pinned commit.
@@ -1284,6 +1515,133 @@ mod tests {
             Err(NtfsSecureError::LimitExceeded {
                 what: "SDS bytes",
                 ..
+            })
+        ));
+    }
+
+    #[test]
+    fn general_parser_recovers_every_windows_format_descriptor() {
+        let entries = parse_ntfs_sds_stream(&windows_format_sds(), NtfsSecureLimits::default())
+            .expect("windows format $SDS parses");
+        assert_eq!(entries.len(), WINDOWS_FORMAT_DESCRIPTORS.len());
+        for (entry, (security_id, hash, descriptor)) in
+            entries.iter().zip(WINDOWS_FORMAT_DESCRIPTORS)
+        {
+            assert_eq!(entry.security_id, security_id);
+            assert_eq!(entry.hash, hash);
+            assert_eq!(entry.descriptor, hex(descriptor));
+            assert_eq!(entry.offset, u64::from(security_id - 0x100) * 0x80);
+            crate::fs::ntfs_security_descriptor::validate_ntfs_security_descriptor(
+                &entry.descriptor,
+                crate::fs::ntfs_security_descriptor::NtfsSecurityDescriptorLimits::default(),
+            )
+            .expect("windows format descriptor is within the supported profile");
+        }
+    }
+
+    #[test]
+    fn general_parser_agrees_with_the_pinned_parser_on_the_canonical_stream() {
+        let metadata = canonical();
+        let entries = parse_ntfs_sds_stream(&metadata.sds, NtfsSecureLimits::default())
+            .expect("canonical $SDS parses generally");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].security_id, SECURITY_ID_READ_ONLY);
+        assert_eq!(entries[0].descriptor, PINNED_READ_ONLY_DESCRIPTOR);
+        assert_eq!(entries[1].security_id, SECURITY_ID_READ_WRITE);
+    }
+
+    #[test]
+    fn general_parser_accepts_an_empty_stream() {
+        assert_eq!(
+            parse_ntfs_sds_stream(&[], NtfsSecureLimits::default()),
+            Ok(Vec::new())
+        );
+    }
+
+    #[test]
+    fn general_parser_refuses_mirror_hash_order_and_padding_violations() {
+        let good = windows_format_sds();
+
+        let mut mirror = good.clone();
+        mirror[SDS_COPY_DISTANCE + 0x30] ^= 0x01;
+        assert!(matches!(
+            parse_ntfs_sds_stream(&mirror, NtfsSecureLimits::default()),
+            Err(NtfsSecureError::Malformed {
+                reason: "mirror block differs from primary",
+                ..
+            })
+        ));
+
+        let mut hash = good.clone();
+        hash[0x80 + 0x30] ^= 0x01;
+        hash[SDS_COPY_DISTANCE + 0x80 + 0x30] ^= 0x01;
+        assert!(matches!(
+            parse_ntfs_sds_stream(&hash, NtfsSecureLimits::default()),
+            Err(NtfsSecureError::Malformed {
+                reason: "descriptor hash mismatch",
+                offset: 0x80,
+                ..
+            })
+        ));
+
+        let mut order = good.clone();
+        put_u32(&mut order, 0x100 + 4, 0x101);
+        put_u32(&mut order, SDS_COPY_DISTANCE + 0x100 + 4, 0x101);
+        assert!(matches!(
+            parse_ntfs_sds_stream(&order, NtfsSecureLimits::default()),
+            Err(NtfsSecureError::Malformed {
+                reason: "security identifiers are not strictly ascending",
+                ..
+            })
+        ));
+
+        let mut padding = good.clone();
+        padding[0x78] = 0xaa;
+        padding[SDS_COPY_DISTANCE + 0x78] = 0xaa;
+        assert!(matches!(
+            parse_ntfs_sds_stream(&padding, NtfsSecureLimits::default()),
+            Err(NtfsSecureError::Malformed {
+                reason: "non-zero alignment padding",
+                offset: 0x78,
+                ..
+            })
+        ));
+
+        // Lengthen the mirror so the stray byte is mirrored too and the mirror check cannot
+        // fire first.
+        let mut tail = good.clone();
+        tail.resize(SDS_COPY_DISTANCE + 0x400, 0);
+        tail[0x300] = 0x01;
+        tail[SDS_COPY_DISTANCE + 0x300] = 0x01;
+        assert!(matches!(
+            parse_ntfs_sds_stream(&tail, NtfsSecureLimits::default()),
+            Err(NtfsSecureError::Malformed {
+                reason: "non-zero bytes after the last entry",
+                ..
+            })
+        ));
+
+        let mut wrong_offset = good.clone();
+        put_u64(&mut wrong_offset, 0x80 + 8, 0x90);
+        put_u64(&mut wrong_offset, SDS_COPY_DISTANCE + 0x80 + 8, 0x90);
+        assert!(matches!(
+            parse_ntfs_sds_stream(&wrong_offset, NtfsSecureLimits::default()),
+            Err(NtfsSecureError::Malformed {
+                reason: "header offset is not the entry offset",
+                ..
+            })
+        ));
+
+        let limits = NtfsSecureLimits {
+            max_descriptors: 5,
+            ..NtfsSecureLimits::default()
+        };
+        assert!(matches!(
+            parse_ntfs_sds_stream(&good, limits),
+            Err(NtfsSecureError::LimitExceeded {
+                what: "security descriptors",
+                actual: 6,
+                limit: 5,
             })
         ));
     }

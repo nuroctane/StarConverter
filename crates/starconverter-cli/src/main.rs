@@ -1104,15 +1104,21 @@ fn print_inspection(inspection: &ImageInspection) {
         }
     }
     if let Some(normalized) = &inspection.normalized_ntfs {
-        println!(
-            "| security    : {}",
-            match normalized.preservation.security_descriptors {
-                starconverter_core::fs::ntfs_normalize::NtfsSecurityDescriptorEvidence::Unavailable =>
-                    "descriptor bytes unavailable",
-                starconverter_core::fs::ntfs_normalize::NtfsSecurityDescriptorEvidence::PinnedNtfs3gWindows2003 { .. } =>
-                    "exact pinned NTFS-3G $Secure:$SDS",
+        use starconverter_core::fs::ntfs_normalize::NtfsSecurityDescriptorEvidence;
+        match &normalized.preservation.security_descriptors {
+            NtfsSecurityDescriptorEvidence::Unavailable => {
+                println!("| security    : descriptor bytes unavailable");
             }
-        );
+            NtfsSecurityDescriptorEvidence::PinnedNtfs3gWindows2003 { .. } => {
+                println!("| security    : exact pinned NTFS-3G $Secure:$SDS");
+            }
+            NtfsSecurityDescriptorEvidence::Parsed { descriptors } => {
+                println!(
+                    "| security    : {} exact descriptor(s) parsed from $Secure:$SDS",
+                    descriptors.len()
+                );
+            }
+        }
     }
     println!("+-------------------------------------------------------------------+");
     println!("[READ-ONLY] Boot geometry was validated from a regular image file.");

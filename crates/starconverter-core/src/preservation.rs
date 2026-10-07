@@ -8,7 +8,7 @@
 
 #![allow(clippy::module_name_repetitions)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crc32fast::Hasher;
@@ -205,7 +205,13 @@ pub enum NtfsVolumeLabelIdentity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NtfsSecurityDescriptorEscrow {
     Unavailable,
-    PinnedNtfs3gWindows2003 { sds: Vec<u8> },
+    PinnedNtfs3gWindows2003 {
+        sds: Vec<u8>,
+    },
+    /// Exact descriptors parsed from the source volume's own `$Secure:$SDS`, by identifier.
+    Parsed {
+        descriptors: BTreeMap<u32, Vec<u8>>,
+    },
 }
 
 /// Validated, versioned escrow contents.
@@ -547,12 +553,14 @@ fn ntfs_assessments(
     let sidecar = &normalized.preservation;
     let mut result = base_assessments()?;
     let unsupported_attributes = sidecar.objects.iter().any(|preserved| {
+        let volume_bookkeeping = preserved.source.is_metadata
+            || preserved.source.reference.record_number == sidecar.root_reference.record_number;
         preserved.source.attribute_census.is_empty()
             || preserved
                 .source
                 .attribute_census
                 .iter()
-                .any(|attribute| !ntfs_attribute_supported(attribute))
+                .any(|attribute| !ntfs_attribute_supported(attribute, volume_bookkeeping))
     });
     set(
         &mut result,
@@ -758,8 +766,19 @@ const NTFS_INDEX_ROOT: u32 = 0x90;
 const NTFS_INDEX_ALLOCATION: u32 = 0xa0;
 const NTFS_BITMAP: u32 = 0xb0;
 const NTFS_REPARSE_POINT: u32 = 0xc0;
+const NTFS_LOGGED_UTILITY_STREAM: u32 = 0x100;
+/// `$TXF_DATA` as UTF-16 code units.
+const TXF_DATA_NAME: [u16; 9] = [0x24, 0x54, 0x58, 0x46, 0x5f, 0x44, 0x41, 0x54, 0x41];
 
-fn ntfs_attribute_supported(attribute: &NtfsAttributeEvidence) -> bool {
+/// Decides whether one census entry is inside the bounded attribute allowlist.
+///
+/// `volume_bookkeeping` is true for the root directory and metadata records. Only there is the
+/// resident `$TXF_DATA` logged-utility stream admitted: Windows `format` stamps the root and
+/// `$Extend\$RmMetadata\$Txf` with transaction resource-manager state that the driver recreates
+/// for a volume without `$RmMetadata`, and whose values describe log positions that cannot survive
+/// a rebuilt `$LogFile`. The same stream on a user file records per-file transaction state and
+/// stays a refusal, as do `$EFS` and every other logged-utility stream.
+fn ntfs_attribute_supported(attribute: &NtfsAttributeEvidence, volume_bookkeeping: bool) -> bool {
     if attribute.flags_unknown_bits != 0
         || attribute
             .name
@@ -770,6 +789,15 @@ fn ntfs_attribute_supported(attribute: &NtfsAttributeEvidence) -> bool {
     }
     let unnamed = attribute.name.is_none();
     match attribute.attribute_type {
+        NTFS_LOGGED_UTILITY_STREAM => {
+            volume_bookkeeping
+                && attribute.resident
+                && attribute.flags_raw == 0
+                && attribute
+                    .name
+                    .as_ref()
+                    .is_some_and(|name| name.code_units == TXF_DATA_NAME)
+        }
         NTFS_STANDARD_INFORMATION | NTFS_FILE_NAME | NTFS_VOLUME_NAME | NTFS_VOLUME_INFORMATION => {
             unnamed && attribute.resident && attribute.flags_raw == 0
         }
@@ -789,22 +817,20 @@ fn ntfs_attribute_supported(attribute: &NtfsAttributeEvidence) -> bool {
 /// Decides whether every graph object's security evidence is exact enough to escrow.
 ///
 /// Two sources of truth are accepted and may coexist on one volume: `$Secure` identifiers that
-/// resolve inside the pinned NTFS-3G Windows-2003 `$SDS`, and inline `$SECURITY_DESCRIPTOR`
-/// attributes whose exact bytes were captured and pass the bounded self-relative validator. An
-/// inline attribute whose bytes were not captured (census-only), a descriptor outside the
-/// supported profile, or an unpinned `$Secure` identifier is a refusal, never a default.
+/// resolve to exact descriptor bytes in the volume's security evidence (the pinned NTFS-3G
+/// Windows-2003 `$SDS`, or a generally parsed `$SDS` such as Windows `format` writes), and inline
+/// `$SECURITY_DESCRIPTOR` attributes whose exact bytes were captured and pass the bounded
+/// self-relative validator. An inline attribute whose bytes were not captured (census-only), a
+/// descriptor outside the supported profile, or a `$Secure` identifier the evidence cannot
+/// resolve is a refusal, never a default.
 fn classify_ntfs_security_descriptors(
     graph: &ObjectGraph,
     sidecar: &NtfsPreservationSidecar,
 ) -> (FieldDisposition, &'static str) {
-    let pinned = matches!(
-        sidecar.security_descriptors,
-        NtfsSecurityDescriptorEvidence::PinnedNtfs3gWindows2003 { .. }
-    );
-    let mut needs_pinned = false;
+    let evidence = &sidecar.security_descriptors;
     let mut census_only = false;
     let mut unsupported_inline = false;
-    let mut unpinned_identifier = false;
+    let mut unresolved_identifier = false;
     for preserved in sidecar.objects.iter().filter(|preserved| {
         graph
             .objects()
@@ -836,19 +862,17 @@ fn classify_ntfs_security_descriptors(
                     }
                 }
             }
-            // A zero identifier means "use the inline descriptor"; a pinned identifier takes
+            // A zero identifier means "use the inline descriptor"; a nonzero identifier takes
             // precedence on a `$Secure` volume and is still required to resolve.
-            match security_id {
-                None | Some(0) => {}
-                Some(0x100 | 0x101) => needs_pinned = true,
-                Some(_) => unpinned_identifier = true,
+            if security_id
+                .filter(|id| *id != 0)
+                .is_some_and(|id| evidence.resolve(id).is_none())
+            {
+                unresolved_identifier = true;
             }
-        } else {
-            match security_id {
-                None => {}
-                Some(0x100 | 0x101) => needs_pinned = true,
-                Some(_) => unpinned_identifier = true,
-            }
+        } else if security_id.is_some_and(|id| evidence.resolve(id).is_none()) {
+            // Identifier zero without an inline descriptor resolves to nothing and is refused.
+            unresolved_identifier = true;
         }
     }
     if census_only {
@@ -863,7 +887,7 @@ fn classify_ntfs_security_descriptors(
             "an inline $SECURITY_DESCRIPTOR is outside the bounded self-relative profile",
         );
     }
-    if unpinned_identifier || (needs_pinned && !pinned) {
+    if unresolved_identifier {
         return (
             FieldDisposition::Refusal,
             "object security presence is known but exact self-relative descriptor bytes are absent",
@@ -1909,6 +1933,9 @@ fn validate_ntfs_snapshot(
     match reader.u8()? {
         0 => {}
         1 => reader.bytes()?,
+        2 => {
+            decode_parsed_security_descriptors(&mut reader)?;
+        }
         _ => return malformed(security_offset, "invalid NTFS security snapshot tag"),
     }
     validate_reference(&mut reader)?;
@@ -2109,8 +2136,45 @@ fn decode_ntfs_security_evidence(
         1 => Ok(NtfsSecurityDescriptorEvidence::PinnedNtfs3gWindows2003 {
             sds: reader.take_vec()?,
         }),
+        2 => Ok(NtfsSecurityDescriptorEvidence::Parsed {
+            descriptors: decode_parsed_security_descriptors(reader)?,
+        }),
         _ => malformed(security_offset, "invalid NTFS security snapshot tag"),
     }
+}
+
+/// Decodes the tag-2 descriptor table: `count`, then `(security_id, bytes)` pairs in strictly
+/// ascending identifier order, each passing the bounded self-relative validator.
+fn decode_parsed_security_descriptors(
+    reader: &mut SnapshotCursor<'_>,
+) -> Result<BTreeMap<u32, Vec<u8>>, PreservationError> {
+    // Each entry is at least an identifier plus a length prefix.
+    let count = reader.count(12)?;
+    let mut descriptors = BTreeMap::new();
+    let mut previous: Option<u32> = None;
+    for _ in 0..count {
+        let id_offset = reader.base + reader.cursor;
+        let security_id = reader.u32()?;
+        if security_id == 0 || previous.is_some_and(|previous| previous >= security_id) {
+            return malformed(
+                id_offset,
+                "NTFS security identifiers are not strictly ascending and nonzero",
+            );
+        }
+        let bytes_offset = reader.base + reader.cursor;
+        let descriptor = reader.take_vec()?;
+        if validate_ntfs_security_descriptor(&descriptor, NtfsSecurityDescriptorLimits::default())
+            .is_err()
+        {
+            return malformed(
+                bytes_offset,
+                "NTFS security descriptor is outside the bounded self-relative profile",
+            );
+        }
+        descriptors.insert(security_id, descriptor);
+        previous = Some(security_id);
+    }
+    Ok(descriptors)
 }
 
 fn decode_reference(
@@ -2457,6 +2521,20 @@ fn decode_ntfs_security_descriptors(
                 );
             }
             Ok(NtfsSecurityDescriptorEscrow::PinnedNtfs3gWindows2003 { sds: sds.to_vec() })
+        }
+        2 => {
+            let table_offset = cursor
+                .checked_add(1)
+                .ok_or(PreservationError::ArithmeticOverflow)?;
+            let table = bytes
+                .get(table_offset..)
+                .ok_or(PreservationError::MalformedEscrow {
+                    offset: offset + table_offset,
+                    reason: "truncated NTFS security descriptor table",
+                })?;
+            let mut reader = SnapshotCursor::new(table, offset + table_offset);
+            let descriptors = decode_parsed_security_descriptors(&mut reader)?;
+            Ok(NtfsSecurityDescriptorEscrow::Parsed { descriptors })
         }
         _ => malformed(offset + cursor, "invalid NTFS security-evidence tag"),
     }
@@ -2837,6 +2915,14 @@ fn encode_ntfs_sidecar(
             writer.u8(1)?;
             writer.bytes(sds)?;
         }
+        NtfsSecurityDescriptorEvidence::Parsed { descriptors } => {
+            writer.u8(2)?;
+            writer.usize(descriptors.len())?;
+            for (security_id, descriptor) in descriptors {
+                writer.u32(*security_id)?;
+                writer.bytes(descriptor)?;
+            }
+        }
     }
     encode_reference(writer, sidecar.root_reference)?;
     writer.usize(sidecar.objects.len())?;
@@ -3051,6 +3137,13 @@ mod tests {
         max_streams: 8,
         max_name_code_units: 255,
     };
+
+    /// Recomputes the envelope checksum so a deliberately corrupted body reaches the decoder.
+    fn reseal(mut escrow: Vec<u8>) -> Vec<u8> {
+        let checksum = escrow_checksum(&escrow[..24], &escrow[HEADER_BYTES..]);
+        escrow[24..28].copy_from_slice(&checksum.to_le_bytes());
+        escrow
+    }
 
     fn empty_graph() -> ObjectGraph {
         ObjectGraph::build(
@@ -4090,6 +4183,75 @@ mod tests {
     }
 
     #[test]
+    fn txf_data_is_admitted_only_as_resident_volume_bookkeeping() {
+        fn txf(name: &str, resident: bool) -> NtfsAttributeEvidence {
+            NtfsAttributeEvidence {
+                attribute_type: NTFS_LOGGED_UTILITY_STREAM,
+                name: Some(NtfsName {
+                    code_units: name.encode_utf16().collect(),
+                    is_well_formed: true,
+                }),
+                flags_raw: 0,
+                flags_unknown_bits: 0,
+                attribute_id: 7,
+                resident,
+            }
+        }
+        fn attributes(source: &NormalizedNtfs) -> FieldDisposition {
+            let report = evaluate_ntfs(
+                source,
+                FileSystem::ExFat,
+                GuaranteeMode::Escrow,
+                PreservationLimits::default(),
+            )
+            .unwrap();
+            disposition(&report, PreservationField::NtfsAttributes)
+        }
+
+        // Windows `format` stamps the root directory and `$Txf` (metadata) with `$TXF_DATA`.
+        let mut root = ntfs();
+        root.preservation.objects[0]
+            .source
+            .attribute_census
+            .push(txf("$TXF_DATA", true));
+        assert_eq!(attributes(&root), FieldDisposition::Native);
+
+        let mut metadata = ntfs();
+        metadata.preservation.objects[1]
+            .source
+            .attribute_census
+            .push(txf("$TXF_DATA", true));
+        assert_eq!(attributes(&metadata), FieldDisposition::Native);
+
+        // The same stream on a user object records per-file transaction state and is refused.
+        let mut user = ntfs();
+        let mut file = ntfs_object();
+        file.reference.record_number = 64;
+        file.is_metadata = false;
+        file.attribute_census.push(txf("$TXF_DATA", true));
+        user.preservation.objects.push(NtfsObjectPreservation {
+            object: ObjectId(64),
+            source: file,
+        });
+        assert_eq!(attributes(&user), FieldDisposition::Refusal);
+
+        // Nonresident `$TXF_DATA` and any other logged-utility stream (`$EFS`) stay refused.
+        let mut nonresident = ntfs();
+        nonresident.preservation.objects[0]
+            .source
+            .attribute_census
+            .push(txf("$TXF_DATA", false));
+        assert_eq!(attributes(&nonresident), FieldDisposition::Refusal);
+
+        let mut efs = ntfs();
+        efs.preservation.objects[0]
+            .source
+            .attribute_census
+            .push(txf("$EFS", true));
+        assert_eq!(attributes(&efs), FieldDisposition::Refusal);
+    }
+
+    #[test]
     fn badclus_requires_a_complete_entirely_sparse_mapping() {
         let sparse = evaluate_ntfs(
             &ntfs(),
@@ -4245,6 +4407,172 @@ mod tests {
             );
             assert!(report.permitted, "{:?}", report.blockers);
         }
+    }
+
+    #[test]
+    fn parsed_ntfs_security_descriptors_resolve_identifiers_and_survive_the_envelope() {
+        let mut source = ntfs();
+        let mut objects = source.graph.objects().to_vec();
+        objects[0].semantics.has_security_descriptor = true;
+        source.graph = crate::object::ObjectGraph::build(
+            source.graph.root(),
+            objects,
+            source.graph.entries().to_vec(),
+            source.graph.extents().clone(),
+            crate::object::ObjectGraphLimits {
+                max_objects: 2,
+                max_entries: 2,
+                max_streams: 2,
+                max_name_code_units: 255,
+            },
+        )
+        .unwrap();
+        // Windows `format` numbers its descriptors from 0x100 upward; 0x105 is the one it gives
+        // `System Volume Information`.
+        source.preservation.objects[0]
+            .source
+            .standard_information
+            .as_mut()
+            .unwrap()
+            .security_id = Some(0x105);
+        let descriptors: BTreeMap<u32, Vec<u8>> = [
+            (0x100, sample_self_relative_descriptor()),
+            (0x105, sample_self_relative_descriptor()),
+        ]
+        .into_iter()
+        .collect();
+        source.preservation.security_descriptors = NtfsSecurityDescriptorEvidence::Parsed {
+            descriptors: descriptors.clone(),
+        };
+
+        let report = evaluate_ntfs(
+            &source,
+            FileSystem::ExFat,
+            GuaranteeMode::Escrow,
+            PreservationLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            disposition(&report, PreservationField::SecurityDescriptors),
+            FieldDisposition::EscrowRequired
+        );
+        assert!(report.permitted, "{:?}", report.blockers);
+        let escrow = report.escrow.as_deref().unwrap();
+        let decoded = decode_escrow(escrow, PreservationLimits::default()).unwrap();
+        assert_eq!(
+            decoded.ntfs_security_descriptors,
+            Some(NtfsSecurityDescriptorEscrow::Parsed { descriptors })
+        );
+
+        // An identifier the parsed stream does not define is a refusal, not a default.
+        let mut unresolved = source.clone();
+        unresolved.preservation.objects[0]
+            .source
+            .standard_information
+            .as_mut()
+            .unwrap()
+            .security_id = Some(0x106);
+        let report = evaluate_ntfs(
+            &unresolved,
+            FileSystem::ExFat,
+            GuaranteeMode::Escrow,
+            PreservationLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            disposition(&report, PreservationField::SecurityDescriptors),
+            FieldDisposition::Refusal
+        );
+        assert!(!report.permitted);
+
+        // Parsed evidence does not make pinned identifiers mean anything either: 0x101 is only
+        // proven when the parsed stream itself carried it.
+        let mut pinned_id = source.clone();
+        pinned_id.preservation.objects[0]
+            .source
+            .standard_information
+            .as_mut()
+            .unwrap()
+            .security_id = Some(0x101);
+        let report = evaluate_ntfs(
+            &pinned_id,
+            FileSystem::ExFat,
+            GuaranteeMode::Escrow,
+            PreservationLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            disposition(&report, PreservationField::SecurityDescriptors),
+            FieldDisposition::Refusal
+        );
+    }
+
+    #[test]
+    fn parsed_ntfs_security_table_rejects_disorder_and_unsupported_descriptors() {
+        let mut source = ntfs();
+        source.preservation.security_descriptors = NtfsSecurityDescriptorEvidence::Parsed {
+            descriptors: [
+                (0x100, sample_self_relative_descriptor()),
+                (0x105, sample_self_relative_descriptor()),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let report = evaluate_ntfs(
+            &source,
+            FileSystem::ExFat,
+            GuaranteeMode::Escrow,
+            PreservationLimits::default(),
+        )
+        .unwrap();
+        let escrow = report.escrow.as_deref().unwrap().to_vec();
+        decode_escrow(&escrow, PreservationLimits::default()).unwrap();
+
+        // Locate the tag-2 table: tag byte, u64 count = 2, then u32 0x100.
+        let marker = {
+            let mut bytes = vec![2_u8];
+            bytes.extend_from_slice(&2_u64.to_le_bytes());
+            bytes.extend_from_slice(&0x100_u32.to_le_bytes());
+            bytes
+        };
+        let table = escrow
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .expect("parsed security table present");
+        let first_id = table + 9;
+        let second_id = first_id + 4 + 8 + sample_self_relative_descriptor().len();
+        assert_eq!(&escrow[second_id..second_id + 4], &0x105_u32.to_le_bytes());
+
+        let mut disorder = escrow.clone();
+        disorder[second_id..second_id + 4].copy_from_slice(&0x100_u32.to_le_bytes());
+        assert!(matches!(
+            decode_escrow(&reseal(disorder), PreservationLimits::default()),
+            Err(PreservationError::MalformedEscrow {
+                reason: "NTFS security identifiers are not strictly ascending and nonzero",
+                ..
+            })
+        ));
+
+        let mut zero = escrow.clone();
+        zero[first_id..first_id + 4].copy_from_slice(&0_u32.to_le_bytes());
+        assert!(matches!(
+            decode_escrow(&reseal(zero), PreservationLimits::default()),
+            Err(PreservationError::MalformedEscrow {
+                reason: "NTFS security identifiers are not strictly ascending and nonzero",
+                ..
+            })
+        ));
+
+        // Corrupt the first descriptor's revision byte.
+        let mut invalid = escrow;
+        invalid[first_id + 4 + 8] = 2;
+        assert!(matches!(
+            decode_escrow(&reseal(invalid), PreservationLimits::default()),
+            Err(PreservationError::MalformedEscrow {
+                reason: "NTFS security descriptor is outside the bounded self-relative profile",
+                ..
+            })
+        ));
     }
 
     #[test]

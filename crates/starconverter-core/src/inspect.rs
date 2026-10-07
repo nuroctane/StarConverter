@@ -42,6 +42,10 @@ use crate::fs::ntfs_normalize::{
 use crate::fs::ntfs_region::{self, NtfsBootRegion, NtfsBootRegionError};
 use crate::fs::ntfs_secure::{
     NtfsSecureError, NtfsSecureLimits, NtfsSecureProfile, generate_ntfs_secure_metadata,
+    parse_ntfs_sds_stream,
+};
+use crate::fs::ntfs_security_descriptor::{
+    NtfsSecurityDescriptorLimits, validate_ntfs_security_descriptor,
 };
 use crate::fs::ntfs_volume::{
     NtfsBitmapEvidence, NtfsMetadataIncompleteReason, NtfsMftBitmapEvidence, NtfsVolumeDiscovery,
@@ -817,6 +821,7 @@ fn inspect_ntfs_security_descriptors(
     else {
         return Ok(NtfsSecurityDescriptorEvidence::Unavailable);
     };
+    let limits = NtfsSecureLimits::default();
     let bytes = match &stream.storage {
         NtfsStreamStorage::Resident { bytes } => bytes.clone(),
         NtfsStreamStorage::NonResident {
@@ -826,16 +831,22 @@ fn inspect_ntfs_security_descriptors(
             extents,
             ..
         } => {
+            // Uninitialized tail bytes read as zero on NTFS, but a stream whose descriptors
+            // could sit in that tail is not proven; the whole declared value must be written.
             if !mapping_complete
-                || *data_bytes != u64::try_from(expected.sds.len()).unwrap_or(u64::MAX)
+                || *data_bytes > u64::try_from(limits.max_sds_bytes).unwrap_or(u64::MAX)
                 || initialized_bytes < data_bytes
             {
                 return Ok(NtfsSecurityDescriptorEvidence::Unavailable);
             }
+            let total =
+                usize::try_from(*data_bytes).map_err(|_| InspectionError::GeometryOverflow {
+                    calculation: "NTFS security stream length",
+                })?;
             let mut ordered = extents.clone();
             ordered.sort_unstable_by_key(|extent| extent.logical_offset);
             let mut output = Vec::new();
-            output.try_reserve_exact(expected.sds.len()).map_err(|_| {
+            output.try_reserve_exact(total).map_err(|_| {
                 InspectionError::InvalidNtfsSecurityProfile(NtfsSecureError::AllocationFailed {
                     what: "inspected $Secure:$SDS evidence",
                 })
@@ -860,17 +871,34 @@ fn inspect_ntfs_security_descriptors(
                     },
                 )?;
             }
-            if output.len() != expected.sds.len() {
+            if output.len() != total {
                 return Ok(NtfsSecurityDescriptorEvidence::Unavailable);
             }
             output
         }
     };
     if bytes == expected.sds {
-        Ok(NtfsSecurityDescriptorEvidence::PinnedNtfs3gWindows2003 { sds: bytes })
-    } else {
-        Ok(NtfsSecurityDescriptorEvidence::Unavailable)
+        return Ok(NtfsSecurityDescriptorEvidence::PinnedNtfs3gWindows2003 { sds: bytes });
     }
+    // Any other stream is admitted only descriptor by descriptor: the general parser proves the
+    // header, hash, mirror, and ordering invariants, and a descriptor is kept only when it also
+    // fits the bounded self-relative profile the serializer can write back inline. Objects whose
+    // identifier is left unresolved are refused by policy, never defaulted.
+    let Ok(entries) = parse_ntfs_sds_stream(&bytes, limits) else {
+        return Ok(NtfsSecurityDescriptorEvidence::Unavailable);
+    };
+    let descriptors = entries
+        .into_iter()
+        .filter(|entry| {
+            validate_ntfs_security_descriptor(
+                &entry.descriptor,
+                NtfsSecurityDescriptorLimits::default(),
+            )
+            .is_ok()
+        })
+        .map(|entry| (entry.security_id, entry.descriptor))
+        .collect();
+    Ok(NtfsSecurityDescriptorEvidence::Parsed { descriptors })
 }
 
 fn finish_inspection(

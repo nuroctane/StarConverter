@@ -33,7 +33,8 @@ performs a bounded object, stream, extent, and directory-index inventory. Both f
 common semantics into the same object graph while retaining format-specific preservation evidence.
 Policy-bound adapters map the supported subset in both directions, including exact DOS fields,
 volume identity, canonical case tables, timestamp conversion, and schema-v4 escrow for source-only
-precision, semantics, and proven pinned NTFS security descriptors. Pure exFAT and NTFS serializers
+precision, semantics, and proven NTFS security descriptors (the pinned mkntfs `$Secure` or any
+`$SDS` parsed descriptor by descriptor, as Windows `format` writes). Pure exFAT and NTFS serializers
 emit phase-separated metadata/backup-boot/primary-boot candidates and round-trip through independent
 readers. The CLI and desktop app can turn a supported source into a brand-new target image, persist
 required escrow, reinspect the result, compare its logical manifest, and prove the source hash
@@ -266,6 +267,9 @@ installed. CI always tests both language stacks.
 - [x] Fail-closed 25-field cross-format preservation policy with bounded versioned escrow
 - [x] Policy-bound exFAT→NTFS and NTFS→exFAT structural adapters with exact timestamp/identity evidence
 - [x] Pinned `$Secure` ordinary-object security-ID assignment in NTFS `$STANDARD_INFORMATION`
+- [x] Windows-formatted NTFS as a conversion source: declared-end backup boot, never-written MFT
+  records, `$Extend` subtree, flag `0x0080`, general `$Secure:$SDS` descriptor parsing with
+  per-identifier escrow and inline restore, and resident `$TXF_DATA` on volume bookkeeping records
 - [x] Reproducible root/rich/edge external fixtures, read-only exfatprogs/NTFS-3G checks, and exFAT/NTFS FUSE payload mounts
 - [x] Formatter-origin exFAT/NTFS differential images with unchanged hashes and parser compatibility regressions
 - [x] Populated formatter-origin feature corpus with nested Unicode, allocation boundaries, fragmentation, and exact driver-read payload hashes

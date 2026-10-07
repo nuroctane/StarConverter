@@ -24,7 +24,7 @@ use crate::escrow_carrier::{
 use crate::extent::StreamId;
 use crate::fs::ntfs_index::FileNameNamespace;
 use crate::fs::ntfs_inventory::{NtfsFileName, NtfsObject, NtfsStreamStorage};
-use crate::fs::ntfs_normalize::NtfsPreservationSidecar;
+use crate::fs::ntfs_normalize::{NtfsPreservationSidecar, NtfsSecurityDescriptorEvidence};
 use crate::fs::ntfs_security_descriptor::{
     NtfsSecurityDescriptorError, NtfsSecurityDescriptorLimits, validate_ntfs_security_descriptor,
 };
@@ -87,7 +87,7 @@ pub enum NtfsRestoreError {
     ArithmeticOverflow,
     /// The candidate-bound escrow envelope is malformed, oversized, or checksum-invalid.
     EscrowEnvelope(String),
-    /// The escrow was not produced by an NTFS→exFAT export.
+    /// The escrow was not produced by an NTFSâ†’exFAT export.
     EscrowDirectionMismatch {
         source: FileSystem,
         target: FileSystem,
@@ -109,7 +109,7 @@ pub struct RestoredNtfsIdentities {
     pub reparse_points: BTreeMap<ObjectId, Vec<u8>>,
     /// Validated self-relative inline descriptors, including the root's when the source had one.
     pub security_descriptors: BTreeMap<ObjectId, Vec<u8>>,
-    /// Dest [`ObjectId`] → sidecar [`ObjectId`] (source MFT record number) for every dest object
+    /// Dest [`ObjectId`] â†’ sidecar [`ObjectId`] (source MFT record number) for every dest object
     /// that the sidecar identified by dest-native path, including the root.
     pub source_by_dest: BTreeMap<ObjectId, ObjectId>,
     /// Dest objects (escrow carrier files and their directory) consumed by the restore and absent
@@ -245,7 +245,7 @@ impl fmt::Display for NtfsRestoreError {
             Self::EscrowEnvelope(error) => write!(formatter, "escrow envelope rejected: {error}"),
             Self::EscrowDirectionMismatch { source, target } => write!(
                 formatter,
-                "escrow records a {source}→{target} export; NTFS identity restore needs an NTFS→exFAT escrow"
+                "escrow records a {source}â†’{target} export; NTFS identity restore needs an NTFSâ†’exFAT escrow"
             ),
             Self::CandidateBindingMismatch { .. } => formatter.write_str(
                 "the exFAT image is not the exact candidate this escrow was bound to (SHA-256 mismatch)",
@@ -270,13 +270,13 @@ impl std::error::Error for NtfsRestoreError {
 /// Decodes a candidate-bound escrow sidecar so its NTFS identities can be restored onto the exact
 /// exFAT candidate it was produced with.
 ///
-/// The envelope must record an NTFS→exFAT export and its candidate SHA-256 must equal
+/// The envelope must record an NTFSâ†’exFAT export and its candidate SHA-256 must equal
 /// `exfat_image_sha256`, the whole-image hash of the exFAT image about to be converted back. Any
 /// later edit to that exFAT image therefore fails closed instead of reattaching stale identities.
 ///
 /// # Errors
 ///
-/// Returns an error for a malformed or oversized envelope, a non-NTFS→exFAT export, a candidate
+/// Returns an error for a malformed or oversized envelope, a non-NTFSâ†’exFAT export, a candidate
 /// hash mismatch, or an undecodable NTFS preservation payload.
 pub fn decode_restore_sidecar(
     escrow_bytes: &[u8],
@@ -366,24 +366,27 @@ pub fn restore_ntfs_identities_with_evidence(
         if sidecar_id == ObjectId(sidecar.root_reference.record_number) {
             // The root keeps its dest-native names and index, but a formatter-origin inline
             // descriptor on record 5 is still exact evidence that must be reattached.
-            restore_security_descriptor(object, source, &mut security_descriptors)?;
+            restore_security_descriptor(
+                object,
+                source,
+                &sidecar.security_descriptors,
+                &mut security_descriptors,
+            )?;
             continue;
         }
         if skip_sidecar_object(source) {
             continue;
         }
-        let expected = if source.is_directory {
-            ObjectKind::Directory
-        } else {
-            ObjectKind::File
-        };
-        if object.kind != expected {
-            return Err(NtfsRestoreError::KindMismatch(object.id));
-        }
+        require_matching_kind(object, source)?;
         restore_namespace_entries(object.id, source, &mut entries, &id_map)?;
         restore_named_streams(object, source, &mut used_streams, &carriers)?;
         restore_reparse_point(object, source, &mut reparse_points)?;
-        restore_security_descriptor(object, source, &mut security_descriptors)?;
+        restore_security_descriptor(
+            object,
+            source,
+            &sidecar.security_descriptors,
+            &mut security_descriptors,
+        )?;
     }
     let removed_objects = remove_escrow_carriers(
         dest_native.root(),
@@ -394,19 +397,7 @@ pub fn restore_ntfs_identities_with_evidence(
     )?;
 
     let root = dest_native.root();
-    for object in &mut objects {
-        object.link_count = if object.id == root {
-            0
-        } else {
-            u32::try_from(
-                entries
-                    .iter()
-                    .filter(|entry| entry.target == object.id)
-                    .count(),
-            )
-            .map_err(|_| NtfsRestoreError::ArithmeticOverflow)?
-        };
-    }
+    recount_links(root, &mut objects, &entries)?;
 
     let max_name_code_units = restored_name_limit(&entries, &objects);
     let max_streams = objects
@@ -440,9 +431,46 @@ pub fn restore_ntfs_identities_with_evidence(
     })
 }
 
+/// The root carries no link count; every other object counts the entries that target it.
+fn recount_links(
+    root: ObjectId,
+    objects: &mut [ObjectRecord],
+    entries: &[NamespaceEntry],
+) -> Result<(), NtfsRestoreError> {
+    for object in objects {
+        object.link_count = if object.id == root {
+            0
+        } else {
+            u32::try_from(
+                entries
+                    .iter()
+                    .filter(|entry| entry.target == object.id)
+                    .count(),
+            )
+            .map_err(|_| NtfsRestoreError::ArithmeticOverflow)?
+        };
+    }
+    Ok(())
+}
+
+fn require_matching_kind(
+    object: &ObjectRecord,
+    source: &NtfsObject,
+) -> Result<(), NtfsRestoreError> {
+    let expected = if source.is_directory {
+        ObjectKind::Directory
+    } else {
+        ObjectKind::File
+    };
+    if object.kind != expected {
+        return Err(NtfsRestoreError::KindMismatch(object.id));
+    }
+    Ok(())
+}
+
 /// Resolves every sidecar-implied carrier to its dest-native file and validates its shape.
 ///
-/// Returns `(sidecar owner, attribute id) → carrier payload`. A carrier the sidecar implies but
+/// Returns `(sidecar owner, attribute id) â†’ carrier payload`. A carrier the sidecar implies but
 /// the dest graph lacks is reported by [`restore_named_streams`] as an unrestorable named stream,
 /// so this function only refuses carriers that exist with the wrong shape.
 fn locate_escrow_carriers(
@@ -664,20 +692,37 @@ fn restore_reparse_point(
     Ok(())
 }
 
-/// Reattaches an exact inline `$SECURITY_DESCRIPTOR` value to a dest object.
+/// Reattaches an exact `$SECURITY_DESCRIPTOR` value to a dest object.
 ///
-/// Census-only evidence (presence without bytes) and descriptors outside the bounded supported
-/// profile are refusals: a destination must never be given a descriptor the escrow cannot prove.
+/// Inline descriptors are restored from their captured bytes. A `$Secure` identifier is restored
+/// from the descriptor the sidecar's parsed `$SDS` evidence proves for it, written back inline
+/// because the destination's `$Secure` is regenerated from the pinned profile and does not carry
+/// the source's identifiers. Pinned-profile identifiers keep their pinned meaning on the
+/// destination and are not inlined. Census-only evidence (presence without bytes), descriptors
+/// outside the bounded supported profile, and unresolved identifiers are refusals: a destination
+/// must never be given a descriptor the escrow cannot prove.
 fn restore_security_descriptor(
     object: &mut ObjectRecord,
     source: &NtfsObject,
+    evidence: &NtfsSecurityDescriptorEvidence,
     security_descriptors: &mut BTreeMap<ObjectId, Vec<u8>>,
 ) -> Result<(), NtfsRestoreError> {
-    if !source.has_security_descriptor {
-        return Ok(());
-    }
-    let Some(payload) = source.security_descriptor.as_ref() else {
-        return Err(NtfsRestoreError::IncompleteSecurityDescriptor(object.id));
+    let payload = if source.has_security_descriptor {
+        let Some(payload) = source.security_descriptor.as_ref() else {
+            return Err(NtfsRestoreError::IncompleteSecurityDescriptor(object.id));
+        };
+        payload.as_slice()
+    } else {
+        let security_id = source
+            .standard_information
+            .and_then(|standard| standard.security_id)
+            .filter(|id| *id != 0);
+        match (security_id, evidence) {
+            (Some(id), NtfsSecurityDescriptorEvidence::Parsed { .. }) => evidence
+                .resolve(id)
+                .ok_or(NtfsRestoreError::IncompleteSecurityDescriptor(object.id))?,
+            _ => return Ok(()),
+        }
     };
     validate_ntfs_security_descriptor(payload, NtfsSecurityDescriptorLimits::default()).map_err(
         |source| NtfsRestoreError::InvalidSecurityDescriptor {
@@ -686,7 +731,7 @@ fn restore_security_descriptor(
         },
     )?;
     object.semantics.has_security_descriptor = true;
-    security_descriptors.insert(object.id, payload.clone());
+    security_descriptors.insert(object.id, payload.to_vec());
     Ok(())
 }
 
@@ -948,7 +993,8 @@ mod tests {
     use crate::cross_format::project_ntfs_graph_for_exfat;
     use crate::extent::ExtentGraph;
     use crate::fs::ntfs_inventory::{
-        NtfsDataStream, NtfsFileName, NtfsName, NtfsObject, NtfsObjectReference, NtfsStreamStorage,
+        NtfsDataStream, NtfsFileName, NtfsName, NtfsObject, NtfsObjectReference,
+        NtfsStandardInformation, NtfsStreamStorage,
     };
     use crate::fs::ntfs_normalize::NtfsObjectPreservation;
     use crate::fs::ntfs_security_descriptor::sample_self_relative_descriptor;
@@ -1897,6 +1943,77 @@ mod tests {
                 .iter()
                 .all(|object| object.semantics.has_security_descriptor)
         );
+    }
+
+    #[test]
+    fn restore_inlines_descriptors_resolved_from_a_parsed_source_sds() {
+        let dest = dest_native_file_graph();
+        let descriptor = sample_self_relative_descriptor();
+        let standard = NtfsStandardInformation {
+            creation_time: 1,
+            modification_time: 2,
+            mft_change_time: 3,
+            access_time: 4,
+            file_attributes: 0x20,
+            owner_id: Some(0),
+            security_id: Some(0x105),
+            quota_charged: Some(0),
+            usn: Some(0),
+        };
+        let mut file = identity_file(
+            vec![file_name(1, FileNameNamespace::Win32, "alpha.txt")],
+            Vec::new(),
+        );
+        file.standard_information = Some(standard);
+        let mut sidecar = sidecar_with_file(file);
+        sidecar.security_descriptors = NtfsSecurityDescriptorEvidence::Parsed {
+            descriptors: std::iter::once((0x105_u32, descriptor.clone())).collect(),
+        };
+
+        let restored = restore_ntfs_identities_with_evidence(&dest, &sidecar).unwrap();
+        assert_eq!(
+            restored
+                .security_descriptors
+                .get(&ObjectId(2))
+                .map(Vec::as_slice),
+            Some(descriptor.as_slice())
+        );
+        assert!(
+            restored
+                .graph
+                .objects()
+                .iter()
+                .find(|object| object.id == ObjectId(2))
+                .unwrap()
+                .semantics
+                .has_security_descriptor
+        );
+
+        // An identifier the parsed stream never defined cannot be defaulted.
+        let mut unresolved = sidecar.clone();
+        unresolved.objects[1]
+            .source
+            .standard_information
+            .as_mut()
+            .unwrap()
+            .security_id = Some(0x106);
+        assert_eq!(
+            restore_ntfs_identities_with_evidence(&dest, &unresolved).err(),
+            Some(NtfsRestoreError::IncompleteSecurityDescriptor(ObjectId(2)))
+        );
+
+        // Pinned evidence keeps pinned identifiers on `$Secure` rather than inlining them.
+        let mut pinned = sidecar;
+        pinned.objects[1]
+            .source
+            .standard_information
+            .as_mut()
+            .unwrap()
+            .security_id = Some(0x101);
+        pinned.security_descriptors =
+            NtfsSecurityDescriptorEvidence::PinnedNtfs3gWindows2003 { sds: Vec::new() };
+        let restored = restore_ntfs_identities_with_evidence(&dest, &pinned).unwrap();
+        assert!(restored.security_descriptors.is_empty());
     }
 
     #[test]

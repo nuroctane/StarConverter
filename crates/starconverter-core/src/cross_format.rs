@@ -43,7 +43,9 @@ use crate::fs::exfat_upcase_serialize::{
 use crate::fs::ntfs_essential::BADCLUS_STREAM_NAME;
 use crate::fs::ntfs_index::FileNameNamespace;
 use crate::fs::ntfs_inventory::{NtfsExtentPlacement, NtfsStreamStorage};
-use crate::fs::ntfs_normalize::{NormalizedNtfs, NtfsPreservationSidecar};
+use crate::fs::ntfs_normalize::{
+    NormalizedNtfs, NtfsPreservationSidecar, NtfsSecurityDescriptorEvidence, is_graph_record,
+};
 use crate::fs::ntfs_serialize::{
     NTFS3G_SECURITY_ID_READ_WRITE, NtfsDestinationDraft, NtfsDestinationInputs,
     NtfsDestinationPlan, NtfsObjectMetadata, NtfsObjectTimestamps, NtfsSerializeError,
@@ -917,9 +919,17 @@ fn restore_ntfs_object_metadata(
         };
         entry.dos_file_attributes = attributes;
         // Without an exact inline descriptor the pinned `$Secure` profile stays in force, which
-        // the policy already required of the escrowed source.
+        // the policy already required of the escrowed source. A restored descriptor keeps a
+        // source identifier only when that identifier means the same thing in the destination's
+        // pinned `$Secure`; identifiers from a parsed source `$SDS` are carried inline instead.
         if restored.security_descriptors.contains_key(&entry.object) {
-            entry.security_id = standard.security_id.unwrap_or(0);
+            entry.security_id = match (&sidecar.security_descriptors, standard.security_id) {
+                (
+                    NtfsSecurityDescriptorEvidence::PinnedNtfs3gWindows2003 { .. },
+                    Some(id @ (0x100 | 0x101)),
+                ) => id,
+                _ => 0,
+            };
         }
     }
     Ok(metadata)
@@ -1963,7 +1973,10 @@ fn map_ntfs_source_object_metadata(
             if by_object.insert(evidence.object, evidence).is_some() {
                 return Err(NtfsToExfatError::DuplicateObjectEvidence(evidence.object));
             }
-        } else if evidence.source.reference.record_number > 26 {
+        } else if is_graph_record(
+            evidence.source.reference.record_number,
+            evidence.source.is_metadata,
+        ) {
             return Err(NtfsToExfatError::UnknownObjectEvidence(evidence.object));
         }
     }

@@ -10301,6 +10301,107 @@ mod tests {
         assert!(inspection.profile.inventory_complete);
     }
 
+    /// A `$Secure:$SDS` that is not the pinned profile is parsed descriptor by descriptor, so a
+    /// Windows-`format` security table resolves exactly instead of being reported unavailable.
+    #[test]
+    fn windows_format_security_table_is_parsed_from_the_live_sds_stream() {
+        use crate::fs::ntfs_normalize::NtfsSecurityDescriptorEvidence;
+        use crate::fs::ntfs_secure::windows_format_fixture::{
+            WINDOWS_FORMAT_DESCRIPTORS, hex, windows_format_sds,
+        };
+
+        let graph = graph(Some(b"inspected".to_vec()), false);
+        let plan = plan_ntfs_destination(&graph, inputs(), NtfsSerializeLimits::default()).unwrap();
+        let mut image = vec![0_u8; usize::try_from(IMAGE_BYTES).unwrap()];
+        for write in &plan.staging_writes {
+            let offset = usize::try_from(write.offset).unwrap();
+            image[offset..offset + write.bytes.len()].copy_from_slice(&write.bytes);
+        }
+        let backup = usize::try_from(plan.backup_boot_write.offset).unwrap();
+        image[backup..backup + 512].copy_from_slice(&plan.backup_boot_write.bytes);
+        image[..512].copy_from_slice(&plan.primary_boot_write.bytes);
+
+        // Locate the pinned `$SDS` placement through read-only inspection, then overwrite the
+        // stream value with the Windows layout (which fits inside the pinned stream length).
+        let temp = TempImage::create(&image);
+        let inspection = crate::inspect::inspect_image(&temp.0).unwrap();
+        let inventory = inspection.ntfs_inventory.as_ref().unwrap();
+        let sds_name: Vec<u16> = "$SDS".encode_utf16().collect();
+        let sds = inventory
+            .objects
+            .iter()
+            .find(|object| object.reference.record_number == 9)
+            .unwrap()
+            .data_streams
+            .iter()
+            .find(|stream| {
+                stream
+                    .name
+                    .as_ref()
+                    .is_some_and(|name| name.code_units == sds_name)
+            })
+            .unwrap();
+        let crate::fs::ntfs_inventory::NtfsStreamStorage::NonResident {
+            data_bytes,
+            extents,
+            ..
+        } = &sds.storage
+        else {
+            panic!("pinned $SDS is nonresident");
+        };
+        // The pinned stream is slightly shorter than Windows' (its mirror covers fewer used
+        // bytes); the parser compares the mirror only over the span the stream actually holds.
+        let mut windows = windows_format_sds();
+        let data_bytes = usize::try_from(*data_bytes).unwrap();
+        assert!(data_bytes > 0x4_0000);
+        windows.truncate(data_bytes);
+        let mut ordered = extents.clone();
+        ordered.sort_unstable_by_key(|extent| extent.logical_offset);
+        let mut logical = 0_usize;
+        for extent in ordered {
+            let crate::fs::ntfs_inventory::NtfsExtentPlacement::Physical { byte_offset } =
+                extent.placement
+            else {
+                panic!("pinned $SDS is physically placed");
+            };
+            let start = usize::try_from(byte_offset).unwrap();
+            let length = usize::try_from(extent.length)
+                .unwrap()
+                .min(data_bytes - logical);
+            for index in 0..length {
+                image[start + index] = windows.get(logical + index).copied().unwrap_or(0);
+            }
+            logical += length;
+        }
+        drop(temp);
+
+        let temp = TempImage::create(&image);
+        let inspection = crate::inspect::inspect_image(&temp.0).unwrap();
+        let normalized = inspection.normalized_ntfs.as_ref().unwrap();
+        let NtfsSecurityDescriptorEvidence::Parsed { descriptors } =
+            &normalized.preservation.security_descriptors
+        else {
+            panic!(
+                "expected parsed evidence, got {:?}",
+                normalized.preservation.security_descriptors
+            );
+        };
+        assert_eq!(descriptors.len(), WINDOWS_FORMAT_DESCRIPTORS.len());
+        for (security_id, _, descriptor) in WINDOWS_FORMAT_DESCRIPTORS {
+            assert_eq!(
+                normalized
+                    .preservation
+                    .security_descriptors
+                    .resolve(security_id),
+                Some(hex(descriptor).as_slice())
+            );
+        }
+        assert_eq!(
+            normalized.preservation.security_descriptors.resolve(0x106),
+            None
+        );
+    }
+
     #[test]
     fn exact_volume_label_roundtrips_and_invalid_labels_fail_before_planning() {
         let graph = two_file_graph();

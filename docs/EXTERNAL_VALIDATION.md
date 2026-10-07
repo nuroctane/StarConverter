@@ -327,11 +327,47 @@ With those four fixes `inspect` accepts the Windows NTFS control: Clean, backup 
 end with 2 048 slack sectors, 256 records scanned, 29 in use, allocation and MFT-record
 reconciliation complete. Unit tests cover each rule, including the exact 40 MiB Windows geometry.
 
-`convert-image --to exfat` on that control is still refused, correctly, by preservation policy:
-the volume carries a real `$Secure:$SDS` with Windows' own security identifiers (StarConverter
-only resolves the pinned mkntfs profile today), and its root directory and `$Txf` carry
-`$TXF_DATA` (attribute type 0x100), which is outside the attribute allowlist. Those are the next
-two pieces of work before Windows-formatted NTFS can be a conversion source.
+`convert-image --to exfat` on that control was then refused, correctly, by preservation policy on
+two counts, each resolved as follows.
+
+5. **Windows' own `$Secure:$SDS`.** StarConverter only recognised the pinned mkntfs stream (two
+   descriptors, `0x100`/`0x101`) and reported anything else as "descriptor bytes unavailable",
+   which policy refuses. Windows `format` writes six descriptors (`0x100`-`0x105`; the root and
+   `System Volume Information` use inline/`0x105`, the rest `0x101`), and even its `0x100` and
+   `0x101` differ byte-for-byte from mkntfs'. A general `$SDS` parser
+   (`parse_ntfs_sds_stream`) now walks the live stream the way `ntfs.sys` does: 16-byte-aligned
+   `(hash, id, offset, length)` headers in each even 256 KiB block, a zero header ending the
+   block, the odd block a mirror of the even one, every hash recomputed, identifiers strictly
+   ascending, no stray bytes. Each descriptor must also pass the bounded self-relative validator.
+   The result is a new `NtfsSecurityDescriptorEvidence::Parsed` table keyed by identifier,
+   escrowed as snapshot tag 2 (`count`, then `(u32 id, bytes)` pairs; the decoder re-validates
+   order and every descriptor). Policy resolves each object's `security_id` through that table
+   and refuses any identifier it does not define. On restore to NTFS the resolved bytes are
+   written as inline `$SECURITY_DESCRIPTOR` attributes with `security_id = 0`, because the
+   destination's `$Secure` is regenerated from the pinned profile and does not carry Windows'
+   identifiers; the ACL content is exact, the storage mechanism is not. The six real descriptors
+   are unit-test fixtures (`ntfs_secure::windows_format_fixture`), and an inspection test rewrites
+   a serializer-built volume's `$SDS` with them to prove the live path.
+6. **`$TXF_DATA`.** Windows stamps the root directory and `$Extend\$RmMetadata\$Txf` with a
+   resident `$LOGGED_UTILITY_STREAM` named `$TXF_DATA` (transaction resource-manager state: RM
+   root reference, LSNs, flags). Its values describe log positions that cannot survive a rebuilt
+   `$LogFile`, and `ntfs.sys` recreates them for a volume without `$RmMetadata`. The attribute
+   allowlist now admits it only when resident, unflagged, and on the root or a metadata record;
+   on a user file (per-file transaction state) and for every other logged-utility stream
+   (`$EFS`) it remains a refusal.
+
+A seventh, smaller fix fell out of the conversion: the planner decided "sidecar-only object" by
+`record_number > 26`, which the `$Extend` subtree (records 27-35) violated. It now shares the
+normalizer's `is_graph_record` rule.
+
+With all of that, `convert-image control-ntfs-partition.img --to exfat` succeeds (`[VERIFIED] 7
+writes / 71.00 KiB`, candidate sha256 `08132ab5…eed4ed`, source unchanged `36d7befa…c8680`), and
+converting that candidate back `--to ntfs --restore-escrow` succeeds (`[VERIFIED] 5 writes /
+2.44 MiB`, candidate `5d2097d5…473ff`). The round-tripped NTFS inspects clean with the Windows
+serial `8056E20956E1FFB0`, the exact 208-byte Windows root descriptor inline on record 5, and the
+exact 76-byte `0x105` descriptor inline on `System Volume Information`. `verify-export` passes on
+both artifacts. These are local results; the Windows-driver judgment of a Windows-origin round
+trip is the next gate to add.
 
 ## 2026-09-01 forced NTFS-to-exFAT relocation qualification
 
