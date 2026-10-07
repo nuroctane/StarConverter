@@ -143,7 +143,8 @@ function New-PayloadBytes {
     for ($index = 0; $index -lt $Length; $index++) {
         $bytes[$index] = [byte](($Seed + $index) % 251)
     }
-    return $bytes
+    # The unary comma keeps the pipeline from unrolling a zero-length array into $null.
+    return , $bytes
 }
 
 function Invoke-Diskpart {
