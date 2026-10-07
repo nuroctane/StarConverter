@@ -120,13 +120,13 @@ $cases = @(
         Name = "exFAT-to-NTFS rich conversion"
         File = "converted-rich-exfat-to-ntfs-windows.vhd"
         FileSystem = "NTFS"
-        Sha256 = "74F3C3B530BE07D2AAA46882D30C31DF2E1752774DEBB9EE1A7C2C38977FCE08"
+        Sha256 = "851095C857EDE374FFDA037CD0AE6EFA75F4B0FE77E1AB0449DDE5FE1F088B06"
     },
     [pscustomobject]@{
         Name = "NTFS-to-exFAT rich conversion"
         File = "converted-rich-ntfs-to-exfat-windows.vhd"
         FileSystem = "exFAT"
-        Sha256 = "3F52FE1A6997A5DAFBA4B66D4C7947E9DFAEAB801A578E597775D9C3F3F0EA41"
+        Sha256 = "BC6301CEE56057A1AFD6B5BEF6D0A44770A9AF8093AF1A7D511240F4D53FCEF3"
     }
 )
 $payloads = @(

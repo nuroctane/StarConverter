@@ -814,20 +814,33 @@ fn export_windows_vhd_candidates(
 ///   `FILE_ATTRIBUTE_I30_INDEX_PRESENT` in `$FILE_NAME` and the directory FILE record flag;
 /// - `$Volume` carries an empty unnamed `$DATA` stream;
 /// - every system `$FILE_NAME` is `FILE_NAME_WIN32_AND_DOS`; a lone `FILE_NAME_WIN32` name is
-///   a missing DOS companion to `chkdsk`.
+///   a missing DOS companion to `chkdsk`;
+/// - the reserved records 12–15 are in use with no name: `$STANDARD_INFORMATION`, the inline
+///   formatter `$SECURITY_DESCRIPTOR`, and an empty unnamed `$DATA`;
+/// - `$LogFile` is 2 MiB, the formatter size for volumes between 4 MB and 200 MB (the
+///   reference formatter refuses anything below 256 KiB).
 fn assert_ntfs_system_records_satisfy_windows_driver_invariants(vhd: &[u8]) {
     const PARTITION_BYTES: usize = 1024 * 1024;
     const CLUSTER_BYTES: usize = 4096;
     const RECORD_BYTES: usize = 1024;
     const MFT_LCN: usize = 4;
-    // Records 12–15 are free formatted reserved records in this profile and carry no attributes.
-    for record_number in 0..12 {
+    for record_number in 0..16 {
         let start = PARTITION_BYTES + MFT_LCN * CLUSTER_BYTES + record_number * RECORD_BYTES;
         let record = SystemRecordView::parse(record_number, &vhd[start..start + RECORD_BYTES]);
         record.assert_header();
         let mut saw = SeenSystemAttributes::default();
         for attribute in record.resident_attributes() {
             record.assert_attribute(&attribute, &mut saw);
+        }
+        if record.is_reserved() {
+            assert!(
+                saw.has("standard_information")
+                    && saw.has("reserved_security_descriptor")
+                    && saw.has("reserved_data")
+                    && !saw.has("file_name"),
+                "reserved record {record_number} must carry SI, inline SD, and empty $DATA only"
+            );
+            continue;
         }
         assert!(
             saw.has("standard_information") && saw.has("file_name"),
@@ -896,10 +909,25 @@ impl SystemRecordView {
         self.flags() & FILE_RECORD_DIRECTORY != 0
     }
 
+    const fn is_reserved(&self) -> bool {
+        matches!(self.record_number, 12..=15)
+    }
+
     fn assert_header(&self) {
+        const FILE_RECORD_IN_USE: u16 = 0x1;
         const FILE_RECORD_VIEW_INDEX: u16 = 0x8;
         let record_number = self.record_number;
         let flags = self.flags();
+        assert_ne!(
+            flags & FILE_RECORD_IN_USE,
+            0,
+            "record {record_number} is not in use"
+        );
+        assert_eq!(
+            usize::from(u16_at(&self.bytes, 0x12)),
+            usize::from(!self.is_reserved()),
+            "record {record_number} hard-link count"
+        );
         assert_eq!(
             flags & 0x4,
             0,
@@ -1008,6 +1036,29 @@ impl SystemRecordView {
                 assert_eq!(
                     value[65], 3,
                     "record {record_number} $FILE_NAME is not FILE_NAME_WIN32_AND_DOS"
+                );
+                if record_number == 2 {
+                    assert_eq!(u64_at(value, 48), 2 * 1024 * 1024, "$LogFile size");
+                }
+            }
+            0x50 if self.is_reserved() => {
+                saw.mark("reserved_security_descriptor");
+                assert_eq!(
+                    value.len(),
+                    100,
+                    "record {record_number} inline $SECURITY_DESCRIPTOR length"
+                );
+                assert_eq!(
+                    u16_at(value, 2),
+                    0x8004,
+                    "record {record_number} SD control"
+                );
+            }
+            0x80 if self.is_reserved() && attribute.name.is_empty() => {
+                saw.mark("reserved_data");
+                assert!(
+                    value.is_empty(),
+                    "record {record_number} unnamed $DATA must be empty"
                 );
             }
             0x80 if record_number == 3 && attribute.name.is_empty() => {

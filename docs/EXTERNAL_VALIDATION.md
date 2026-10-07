@@ -15,8 +15,8 @@ hashes. The non-elevated preflight therefore refused the regenerated candidates.
 Both pins were refreshed from the regenerated fixtures and now read:
 
 ```text
-converted Windows NTFS VHD   74F3C3B530BE07D2AAA46882D30C31DF2E1752774DEBB9EE1A7C2C38977FCE08
-converted Windows exFAT VHD  3F52FE1A6997A5DAFBA4B66D4C7947E9DFAEAB801A578E597775D9C3F3F0EA41
+converted Windows NTFS VHD   851095C857EDE374FFDA037CD0AE6EFA75F4B0FE77E1AB0449DDE5FE1F088B06
+converted Windows exFAT VHD  BC6301CEE56057A1AFD6B5BEF6D0A44770A9AF8093AF1A7D511240F4D53FCEF3
 ```
 
 Two guards now keep the three pin sites in lockstep:
@@ -126,7 +126,33 @@ root `.` and the `$Extend` children; NTFS-3G creates user names as `FILE_NAME_PO
 serializer now follows both: system names and the root `.` are namespace 3, converted object
 names are namespace 0, and the root index gains the self-parented `.` entry that both formatters
 index (the normalizer already accepted and verified it). The NTFS pin moved to `74F3...CE08`.
-Whether the Windows driver now mounts the candidate is answered by the next `windows-vhd` lane run.
+
+CI run 37595651352 cleared Stage 2 as well ("48 index entries processed. Index verification
+completed.") and then failed while "scanning unindexed files for reconnect" with an internal
+`chkdsk` error pointing at `frs.cxx` line 1551; `fsutil` reported `ERROR_NO_SYSTEM_RESOURCES`
+(1450) for the mount. That pass walks every in-use record that has no `$FILE_NAME`, which pointed
+at two remaining divergences from both the Windows control and the pinned `mkntfs` source:
+
+- Records 12 through 15 were free (flag 0, no attributes, clear MFT bitmap bits). Both formatters
+  keep the reserved metafile records in use with zero hard links: hidden+system
+  `$STANDARD_INFORMATION` with security ID 0, an inline 100-byte self-relative
+  `$SECURITY_DESCRIPTOR` (owner `S-1-5-18`, group `S-1-5-32-544`, two `0x12019f` allow ACEs,
+  byte-identical between `mkntfs` `init_system_file_sd` and the Windows Server 2025 control), and
+  an empty unnamed `$DATA`. The serializer now writes those records and sets bitmap bits 12
+  through 15; records 16 through 23 stay free and formatted.
+- `$LogFile` was 200 KiB, the reader's floor. `mkntfs` refuses anything below 256 KiB ("would
+  blue screen") and sizes the log by volume: 256 KiB below 2 MB, 512 KiB below 4 MB, 2 MiB up to
+  200 MB, then volume/200 (cluster-aligned, halved while it does not fit) capped at 64 MiB from
+  12 GiB. The planner now applies that rule, so the 32 MiB candidate carries the same 2 MiB log
+  as the control.
+
+`export_external_fixtures` asserts both (records 12 through 15 in use with exactly SI, inline SD,
+and empty `$DATA`; `$LogFile` 2 MiB) alongside the earlier invariants. The NTFS pin moved to
+`8510...8B06`. The exFAT pin moved for the first time, to `BC63...CEF3`: the rich NTFS source
+fixture is produced by the same serializer, so its escrow sidecar now preserves four additional
+metadata records (the exFAT volume structure itself is unchanged apart from that embedded
+sidecar). Whether the Windows driver now mounts the NTFS candidate is answered by the next
+`windows-vhd` lane run.
 
 ## 2026-09-01 forced NTFS-to-exFAT relocation qualification
 

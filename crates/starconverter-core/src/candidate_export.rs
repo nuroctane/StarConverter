@@ -5839,9 +5839,24 @@ mod tests {
                 .preservation
                 .objects
                 .iter()
-                .filter(|preserved| preserved.source.security_descriptor.is_some())
+                .filter(|preserved| {
+                    !preserved.source.is_metadata && preserved.source.security_descriptor.is_some()
+                })
                 .count(),
             2
+        );
+        // The reserved metafile records 12-15 carry the formatter's inline descriptor too; they
+        // are preserved as metadata, never as graph objects.
+        assert_eq!(
+            normalized
+                .preservation
+                .objects
+                .iter()
+                .filter(|preserved| {
+                    preserved.source.is_metadata && preserved.source.security_descriptor.is_some()
+                })
+                .count(),
+            4
         );
         let fork_name: Vec<u16> = "fork".encode_utf16().collect();
         let source_fork = normalized

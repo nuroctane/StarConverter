@@ -122,6 +122,24 @@ const FILE_ATTRIBUTE_VIEW_INDEX_PRESENT: u32 = 0x2000_0000;
 /// `$Secure` and the `$Extend` children share the pinned `mkntfs` read/write descriptor; the
 /// remaining system files use the read-only one. Both live in the canonical `$Secure:$SDS`.
 const SYSTEM_FILE_SECURITY_ID_READ_ONLY: u32 = 0x100;
+/// First and last of the reserved NTFS metafile records (`0xc..=0xf`) that both `mkntfs` and the
+/// Windows formatter keep in use with no name: `$STANDARD_INFORMATION`, an inline
+/// `$SECURITY_DESCRIPTOR`, and an empty unnamed `$DATA`.
+const FIRST_RESERVED_SYSTEM_RECORD: u64 = 12;
+const LAST_RESERVED_SYSTEM_RECORD: u64 = 15;
+/// Self-relative descriptor the Windows formatter writes inline on the reserved records
+/// `0xc..=0xf`: owner `S-1-5-18`, group `S-1-5-32-544`, and a two-entry DACL granting both
+/// SIDs `0x12019f` (read/write/append data, EA, attributes, `READ_CONTROL`, `SYNCHRONIZE`).
+/// `mkntfs` (`init_system_file_sd`) writes the identical bytes.
+const RESERVED_SYSTEM_RECORD_SECURITY_DESCRIPTOR: [u8; 100] = [
+    0x01, 0x00, 0x04, 0x80, 0x48, 0x00, 0x00, 0x00, 0x54, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x14, 0x00, 0x00, 0x00, 0x02, 0x00, 0x34, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x14, 0x00,
+    0x9f, 0x01, 0x12, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x12, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x18, 0x00, 0x9f, 0x01, 0x12, 0x00, 0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05,
+    0x20, 0x00, 0x00, 0x00, 0x20, 0x02, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05,
+    0x12, 0x00, 0x00, 0x00, 0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x20, 0x00, 0x00, 0x00,
+    0x20, 0x02, 0x00, 0x00,
+];
 const FILE_RECORD_VIEW_INDEX: u16 = 0x0008;
 const MFT_LCN: u64 = 4;
 const BOOT_FILE_BYTES: u64 = 8192;
@@ -770,6 +788,7 @@ struct MandatoryMetadata {
 fn mandatory_metadata(
     cluster_count: u64,
     cluster_bytes: u32,
+    logfile_bytes: u64,
     timestamp: u64,
     maximum_bytes: usize,
     bad_lcns: &[u64],
@@ -790,7 +809,7 @@ fn mandatory_metadata(
     })?;
     let logfile = generate_ntfs_logfile(
         NtfsLogFileProfile::Ntfs3gErased,
-        NtfsLogFileConfig::ntfs31_lfs_v1_1(NTFS_LOGFILE_MIN_BYTES, 0),
+        NtfsLogFileConfig::ntfs31_lfs_v1_1(logfile_bytes, 0),
         NtfsLogFileLimits {
             max_bytes: maximum_bytes,
         },
@@ -1885,6 +1904,7 @@ fn plan_ntfs_destination_impl(
     let mandatory = mandatory_metadata(
         cluster_count,
         inputs.cluster_bytes,
+        planned_logfile_bytes(cluster, cluster_count, record_count)?,
         inputs.timestamp,
         limits.max_metadata_bytes,
         &bad_lcns,
@@ -2015,9 +2035,15 @@ fn plan_ntfs_destination_impl(
 
     let mut records = vec![vec![0_u8; RECORD_BYTES]; record_count];
     for (record_number, record) in records.iter_mut().enumerate() {
-        *record = unused_record(
-            u64::try_from(record_number).map_err(|_| NtfsSerializeError::ArithmeticOverflow)?,
-        )?;
+        let record_number =
+            u64::try_from(record_number).map_err(|_| NtfsSerializeError::ArithmeticOverflow)?;
+        *record = if (FIRST_RESERVED_SYSTEM_RECORD..=LAST_RESERVED_SYSTEM_RECORD)
+            .contains(&record_number)
+        {
+            reserved_system_record(record_number, inputs.timestamp)?
+        } else {
+            unused_record(record_number)?
+        };
     }
     records[0] = system_mft_record(0, layout, inputs.timestamp)?;
     records[1] = system_data_record(
@@ -2635,14 +2661,55 @@ fn validate_names(
     Ok(())
 }
 
-fn metadata_layout(
+/// `$LogFile` size the pinned `mkntfs` chooses for a volume of `cluster_count` clusters: 256 KiB
+/// below 2 MiB, 512 KiB below 4 MB, 2 MiB up to 200 MiB, 64 MiB from 12 GiB, otherwise one
+/// two-hundredth of the volume, halved while it would overflow the volume. The Windows formatter
+/// picks the same 2 MiB for small volumes; `mkntfs` refuses to go below 256 KiB because the
+/// Windows driver cannot run a smaller journal.
+fn formatter_logfile_bytes(
     cluster: u64,
     cluster_count: u64,
+    logfile_lcn: u64,
+) -> Result<u64, NtfsSerializeError> {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB: u64 = 1024 * MIB;
+    const FLOOR_BYTES: u64 = 256 * KIB;
+    let volume_bytes = cluster_count
+        .checked_mul(cluster)
+        .ok_or(NtfsSerializeError::ArithmeticOverflow)?;
+    let mut bytes = if volume_bytes < 2 * MIB {
+        FLOOR_BYTES
+    } else if volume_bytes < 4_000_000 {
+        512 * KIB
+    } else if volume_bytes <= 200 * MIB {
+        2 * MIB
+    } else if volume_bytes >= 12 * GIB {
+        64 * MIB
+    } else {
+        (volume_bytes / 200) & !(cluster - 1)
+    };
+    while logfile_lcn.saturating_add(bytes / cluster) >= cluster_count {
+        bytes >>= 1;
+        if bytes < FLOOR_BYTES {
+            return Err(NtfsSerializeError::InvalidImageGeometry);
+        }
+    }
+    let bytes = div_ceil(bytes, cluster)?
+        .checked_mul(cluster)
+        .ok_or(NtfsSerializeError::ArithmeticOverflow)?;
+    if bytes < FLOOR_BYTES || bytes < NTFS_LOGFILE_MIN_BYTES {
+        return Err(NtfsSerializeError::InvalidImageGeometry);
+    }
+    Ok(bytes)
+}
+
+/// `(mft_clusters, mirror_lcn, mirror_clusters, logfile_lcn)` for a `record_count`-record `$MFT`
+/// at `MFT_LCN`.
+fn logfile_placement(
+    cluster: u64,
     record_count: usize,
-    in_use_record_count: usize,
-    secure_sds_bytes: usize,
-    directory_index_clusters: u64,
-) -> Result<MetadataLayout, NtfsSerializeError> {
+) -> Result<(u64, u64, u64, u64), NtfsSerializeError> {
     let mft_bytes = u64::try_from(record_count)
         .map_err(|_| NtfsSerializeError::ArithmeticOverflow)?
         .checked_mul(RECORD_BYTES as u64)
@@ -2655,7 +2722,33 @@ fn metadata_layout(
     let logfile_lcn = mirror_lcn
         .checked_add(mirror_clusters)
         .ok_or(NtfsSerializeError::ArithmeticOverflow)?;
-    let logfile_clusters = div_ceil(NTFS_LOGFILE_MIN_BYTES, cluster)?;
+    Ok((mft_clusters, mirror_lcn, mirror_clusters, logfile_lcn))
+}
+
+/// Byte length of the `$LogFile` this volume geometry receives.
+fn planned_logfile_bytes(
+    cluster: u64,
+    cluster_count: u64,
+    record_count: usize,
+) -> Result<u64, NtfsSerializeError> {
+    let (_, _, _, logfile_lcn) = logfile_placement(cluster, record_count)?;
+    formatter_logfile_bytes(cluster, cluster_count, logfile_lcn)
+}
+
+fn metadata_layout(
+    cluster: u64,
+    cluster_count: u64,
+    record_count: usize,
+    in_use_record_count: usize,
+    secure_sds_bytes: usize,
+    directory_index_clusters: u64,
+) -> Result<MetadataLayout, NtfsSerializeError> {
+    let (mft_clusters, mirror_lcn, mirror_clusters, logfile_lcn) =
+        logfile_placement(cluster, record_count)?;
+    let logfile_clusters = div_ceil(
+        planned_logfile_bytes(cluster, cluster_count, record_count)?,
+        cluster,
+    )?;
     let attrdef_lcn = logfile_lcn
         .checked_add(logfile_clusters)
         .ok_or(NtfsSerializeError::ArithmeticOverflow)?;
@@ -2954,6 +3047,35 @@ fn boot_sector(
 
 fn unused_record(record_number: u64) -> Result<Vec<u8>, NtfsSerializeError> {
     finish_record(record_number, 0, 0, Vec::new())
+}
+
+/// Reserved metafile record `0xc..=0xf`: in use with zero hard links, hidden+system
+/// `$STANDARD_INFORMATION` with security ID 0, the inline formatter descriptor, and an empty
+/// unnamed `$DATA`. Attribute IDs follow the formatter (`$DATA` 1, `$SECURITY_DESCRIPTOR` 2);
+/// chkdsk's unindexed-file pass expects these records populated rather than free.
+fn reserved_system_record(
+    record_number: u64,
+    timestamp: u64,
+) -> Result<Vec<u8>, NtfsSerializeError> {
+    finish_record(
+        record_number,
+        FILE_RECORD_IN_USE,
+        0,
+        vec![
+            standard_information_with_security_id(
+                NtfsObjectTimestamps::uniform(timestamp),
+                FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM,
+                0,
+            )?,
+            resident_attribute(
+                SECURITY_DESCRIPTOR,
+                None,
+                2,
+                &RESERVED_SYSTEM_RECORD_SECURITY_DESCRIPTOR,
+            )?,
+            resident_attribute(DATA, None, 1, &[])?,
+        ],
+    )
 }
 
 fn standard_information_with_security_id(
@@ -4456,7 +4578,7 @@ fn system_directory_index_entries(
             2,
             "$LogFile",
             layout.logfile_clusters * layout.cluster,
-            NTFS_LOGFILE_MIN_BYTES,
+            layout.logfile_clusters * layout.cluster,
         ),
         (3, "$Volume", 0, 0),
         (
@@ -6639,7 +6761,8 @@ fn write_mft_bitmap(metadata: &mut [u8], layout: MetadataLayout) -> Result<(), N
     let bitmap = metadata
         .get_mut(offset..offset + bitmap_len)
         .ok_or(NtfsSerializeError::ArithmeticOverflow)?;
-    for record in 0..=11_usize {
+    for record in 0..=LAST_RESERVED_SYSTEM_RECORD {
+        let record = usize::try_from(record).map_err(|_| NtfsSerializeError::ArithmeticOverflow)?;
         bitmap[record / 8] |= 1 << (record % 8);
     }
     for record in 24..FIRST_USER_RECORD {
@@ -7872,7 +7995,7 @@ mod tests {
             .unwrap();
         assert_eq!(root_index.file_reference.unwrap().record_number, 11);
         assert_eq!(root_index.file_reference.unwrap().sequence_number, 11);
-        for number in 12..24 {
+        for number in 16..24 {
             assert!(
                 !parse_file_record(record(&plan, number))
                     .unwrap()
@@ -8460,10 +8583,10 @@ mod tests {
             layout.mft_bitmap_lcn * layout.cluster,
             usize::try_from(MIN_MFT_BITMAP_BYTES).unwrap(),
         );
-        for record in 0..=11 {
+        for record in 0..=15 {
             assert_ne!(bitmap[record / 8] & (1 << (record % 8)), 0);
         }
-        for record in 12..24 {
+        for record in 16..24 {
             assert_eq!(bitmap[record / 8] & (1 << (record % 8)), 0);
         }
         for record in 24..=27 {
@@ -8526,6 +8649,112 @@ mod tests {
     }
 
     #[test]
+    fn reserved_records_12_to_15_are_in_use_with_formatter_descriptor_and_16_to_23_free() {
+        let plan = plan_ntfs_destination(
+            &graph(Some(b"metadata".to_vec()), false),
+            inputs(),
+            NtfsSerializeLimits::default(),
+        )
+        .unwrap();
+        for record_number in 12..=15 {
+            let parsed = parse_file_record(record(&plan, record_number)).unwrap();
+            assert!(parsed.flags.is_in_use());
+            assert!(!parsed.flags.is_metadata());
+            assert_eq!(parsed.hard_link_count, 0);
+            assert_eq!(
+                parsed.sequence_number,
+                u16::try_from(record_number).unwrap()
+            );
+            let attrs = parse_attribute_list(
+                parsed.repaired_bytes(),
+                usize::from(parsed.attributes_offset),
+                usize::try_from(parsed.bytes_in_use).unwrap(),
+                attr_limits(),
+            )
+            .unwrap();
+            let types: Vec<(u32, u16)> = attrs
+                .attributes
+                .iter()
+                .map(|attribute| (attribute.attribute_type, attribute.id))
+                .collect();
+            assert_eq!(
+                types,
+                [
+                    (STANDARD_INFORMATION, 0),
+                    (SECURITY_DESCRIPTOR, 2),
+                    (DATA, 1)
+                ]
+            );
+            let AttributeBody::Resident(standard) = &attrs.attributes[0].body else {
+                panic!("resident STANDARD_INFORMATION")
+            };
+            assert_eq!(standard.value.len(), 72);
+            assert_eq!(
+                read_u32(standard.value, 32),
+                FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM
+            );
+            assert_eq!(read_u32(standard.value, 52), 0, "security id");
+            let AttributeBody::Resident(descriptor) = &attrs.attributes[1].body else {
+                panic!("resident SECURITY_DESCRIPTOR")
+            };
+            assert_eq!(
+                descriptor.value,
+                &RESERVED_SYSTEM_RECORD_SECURITY_DESCRIPTOR
+            );
+            let AttributeBody::Resident(data) = &attrs.attributes[2].body else {
+                panic!("resident DATA")
+            };
+            assert_eq!(data.value, &[] as &[u8]);
+        }
+        for record_number in 16..24 {
+            let parsed = parse_file_record(record(&plan, record_number)).unwrap();
+            assert!(!parsed.flags.is_in_use());
+            assert_eq!(
+                parsed.sequence_number,
+                u16::try_from(record_number).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_record_descriptor_is_the_pinned_self_relative_formatter_layout() {
+        let descriptor = &RESERVED_SYSTEM_RECORD_SECURITY_DESCRIPTOR;
+        assert_eq!(descriptor[0], 1, "revision");
+        assert_eq!(
+            read_u16(descriptor, 2),
+            0x8004,
+            "SE_SELF_RELATIVE | SE_DACL_PRESENT"
+        );
+        let owner = usize::try_from(read_u32(descriptor, 4)).unwrap();
+        let group = usize::try_from(read_u32(descriptor, 8)).unwrap();
+        let sacl = read_u32(descriptor, 12);
+        let dacl = usize::try_from(read_u32(descriptor, 16)).unwrap();
+        assert_eq!((owner, group, sacl, dacl), (0x48, 0x54, 0, 0x14));
+        // Owner S-1-5-18 (LocalSystem), group S-1-5-32-544 (Administrators).
+        assert_eq!(
+            &descriptor[owner..owner + 12],
+            &[1, 1, 0, 0, 0, 0, 0, 5, 0x12, 0, 0, 0]
+        );
+        assert_eq!(
+            &descriptor[group..group + 16],
+            &[1, 2, 0, 0, 0, 0, 0, 5, 0x20, 0, 0, 0, 0x20, 2, 0, 0]
+        );
+        assert_eq!(descriptor[dacl], 2, "ACL revision");
+        assert_eq!(read_u16(descriptor, dacl + 2), 0x34, "ACL size");
+        assert_eq!(read_u16(descriptor, dacl + 4), 2, "ACE count");
+        let first_ace = dacl + 8;
+        let second_ace = first_ace + usize::from(read_u16(descriptor, first_ace + 2));
+        for ace in [first_ace, second_ace] {
+            assert_eq!(descriptor[ace], 0, "ACCESS_ALLOWED_ACE_TYPE");
+            assert_eq!(read_u32(descriptor, ace + 4), 0x0012_019f, "ACE mask");
+        }
+        assert_eq!(
+            second_ace + usize::from(read_u16(descriptor, second_ace + 2)),
+            owner
+        );
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn mandatory_metadata_payloads_wrappers_and_bitmap_roundtrip() {
         let plan = plan_ntfs_destination(
@@ -8581,7 +8810,7 @@ mod tests {
         let logfile = staged_bytes(
             &plan,
             layout.logfile_lcn * layout.cluster,
-            usize::try_from(NTFS_LOGFILE_MIN_BYTES).unwrap(),
+            usize::try_from(layout.logfile_clusters * layout.cluster).unwrap(),
         );
         let logfile_validation =
             validate_ntfs_logfile(logfile, NtfsLogFileLimits::default()).unwrap();
@@ -8604,7 +8833,12 @@ mod tests {
         else {
             panic!("nonresident $LogFile")
         };
-        assert_eq!(logfile_data.sizes.unwrap().data, NTFS_LOGFILE_MIN_BYTES);
+        // The pinned formatter gives every volume between 4 MB and 200 MiB a 2 MiB journal.
+        assert_eq!(layout.logfile_clusters * layout.cluster, 2 * 1024 * 1024);
+        assert_eq!(
+            logfile_data.sizes.unwrap().data,
+            layout.logfile_clusters * layout.cluster
+        );
         let logfile_runs = parse_mapping_pairs(
             logfile_data.mapping_pairs,
             MappingPairsLimits {
@@ -11224,7 +11458,7 @@ mod tests {
                     Some(u32::try_from(record_number).unwrap())
                 );
                 assert_eq!(mirror.record_number, mft.record_number);
-                let expected_in_use = record_number <= 11 || (24..=27).contains(&record_number);
+                let expected_in_use = record_number <= 15 || (24..=27).contains(&record_number);
                 assert_eq!(mft.flags.is_in_use(), expected_in_use);
                 assert_eq!(mirror.flags.is_in_use(), expected_in_use);
             }
@@ -11285,7 +11519,7 @@ mod tests {
             for record_number in 0..mirror_records {
                 let set =
                     image[bitmap_offset + record_number / 8] & (1 << (record_number % 8)) != 0;
-                let expected_in_use = record_number <= 11 || (24..=27).contains(&record_number);
+                let expected_in_use = record_number <= 15 || (24..=27).contains(&record_number);
                 assert_eq!(set, expected_in_use, "record {record_number}");
             }
         }
