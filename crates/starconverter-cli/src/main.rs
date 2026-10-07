@@ -972,7 +972,7 @@ fn print_inspection(inspection: &ImageInspection) {
             }
         },
         BootRedundancy::Ntfs(validation) => println!(
-            "| redundancy  : primary + final backup exact ({} trailing sectors)",
+            "| redundancy  : primary + backup at declared end exact ({} slack sectors after it)",
             validation.unaddressed_trailing_sectors
         ),
     }

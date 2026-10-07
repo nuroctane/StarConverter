@@ -286,6 +286,53 @@ filesystem-driver acceptance of a StarConverter candidate whose payload the layo
 relocated.** Every converted fixture in the regular image corpus (rich, large-directory, edge, and
 misaligned, in every direction the corpus defines) now passes the Windows driver gate.
 
+### Windows-formatted volumes as sources
+
+The gate above judges StarConverter's output. The reverse direction, feeding a volume that Windows
+itself formatted into StarConverter, had never been tried. The `windows-vhd` probe already keeps
+the two Windows Server 2025 control VHDs (`format fs=ntfs|exfat quick` on a 40 MiB fixed VHD with
+the partition at 1 MiB) in `windows-control/`, so their partitions were carved (1 MiB to the
+partition end, 40 894 464 bytes) and inspected.
+
+The Windows exFAT control inspected clean on the first attempt and `convert-image --to ntfs`
+produced a verified NTFS candidate from it. The Windows NTFS control was refused four times over,
+each by a StarConverter assumption that `ntfs.sys` and Windows `format` do not share:
+
+1. **Backup boot sector location.** Windows declares the volume 2 049 sectors short of the
+   partition (77 823 of 79 872) and writes the backup at sector `total_sectors`, leaving 1 MiB of
+   zeroed slack after it. The inspector read the partition's final sector and found zeros. It now
+   reads sector `declared_sectors` (which is also where mkntfs and NTFS-3G place it) and reports
+   the slack as `unaddressed_trailing_sectors` instead of refusing.
+2. **Never-written MFT records.** Windows leaves records 16-23 and the unused tail of the initial
+   256 KiB `$MFT` (records 37-255 here) as all-zero bytes rather than stamping empty `FILE`
+   headers. The sequential scan treated the first one as a corrupt record. All-zero records are
+   now `ScannedMftRecord::NeverWritten`, free by definition, and the `$MFT::$BITMAP`
+   reconciliation requires their bit to be clear. A single nonzero byte makes the record parse
+   again under the old rules.
+3. **The `$Extend` subtree.** Windows formats `$Extend\$RmMetadata` (27), `$TxfLog` (30), `$Txf`
+   (31), `$Tops` (32), `$TxfLog.blf` (33), two CLFS containers, and `$Extend\$Deleted` (29) with
+   plain directory or file flags; only `$Quota`, `$ObjId`, `$Reparse`, and `$Repair` carry the
+   0x0004 metadata hint. The unflagged ones leaked into the object graph and failed as
+   "record 27 names missing parent record 11". The inventory now marks every record whose names
+   all live under `$Extend` as metadata, so the whole subtree stays out of the graph while
+   remaining in the preservation sidecar. A record with names both inside and outside the subtree
+   is still refused.
+4. **Volume flag `0x0080`.** Windows 8 and later `format` sets this undocumented
+   `$VOLUME_INFORMATION` bit on every new volume, and the probe already showed `ntfs.sys`
+   mounting such volumes healthy with a clean `chkdsk`. The inspector treated any nonzero flag
+   word as dirty. It now treats the eight NTFS-3G-documented bits (`0xc03f`) as dirty, `0x0080` as
+   known and clean, and any other unknown bit as health Unknown rather than Dirty.
+
+With those four fixes `inspect` accepts the Windows NTFS control: Clean, backup at the declared
+end with 2 048 slack sectors, 256 records scanned, 29 in use, allocation and MFT-record
+reconciliation complete. Unit tests cover each rule, including the exact 40 MiB Windows geometry.
+
+`convert-image --to exfat` on that control is still refused, correctly, by preservation policy:
+the volume carries a real `$Secure:$SDS` with Windows' own security identifiers (StarConverter
+only resolves the pinned mkntfs profile today), and its root directory and `$Txf` carry
+`$TXF_DATA` (attribute type 0x100), which is outside the attribute allowlist. Those are the next
+two pieces of work before Windows-formatted NTFS can be a conversion source.
+
 ## 2026-09-01 forced NTFS-to-exFAT relocation qualification
 
 A dedicated 32 MiB NTFS 3.1 regular image placed one 8,192-byte file at byte

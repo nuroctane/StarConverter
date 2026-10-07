@@ -13,7 +13,7 @@ use super::ntfs::{NtfsBootSector, NtfsBootSectorError, parse_boot_sector};
 pub enum BootSectorCopy {
     /// The primary copy at partition-relative byte offset zero.
     Primary,
-    /// The alternate copy in the partition's final physical sector.
+    /// The alternate copy in the sector immediately after the declared filesystem.
     Backup,
 }
 
@@ -40,10 +40,11 @@ pub struct NtfsBootRegion {
     pub partition_sectors: u64,
     /// Partition-relative byte offset at which the backup copy was validated.
     pub backup_offset: u64,
-    /// Complete sectors after the declared NTFS filesystem and before the final backup sector.
+    /// Complete sectors after the backup boot sector and before the end of the partition.
     ///
-    /// This may be nonzero after a partition has been enlarged without resizing NTFS. NTFS-3G's
-    /// repair code still expects the backup at the actual final partition sector in that case.
+    /// Windows `format` leaves this slack on purpose: it declares the NTFS volume about 1 MiB
+    /// shorter than the partition and writes the backup at sector `declared_sectors`, not at the
+    /// partition's final sector. A partition enlarged without resizing NTFS looks the same.
     pub unaddressed_trailing_sectors: u64,
 }
 
@@ -79,8 +80,9 @@ pub enum NtfsBootRegionError {
         /// Sectors declared as belonging to the NTFS filesystem.
         declared_sectors: u64,
     },
-    /// The claimed backup slice was not read from the final logical sector of the bounded view.
-    BackupOffsetNotFinalSector {
+    /// The claimed backup slice was not read from the sector immediately after the declared
+    /// filesystem.
+    BackupOffsetNotDeclaredEnd {
         /// Claimed partition-relative byte offset.
         actual: u64,
         /// Required partition-relative byte offset.
@@ -130,9 +132,9 @@ impl fmt::Display for NtfsBootRegionError {
                 formatter,
                 "NTFS partition has {partition_sectors} sectors but the filesystem declares {declared_sectors}; no final sector remains for the modern backup boot sector"
             ),
-            Self::BackupOffsetNotFinalSector { actual, expected } => write!(
+            Self::BackupOffsetNotDeclaredEnd { actual, expected } => write!(
                 formatter,
-                "NTFS backup boot sector was supplied from byte offset {actual}; the bounded partition's final sector starts at {expected}"
+                "NTFS backup boot sector was supplied from byte offset {actual}; the sector after the declared filesystem starts at {expected}"
             ),
             Self::InvalidBackup { source } => {
                 write!(formatter, "invalid backup NTFS boot sector: {source}")
@@ -163,22 +165,24 @@ impl std::error::Error for NtfsBootRegionError {
 /// `primary_sector` and `backup_sector` must each contain exactly one logical sector, while
 /// `partition_bytes` describes the exact bounded partition view and `backup_offset` records where
 /// the caller read the backup slice. The primary copy is expected at byte offset zero; the backup
-/// copy is required at the start of the partition's final logical sector.
+/// copy is required at the start of logical sector `declared_sectors`, the sector immediately
+/// after the filesystem the primary boot sector describes.
+///
+/// That placement is what `ntfs.sys`, Windows `format`, and `mkntfs` all agree on. Windows
+/// `format` additionally leaves about 1 MiB of partition slack after the backup, so the backup is
+/// frequently not the partition's final sector on Windows-formatted volumes. Any sectors after the
+/// backup are reported, never rejected.
 ///
 /// The two sector slices must be byte-for-byte identical, including bootstrap code and any bytes
 /// after the fixed 512-byte NTFS header when the logical sector is larger than 512 bytes. No field
 /// differences are tolerated. This matches the full-sector `memcmp` policy used by NTFS-3G's
 /// alternate-boot repair, label, and resize paths.
 ///
-/// A partition may contain complete unaddressed sectors between the declared NTFS filesystem and
-/// the final backup. NTFS-3G explicitly handles that post-resize geometry by using the actual last
-/// partition sector for the backup while leaving the on-disk sector count unchanged.
-///
 /// # Errors
 ///
 /// Returns [`NtfsBootRegionError`] if either copy is invalid, either slice is not exactly one
-/// logical sector, the partition geometry cannot reserve a final backup sector, the claimed backup
-/// offset is not the final sector, or any sector byte differs.
+/// logical sector, the partition geometry cannot hold a backup sector after the declared
+/// filesystem, the claimed backup offset is not that sector, or any sector byte differs.
 pub fn validate_boot_region(
     primary_sector: &[u8],
     backup_sector: &[u8],
@@ -208,9 +212,9 @@ pub fn validate_boot_region(
         });
     }
 
-    let expected_backup_offset = partition_bytes - sector_bytes_u64;
+    let expected_backup_offset = primary.declared_sectors * sector_bytes_u64;
     if backup_offset != expected_backup_offset {
-        return Err(NtfsBootRegionError::BackupOffsetNotFinalSector {
+        return Err(NtfsBootRegionError::BackupOffsetNotDeclaredEnd {
             actual: backup_offset,
             expected: expected_backup_offset,
         });
@@ -348,24 +352,40 @@ mod tests {
     }
 
     #[test]
-    fn permits_post_resize_unaddressed_sectors_but_requires_actual_last_sector() {
+    fn permits_windows_format_slack_but_requires_the_declared_end_sector() {
         let primary = boot_sector(512);
         let partition_sectors = DECLARED_SECTORS + 17;
         let partition_bytes = partition_sectors * 512;
-        let expected_offset = partition_bytes - 512;
+        let declared_end = DECLARED_SECTORS * 512;
 
-        let region = validate_boot_region(&primary, &primary, partition_bytes, expected_offset)
-            .expect("enlarged partition with final-sector backup");
+        let region = validate_boot_region(&primary, &primary, partition_bytes, declared_end)
+            .expect("partition slack after the backup boot sector");
+        assert_eq!(region.backup_offset, declared_end);
         assert_eq!(region.unaddressed_trailing_sectors, 16);
 
-        let declared_end = DECLARED_SECTORS * 512;
+        let final_sector = partition_bytes - 512;
         assert_eq!(
-            validate_boot_region(&primary, &primary, partition_bytes, declared_end),
-            Err(NtfsBootRegionError::BackupOffsetNotFinalSector {
-                actual: declared_end,
-                expected: expected_offset,
+            validate_boot_region(&primary, &primary, partition_bytes, final_sector),
+            Err(NtfsBootRegionError::BackupOffsetNotDeclaredEnd {
+                actual: final_sector,
+                expected: declared_end,
             })
         );
+    }
+
+    #[test]
+    fn accepts_the_windows_format_geometry_of_a_40_mib_control_partition() {
+        // Windows Server 2025 `format fs=ntfs quick` on a 40 MiB fixed VHD with the partition at
+        // 1 MiB: 79 872 partition sectors, 77 823 declared sectors, backup at sector 77 823,
+        // 2 048 sectors (1 MiB) of slack after it.
+        let mut primary = boot_sector(512);
+        primary[40..48].copy_from_slice(&77_823_i64.to_le_bytes());
+        let partition_bytes = 79_872 * 512;
+
+        let region = validate_boot_region(&primary, &primary, partition_bytes, 77_823 * 512)
+            .expect("Windows-formatted geometry");
+        assert_eq!(region.partition_sectors, 79_872);
+        assert_eq!(region.unaddressed_trailing_sectors, 2_048);
     }
 
     #[test]

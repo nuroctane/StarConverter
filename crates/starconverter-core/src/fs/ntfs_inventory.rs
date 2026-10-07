@@ -18,7 +18,7 @@ use crate::fs::ntfs_attribute_list::{
     resolve_attribute_list_with_reader,
 };
 use crate::fs::ntfs_discovery::{
-    MftBootstrap, NtfsDiscoveryError, read_mft_record_for_inventory_with_reader,
+    MftBootstrap, NtfsDiscoveryError, ScannedMftRecord, read_mft_record_for_inventory_with_reader,
 };
 use crate::fs::ntfs_extend::ReparseIndexKey;
 use crate::fs::ntfs_index::{
@@ -909,7 +909,7 @@ pub(crate) fn inventory_ntfs_with_reader(
                 maximum: limits.max_bytes,
             });
         }
-        let record = read_mft_record_for_inventory_with_reader(
+        let scanned = read_mft_record_for_inventory_with_reader(
             image,
             boot,
             mft,
@@ -917,9 +917,10 @@ pub(crate) fn inventory_ntfs_with_reader(
             record_bytes,
         )?;
         bytes_read = requested_total;
-        if !record.flags.is_in_use() {
-            continue;
-        }
+        let record = match scanned {
+            ScannedMftRecord::Parsed(record) if record.flags.is_in_use() => record,
+            ScannedMftRecord::Parsed(_) | ScannedMftRecord::NeverWritten => continue,
+        };
         if record.base_record.is_some() {
             extension_records += 1;
             continue;
@@ -1010,6 +1011,7 @@ pub(crate) fn inventory_ntfs_with_reader(
         }
         objects.push(object);
     }
+    mark_extend_subtree_as_metadata(&mut objects);
     validate_references(&objects, scan_records, &mut incomplete)?;
     let reparse_index = reconcile_reparse_index(&objects, reparse_scan, &incomplete)?;
     Ok(NtfsInventory {
@@ -1031,6 +1033,40 @@ pub(crate) fn inventory_ntfs_with_reader(
 struct InventoriedBaseRecord {
     object: NtfsObject,
     volume_label: Option<Vec<u16>>,
+}
+
+/// Marks every record whose names all live under `$Extend` as metadata.
+///
+/// Windows formats `$Extend\$RmMetadata` as a plain directory (flags 0x3) holding `$Repair`,
+/// `$Txf`, `$TxfLog`, `$Tops`, `$TxfLog.blf`, and the CLFS containers, and `$Extend\$Deleted`
+/// alongside it; only some of those carry the 0x0004 hint. ntfs.sys recreates the whole subtree
+/// on first mount when it is absent, so none of it is user data and none of it may enter the
+/// object graph. A record with names both inside and outside the subtree is left alone and is
+/// refused later as a graph object naming a missing parent.
+fn mark_extend_subtree_as_metadata(objects: &mut [NtfsObject]) {
+    let mut subtree = BTreeSet::from([NTFS_EXTEND_RECORD]);
+    loop {
+        let mut changed = false;
+        for object in objects.iter_mut() {
+            let record = object.reference.record_number;
+            if record == NTFS_ROOT_RECORD
+                || subtree.contains(&record)
+                || object.file_names.is_empty()
+                || !object
+                    .file_names
+                    .iter()
+                    .all(|name| subtree.contains(&name.parent.record_number))
+            {
+                continue;
+            }
+            subtree.insert(record);
+            object.is_metadata = true;
+            changed = true;
+        }
+        if !changed {
+            return;
+        }
+    }
 }
 
 fn record_has_attribute_list(
@@ -2888,6 +2924,7 @@ mod tests {
     use super::*;
     use crate::fs::ntfs::{NtfsBootSector, RecordSize};
     use crate::fs::ntfs_normalize::{NtfsNormalizeLimits, normalize_inventory};
+    use crate::fs::ntfs_record::NtfsFileRecordError;
     use crate::fs::ntfs_security_descriptor::sample_self_relative_descriptor;
     use crate::object::ObjectGraphLimits;
     use crate::overlay::{OverlayLimits, OverlayPlan, OverlayWrite};
@@ -4506,6 +4543,120 @@ mod tests {
         assert_eq!(
             inventory.incomplete_reasons,
             vec![NtfsInventoryIncompleteReason::RecordLimit]
+        );
+    }
+
+    fn named_record(record_number: u32, parent: u64, name: &str, directory: bool) -> Vec<u8> {
+        let name: Vec<u16> = name.encode_utf16().collect();
+        let mut attributes = vec![resident_attribute(
+            FILE_NAME,
+            2,
+            &file_name_value(parent, 1, &name, 3),
+        )];
+        if directory {
+            attributes.push(named_resident_attribute(
+                INDEX_ROOT,
+                3,
+                &[0x24, 0x49, 0x33, 0x30],
+                &empty_index_root(),
+            ));
+        }
+        let mut record = record_with_attributes(record_number, 1, None, &attributes);
+        if directory {
+            record[22..24].copy_from_slice(&3_u16.to_le_bytes());
+        }
+        record
+    }
+
+    #[test]
+    fn never_written_zero_records_are_free_rather_than_malformed() {
+        // Windows `format` leaves records 16-23 and the unused `$MFT` tail as all-zero bytes.
+        let mut bytes = reparse_fixture_image(&[(0, record_with_attributes(0, 1, None, &[]))]);
+        let mft = 4 * 4096;
+        bytes[mft + 7 * 1024..mft + 9 * 1024].fill(0);
+        let temp = TempImage::create(&bytes);
+        let image = ImageFile::open(&temp.0).unwrap();
+
+        let inventory = inventory_ntfs(
+            &image,
+            &boot(),
+            &reparse_fixture_bootstrap(),
+            NtfsInventoryLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(inventory.scanned_records, REPARSE_FIXTURE_RECORDS);
+        assert_eq!(inventory.objects.len(), 1);
+        assert!(inventory.is_complete());
+
+        // A single nonzero byte turns the record back into one that must parse.
+        bytes[mft + 8 * 1024 + 500] = 1;
+        let temp = TempImage::create(&bytes);
+        let image = ImageFile::open(&temp.0).unwrap();
+        assert!(matches!(
+            inventory_ntfs(
+                &image,
+                &boot(),
+                &reparse_fixture_bootstrap(),
+                NtfsInventoryLimits::default(),
+            ),
+            Err(NtfsInventoryError::Discovery(
+                NtfsDiscoveryError::FileRecord(NtfsFileRecordError::InvalidMagic {
+                    found: [0, 0, 0, 0]
+                })
+            ))
+        ));
+    }
+
+    #[test]
+    fn extend_subtree_without_the_metadata_hint_is_still_metadata() {
+        // Windows formats `$Extend\$RmMetadata` (and `$TxfLog`, `$Txf`, `$Tops`, ...) with plain
+        // directory/file flags; only `$Repair` carries the 0x0004 hint.
+        const RECORDS: u64 = 32;
+        let records = [
+            (5, named_record(5, 5, ".", true)),
+            (11, named_record(11, 5, "$Extend", true)),
+            (27, named_record(27, 11, "$RmMetadata", true)),
+            (30, named_record(30, 27, "$TxfLog", true)),
+            (31, named_record(31, 30, "$Tops", false)),
+            (24, named_record(24, 5, "user.bin", false)),
+        ];
+        let mut bytes = vec![0_u8; 128 * 512];
+        let mft = 4 * 4096;
+        for record_number in 0..u32::try_from(RECORDS).unwrap() {
+            let record = records
+                .iter()
+                .find(|(number, _)| *number == record_number)
+                .map_or_else(|| empty_record(record_number, false), |(_, r)| r.clone());
+            let offset = mft + usize::try_from(record_number).unwrap() * 1024;
+            bytes[offset..offset + 1024].copy_from_slice(&record);
+        }
+        let clusters = RECORDS * 1024 / 4096;
+        let mut bootstrap = bootstrap(RECORDS * 1024);
+        bootstrap.runlist.extents[0].length = clusters;
+        bootstrap.runlist.next_vcn = clusters;
+        bootstrap.runlist.decoded_clusters = clusters;
+        bootstrap.runlist.physical_clusters = clusters;
+        bootstrap.allocated_bytes = clusters * 4096;
+        let temp = TempImage::create(&bytes);
+        let image = ImageFile::open(&temp.0).unwrap();
+
+        let inventory =
+            inventory_ntfs(&image, &boot(), &bootstrap, NtfsInventoryLimits::default()).unwrap();
+        let metadata: Vec<(u64, bool)> = inventory
+            .objects
+            .iter()
+            .map(|object| (object.reference.record_number, object.is_metadata))
+            .collect();
+        assert_eq!(
+            metadata,
+            vec![
+                (5, false),
+                (11, false),
+                (24, false),
+                (27, true),
+                (30, true),
+                (31, true),
+            ]
         );
     }
 }

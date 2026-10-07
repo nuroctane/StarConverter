@@ -34,7 +34,13 @@ const VOLUME_INFORMATION_LENGTH: usize = 12;
 const MFT_RECORD_NUMBER: u64 = 0;
 const VOLUME_RECORD_NUMBER: u64 = 3;
 const BITMAP_RECORD_NUMBER: u64 = 6;
-const KNOWN_VOLUME_FLAGS: u16 = 0xc03f;
+/// Flags whose meaning NTFS-3G documents (`VOLUME_FLAGS_MASK`). Every one of them signals
+/// pending driver work, so any set bit makes the volume dirty for conversion purposes.
+const REPAIR_VOLUME_FLAGS: u16 = 0xc03f;
+/// Set by Windows 8 and later `format` on every new volume and left set by ntfs.sys; the
+/// meaning is undocumented, but Windows mounts such volumes healthy and chkdsk passes them.
+const WINDOWS_FORMAT_VOLUME_FLAG: u16 = 0x0080;
+const KNOWN_VOLUME_FLAGS: u16 = REPAIR_VOLUME_FLAGS | WINDOWS_FORMAT_VOLUME_FLAG;
 
 /// Caller-controlled resource bounds for `$Volume` and `$Bitmap` discovery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +85,8 @@ pub struct NtfsVolumeFlags {
     pub repair_object_ids: bool,
     pub chkdsk_underway: bool,
     pub modified_by_chkdsk: bool,
+    /// The undocumented `0x0080` bit Windows 8+ `format` sets on every new volume.
+    pub set_by_windows_format: bool,
     pub unknown_bits: u16,
 }
 
@@ -94,8 +102,15 @@ impl NtfsVolumeFlags {
             repair_object_ids: raw & 0x0020 != 0,
             chkdsk_underway: raw & 0x4000 != 0,
             modified_by_chkdsk: raw & 0x8000 != 0,
+            set_by_windows_format: raw & WINDOWS_FORMAT_VOLUME_FLAG != 0,
             unknown_bits: raw & !KNOWN_VOLUME_FLAGS,
         }
+    }
+
+    /// Whether any flag that NTFS-3G treats as pending driver or chkdsk work is set.
+    #[must_use]
+    pub const fn requires_repair(self) -> bool {
+        self.raw & REPAIR_VOLUME_FLAGS != 0
     }
 }
 
@@ -1685,6 +1700,34 @@ mod tests {
         };
         assert_eq!(volume.flags.unknown_bits, 0x0040);
         assert!(!volume.flags.dirty);
+        assert!(!volume.flags.requires_repair());
+    }
+
+    #[test]
+    fn windows_format_flag_is_known_and_does_not_require_repair() {
+        let record = parse_file_record(&volume_record(0x0080)).unwrap();
+        let parsed = attributes(&record, &boot(), NtfsVolumeLimits::default()).unwrap();
+        let NtfsVolumeEvidence::Complete(volume) =
+            parse_volume_evidence(&parsed.attributes).unwrap()
+        else {
+            panic!("complete")
+        };
+        assert!(volume.flags.set_by_windows_format);
+        assert_eq!(volume.flags.unknown_bits, 0);
+        assert!(!volume.flags.requires_repair());
+
+        for raw in [
+            0x0001_u16, 0x0002, 0x0004, 0x0008, 0x0010, 0x0020, 0x4000, 0x8000,
+        ] {
+            let record = parse_file_record(&volume_record(raw | 0x0080)).unwrap();
+            let parsed = attributes(&record, &boot(), NtfsVolumeLimits::default()).unwrap();
+            let NtfsVolumeEvidence::Complete(volume) =
+                parse_volume_evidence(&parsed.attributes).unwrap()
+            else {
+                panic!("complete")
+            };
+            assert!(volume.flags.requires_repair(), "flag {raw:#06x}");
+        }
     }
 
     #[test]

@@ -546,9 +546,11 @@ fn inspect_ntfs(
     } else {
         image.read_first_sector(sector_bytes)?
     };
-    let backup_offset = image
-        .len()
-        .checked_sub(u64::from(boot.bytes_per_sector))
+    // ntfs.sys, Windows `format`, and mkntfs all place the backup boot sector at sector
+    // `declared_sectors`; Windows then leaves roughly 1 MiB of partition slack after it.
+    let backup_offset = boot
+        .declared_sectors
+        .checked_mul(u64::from(boot.bytes_per_sector))
         .ok_or(InspectionError::GeometryOverflow {
             calculation: "NTFS backup boot-sector offset",
         })?;
@@ -713,7 +715,7 @@ fn reconcile_ntfs_mft_records(
         )
         .map_err(InspectionError::InvalidNtfsDiscovery)?;
         let bitmap_in_use = mft_bitmap_bit(mft_bitmap, record_number);
-        let file_record_in_use = record.flags.is_in_use();
+        let file_record_in_use = record.in_use();
         if bitmap_in_use != file_record_in_use {
             return Err(InspectionError::InvalidNtfsMftRecordReconciliation(
                 NtfsMftRecordReconciliationError::RecordStateMismatch {
@@ -990,14 +992,17 @@ const fn ntfs_health(
     mft_mirror: crate::fs::ntfs_discovery::MftMirrorEvidence,
 ) -> HealthState {
     match volume {
-        NtfsVolumeEvidence::Complete(information) if information.flags.raw != 0 => {
+        NtfsVolumeEvidence::Complete(information) if information.flags.requires_repair() => {
             HealthState::Dirty
         }
-        NtfsVolumeEvidence::Complete(_)
-            if matches!(
-                mft_mirror,
-                crate::fs::ntfs_discovery::MftMirrorEvidence::Exact { .. }
-            ) =>
+        // Bits nobody documents cannot be proven harmless; only the Windows `format` bit is
+        // vouched for by ntfs.sys mounting such volumes healthy.
+        NtfsVolumeEvidence::Complete(information)
+            if information.flags.unknown_bits == 0
+                && matches!(
+                    mft_mirror,
+                    crate::fs::ntfs_discovery::MftMirrorEvidence::Exact { .. }
+                ) =>
         {
             HealthState::Clean
         }
@@ -1587,6 +1592,42 @@ mod tests {
             inspect_image(&temp.0),
             Err(InspectionError::InvalidNtfs(
                 NtfsBootSectorError::ImageTooSmall { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn accepts_ntfs_backup_at_declared_end_with_windows_format_slack() {
+        // Windows `format` declares the volume short of the partition and writes the backup boot
+        // sector at sector `declared_sectors`, leaving ~1 MiB of zeroed slack after it.
+        let mut image = ntfs_image();
+        let declared_backup_offset = image.len() - 512;
+        image.extend(std::iter::repeat_n(0_u8, 1_048_576));
+        let temp = TempImage::write(&image);
+
+        let inspection = inspect_image(&temp.0).expect("Windows-style slack after the backup");
+        assert_eq!(inspection.profile.state.health, HealthState::Clean);
+        match &inspection.boot_redundancy {
+            BootRedundancy::Ntfs(region) => {
+                assert_eq!(
+                    region.backup_offset,
+                    u64::try_from(declared_backup_offset).unwrap()
+                );
+                assert_eq!(region.unaddressed_trailing_sectors, 2_048);
+            }
+            BootRedundancy::ExFat(_) => panic!("expected NTFS boot redundancy"),
+        }
+
+        // A backup copy left only in the partition's final sector is not where ntfs.sys looks.
+        let mut final_sector_only = image.clone();
+        final_sector_only[declared_backup_offset..declared_backup_offset + 512].fill(0);
+        let len = final_sector_only.len();
+        final_sector_only.copy_within(0..512, len - 512);
+        let temp = TempImage::write(&final_sector_only);
+        assert!(matches!(
+            inspect_image(&temp.0),
+            Err(InspectionError::InvalidNtfsBootRegion(
+                NtfsBootRegionError::InvalidBackup { .. }
             ))
         ));
     }
