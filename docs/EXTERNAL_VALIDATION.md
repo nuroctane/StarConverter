@@ -15,7 +15,7 @@ hashes. The non-elevated preflight therefore refused the regenerated candidates.
 Both pins were refreshed from the regenerated fixtures and now read:
 
 ```text
-converted Windows NTFS VHD   C1E66A7B355CA51A047AE302FF802EE0ACFDC34CA46FC48A382C953C15C9326C
+converted Windows NTFS VHD   1A51438BFD762272F4367A0411D4E14DC32F01F28A5E3B1B309AC094F69CEA36
 converted Windows exFAT VHD  3F52FE1A6997A5DAFBA4B66D4C7947E9DFAEAB801A578E597775D9C3F3F0EA41
 ```
 
@@ -85,8 +85,36 @@ pinned `mkntfs` source surfaced, all now corrected in the serializer:
 `export_external_fixtures` now applies the record fixups and asserts all four Windows-facing
 invariants (nonzero FILETIMEs, indexed `$FILE_NAME`, no `0x4` flag on records 0 through 11, and
 the `$UpCase:$Info` CRC) on every regenerated candidate. These byte changes moved the NTFS pin to
-`C1E6...326C`; the exFAT pin was again unaffected. Whether the Windows driver now mounts the
-candidate is answered by the next `windows-vhd` lane run.
+`C1E6...326C`; the exFAT pin was again unaffected.
+
+CI run 37589383889 confirmed those three fixes cleared the attribute-0x30 and uppercase-table
+messages, but `ntfs.sys` still refused the mount and `chkdsk` reported "Incorrect information was
+detected in file record segment" for records 2 through 10 (0, 1, and 11 were clean). A second
+record-level comparison against the Windows Server 2025 control explained the pattern, and the
+serializer now matches Windows and `mkntfs` on each point:
+
+- System records 1 through 23 carry sequence number `n` (`$MFT` keeps 1). The candidate wrote 1
+  everywhere except `$` root and `$Extend`, and `ntfs.sys` opens every system file through a
+  fixed `{record, sequence = record}` reference, so records 2 through 10 looked stale. Every
+  directory index entry and `$FILE_NAME` parent reference was already derived from the same rule,
+  so only the record headers changed.
+- `FILE_ATTRIBUTE_DIRECTORY` (`0x10`) never appears on disk. Windows and `mkntfs` keep the
+  directory bit in the FILE record flag and mark directory `$FILE_NAME`s and index entries with
+  `FILE_ATTRIBUTE_I30_INDEX_PRESENT` (`0x1000_0000`); the candidate had written `0x10` into both
+  `$STANDARD_INFORMATION` and `$FILE_NAME` and never set the `$I30` bit (the constant previously
+  named `FILE_ATTRIBUTE_VIEW_INDEX_PRESENT` held the `$I30` value; the view-index bit is
+  `0x2000_0000`). The root is additionally marked hidden and system as both formatters do, and
+  the NTFS-to-exFAT projection now derives the exFAT directory attribute from the object kind
+  instead of trusting a `0x10` bit that Windows volumes never carry.
+- `$Secure` carries MFT record flag `0x8` (`FILE_RECORD_IS_VIEW_INDEX`) and
+  `FILE_ATTRIBUTE_VIEW_INDEX_PRESENT` in both `$STANDARD_INFORMATION` and `$FILE_NAME`.
+- System-record `$STANDARD_INFORMATION` security IDs follow `mkntfs` and the control volume:
+  `0x101` on `$Volume`, root, `$Secure`, `$Extend`, and the `$Extend` children, `0x100` elsewhere.
+- `$Volume` carries the empty unnamed `$DATA` stream Windows and `mkntfs` both create.
+
+`export_external_fixtures` asserts each of these on every regenerated candidate alongside the
+earlier four invariants. The NTFS pin moved to `1A51...EA36`; the exFAT pin was unaffected.
+Whether the Windows driver now mounts the candidate is answered by the next `windows-vhd` lane run.
 
 ## 2026-09-01 forced NTFS-to-exFAT relocation qualification
 

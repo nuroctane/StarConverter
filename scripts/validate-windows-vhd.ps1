@@ -120,7 +120,7 @@ $cases = @(
         Name = "exFAT-to-NTFS rich conversion"
         File = "converted-rich-exfat-to-ntfs-windows.vhd"
         FileSystem = "NTFS"
-        Sha256 = "C1E66A7B355CA51A047AE302FF802EE0ACFDC34CA46FC48A382C953C15C9326C"
+        Sha256 = "1A51438BFD762272F4367A0411D4E14DC32F01F28A5E3B1B309AC094F69CEA36"
     },
     [pscustomobject]@{
         Name = "NTFS-to-exFAT rich conversion"

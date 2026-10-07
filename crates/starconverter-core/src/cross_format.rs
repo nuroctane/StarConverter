@@ -1982,8 +1982,14 @@ fn map_ntfs_source_object_metadata(
             .source
             .standard_information
             .ok_or(NtfsToExfatError::MissingStandardInformation(object.id))?;
-        let attributes = u16::try_from(standard.file_attributes & 0x37)
+        // NTFS keeps the directory bit in the FILE record flags, not in `$STANDARD_INFORMATION`
+        // (Windows never writes `FILE_ATTRIBUTE_DIRECTORY` there), so exFAT derives it from the
+        // normalized object kind.
+        let mut attributes = u16::try_from(standard.file_attributes & 0x37)
             .map_err(|_| NtfsToExfatError::AttributesOutsideExfatRange(object.id))?;
+        if object.kind == ObjectKind::Directory {
+            attributes |= EXFAT_ATTRIBUTE_DIRECTORY;
+        }
         let timestamps = map_ntfs_timestamps(
             standard.creation_time,
             standard.modification_time,

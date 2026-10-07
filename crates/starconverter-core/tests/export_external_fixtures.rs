@@ -805,108 +805,236 @@ fn export_windows_vhd_candidates(
 /// - every resident `$FILE_NAME` carries `RESIDENT_ATTR_IS_INDEXED`;
 /// - no record 0–11 carries `FILE_SYSTEM_FILE` (`0x4`), which Windows and `mkntfs` reserve for
 ///   the `$Extend` view-index children;
-/// - `$UpCase` carries the resident `$Info` stream with the pinned table CRC.
+/// - `$UpCase` carries the resident `$Info` stream with the pinned table CRC;
+/// - records 1–11 carry sequence number `n` (`$MFT` uses 1), the fixed references `ntfs.sys`
+///   opens them through;
+/// - `$Secure` is flagged `FILE_RECORD_IS_VIEW_INDEX` and its `$STANDARD_INFORMATION` carries
+///   `FILE_ATTRIBUTE_VIEW_INDEX_PRESENT`;
+/// - no `$STANDARD_INFORMATION` carries `FILE_ATTRIBUTE_DIRECTORY`; directories instead carry
+///   `FILE_ATTRIBUTE_I30_INDEX_PRESENT` in `$FILE_NAME` and the directory FILE record flag;
+/// - `$Volume` carries an empty unnamed `$DATA` stream.
 fn assert_ntfs_system_records_satisfy_windows_driver_invariants(vhd: &[u8]) {
     const PARTITION_BYTES: usize = 1024 * 1024;
     const CLUSTER_BYTES: usize = 4096;
     const RECORD_BYTES: usize = 1024;
     const MFT_LCN: usize = 4;
-    let u16_at = |bytes: &[u8], at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]);
-    let u32_at =
-        |bytes: &[u8], at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
-    let u64_at =
-        |bytes: &[u8], at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
     // Records 12–15 are free formatted reserved records in this profile and carry no attributes.
     for record_number in 0..12 {
         let start = PARTITION_BYTES + MFT_LCN * CLUSTER_BYTES + record_number * RECORD_BYTES;
-        let mut record = vhd[start..start + RECORD_BYTES].to_vec();
-        assert_eq!(&record[..4], b"FILE", "record {record_number} magic");
-        // Undo the update-sequence fixups so attribute headers that straddle a sector end parse.
-        let usa_offset = usize::from(u16_at(&record, 4));
-        let usa_count = usize::from(u16_at(&record, 6));
-        for sector in 1..usa_count {
-            let original = u16_at(&record, usa_offset + 2 * sector);
-            record[sector * 512 - 2..sector * 512].copy_from_slice(&original.to_le_bytes());
-        }
-        let record_flags = u16_at(&record, 0x16);
-        assert_eq!(
-            record_flags & 0x4,
-            0,
-            "record {record_number} carries FILE_SYSTEM_FILE"
-        );
-
-        let mut offset = usize::from(u16_at(&record, 0x14));
-        let mut saw_standard_information = false;
-        let mut saw_file_name = false;
-        let mut saw_upcase_info = false;
-        loop {
-            let attribute_type = u32_at(&record, offset);
-            if attribute_type == u32::MAX {
-                break;
-            }
-            let length = usize::try_from(u32_at(&record, offset + 4)).unwrap();
-            let non_resident = record[offset + 8] != 0;
-            let name_len = usize::from(record[offset + 9]);
-            let name_offset = usize::from(u16_at(&record, offset + 10));
-            let name: Vec<u16> = (0..name_len)
-                .map(|unit| u16_at(&record, offset + name_offset + 2 * unit))
-                .collect();
-            if !non_resident {
-                let value_offset = usize::from(u16_at(&record, offset + 0x14));
-                let value_len = usize::try_from(u32_at(&record, offset + 0x10)).unwrap();
-                let value = &record[offset + value_offset..offset + value_offset + value_len];
-                match attribute_type {
-                    0x10 => {
-                        saw_standard_information = true;
-                        for field in 0..4 {
-                            assert_ne!(
-                                u64_at(value, field * 8),
-                                0,
-                                "record {record_number} $STANDARD_INFORMATION"
-                            );
-                        }
-                    }
-                    0x30 => {
-                        saw_file_name = true;
-                        assert_eq!(
-                            record[offset + 0x16],
-                            1,
-                            "record {record_number} $FILE_NAME lacks RESIDENT_ATTR_IS_INDEXED"
-                        );
-                        for field in 0..4 {
-                            assert_ne!(
-                                u64_at(value, 8 + field * 8),
-                                0,
-                                "record {record_number} $FILE_NAME"
-                            );
-                        }
-                    }
-                    0x80 if record_number == 10
-                        && name == "$Info".encode_utf16().collect::<Vec<_>>() =>
-                    {
-                        saw_upcase_info = true;
-                        assert_eq!(value.len(), ntfs_upcase_serialize::NTFS_UPCASE_INFO_BYTES);
-                        assert_eq!(u32_at(value, 0), 32, "$UpCase:$Info length field");
-                        assert_eq!(
-                            u64_at(value, 8),
-                            ntfs_upcase_serialize::NTFS3G_WINDOWS61_UPCASE_INFO_CRC64,
-                            "$UpCase:$Info CRC-64"
-                        );
-                    }
-                    _ => {}
-                }
-            }
-            offset += length;
+        let record = SystemRecordView::parse(record_number, &vhd[start..start + RECORD_BYTES]);
+        record.assert_header();
+        let mut saw = SeenSystemAttributes::default();
+        for attribute in record.resident_attributes() {
+            record.assert_attribute(&attribute, &mut saw);
         }
         assert!(
-            saw_standard_information && saw_file_name,
+            saw.has("standard_information") && saw.has("file_name"),
             "system record {record_number} lacks $STANDARD_INFORMATION or $FILE_NAME"
         );
         assert!(
-            record_number != 10 || saw_upcase_info,
+            record_number != 10 || saw.has("upcase_info"),
             "$UpCase lacks the resident $Info stream"
         );
+        assert!(
+            record_number != 3 || saw.has("volume_data"),
+            "$Volume lacks the empty unnamed $DATA stream"
+        );
     }
+}
+
+/// Attribute types the per-record walk has already confirmed, keyed by on-disk type.
+#[derive(Default)]
+struct SeenSystemAttributes(std::collections::BTreeSet<&'static str>);
+
+impl SeenSystemAttributes {
+    fn mark(&mut self, which: &'static str) {
+        self.0.insert(which);
+    }
+
+    fn has(&self, which: &str) -> bool {
+        self.0.contains(which)
+    }
+}
+
+struct ResidentAttributeView {
+    attribute_type: u32,
+    name: Vec<u16>,
+    indexed: u8,
+    value: Vec<u8>,
+}
+
+struct SystemRecordView {
+    record_number: usize,
+    bytes: Vec<u8>,
+}
+
+impl SystemRecordView {
+    fn parse(record_number: usize, raw: &[u8]) -> Self {
+        let mut bytes = raw.to_vec();
+        assert_eq!(&bytes[..4], b"FILE", "record {record_number} magic");
+        // Undo the update-sequence fixups so attribute headers that straddle a sector end parse.
+        let usa_offset = usize::from(u16_at(&bytes, 4));
+        let usa_count = usize::from(u16_at(&bytes, 6));
+        for sector in 1..usa_count {
+            let original = u16_at(&bytes, usa_offset + 2 * sector);
+            bytes[sector * 512 - 2..sector * 512].copy_from_slice(&original.to_le_bytes());
+        }
+        Self {
+            record_number,
+            bytes,
+        }
+    }
+
+    fn flags(&self) -> u16 {
+        u16_at(&self.bytes, 0x16)
+    }
+
+    fn is_directory(&self) -> bool {
+        const FILE_RECORD_DIRECTORY: u16 = 0x2;
+        self.flags() & FILE_RECORD_DIRECTORY != 0
+    }
+
+    fn assert_header(&self) {
+        const FILE_RECORD_VIEW_INDEX: u16 = 0x8;
+        let record_number = self.record_number;
+        let flags = self.flags();
+        assert_eq!(
+            flags & 0x4,
+            0,
+            "record {record_number} carries FILE_SYSTEM_FILE"
+        );
+        let expected_sequence = if record_number == 0 { 1 } else { record_number };
+        assert_eq!(
+            usize::from(u16_at(&self.bytes, 0x10)),
+            expected_sequence,
+            "record {record_number} sequence number"
+        );
+        assert_eq!(
+            flags & FILE_RECORD_VIEW_INDEX != 0,
+            record_number == 9,
+            "record {record_number} FILE_RECORD_IS_VIEW_INDEX"
+        );
+        assert_eq!(
+            self.is_directory(),
+            matches!(record_number, 5 | 11),
+            "record {record_number} directory flag"
+        );
+    }
+
+    fn resident_attributes(&self) -> Vec<ResidentAttributeView> {
+        let mut attributes = Vec::new();
+        let mut offset = usize::from(u16_at(&self.bytes, 0x14));
+        loop {
+            let attribute_type = u32_at(&self.bytes, offset);
+            if attribute_type == u32::MAX {
+                return attributes;
+            }
+            let length = usize::try_from(u32_at(&self.bytes, offset + 4)).unwrap();
+            let non_resident = self.bytes[offset + 8] != 0;
+            let name_len = usize::from(self.bytes[offset + 9]);
+            let name_offset = usize::from(u16_at(&self.bytes, offset + 10));
+            let name: Vec<u16> = (0..name_len)
+                .map(|unit| u16_at(&self.bytes, offset + name_offset + 2 * unit))
+                .collect();
+            if !non_resident {
+                let value_offset = usize::from(u16_at(&self.bytes, offset + 0x14));
+                let value_len = usize::try_from(u32_at(&self.bytes, offset + 0x10)).unwrap();
+                attributes.push(ResidentAttributeView {
+                    attribute_type,
+                    name,
+                    indexed: self.bytes[offset + 0x16],
+                    value: self.bytes[offset + value_offset..offset + value_offset + value_len]
+                        .to_vec(),
+                });
+            }
+            offset += length;
+        }
+    }
+
+    fn assert_attribute(&self, attribute: &ResidentAttributeView, saw: &mut SeenSystemAttributes) {
+        const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+        const FILE_ATTRIBUTE_I30_INDEX_PRESENT: u32 = 0x1000_0000;
+        const FILE_ATTRIBUTE_VIEW_INDEX_PRESENT: u32 = 0x2000_0000;
+        let record_number = self.record_number;
+        let value = attribute.value.as_slice();
+        match attribute.attribute_type {
+            0x10 => {
+                saw.mark("standard_information");
+                for field in 0..4 {
+                    assert_ne!(
+                        u64_at(value, field * 8),
+                        0,
+                        "record {record_number} $STANDARD_INFORMATION"
+                    );
+                }
+                let attributes = u32_at(value, 32);
+                assert_eq!(
+                    attributes & FILE_ATTRIBUTE_DIRECTORY,
+                    0,
+                    "record {record_number} $STANDARD_INFORMATION carries 0x10"
+                );
+                assert_eq!(
+                    attributes & FILE_ATTRIBUTE_VIEW_INDEX_PRESENT != 0,
+                    record_number == 9,
+                    "record {record_number} $STANDARD_INFORMATION view-index bit"
+                );
+            }
+            0x30 => {
+                saw.mark("file_name");
+                assert_eq!(
+                    attribute.indexed, 1,
+                    "record {record_number} $FILE_NAME lacks RESIDENT_ATTR_IS_INDEXED"
+                );
+                for field in 0..4 {
+                    assert_ne!(
+                        u64_at(value, 8 + field * 8),
+                        0,
+                        "record {record_number} $FILE_NAME"
+                    );
+                }
+                let attributes = u32_at(value, 56);
+                assert_eq!(
+                    attributes & FILE_ATTRIBUTE_DIRECTORY,
+                    0,
+                    "record {record_number} $FILE_NAME carries 0x10"
+                );
+                assert_eq!(
+                    attributes & FILE_ATTRIBUTE_I30_INDEX_PRESENT != 0,
+                    self.is_directory(),
+                    "record {record_number} $FILE_NAME I30 bit"
+                );
+            }
+            0x80 if record_number == 3 && attribute.name.is_empty() => {
+                saw.mark("volume_data");
+                assert!(value.is_empty(), "$Volume unnamed $DATA must be empty");
+            }
+            0x80 if record_number == 10
+                && attribute.name == "$Info".encode_utf16().collect::<Vec<_>>() =>
+            {
+                saw.mark("upcase_info");
+                assert_eq!(value.len(), ntfs_upcase_serialize::NTFS_UPCASE_INFO_BYTES);
+                assert_eq!(u32_at(value, 0), 32, "$UpCase:$Info length field");
+                assert_eq!(
+                    u64_at(value, 8),
+                    ntfs_upcase_serialize::NTFS3G_WINDOWS61_UPCASE_INFO_CRC64,
+                    "$UpCase:$Info CRC-64"
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+const fn u16_at(bytes: &[u8], at: usize) -> u16 {
+    u16::from_le_bytes([bytes[at], bytes[at + 1]])
+}
+
+fn u32_at(bytes: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
+}
+
+fn u64_at(bytes: &[u8], at: usize) -> u64 {
+    u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
 }
 
 fn upper_hex(bytes: &[u8]) -> String {

@@ -114,7 +114,15 @@ const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0010;
 const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x0020;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
 const REPARSE_POINT: u32 = 0xc0;
-const FILE_ATTRIBUTE_VIEW_INDEX_PRESENT: u32 = 0x1000_0000;
+/// `$FILE_NAME`/`$STANDARD_INFORMATION` bit NTFS stores for a directory (`$I30` index present).
+/// `FILE_ATTRIBUTE_DIRECTORY` (`0x10`) itself never appears on disk.
+const FILE_ATTRIBUTE_I30_INDEX_PRESENT: u32 = 0x1000_0000;
+/// Bit NTFS stores on records whose indexes are view indexes (`$Secure`, `$Extend` children).
+const FILE_ATTRIBUTE_VIEW_INDEX_PRESENT: u32 = 0x2000_0000;
+/// `$Secure` and the `$Extend` children share the pinned `mkntfs` read/write descriptor; the
+/// remaining system files use the read-only one. Both live in the canonical `$Secure:$SDS`.
+const SYSTEM_FILE_SECURITY_ID_READ_ONLY: u32 = 0x100;
+const FILE_RECORD_VIEW_INDEX: u16 = 0x0008;
 const MFT_LCN: u64 = 4;
 const BOOT_FILE_BYTES: u64 = 8192;
 const MIN_MFT_BITMAP_BYTES: u64 = 8;
@@ -2948,13 +2956,6 @@ fn unused_record(record_number: u64) -> Result<Vec<u8>, NtfsSerializeError> {
     finish_record(record_number, 0, 0, Vec::new())
 }
 
-fn standard_information(
-    timestamps: NtfsObjectTimestamps,
-    attributes: u32,
-) -> Result<Vec<u8>, NtfsSerializeError> {
-    standard_information_with_security_id(timestamps, attributes, 0)
-}
-
 fn standard_information_with_security_id(
     timestamps: NtfsObjectTimestamps,
     attributes: u32,
@@ -2977,7 +2978,37 @@ fn standard_information_with_security_id(
     resident_attribute(STANDARD_INFORMATION, None, 0, &value)
 }
 
+/// `$STANDARD_INFORMATION` attribute bits of system record `record_number`, as `mkntfs` and the
+/// Windows formatter write them: hidden and system, plus the view-index bit on `$Secure`.
+const fn system_standard_information_attributes(record_number: u64) -> u32 {
+    match record_number {
+        9 => FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_VIEW_INDEX_PRESENT,
+        _ => FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM,
+    }
+}
+
+/// `$FILE_NAME` attribute bits of system record `record_number`; `$Extend` additionally carries
+/// the `$I30` index-present bit that only `$FILE_NAME` and index entries store.
+const fn system_file_name_attributes(record_number: u64) -> u32 {
+    match record_number {
+        11 => FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_I30_INDEX_PRESENT,
+        _ => system_standard_information_attributes(record_number),
+    }
+}
+
+fn system_standard_information(
+    record_number: u64,
+    timestamp: u64,
+) -> Result<Vec<u8>, NtfsSerializeError> {
+    standard_information_with_security_id(
+        NtfsObjectTimestamps::uniform(timestamp),
+        system_standard_information_attributes(record_number),
+        system_file_security_id(record_number),
+    )
+}
+
 fn system_file_name_attribute(
+    record_number: u64,
     name: &str,
     allocated: u64,
     logical: u64,
@@ -2990,7 +3021,7 @@ fn system_file_name_attribute(
         &name,
         allocated,
         logical,
-        FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM,
+        system_file_name_attributes(record_number),
         NtfsObjectTimestamps::uniform(timestamp),
         0,
     )?;
@@ -3003,11 +3034,9 @@ fn system_mft_record(
     timestamp: u64,
 ) -> Result<Vec<u8>, NtfsSerializeError> {
     let attrs = vec![
-        standard_information(
-            NtfsObjectTimestamps::uniform(timestamp),
-            FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM,
-        )?,
+        system_standard_information(record_number, timestamp)?,
         system_file_name_attribute(
+            record_number,
             "$MFT",
             layout.mft_clusters * layout.cluster,
             layout.record_count as u64 * RECORD_BYTES as u64,
@@ -3054,11 +3083,15 @@ fn system_data_record(
         FILE_RECORD_IN_USE,
         1,
         vec![
-            standard_information(
-                NtfsObjectTimestamps::uniform(timestamp),
-                FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM,
+            system_standard_information(record_number, timestamp)?,
+            system_file_name_attribute(
+                record_number,
+                name,
+                clusters * cluster,
+                logical,
+                timestamp,
+                1,
             )?,
-            system_file_name_attribute(name, clusters * cluster, logical, timestamp, 1)?,
             nonresident_attribute(
                 DATA,
                 (lcn, clusters),
@@ -3092,11 +3125,15 @@ fn upcase_record(
         FILE_RECORD_IN_USE,
         1,
         vec![
-            standard_information(
-                NtfsObjectTimestamps::uniform(timestamp),
-                FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM,
+            system_standard_information(record_number, timestamp)?,
+            system_file_name_attribute(
+                record_number,
+                "$UpCase",
+                allocated,
+                table_bytes,
+                timestamp,
+                1,
             )?,
-            system_file_name_attribute("$UpCase", allocated, table_bytes, timestamp, 1)?,
             nonresident_attribute(
                 DATA,
                 (layout.upcase_lcn, layout.upcase_clusters),
@@ -3123,11 +3160,8 @@ fn badclus_record(
         FILE_RECORD_IN_USE,
         1,
         vec![
-            standard_information(
-                NtfsObjectTimestamps::uniform(timestamp),
-                FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM,
-            )?,
-            system_file_name_attribute("$BadClus", 0, 0, timestamp, 1)?,
+            system_standard_information(record_number, timestamp)?,
+            system_file_name_attribute(record_number, "$BadClus", 0, 0, timestamp, 1)?,
             resident_attribute(DATA, None, 2, &[])?,
             badclus_attribute(badclus, 3)?,
         ],
@@ -3158,14 +3192,12 @@ fn secure_record(
     )?;
     finish_record(
         record_number,
-        FILE_RECORD_IN_USE,
+        FILE_RECORD_IN_USE | FILE_RECORD_VIEW_INDEX,
         1,
         vec![
-            standard_information(
-                NtfsObjectTimestamps::uniform(timestamp),
-                FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM,
-            )?,
+            system_standard_information(record_number, timestamp)?,
             system_file_name_attribute(
+                record_number,
                 "$Secure",
                 layout.secure_sds_clusters * layout.cluster,
                 u64::try_from(secure.sds.len())
@@ -3494,9 +3526,10 @@ fn extend_record_prefix_attributes(
         0,
     )?;
     Ok(vec![
-        standard_information(
+        standard_information_with_security_id(
             NtfsObjectTimestamps::uniform(timestamp),
             spec.standard_information_file_attributes,
+            NTFS3G_SECURITY_ID_READ_WRITE,
         )?,
         resident_attribute(FILE_NAME, None, 1, &file_name)?,
     ])
@@ -3622,9 +3655,10 @@ fn extend_directory_record(
         spec.mft_flags,
         1,
         vec![
-            standard_information(
+            standard_information_with_security_id(
                 NtfsObjectTimestamps::uniform(timestamp),
                 spec.standard_information_file_attributes,
+                NTFS3G_SECURITY_ID_READ_WRITE,
             )?,
             resident_attribute(FILE_NAME, None, 1, &file_name)?,
             resident_attribute(INDEX_ROOT, Some(&index_name), 2, &root)?,
@@ -3650,9 +3684,10 @@ fn extend_child_record(
         0,
     )?;
     let mut attributes = vec![
-        standard_information(
+        standard_information_with_security_id(
             NtfsObjectTimestamps::uniform(timestamp),
             spec.standard_information_file_attributes,
+            NTFS3G_SECURITY_ID_READ_WRITE,
         )?,
         resident_attribute(FILE_NAME, None, 1, &file_name)?,
     ];
@@ -3773,11 +3808,8 @@ fn volume_record(timestamp: u64, label: Option<&[u16]>) -> Result<Vec<u8>, NtfsS
     info[8] = 3;
     info[9] = 1;
     let mut attributes = vec![
-        standard_information(
-            NtfsObjectTimestamps::uniform(timestamp),
-            FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM,
-        )?,
-        system_file_name_attribute("$Volume", 0, 0, timestamp, 1)?,
+        system_standard_information(3, timestamp)?,
+        system_file_name_attribute(3, "$Volume", 0, 0, timestamp, 1)?,
     ];
     let volume_information_id = if let Some(label) = label {
         let mut bytes = Vec::new();
@@ -3797,6 +3829,13 @@ fn volume_record(timestamp: u64, label: Option<&[u16]>) -> Result<Vec<u8>, NtfsS
         None,
         volume_information_id,
         &info,
+    )?);
+    // Both `mkntfs` and the Windows formatter give `$Volume` an empty unnamed `$DATA` stream.
+    attributes.push(resident_attribute(
+        DATA,
+        None,
+        volume_information_id + 1,
+        &[],
     )?);
     finish_record(3, FILE_RECORD_IN_USE, 1, attributes)
 }
@@ -4238,13 +4277,17 @@ fn directory_prefix_attributes(
     reparse_point: Option<&[u8]>,
 ) -> Result<Vec<Vec<u8>>, NtfsSerializeError> {
     let mut dos_file_attributes = object_metadata.dos_file_attributes;
+    if record_number == 5 {
+        // Both reference formatters mark the root directory hidden and system.
+        dos_file_attributes |= FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM;
+    }
     let reparse_tag = reparse_point.map_or(0, |payload| {
         dos_file_attributes |= FILE_ATTRIBUTE_REPARSE_POINT;
         reparse_tag(payload)
     });
     let mut attributes = vec![standard_information_with_security_id(
         object_metadata.timestamps,
-        dos_file_attributes,
+        standard_information_attributes(dos_file_attributes),
         object_metadata.security_id,
     )?];
     for (index, entry) in names.iter().enumerate() {
@@ -4259,7 +4302,7 @@ fn directory_prefix_attributes(
             &entry.name,
             0,
             0,
-            dos_file_attributes,
+            file_name_attributes(dos_file_attributes, ObjectKind::Directory),
             object_metadata.timestamps,
             reparse_tag,
         )?;
@@ -4310,8 +4353,11 @@ fn directory_index_entries(
         let stream = object.streams.first();
         let metadata = metadata_by_object[&child.target];
         let reparse_payload = reparse_by_object.get(&child.target);
-        let file_attributes = metadata.dos_file_attributes
-            | reparse_payload.map_or(0, |_| FILE_ATTRIBUTE_REPARSE_POINT);
+        let file_attributes = file_name_attributes(
+            metadata.dos_file_attributes
+                | reparse_payload.map_or(0, |_| FILE_ATTRIBUTE_REPARSE_POINT),
+            object.kind,
+        );
         let reparse_tag_or_ea_size = reparse_payload.map_or(0_u32, |payload| reparse_tag(payload));
         entries.push(NtfsDirectoryIndexEntry {
             file_reference: NtfsFileReference {
@@ -4415,10 +4461,10 @@ fn system_directory_index_entries(
             access_time: uniform.access_time,
             allocated_size,
             data_size,
-            file_attributes: if record_number == 11 {
-                attributes | FILE_ATTRIBUTE_VIEW_INDEX_PRESENT
-            } else {
-                attributes
+            file_attributes: match record_number {
+                9 => attributes | FILE_ATTRIBUTE_VIEW_INDEX_PRESENT,
+                11 => attributes | FILE_ATTRIBUTE_I30_INDEX_PRESENT,
+                _ => attributes,
             },
             reparse_tag_or_ea_size: 0,
             namespace: FileNameNamespace::Win32,
@@ -5624,7 +5670,7 @@ fn file_attributes(
     let mut next_id = 1_u16;
     let mut attrs = vec![standard_information_with_security_id(
         metadata.timestamps,
-        dos_file_attributes,
+        standard_information_attributes(dos_file_attributes),
         metadata.security_id,
     )?];
     for entry in names {
@@ -5633,7 +5679,7 @@ fn file_attributes(
             &entry.name,
             allocated,
             logical,
-            dos_file_attributes,
+            file_name_attributes(dos_file_attributes, object.kind),
             metadata.timestamps,
             reparse_tag,
         )?;
@@ -5761,7 +5807,13 @@ fn finish_record(
     hard_links: u16,
     attributes: Vec<Vec<u8>>,
 ) -> Result<Vec<u8>, NtfsSerializeError> {
-    finish_record_with_sequence(record_number, 1, flags, hard_links, attributes)
+    finish_record_with_sequence(
+        record_number,
+        record_sequence(record_number),
+        flags,
+        hard_links,
+        attributes,
+    )
 }
 
 fn finish_record_with_sequence(
@@ -6559,11 +6611,39 @@ const fn mft_reference_with_sequence(record_number: u64, sequence_number: u16) -
     ((sequence_number as u64) << 48) | record_number
 }
 
+/// Sequence number of a freshly formatted record. `ntfs.sys` opens every system file through a
+/// fixed `{record, sequence = record}` reference (`$MFT` uses 1) and treats a mismatch as
+/// corruption; `mkntfs` applies the same rule to records 1 through 23.
 const fn record_sequence(record_number: u64) -> u16 {
     match record_number {
-        5 => 5,
-        11 => 11,
+        // The arm bounds the value to 23, so the narrowing cannot truncate.
+        #[allow(clippy::cast_possible_truncation)]
+        1..=23 => record_number as u16,
         _ => 1,
+    }
+}
+
+/// On-disk `$STANDARD_INFORMATION` attribute bits for the semantic `dos_file_attributes`.
+/// `FILE_ATTRIBUTE_DIRECTORY` is carried by the FILE record flag and by
+/// `FILE_ATTRIBUTE_I30_INDEX_PRESENT` in `$FILE_NAME`, never by this bit.
+const fn standard_information_attributes(dos_file_attributes: u32) -> u32 {
+    dos_file_attributes & !FILE_ATTRIBUTE_DIRECTORY
+}
+
+/// On-disk `$FILE_NAME` (and directory index entry) attribute bits for one object.
+const fn file_name_attributes(dos_file_attributes: u32, kind: ObjectKind) -> u32 {
+    let attributes = standard_information_attributes(dos_file_attributes);
+    match kind {
+        ObjectKind::Directory => attributes | FILE_ATTRIBUTE_I30_INDEX_PRESENT,
+        ObjectKind::File => attributes,
+    }
+}
+
+/// `mkntfs` security IDs for the system records; see `SYSTEM_FILE_SECURITY_ID_READ_ONLY`.
+const fn system_file_security_id(record_number: u64) -> u32 {
+    match record_number {
+        3 | 9 | 11 => NTFS3G_SECURITY_ID_READ_WRITE,
+        _ => SYSTEM_FILE_SECURITY_ID_READ_ONLY,
     }
 }
 

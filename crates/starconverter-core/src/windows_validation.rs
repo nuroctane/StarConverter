@@ -23,7 +23,7 @@ pub const NTFS_CASE_NAME: &str = "exFAT-to-NTFS rich conversion";
 /// The fixture exporter regenerates that VHD and asserts this value, so any serializer change that
 /// alters the candidate bytes fails CI until the pin here, in `scripts/validate-windows-vhd.ps1`,
 /// and in `docs/EXTERNAL_VALIDATION.md` is refreshed deliberately.
-pub const NTFS_CASE_HASH: &str = "C1E66A7B355CA51A047AE302FF802EE0ACFDC34CA46FC48A382C953C15C9326C";
+pub const NTFS_CASE_HASH: &str = "1A51438BFD762272F4367A0411D4E14DC32F01F28A5E3B1B309AC094F69CEA36";
 /// Pinned case name for the NTFS-to-exFAT rich-conversion Windows VHD candidate.
 pub const EXFAT_CASE_NAME: &str = "NTFS-to-exFAT rich conversion";
 /// Pinned upper-case SHA-256 of `converted-rich-ntfs-to-exfat-windows.vhd`.
@@ -1007,7 +1007,7 @@ mod tests {
                 .iter()
                 .all(|case| case.driver_evidence().is_none())
         );
-        assert_eq!(evidence.cases()[0].sha256()[0], 0xc1);
+        assert_eq!(evidence.cases()[0].sha256()[0], 0x1a);
     }
 
     #[test]
