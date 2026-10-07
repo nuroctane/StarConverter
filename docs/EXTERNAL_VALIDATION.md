@@ -413,6 +413,23 @@ python3 scripts/validate-formatter-ads.py target --cli <starconverter executable
 python3 -m unittest discover -s scripts -p test_formatter_ads.py
 ```
 
+The CI `external-images` job runs this probe on every push with the Ubuntu `ntfs-3g` and
+`exfatprogs` packages and uploads `target/formatter-ads-report.json` with the other evidence.
+
+Without root or network in WSL, the same tools run from an unpacked validator root. Download the
+`ntfs-3g`, `libntfs-3g89t64`, and `exfatprogs` `.deb` packages into one directory, then:
+
+```text
+powershell -File scripts/validate-formatter-ads.ps1 -DebDirectory <deb directory>
+```
+
+The driver builds the CLI, calls `scripts/extract-validator-bundle.sh` (`dpkg -x` into
+`/tmp/starconverter-validators-current/root`, refusing roots outside `/tmp` or `$HOME` and
+failing on missing tools or unresolved shared libraries) only when the root lacks `mkntfs`, runs
+the probe through `scripts/run-formatter-ads-probe.sh` with that root on `PATH` and
+`LD_LIBRARY_PATH`, refuses an existing report name, and prints the descriptor digests from the
+passing report. Both shell helpers also run directly on Linux.
+
 The October 2026 NTFS-3G 2022.10.3 run is **not a passing round-trip qualification**. It exposed
 nonzero quadword-alignment slack after a mapping-pairs zero terminator, left by resident-to-
 nonresident promotion. Attribute parsing now accepts at most seven such alignment bytes without
@@ -456,7 +473,8 @@ in-tree with regression tests:
 Tools: NTFS-3G 2022.10.3 (`mkntfs`, `ntfscp`, `ntfsls`, `ntfscat`, `ntfsinfo`, `ntfsfix`) and
 exfatprogs 1.2.2 (`fsck.exfat`) from the Ubuntu noble packages, unpacked into a WSL root without
 installation. Report `target/formatter-ads-report-security-capture-04.json`, schema
-`starconverter.formatter-ads.v2`, `passed: true`, no failures.
+`starconverter.formatter-ads.v2`, `passed: true`, no failures; the repository driver
+`scripts/validate-formatter-ads.ps1` reproduced the identical result (`…-capture-06.json`).
 
 | Object | Source | Restored | SHA-256 |
 | --- | --- | --- | --- |

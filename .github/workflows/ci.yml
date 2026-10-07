@@ -44,6 +44,13 @@ jobs:
       - name: Traverse large NTFS directory without mounting
         if: ${{ !cancelled() && steps.generate.outcome == 'success' }}
         run: python3 scripts/validate-large-directory.py target/external-large-directory-fixtures --report target/large-directory-report.json
+      - name: Build CLI for the formatter-origin probe
+        id: cli
+        if: ${{ !cancelled() }}
+        run: cargo build -p starconverter-cli
+      - name: Round-trip a formatter-origin NTFS image with ADS and inline security descriptors
+        if: ${{ !cancelled() && steps.cli.outcome == 'success' }}
+        run: python3 scripts/validate-formatter-ads.py target --cli target/debug/starconverter --report target/formatter-ads-report.json
       - name: Upload independent evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -53,6 +60,7 @@ jobs:
             target/external-unmounted-report.json
             target/ntfs-payload-report.json
             target/large-directory-report.json
+            target/formatter-ads-report.json
           if-no-files-found: warn
 
   rust:
