@@ -442,9 +442,60 @@ function Export-PartitionImage {
     }
 }
 
+# VHD footer layout (fixed disks): the 512-byte footer trails the disk bytes; its checksum at
+# +0x40 is the big-endian one's complement of the byte sum with the checksum field zeroed, and
+# the 16-byte UniqueId lives at +0x44.
+$vhdFooterChecksumOffset = 0x40
+$vhdFooterUniqueIdOffset = 0x44
+$mbrDiskSignatureOffset = 0x1B8
+
+function Get-VhdFooterChecksum {
+    param([byte[]]$Footer)
+    [long]$sum = 0
+    for ($i = 0; $i -lt $Footer.Length; $i++) {
+        if ($i -ge $vhdFooterChecksumOffset -and $i -lt ($vhdFooterChecksumOffset + 4)) { continue }
+        $sum += [long]$Footer[$i]
+    }
+    return [uint32]((-bnot $sum) -band [long][uint32]::MaxValue)
+}
+
+function Read-BigEndianUInt32 {
+    param([byte[]]$Buffer, [int]$Offset)
+    [long]$value = 0
+    for ($i = 0; $i -lt 4; $i++) {
+        $value = ($value * 256) + [long]$Buffer[$Offset + $i]
+    }
+    return [uint32]$value
+}
+
+function Write-BigEndianUInt32 {
+    param([byte[]]$Buffer, [int]$Offset, [uint32]$Value)
+    [long]$remaining = $Value
+    for ($i = 3; $i -ge 0; $i--) {
+        $Buffer[$Offset + $i] = [byte]($remaining % 256)
+        $remaining = [long][Math]::Floor($remaining / 256)
+    }
+}
+
+function New-RandomBytes {
+    param([int]$Count)
+    $bytes = New-Object byte[] $Count
+    $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $rng.GetBytes($bytes)
+    }
+    finally {
+        $rng.Dispose()
+    }
+    return , $bytes
+}
+
 # Splices a converted partition image back between the exact MBR region and VHD footer Windows
 # wrote for the source. The partition geometry is unchanged, so Windows' own partition table and
 # footer describe the candidate exactly; StarConverter's VHD writer is deliberately not involved.
+# The MBR disk signature and the footer UniqueId are replaced with fresh random values so the
+# mount manager cannot reuse the source disk's cached volume identity (and with it the source
+# filesystem's view) for the candidate.
 function New-CandidateVhd {
     param([string]$SourceVhdPath, [string]$ImagePath, [string]$CandidateVhdPath)
     if (Test-Path -LiteralPath $CandidateVhdPath) {
@@ -479,6 +530,51 @@ function New-CandidateVhd {
     $item = Get-Item -LiteralPath $CandidateVhdPath -Force
     if ($item.Length -ne $vhdBytes) {
         throw "Candidate VHD is $($item.Length) bytes, expected $vhdBytes"
+    }
+
+    $candidate = [IO.File]::Open($CandidateVhdPath, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    try {
+        $mbr = New-Object byte[] 512
+        $null = $candidate.Seek(0, [IO.SeekOrigin]::Begin)
+        if ($candidate.Read($mbr, 0, 512) -ne 512) { throw "Short read of candidate MBR" }
+        if ($mbr[510] -ne 0x55 -or $mbr[511] -ne 0xAA) {
+            throw "Candidate MBR lacks the 0x55AA boot signature"
+        }
+        $oldSignature = [BitConverter]::ToUInt32($mbr, $mbrDiskSignatureOffset)
+        do {
+            $signatureBytes = New-RandomBytes -Count 4
+            $newSignature = [BitConverter]::ToUInt32($signatureBytes, 0)
+        } while ($newSignature -eq 0 -or $newSignature -eq $oldSignature)
+        [Array]::Copy($signatureBytes, 0, $mbr, $mbrDiskSignatureOffset, 4)
+        $null = $candidate.Seek(0, [IO.SeekOrigin]::Begin)
+        $candidate.Write($mbr, 0, 512)
+
+        $footer = New-Object byte[] 512
+        $null = $candidate.Seek($diskBytes, [IO.SeekOrigin]::Begin)
+        if ($candidate.Read($footer, 0, 512) -ne 512) { throw "Short read of candidate VHD footer" }
+        if ([Text.Encoding]::ASCII.GetString($footer, 0, 8) -ne "conectix") {
+            throw "Candidate VHD footer lacks the conectix cookie"
+        }
+        $storedChecksum = Read-BigEndianUInt32 -Buffer $footer -Offset $vhdFooterChecksumOffset
+        $computedChecksum = Get-VhdFooterChecksum -Footer $footer
+        if ($storedChecksum -ne $computedChecksum) {
+            throw ("Source VHD footer checksum mismatch: stored 0x{0:X8}, computed 0x{1:X8}" -f $storedChecksum, $computedChecksum)
+        }
+        $oldUniqueId = [Guid]::new([byte[]]$footer[$vhdFooterUniqueIdOffset..($vhdFooterUniqueIdOffset + 15)])
+        $newUniqueId = [Guid]::NewGuid()
+        [Array]::Copy($newUniqueId.ToByteArray(), 0, $footer, $vhdFooterUniqueIdOffset, 16)
+        Write-BigEndianUInt32 -Buffer $footer -Offset $vhdFooterChecksumOffset -Value (Get-VhdFooterChecksum -Footer $footer)
+        $null = $candidate.Seek($diskBytes, [IO.SeekOrigin]::Begin)
+        $candidate.Write($footer, 0, 512)
+        $candidate.Flush($true)
+        Write-Line ("candidate identity: disk signature 0x{0:X8} -> 0x{1:X8}, vhd id {2} -> {3}" -f $oldSignature, $newSignature, $oldUniqueId, $newUniqueId)
+    }
+    finally {
+        $candidate.Dispose()
+    }
+    $item = Get-Item -LiteralPath $CandidateVhdPath -Force
+    if ($item.Length -ne $vhdBytes) {
+        throw "Candidate VHD is $($item.Length) bytes after identity rewrite, expected $vhdBytes"
     }
 }
 
@@ -572,6 +668,21 @@ function Invoke-DriverJudgment {
         finally {
             $ErrorActionPreference = $previous
         }
+        # CHKDSK names the filesystem it actually examined; a mismatch means it judged some other
+        # volume view (for example a stale identity), and its verdict would be meaningless either way.
+        $reportedType = $null
+        foreach ($line in $chkdskOutput) {
+            if ($line -match '^The type of the file system is (\S+)\.') {
+                $reportedType = $Matches[1]
+                break
+            }
+        }
+        if ($null -eq $reportedType) {
+            throw "CHKDSK did not report the file system type it examined."
+        }
+        if ($reportedType -ine $FileSystem) {
+            throw "CHKDSK examined a $reportedType volume, expected $FileSystem."
+        }
         if ($chkdskExit -ne 0) {
             throw "CHKDSK reported exit code $chkdskExit; no repair was attempted."
         }
@@ -650,6 +761,7 @@ foreach ($origin in @("NTFS", "exFAT")) {
         $results += [pscustomobject]@{
             Name = $forwardName
             Origin = $origin
+            RestoreEscrow = $false
             SourceVhdPath = $sourceVhd
             SourceVhdSha256 = $sourceVhdHash
             SourceImageSha256 = $sourceImageHash
@@ -662,14 +774,24 @@ foreach ($origin in @("NTFS", "exFAT")) {
         foreach ($stale in @($backImage, $backEscrow)) {
             if (Test-Path -LiteralPath $stale) { Remove-Item -LiteralPath $stale -Force }
         }
-        $backOutput = Invoke-Cli -Label "roundtrip-$lower" -Arguments @("convert-image", $forwardImage, $backImage, "--to", $lower, "--restore-escrow", $forwardEscrow)
+        # Escrow restore exists only for the exFAT -> NTFS direction today, so the NTFS origin
+        # round trip restores identities (and must reproduce exact SDDL), while the exFAT origin
+        # round trip is a plain conversion judged on payload bytes alone.
+        $restoreEscrow = ($origin -ieq "NTFS")
+        $backArguments = @("convert-image", $forwardImage, $backImage, "--to", $lower)
+        if ($restoreEscrow) {
+            $backArguments += @("--restore-escrow", $forwardEscrow)
+        }
+        $backOutput = Invoke-Cli -Label "roundtrip-$lower" -Arguments $backArguments
         Invoke-Cli -Label "verify-roundtrip-$lower" -Arguments @("verify-export", $backImage, $backEscrow, "--source", $forwardImage) | Out-Null
         $backVhd = Join-Path $workDirectory "roundtrip-$lower.vhd"
         New-CandidateVhd -SourceVhdPath $sourceVhd -ImagePath $backImage -CandidateVhdPath $backVhd
-        $back = Invoke-DriverJudgment -Name $roundTripName -CandidateVhdPath $backVhd -FileSystem $origin -Payloads $populated.Payloads -Security $populated.Security
+        $backSecurity = if ($restoreEscrow) { $populated.Security } else { @() }
+        $back = Invoke-DriverJudgment -Name $roundTripName -CandidateVhdPath $backVhd -FileSystem $origin -Payloads $populated.Payloads -Security $backSecurity
         $results += [pscustomobject]@{
             Name = $roundTripName
             Origin = $origin
+            RestoreEscrow = $restoreEscrow
             SourceVhdPath = $sourceVhd
             SourceVhdSha256 = $sourceVhdHash
             SourceImageSha256 = $sourceImageHash

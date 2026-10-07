@@ -118,6 +118,7 @@ impl WindowsOriginValidationEvidence {
 pub struct WindowsOriginCaseEvidence {
     name: String,
     origin: FileSystem,
+    restore_escrow: bool,
     source_vhd_path: String,
     source_vhd_sha256: [u8; 32],
     source_image_sha256: [u8; 32],
@@ -133,6 +134,13 @@ impl WindowsOriginCaseEvidence {
     #[must_use]
     pub const fn origin(&self) -> FileSystem {
         self.origin
+    }
+
+    /// Whether the conversion replayed the forward escrow so the candidate carries the source
+    /// identities (only the NTFS round trip; exFAT-direction restore does not exist yet).
+    #[must_use]
+    pub const fn restore_escrow(&self) -> bool {
+        self.restore_escrow
     }
 
     #[must_use]
@@ -288,6 +296,7 @@ struct RawReport {
 struct RawCase {
     name: String,
     origin: String,
+    restore_escrow: bool,
     source_vhd_path: String,
     source_vhd_sha256: String,
     source_image_sha256: String,
@@ -421,7 +430,11 @@ struct CaseIdentity {
     index: usize,
     origin: FileSystem,
     candidate: FileSystem,
-    /// Only an NTFS volume that started as NTFS can be asked to serve the same descriptors.
+    /// Only the NTFS round trip replays the forward escrow; exFAT-direction restore does not
+    /// exist yet, and forward conversions never restore.
+    restores_escrow: bool,
+    /// Only an NTFS volume that started as NTFS and had its identities restored can be asked to
+    /// serve the same descriptors.
     carries_security: bool,
 }
 
@@ -431,24 +444,28 @@ fn case_identity(name: &str) -> Result<CaseIdentity, WindowsValidationError> {
             index: 0,
             origin: FileSystem::Ntfs,
             candidate: FileSystem::ExFat,
+            restores_escrow: false,
             carries_security: false,
         },
         NTFS_ROUND_TRIP_CASE_NAME => CaseIdentity {
             index: 1,
             origin: FileSystem::Ntfs,
             candidate: FileSystem::Ntfs,
+            restores_escrow: true,
             carries_security: true,
         },
         EXFAT_FORWARD_CASE_NAME => CaseIdentity {
             index: 2,
             origin: FileSystem::ExFat,
             candidate: FileSystem::Ntfs,
+            restores_escrow: false,
             carries_security: false,
         },
         EXFAT_ROUND_TRIP_CASE_NAME => CaseIdentity {
             index: 3,
             origin: FileSystem::ExFat,
             candidate: FileSystem::ExFat,
+            restores_escrow: false,
             carries_security: false,
         },
         _ => {
@@ -510,6 +527,11 @@ fn validate_case(
             "case origin does not match its name",
         ));
     }
+    if case.restore_escrow != identity.restores_escrow {
+        return Err(WindowsValidationError::InvalidEvidence(
+            "case escrow restore flag does not match its name",
+        ));
+    }
     if !valid_local_vhd_path(&case.source_vhd_path) {
         return Err(WindowsValidationError::InvalidEvidence(
             "source VHD path is not a local drive-absolute .vhd path",
@@ -531,6 +553,7 @@ fn validate_case(
     Ok(WindowsOriginCaseEvidence {
         name: case.name,
         origin: identity.origin,
+        restore_escrow: case.restore_escrow,
         source_vhd_path: case.source_vhd_path,
         source_vhd_sha256,
         source_image_sha256,
@@ -808,6 +831,28 @@ fn check_shared_sources(cases: &[WindowsOriginCaseEvidence]) -> Result<(), Windo
             ));
         }
     }
+    check_distinct_volume_identities(cases)
+}
+
+/// Every candidate is a freshly identified disk, so Windows must have assigned each one its own
+/// volume GUID; a repeat means the mount manager reused a cached identity and the driver may
+/// have judged a stale view rather than the candidate's bytes.
+fn check_distinct_volume_identities(
+    cases: &[WindowsOriginCaseEvidence],
+) -> Result<(), WindowsValidationError> {
+    for (index, case) in cases.iter().enumerate() {
+        let repeated = cases[..index].iter().any(|earlier| {
+            earlier
+                .candidate
+                .volume_guid_path
+                .eq_ignore_ascii_case(&case.candidate.volume_guid_path)
+        });
+        if repeated {
+            return Err(WindowsValidationError::InvalidEvidence(
+                "two candidates report the same volume GUID path",
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -871,8 +916,19 @@ mod tests {
         ))
         .unwrap();
         let candidate_path = serde_json::to_string(candidate_path).unwrap();
+        let restore_escrow = name == NTFS_ROUND_TRIP_CASE_NAME;
+        // Each fixture candidate gets its own volume GUID, derived from its digest.
+        let h = candidate_hash.to_ascii_lowercase();
+        let guid = format!(
+            "{}-{}-{}-{}-{}",
+            &h[0..8],
+            &h[8..12],
+            &h[12..16],
+            &h[16..20],
+            &h[20..32]
+        );
         format!(
-            r#"{{"Name":"{name}","Origin":"{origin}","SourceVhdPath":{source_path},"SourceVhdSha256":"{source_hash}","SourceImageSha256":"{image_hash}","Candidate":{{"FileSystem":"{candidate_fs}","VhdPath":{candidate_path},"VhdBytes":41943552,"Sha256Before":"{candidate_hash}","Sha256After":"{candidate_hash}","ReadOnlyAttached":true,"NoDriveLetter":true,"DetachedAfter":true,"PartitionOffsetBytes":1048576,"VolumeGuidPath":"\\\\?\\Volume{{01234567-89ab-cdef-0123-456789abcdef}}\\","Payloads":[{}],"Security":[{security}],"ChkdskExitCode":0,"ChkdskOutput":["Windows has scanned the file system and found no problems."]}}}}"#,
+            r#"{{"Name":"{name}","Origin":"{origin}","RestoreEscrow":{restore_escrow},"SourceVhdPath":{source_path},"SourceVhdSha256":"{source_hash}","SourceImageSha256":"{image_hash}","Candidate":{{"FileSystem":"{candidate_fs}","VhdPath":{candidate_path},"VhdBytes":41943552,"Sha256Before":"{candidate_hash}","Sha256After":"{candidate_hash}","ReadOnlyAttached":true,"NoDriveLetter":true,"DetachedAfter":true,"PartitionOffsetBytes":1048576,"VolumeGuidPath":"\\\\?\\Volume{{{guid}}}\\","Payloads":[{}],"Security":[{security}],"ChkdskExitCode":0,"ChkdskOutput":["Windows has scanned the file system and found no problems."]}}}}"#,
             payload_json()
         )
     }
@@ -999,6 +1055,13 @@ mod tests {
         assert_eq!(expected_security_paths().len(), 11);
     }
 
+    /// A full report in which only case `index` has `from` replaced by `to` (first occurrence).
+    fn report_with_case_edited(index: usize, from: &str, to: &str) -> String {
+        let mut cases = cases();
+        cases[index] = cases[index].replacen(from, to, 1);
+        report_with(&cases)
+    }
+
     #[test]
     fn rejects_unknown_missing_duplicate_and_mismatched_cases() {
         let cases = cases();
@@ -1006,29 +1069,22 @@ mod tests {
             &report_with(&cases[..3]),
             "schema v1 requires exactly the four Windows-origin cases",
         );
-        let mut duplicated = cases.clone();
-        duplicated[3] = duplicated[2].clone();
+        let duplicated = [&cases[0], &cases[1], &cases[2], &cases[2]].map(String::clone);
         invalid(&report_with(&duplicated), "duplicate Windows-origin case");
-        let mut renamed = cases.clone();
-        renamed[0] = renamed[0].replace(NTFS_FORWARD_CASE_NAME, "Windows NTFS to NTFS");
-        invalid(&report_with(&renamed), "unexpected Windows-origin case");
-        let mut wrong_origin = cases.clone();
-        wrong_origin[0] = wrong_origin[0].replacen(r#""Origin":"NTFS""#, r#""Origin":"exFAT""#, 1);
         invalid(
-            &report_with(&wrong_origin),
+            &report_with_case_edited(0, NTFS_FORWARD_CASE_NAME, "Windows NTFS to NTFS"),
+            "unexpected Windows-origin case",
+        );
+        invalid(
+            &report_with_case_edited(0, r#""Origin":"NTFS""#, r#""Origin":"exFAT""#),
             "case origin does not match its name",
         );
-        let mut wrong_candidate = cases.clone();
-        wrong_candidate[0] =
-            wrong_candidate[0].replacen(r#""FileSystem":"exFAT""#, r#""FileSystem":"NTFS""#, 1);
         invalid(
-            &report_with(&wrong_candidate),
+            &report_with_case_edited(0, r#""FileSystem":"exFAT""#, r#""FileSystem":"NTFS""#),
             "candidate filesystem does not match the case direction",
         );
-        let mut other_source = cases.clone();
-        other_source[1] = other_source[1].replacen(H2, H6, 1);
         invalid(
-            &report_with(&other_source),
+            &report_with_case_edited(1, H2, H6),
             "forward and round-trip cases disagree about the Windows source",
         );
         let mut same_candidate = cases;
@@ -1036,6 +1092,41 @@ mod tests {
         invalid(
             &report_with(&same_candidate),
             "forward and round-trip candidates are the same VHD",
+        );
+        invalid(
+            &report_with_case_edited(0, r#""RestoreEscrow":false"#, r#""RestoreEscrow":true"#),
+            "case escrow restore flag does not match its name",
+        );
+        invalid(
+            &report_with_case_edited(1, r#""RestoreEscrow":true"#, r#""RestoreEscrow":false"#),
+            "case escrow restore flag does not match its name",
+        );
+        assert!(matches!(
+            verify(&report_with_case_edited(0, r#""RestoreEscrow":false,"#, "")),
+            Err(WindowsValidationError::MalformedJson(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_candidates_sharing_a_volume_identity() {
+        let mut cases = cases();
+        let guid = |hash: &str| {
+            let h = hash.to_ascii_lowercase();
+            format!(
+                "{}-{}-{}-{}-{}",
+                &h[0..8],
+                &h[8..12],
+                &h[12..16],
+                &h[16..20],
+                &h[20..32]
+            )
+        };
+        // The exFAT round trip reusing the NTFS forward candidate's volume GUID (even with
+        // different casing) means Windows served a cached identity, not the candidate.
+        cases[3] = cases[3].replace(&guid(H8), &guid(H3).to_ascii_uppercase());
+        invalid(
+            &report_with(&cases),
+            "two candidates report the same volume GUID path",
         );
     }
 

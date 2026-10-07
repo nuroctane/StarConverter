@@ -63,6 +63,11 @@ point produces an ambiguous writable mount.
   StarConverter object IDs into vendor entries remains a target contract that path-based escrow
   restore does not need
 - round-trip restoration to NTFS (implemented; see the NTFS→exFAT(+escrow)→NTFS proof above)
+- round-trip restoration to exFAT (not implemented): the exFAT→NTFS sidecar v3 already escrows
+  the serial, label, up-case mappings, and per-object timestamps/centiseconds/UTC offsets, cluster
+  placement, flags, and benign entry bytes, but `convert-image --to exfat` refuses
+  `--restore-escrow`; the `windows-origin` lane therefore judges the exFAT round trip on payload
+  bytes alone until an exFAT-direction restore exists
 - formatter-origin inline `$SECURITY_DESCRIPTOR` support (implemented in-tree): the read-only
   inventory captures unnamed resident and fully mapped nonresident `0x50` values up to 64 KiB, the
   bounded self-relative validator accepts owner/group SIDs plus ACL revision 2/4 with
