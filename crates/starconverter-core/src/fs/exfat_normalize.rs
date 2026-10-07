@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use super::exfat_directory::VolumeLabelEntry;
+use super::exfat_directory::{ENTRY_BYTES, VolumeLabelEntry};
 use super::exfat_discovery::ExfatRootDiscovery;
 use super::exfat_inventory::{
     ExfatInventory, ExfatObjectFlags, ExfatObjectKind, ExfatPreservationEvidence, ExfatTimestamps,
@@ -38,6 +38,18 @@ pub struct ExfatObjectPreservation {
     pub timestamps: Option<ExfatTimestamps>,
     pub clusters: Vec<u32>,
     pub flags: ExfatObjectFlags,
+    /// Exact trailing vendor/benign secondary entries of the file set (32 bytes each); the
+    /// length always equals `flags.benign_secondary_entries * 32`.
+    pub benign_secondary_bytes: Vec<u8>,
+}
+
+/// One benign primary entry set retained byte-for-byte against the neutral directory that held
+/// it. The target filesystem has no slot for it; only escrow can carry it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExfatBenignPrimarySetPreservation {
+    pub directory: ObjectId,
+    pub entry_type: u8,
+    pub raw_set: Vec<u8>,
 }
 
 /// exFAT evidence which cannot be represented directly by [`ObjectGraph`].
@@ -51,7 +63,39 @@ pub struct ExfatPreservationSidecar {
     /// Validated allocation belonging to filesystem structures rather than live objects.
     pub filesystem_extents: Vec<Extent>,
     pub directory_evidence: ExfatPreservationEvidence,
+    /// Every benign primary set, in directory-walk order; `directory_evidence` counts these.
+    pub benign_primary_sets: Vec<ExfatBenignPrimarySetPreservation>,
     pub allocated_bad_clusters: u64,
+}
+
+impl ExfatPreservationSidecar {
+    /// Whether every counted benign entry is backed by its exact bytes, so escrow can carry
+    /// the vendor data instead of refusing the volume.
+    #[must_use]
+    pub fn benign_entries_fully_captured(&self) -> bool {
+        let evidence = self.directory_evidence;
+        let primary_count = u64::try_from(self.benign_primary_sets.len()).unwrap_or(u64::MAX);
+        if primary_count != evidence.benign_primary_sets {
+            return false;
+        }
+        if self
+            .benign_primary_sets
+            .iter()
+            .any(|set| set.raw_set.len() < ENTRY_BYTES || set.raw_set.len() % ENTRY_BYTES != 0)
+        {
+            return false;
+        }
+        let mut secondary_total = 0_u64;
+        for object in &self.objects {
+            let expected = usize::from(object.flags.benign_secondary_entries) * ENTRY_BYTES;
+            if object.benign_secondary_bytes.len() != expected {
+                return false;
+            }
+            secondary_total =
+                secondary_total.saturating_add(u64::from(object.flags.benign_secondary_entries));
+        }
+        secondary_total == evidence.benign_secondary_entries
+    }
 }
 
 /// A neutral object graph inseparably paired with exact exFAT preservation evidence.
@@ -95,6 +139,9 @@ pub enum ExfatNormalizeError {
     InvalidPath(StreamId),
     AttributeKindMismatch(StreamId),
     VolumeLabelEvidenceMismatch,
+    /// Benign-entry counts disagree with the captured raw bytes, or a benign primary set names
+    /// a directory the inventory does not contain.
+    BenignEntryEvidenceMismatch,
     UnexpectedSparseExtent(StreamId),
     ExtentKindMismatch {
         stream: StreamId,
@@ -184,6 +231,8 @@ impl fmt::Display for ExfatNormalizeError {
             ),
             Self::VolumeLabelEvidenceMismatch => formatter
                 .write_str("exFAT volume-label count, exact value, and padding evidence disagree"),
+            Self::BenignEntryEvidenceMismatch => formatter
+                .write_str("exFAT benign-entry counts disagree with the captured raw entry bytes"),
             Self::UnexpectedSparseExtent(stream) => {
                 write!(
                     formatter,
@@ -273,20 +322,54 @@ pub fn normalize_inventory(
 
     let (extents, filesystem_extents) = partition_extents(inventory, &source_to_object, limits)?;
     let (objects, entries, preserved) = normalize_records(inventory, &source_to_object, root)?;
+    let benign_primary_sets = normalize_benign_primary_sets(inventory, &source_to_object)?;
     let graph = ObjectGraph::build(root, objects, entries, extents, limits.graph)
         .map_err(ExfatNormalizeError::Graph)?;
+    let preservation = ExfatPreservationSidecar {
+        root: inventory.root.clone(),
+        volume_serial_number: inventory.volume_serial_number,
+        volume_label: inventory.volume_label,
+        objects: preserved,
+        filesystem_extents,
+        directory_evidence: inventory.preservation,
+        benign_primary_sets,
+        allocated_bad_clusters: inventory.allocated_bad_clusters,
+    };
+    if !preservation.benign_entries_fully_captured() {
+        return Err(ExfatNormalizeError::BenignEntryEvidenceMismatch);
+    }
     Ok(NormalizedExfat {
         graph,
-        preservation: ExfatPreservationSidecar {
-            root: inventory.root.clone(),
-            volume_serial_number: inventory.volume_serial_number,
-            volume_label: inventory.volume_label,
-            objects: preserved,
-            filesystem_extents,
-            directory_evidence: inventory.preservation,
-            allocated_bad_clusters: inventory.allocated_bad_clusters,
-        },
+        preservation,
     })
+}
+
+fn normalize_benign_primary_sets(
+    inventory: &ExfatInventory,
+    source_to_object: &BTreeMap<StreamId, ObjectId>,
+) -> Result<Vec<ExfatBenignPrimarySetPreservation>, ExfatNormalizeError> {
+    let directories = inventory
+        .objects
+        .iter()
+        .filter(|object| object.kind != ExfatObjectKind::File)
+        .map(|object| object.stream)
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut sets = Vec::with_capacity(inventory.benign_primary_sets.len());
+    for set in &inventory.benign_primary_sets {
+        if !directories.contains(&set.directory) {
+            return Err(ExfatNormalizeError::BenignEntryEvidenceMismatch);
+        }
+        let directory = source_to_object
+            .get(&set.directory)
+            .copied()
+            .ok_or(ExfatNormalizeError::MissingIdentity(set.directory))?;
+        sets.push(ExfatBenignPrimarySetPreservation {
+            directory,
+            entry_type: set.entry_type,
+            raw_set: set.raw_set.clone(),
+        });
+    }
+    Ok(sets)
 }
 
 const fn validate_volume_identity(inventory: &ExfatInventory) -> Result<(), ExfatNormalizeError> {
@@ -418,6 +501,7 @@ fn normalize_records(
             timestamps: source.timestamps,
             clusters: source.clusters.clone(),
             flags: source.flags,
+            benign_secondary_bytes: source.benign_secondary_bytes.clone(),
         });
     }
     Ok((objects, entries, preserved))
@@ -487,6 +571,7 @@ mod tests {
     use crate::extent::Placement;
     use crate::fs::exfat_allocation::AllocationSummary;
     use crate::fs::exfat_directory::{AllocationBitmapEntry, DirectorySummary, UpcaseTableEntry};
+    use crate::fs::exfat_inventory::ExfatBenignPrimarySet;
     use crate::fs::exfat_upcase::{UpcaseLimits, UpcaseTable, table_checksum};
 
     const LIMITS: ExfatNormalizeLimits = ExfatNormalizeLimits {
@@ -517,6 +602,27 @@ mod tests {
             no_fat_chain: true,
             name_padding_zeroed: false,
             benign_secondary_entries: 2,
+        }
+    }
+
+    /// Two vendor-extension secondaries matching `flags().benign_secondary_entries`.
+    fn benign_secondary_bytes() -> Vec<u8> {
+        let mut bytes = vec![0_u8; 64];
+        bytes[0] = 0xe0;
+        bytes[32] = 0xe0;
+        bytes[2..18].fill(0x11);
+        bytes[34..50].fill(0x22);
+        bytes
+    }
+
+    fn benign_primary_set(directory: StreamId, fill: u8) -> ExfatBenignPrimarySet {
+        let mut raw_set = vec![0_u8; 32];
+        raw_set[0] = 0xa0;
+        raw_set[6..22].fill(fill);
+        ExfatBenignPrimarySet {
+            directory,
+            entry_type: 0xa0,
+            raw_set,
         }
     }
 
@@ -586,6 +692,7 @@ mod tests {
             allocation_bytes: 512,
             clusters: vec![2],
             flags: flags(),
+            benign_secondary_bytes: benign_secondary_bytes(),
         }
     }
 
@@ -615,6 +722,7 @@ mod tests {
             allocation_bytes: allocation,
             clusters: if allocation == 0 { Vec::new() } else { vec![5] },
             flags: flags(),
+            benign_secondary_bytes: benign_secondary_bytes(),
         }
     }
 
@@ -640,6 +748,12 @@ mod tests {
         objects: Vec<super::super::exfat_inventory::ExfatObjectRecord>,
         extents: Vec<Extent>,
     ) -> ExfatInventory {
+        // Every fixture object carries flags().benign_secondary_entries vendor secondaries, and
+        // the root holds two benign primary sets, so the counted evidence matches the bytes.
+        let benign_secondary_entries = objects
+            .iter()
+            .map(|object| u64::from(object.flags.benign_secondary_entries))
+            .sum();
         ExfatInventory {
             root: discovery(),
             volume_serial_number: 0x1234_abcd,
@@ -649,10 +763,14 @@ mod tests {
             preservation: ExfatPreservationEvidence {
                 unused_directory_entries: 1,
                 benign_primary_sets: 2,
-                benign_secondary_entries: 3,
+                benign_secondary_entries,
                 nonzero_name_padding_sets: 4,
                 nonzero_volume_label_padding: false,
             },
+            benign_primary_sets: vec![
+                benign_primary_set(StreamId(10), 0x33),
+                benign_primary_set(StreamId(10), 0x44),
+            ],
             allocated_bad_clusters: 1,
         }
     }
@@ -693,11 +811,64 @@ mod tests {
         assert_eq!(sidecar.timestamps, Some(timestamps()));
         assert_eq!(sidecar.file_attributes, 0x21);
         assert_eq!(sidecar.flags, flags());
+        assert_eq!(sidecar.benign_secondary_bytes, benign_secondary_bytes());
         assert_eq!(normalized.preservation.volume_serial_number, 0x1234_abcd);
         assert!(normalized.preservation.volume_label.is_none());
         assert_eq!(normalized.preservation.filesystem_extents.len(), 2);
         assert_eq!(normalized.graph.objects()[0].streams, Vec::new());
         assert_eq!(normalized.preservation.allocated_bad_clusters, 1);
+        assert_eq!(
+            normalized.preservation.benign_primary_sets,
+            vec![
+                ExfatBenignPrimarySetPreservation {
+                    directory: ObjectId(1),
+                    entry_type: 0xa0,
+                    raw_set: benign_primary_set(StreamId(10), 0x33).raw_set,
+                },
+                ExfatBenignPrimarySetPreservation {
+                    directory: ObjectId(1),
+                    entry_type: 0xa0,
+                    raw_set: benign_primary_set(StreamId(10), 0x44).raw_set,
+                },
+            ]
+        );
+        assert!(normalized.preservation.benign_entries_fully_captured());
+    }
+
+    #[test]
+    fn rejects_benign_entry_counts_that_are_not_backed_by_exact_bytes() {
+        let extents = || vec![extent(10, 0, 1024, 512, ExtentKind::DirectoryData)];
+
+        let mut truncated = root();
+        truncated.benign_secondary_bytes.truncate(32);
+        assert!(matches!(
+            normalize_inventory(&inventory(vec![truncated], extents()), LIMITS),
+            Err(ExfatNormalizeError::BenignEntryEvidenceMismatch)
+        ));
+
+        let mut missing_set = inventory(vec![root()], extents());
+        missing_set.benign_primary_sets.pop();
+        assert!(matches!(
+            normalize_inventory(&missing_set, LIMITS),
+            Err(ExfatNormalizeError::BenignEntryEvidenceMismatch)
+        ));
+
+        let mut undercounted = inventory(vec![root()], extents());
+        undercounted.preservation.benign_secondary_entries -= 1;
+        assert!(matches!(
+            normalize_inventory(&undercounted, LIMITS),
+            Err(ExfatNormalizeError::BenignEntryEvidenceMismatch)
+        ));
+
+        let mut file_hosted = inventory(
+            vec![root(), child(20, 10, "file", ExfatObjectKind::File, 0, 0)],
+            extents(),
+        );
+        file_hosted.benign_primary_sets[0].directory = StreamId(20);
+        assert!(matches!(
+            normalize_inventory(&file_hosted, LIMITS),
+            Err(ExfatNormalizeError::BenignEntryEvidenceMismatch)
+        ));
     }
 
     #[test]

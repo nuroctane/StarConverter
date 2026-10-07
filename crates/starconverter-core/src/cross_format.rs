@@ -2300,6 +2300,7 @@ mod tests {
                         timestamps: None,
                         clusters: Vec::new(),
                         flags,
+                        benign_secondary_bytes: Vec::new(),
                     },
                     ExfatObjectPreservation {
                         object: file,
@@ -2309,6 +2310,7 @@ mod tests {
                         timestamps: Some(raw),
                         clusters: Vec::new(),
                         flags,
+                        benign_secondary_bytes: Vec::new(),
                     },
                 ],
                 filesystem_extents: vec![crate::extent::Extent {
@@ -2321,6 +2323,7 @@ mod tests {
                     kind: crate::extent::ExtentKind::FileSystemMetadata,
                 }],
                 directory_evidence: ExfatPreservationEvidence::default(),
+                benign_primary_sets: Vec::new(),
                 allocated_bad_clusters: 0,
             },
         }

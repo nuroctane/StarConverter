@@ -17,7 +17,7 @@ use super::exfat_allocation::{
 };
 use super::exfat_directory::{
     AllocationBitmapEntry, DirectoryContext, DirectoryError, DirectoryRecord, DirectorySummary,
-    FileEntry, UpcaseTableEntry, VolumeLabelEntry, parse_directory,
+    ENTRY_BYTES, FileEntry, UpcaseTableEntry, VolumeLabelEntry, parse_directory,
 };
 use super::exfat_discovery::{
     ExfatDiscoveryError, ExfatDiscoveryLimits, ExfatRootDiscovery, discover_root_with_reader,
@@ -104,6 +104,20 @@ pub struct ExfatObjectRecord {
     /// Logical-order cluster chain. Contiguous streams are represented explicitly too.
     pub clusters: Vec<u32>,
     pub flags: ExfatObjectFlags,
+    /// Exact bytes of the `flags.benign_secondary_entries` vendor/benign secondary entries that
+    /// trail the file set's name entries (32 bytes each, in on-disk order).
+    pub benign_secondary_bytes: Vec<u8>,
+}
+
+/// One benign primary entry set (volume GUID, `TexFAT` padding, vendor sets, and so on) retained
+/// byte-for-byte because conversion cannot interpret it and must not drop it silently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExfatBenignPrimarySet {
+    /// Directory stream whose entries held the set.
+    pub directory: StreamId,
+    pub entry_type: u8,
+    /// The primary entry plus every secondary, exactly as covered by `SetChecksum`.
+    pub raw_set: Vec<u8>,
 }
 
 /// Counts of benign or recommendation-level on-disk evidence that must survive conversion.
@@ -128,6 +142,9 @@ pub struct ExfatInventory {
     pub objects: Vec<ExfatObjectRecord>,
     pub extents: ExtentGraph,
     pub preservation: ExfatPreservationEvidence,
+    /// Every benign primary set in directory-walk order; `preservation.benign_primary_sets`
+    /// counts exactly these.
+    pub benign_primary_sets: Vec<ExfatBenignPrimarySet>,
     pub allocated_bad_clusters: u64,
 }
 
@@ -373,11 +390,15 @@ struct OwnedFileEntry {
     name: Vec<u16>,
     name_padding_zeroed: bool,
     benign_secondary_entries: u8,
+    benign_secondary_bytes: Vec<u8>,
     timestamps: ExfatTimestamps,
 }
 
 impl From<FileEntry<'_>> for OwnedFileEntry {
     fn from(entry: FileEntry<'_>) -> Self {
+        // The parser guarantees the benign secondaries are the trailing members of the set.
+        let benign_bytes = usize::from(entry.benign_secondary_entries) * ENTRY_BYTES;
+        let benign_start = entry.raw_set.len().saturating_sub(benign_bytes);
         Self {
             file_attributes: entry.file_attributes,
             is_directory: entry.is_directory,
@@ -389,6 +410,7 @@ impl From<FileEntry<'_>> for OwnedFileEntry {
             name: entry.name.as_units().to_vec(),
             name_padding_zeroed: entry.name_padding_zeroed,
             benign_secondary_entries: entry.benign_secondary_entries,
+            benign_secondary_bytes: entry.raw_set[benign_start..].to_vec(),
             timestamps: ExfatTimestamps {
                 create: entry.create_timestamp,
                 modified: entry.modified_timestamp,
@@ -425,6 +447,7 @@ struct InventoryState<'a> {
     owners: HashMap<u32, StreamId>,
     pending: VecDeque<PendingDirectory>,
     preservation: ExfatPreservationEvidence,
+    benign_primary_sets: Vec<ExfatBenignPrimarySet>,
     next_stream: u64,
     directory_count: usize,
     directory_bytes: u64,
@@ -484,6 +507,7 @@ pub(crate) fn inventory_image_with_reader(
         owners: HashMap::new(),
         pending: VecDeque::new(),
         preservation: ExfatPreservationEvidence::default(),
+        benign_primary_sets: Vec::new(),
         next_stream: 2,
         directory_count: 1,
         directory_bytes: u64::try_from(root_stream.bytes.len()).map_err(|_| {
@@ -519,13 +543,14 @@ pub(crate) fn inventory_image_with_reader(
             name_padding_zeroed: true,
             benign_secondary_entries: 0,
         },
+        benign_secondary_bytes: Vec::new(),
     });
 
-    let (root_summary, root_files, bitmaps, upcase_entry, label_padding, volume_label) =
-        parse_owned_directory(&root_stream.bytes, boot, true, limits)?;
-    state.accumulate_preservation(root_summary, &root_files, label_padding)?;
-    claim_system_streams(&mut state, &bitmaps, upcase_entry)?;
-    state.process_children(ROOT_STREAM, 0, &[], root_files)?;
+    let root_directory = parse_owned_directory(&root_stream.bytes, boot, true, limits)?;
+    let volume_label = root_directory.volume_label;
+    state.accumulate_preservation(ROOT_STREAM, &root_directory)?;
+    claim_system_streams(&mut state, &root_directory.bitmaps, root_directory.upcase)?;
+    state.process_children(ROOT_STREAM, 0, &[], root_directory.files)?;
 
     while let Some(directory) = state.pending.pop_front() {
         let stream = read_stream_with_reader(
@@ -555,10 +580,14 @@ pub(crate) fn inventory_image_with_reader(
                 .cloned()
                 .unwrap_or_default()
         );
-        let (summary, files, _, _, label_padding, _) =
-            parse_owned_directory(&stream.bytes, boot, false, limits)?;
-        state.accumulate_preservation(summary, &files, label_padding)?;
-        state.process_children(directory.stream, directory.depth, &directory.path, files)?;
+        let parsed = parse_owned_directory(&stream.bytes, boot, false, limits)?;
+        state.accumulate_preservation(directory.stream, &parsed)?;
+        state.process_children(
+            directory.stream,
+            directory.depth,
+            &directory.path,
+            parsed.files,
+        )?;
     }
 
     let allocated_bad_clusters = state.finish_cluster_ownership()?;
@@ -570,6 +599,7 @@ pub(crate) fn inventory_image_with_reader(
         })?;
     let objects = std::mem::take(&mut state.objects);
     let raw_extents = std::mem::take(&mut state.extents);
+    let benign_primary_sets = std::mem::take(&mut state.benign_primary_sets);
     let preservation = state.preservation;
     drop(state);
     let extents = ExtentGraph::build(raw_extents, volume_bytes, limits.max_extents)
@@ -581,6 +611,7 @@ pub(crate) fn inventory_image_with_reader(
         objects,
         extents,
         preservation,
+        benign_primary_sets,
         allocated_bad_clusters,
     })
 }
@@ -671,14 +702,16 @@ fn add_reserved_extent(state: &mut InventoryState<'_>) -> Result<(), ExfatInvent
     Ok(())
 }
 
-type ParsedDirectory = (
-    DirectorySummary,
-    Vec<OwnedFileEntry>,
-    Vec<AllocationBitmapEntry>,
-    Option<UpcaseTableEntry>,
-    bool,
-    Option<VolumeLabelEntry>,
-);
+struct ParsedDirectory {
+    summary: DirectorySummary,
+    files: Vec<OwnedFileEntry>,
+    bitmaps: Vec<AllocationBitmapEntry>,
+    upcase: Option<UpcaseTableEntry>,
+    label_padding: bool,
+    volume_label: Option<VolumeLabelEntry>,
+    /// `(entry_type, raw_set)` of every benign primary set, in on-disk order.
+    benign_primary_sets: Vec<(u8, Vec<u8>)>,
+}
 
 fn parse_owned_directory(
     bytes: &[u8],
@@ -691,6 +724,7 @@ fn parse_owned_directory(
     let mut upcase = None;
     let mut label_padding = true;
     let mut volume_label = None;
+    let mut benign_primary_sets = Vec::new();
     let summary = parse_directory(
         bytes,
         DirectoryContext {
@@ -711,11 +745,24 @@ fn parse_owned_directory(
                     volume_label = Some(entry);
                 }
             }
-            DirectoryRecord::Unused { .. } | DirectoryRecord::BenignPrimary { .. } => {}
+            DirectoryRecord::BenignPrimary {
+                entry_type,
+                raw_set,
+                ..
+            } => benign_primary_sets.push((entry_type, raw_set.to_vec())),
+            DirectoryRecord::Unused { .. } => {}
         },
     )
     .map_err(ExfatInventoryError::Directory)?;
-    Ok((summary, files, bitmaps, upcase, label_padding, volume_label))
+    Ok(ParsedDirectory {
+        summary,
+        files,
+        bitmaps,
+        upcase,
+        label_padding,
+        volume_label,
+        benign_primary_sets,
+    })
 }
 
 fn claim_system_streams(
@@ -752,10 +799,27 @@ fn claim_system_streams(
 impl InventoryState<'_> {
     fn accumulate_preservation(
         &mut self,
-        summary: DirectorySummary,
-        files: &[OwnedFileEntry],
-        label_padding: bool,
+        directory: StreamId,
+        parsed: &ParsedDirectory,
     ) -> Result<(), ExfatInventoryError> {
+        let summary = parsed.summary;
+        let files = &parsed.files;
+        let label_padding = parsed.label_padding;
+        if parsed.benign_primary_sets.len() != summary.benign_primary_sets {
+            return Err(ExfatInventoryError::InvalidLimits(
+                "directory parser delivered a benign primary count it did not visit",
+            ));
+        }
+        self.benign_primary_sets
+            .try_reserve(parsed.benign_primary_sets.len())
+            .map_err(|_| ExfatInventoryError::AllocationFailed)?;
+        for (entry_type, raw_set) in &parsed.benign_primary_sets {
+            self.benign_primary_sets.push(ExfatBenignPrimarySet {
+                directory,
+                entry_type: *entry_type,
+                raw_set: raw_set.clone(),
+            });
+        }
         self.preservation.unused_directory_entries = self
             .preservation
             .unused_directory_entries
@@ -920,6 +984,7 @@ impl InventoryState<'_> {
                     name_padding_zeroed: file.name_padding_zeroed,
                     benign_secondary_entries: file.benign_secondary_entries,
                 },
+                benign_secondary_bytes: file.benign_secondary_bytes.clone(),
             });
             if file.is_directory {
                 let depth =
@@ -1796,6 +1861,90 @@ mod tests {
             .preservation;
         assert_eq!(evidence.nonzero_name_padding_sets, 1);
         assert_eq!(evidence.unused_directory_entries, 1);
+    }
+
+    #[test]
+    fn captures_exact_benign_primary_sets_and_vendor_secondary_bytes() {
+        let (mut bytes, _) = fixture(&[("a", 5, false)]);
+        let set_start = cluster_offset(2) + ENTRY * 2;
+        // Append a vendor-extension secondary (0xE0) to the file set and grow SecondaryCount.
+        let mut vendor = [0_u8; ENTRY];
+        vendor[0] = 0xe0;
+        vendor[2..18].copy_from_slice(&[0x5a; 16]);
+        vendor[18..].copy_from_slice(&[0xa5; 14]);
+        bytes[set_start + ENTRY * 3..set_start + ENTRY * 4].copy_from_slice(&vendor);
+        bytes[set_start + 1] = 3;
+        set_checksum(&mut bytes[set_start..set_start + ENTRY * 4]);
+        // Follow it with a secondary-less volume GUID benign primary set (0xA0).
+        let guid_start = set_start + ENTRY * 4;
+        let mut guid = [0_u8; ENTRY];
+        guid[0] = 0xa0;
+        guid[6..22].copy_from_slice(&[0x3c; 16]);
+        set_checksum(&mut guid);
+        bytes[guid_start..guid_start + ENTRY].copy_from_slice(&guid);
+
+        let temp = TempImage::write(&bytes);
+        let image = ImageFile::open(&temp.0).unwrap();
+        let inventory = inventory_image(&image, &boot(), limits()).unwrap();
+        assert_eq!(inventory.preservation.benign_primary_sets, 1);
+        assert_eq!(inventory.preservation.benign_secondary_entries, 1);
+        assert_eq!(
+            inventory.benign_primary_sets,
+            vec![ExfatBenignPrimarySet {
+                directory: ROOT_STREAM,
+                entry_type: 0xa0,
+                raw_set: guid.to_vec(),
+            }]
+        );
+        let file = inventory
+            .objects
+            .iter()
+            .find(|object| object.kind == ExfatObjectKind::File)
+            .unwrap();
+        assert_eq!(file.flags.benign_secondary_entries, 1);
+        assert_eq!(file.benign_secondary_bytes, vendor.to_vec());
+        assert_eq!(
+            inventory.objects[0].benign_secondary_bytes,
+            Vec::<u8>::new()
+        );
+
+        // The captured bytes turn the former refusal into an escrow-permitted conversion.
+        let normalized = normalize_inventory(&inventory, normalize_limits()).expect("normalize");
+        assert!(normalized.preservation.benign_entries_fully_captured());
+        let strict = evaluate_exfat(
+            &normalized,
+            FileSystem::Ntfs,
+            GuaranteeMode::Strict,
+            PreservationLimits::default(),
+        )
+        .expect("strict policy");
+        assert!(
+            strict
+                .blockers
+                .contains(&PreservationField::ExfatBenignEntries)
+        );
+        let escrow = evaluate_exfat(
+            &normalized,
+            FileSystem::Ntfs,
+            GuaranteeMode::Escrow,
+            PreservationLimits::default(),
+        )
+        .expect("escrow policy");
+        assert!(escrow.permitted);
+        assert_eq!(
+            escrow
+                .assessments
+                .iter()
+                .find(|assessment| assessment.field == PreservationField::ExfatBenignEntries)
+                .expect("benign assessment")
+                .disposition,
+            FieldDisposition::EscrowRequired
+        );
+        decode_escrow(
+            &escrow.escrow.expect("escrow bytes"),
+            PreservationLimits::default(),
+        )
+        .expect("v3 exFAT snapshot decodes");
     }
 
     #[test]

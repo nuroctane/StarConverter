@@ -448,25 +448,30 @@ fn exfat_assessments(
         );
     }
     let evidence = sidecar.directory_evidence;
-    if evidence.benign_primary_sets != 0 || evidence.benign_secondary_entries != 0 {
-        set(
-            &mut result,
-            PreservationField::ExfatBenignEntries,
-            FieldDisposition::Refusal,
-            "normalization retained benign-entry counts but not their exact raw entry sets",
-        );
-    }
     let object_has_benign = sidecar
         .objects
         .iter()
         .any(|object| object.flags.benign_secondary_entries != 0);
-    if object_has_benign {
-        set(
-            &mut result,
-            PreservationField::ExfatBenignEntries,
-            FieldDisposition::Refusal,
-            "object evidence retained benign-secondary counts but not their exact bytes",
-        );
+    if evidence.benign_primary_sets != 0
+        || evidence.benign_secondary_entries != 0
+        || object_has_benign
+    {
+        // NTFS has no slot for vendor/benign exFAT entries; only their exact bytes can travel.
+        if sidecar.benign_entries_fully_captured() {
+            set(
+                &mut result,
+                PreservationField::ExfatBenignEntries,
+                FieldDisposition::EscrowRequired,
+                "exact benign primary sets and vendor secondary entries travel byte-for-byte in escrow",
+            );
+        } else {
+            set(
+                &mut result,
+                PreservationField::ExfatBenignEntries,
+                FieldDisposition::Refusal,
+                "benign-entry counts are not backed by their exact raw entry bytes",
+            );
+        }
     }
     let nonzero_name_padding = evidence.nonzero_name_padding_sets != 0
         || sidecar
@@ -1461,7 +1466,9 @@ fn validate_snapshot(
     })?;
     let version = u16::from_le_bytes([version[0], version[1]]);
     match source {
-        FileSystem::ExFat if version == 2 => validate_exfat_snapshot(bytes, offset),
+        FileSystem::ExFat if version == 2 || version == EXFAT_SNAPSHOT_VERSION => {
+            validate_exfat_snapshot(bytes, offset)
+        }
         FileSystem::Ntfs if version == 8 => {
             validate_ntfs_snapshot(bytes, offset, NtfsSnapshotLayout::V8)
         }
@@ -1669,9 +1676,11 @@ impl<'a> SnapshotCursor<'a> {
 
 fn validate_exfat_snapshot(bytes: &[u8], base: usize) -> Result<(), PreservationError> {
     let mut reader = SnapshotCursor::new(bytes, base);
-    if reader.u16()? != 2 {
+    let version = reader.u16()?;
+    if version != 2 && version != EXFAT_SNAPSHOT_VERSION {
         return malformed(base, "unsupported exFAT sidecar snapshot version");
     }
+    let has_benign_bytes = version >= 3;
     reader.u32()?;
     let label_offset = reader.base + reader.cursor;
     match reader.u8()? {
@@ -1728,31 +1737,7 @@ fn validate_exfat_snapshot(bytes: &[u8], base: usize) -> Result<(), Preservation
     }
     let objects = reader.count(1)?;
     for _ in 0..objects {
-        reader.u64()?;
-        reader.u64()?;
-        let components = reader.count(8)?;
-        for _ in 0..components {
-            let component_offset = reader.base + reader.cursor;
-            if !reader.utf16()? {
-                return malformed(
-                    component_offset,
-                    "exFAT snapshot path contains invalid UTF-16",
-                );
-            }
-        }
-        reader.u16()?;
-        if reader.boolean()? {
-            for _ in 0..3 {
-                reader.u32()?;
-            }
-            for _ in 0..5 {
-                reader.u8()?;
-            }
-        }
-        validate_u32_vector(&mut reader)?;
-        reader.boolean()?;
-        reader.boolean()?;
-        reader.u8()?;
+        validate_exfat_snapshot_object(&mut reader, has_benign_bytes)?;
     }
     let extents = reader.count(26)?;
     for _ in 0..extents {
@@ -1763,7 +1748,74 @@ fn validate_exfat_snapshot(bytes: &[u8], base: usize) -> Result<(), Preservation
     }
     reader.boolean()?;
     reader.u64()?;
+    if has_benign_bytes {
+        validate_exfat_benign_primary_sets(&mut reader)?;
+    }
     reader.finish()
+}
+
+fn validate_exfat_snapshot_object(
+    reader: &mut SnapshotCursor<'_>,
+    has_benign_bytes: bool,
+) -> Result<(), PreservationError> {
+    reader.u64()?;
+    reader.u64()?;
+    let components = reader.count(8)?;
+    for _ in 0..components {
+        let component_offset = reader.base + reader.cursor;
+        if !reader.utf16()? {
+            return malformed(
+                component_offset,
+                "exFAT snapshot path contains invalid UTF-16",
+            );
+        }
+    }
+    reader.u16()?;
+    if reader.boolean()? {
+        for _ in 0..3 {
+            reader.u32()?;
+        }
+        for _ in 0..5 {
+            reader.u8()?;
+        }
+    }
+    validate_u32_vector(reader)?;
+    reader.boolean()?;
+    reader.boolean()?;
+    let benign_secondary_entries = reader.u8()?;
+    if has_benign_bytes {
+        let bytes_offset = reader.base + reader.cursor;
+        let length = reader.count(1)?;
+        if length != usize::from(benign_secondary_entries) * EXFAT_ENTRY_BYTES {
+            return malformed(
+                bytes_offset,
+                "exFAT snapshot benign secondary bytes disagree with their entry count",
+            );
+        }
+        reader.take(length)?;
+    }
+    Ok(())
+}
+
+/// Validates the v3 benign primary set list: each raw set is whole 32-byte entries.
+fn validate_exfat_benign_primary_sets(
+    reader: &mut SnapshotCursor<'_>,
+) -> Result<(), PreservationError> {
+    let sets = reader.count(8 + 1 + 8)?;
+    for _ in 0..sets {
+        reader.u64()?;
+        reader.u8()?;
+        let set_offset = reader.base + reader.cursor;
+        let length = reader.count(1)?;
+        if length < EXFAT_ENTRY_BYTES || length % EXFAT_ENTRY_BYTES != 0 {
+            return malformed(
+                set_offset,
+                "exFAT snapshot benign primary set is not whole 32-byte entries",
+            );
+        }
+        reader.take(length)?;
+    }
+    Ok(())
 }
 
 fn validate_u32_vector(reader: &mut SnapshotCursor<'_>) -> Result<(), PreservationError> {
@@ -2608,11 +2660,18 @@ impl BoundedWriter {
     }
 }
 
+/// exFAT snapshot layout version. Version 3 appends the exact benign secondary bytes to every
+/// object and the benign primary sets after the directory evidence; the envelope schema remains
+/// `ESCROW_SCHEMA_VERSION`.
+const EXFAT_SNAPSHOT_VERSION: u16 = 3;
+/// Size of one exFAT directory entry; benign entry bytes are whole multiples of it.
+const EXFAT_ENTRY_BYTES: usize = 32;
+
 fn encode_exfat_sidecar(
     writer: &mut BoundedWriter,
     sidecar: &ExfatPreservationSidecar,
 ) -> Result<(), PreservationError> {
-    writer.u16(2)?;
+    writer.u16(EXFAT_SNAPSHOT_VERSION)?;
     writer.u32(sidecar.volume_serial_number)?;
     match sidecar.volume_label {
         Some(label) => {
@@ -2674,6 +2733,7 @@ fn encode_exfat_sidecar(
         }
         encode_u32_vec(writer, &object.clusters)?;
         encode_exfat_flags(writer, object.flags)?;
+        writer.bytes(&object.benign_secondary_bytes)?;
     }
     writer.usize(sidecar.filesystem_extents.len())?;
     for extent in &sidecar.filesystem_extents {
@@ -2685,7 +2745,14 @@ fn encode_exfat_sidecar(
     writer.u64(evidence.benign_secondary_entries)?;
     writer.u64(evidence.nonzero_name_padding_sets)?;
     writer.bool(evidence.nonzero_volume_label_padding)?;
-    writer.u64(sidecar.allocated_bad_clusters)
+    writer.u64(sidecar.allocated_bad_clusters)?;
+    writer.usize(sidecar.benign_primary_sets.len())?;
+    for set in &sidecar.benign_primary_sets {
+        writer.u64(set.directory.0)?;
+        writer.u8(set.entry_type)?;
+        writer.bytes(&set.raw_set)?;
+    }
+    Ok(())
 }
 
 fn encode_exfat_timestamps(
@@ -2967,7 +3034,9 @@ mod tests {
     use crate::fs::exfat_directory::{AllocationBitmapEntry, DirectorySummary, UpcaseTableEntry};
     use crate::fs::exfat_discovery::ExfatRootDiscovery;
     use crate::fs::exfat_inventory::ExfatPreservationEvidence;
-    use crate::fs::exfat_normalize::{ExfatObjectPreservation, ExfatPreservationSidecar};
+    use crate::fs::exfat_normalize::{
+        ExfatBenignPrimarySetPreservation, ExfatObjectPreservation, ExfatPreservationSidecar,
+    };
     use crate::fs::exfat_upcase::{UpcaseLimits, UpcaseTable};
     use crate::fs::ntfs_normalize::{NtfsObjectPreservation, NtfsPreservationSidecar};
     use crate::fs::ntfs_security_descriptor::sample_self_relative_descriptor;
@@ -3074,9 +3143,11 @@ mod tests {
                         name_padding_zeroed: true,
                         benign_secondary_entries: 0,
                     },
+                    benign_secondary_bytes: Vec::new(),
                 }],
                 filesystem_extents: Vec::new(),
                 directory_evidence: ExfatPreservationEvidence::default(),
+                benign_primary_sets: Vec::new(),
                 allocated_bad_clusters: 0,
             },
         }
@@ -4200,6 +4271,78 @@ mod tests {
             FieldDisposition::Refusal
         );
         assert!(!report.permitted);
+    }
+
+    #[test]
+    fn exact_benign_entry_bytes_are_escrowed_and_survive_the_envelope() {
+        let mut source = exfat();
+        let mut vendor = vec![0_u8; 32];
+        vendor[0] = 0xe0;
+        vendor[2..18].fill(0x5a);
+        let mut guid = vec![0_u8; 32];
+        guid[0] = 0xa0;
+        guid[6..22].fill(0x3c);
+        source.preservation.objects[0]
+            .flags
+            .benign_secondary_entries = 1;
+        source.preservation.objects[0].benign_secondary_bytes = vendor;
+        source
+            .preservation
+            .directory_evidence
+            .benign_secondary_entries = 1;
+        source.preservation.directory_evidence.benign_primary_sets = 1;
+        source.preservation.benign_primary_sets = vec![ExfatBenignPrimarySetPreservation {
+            directory: ObjectId(1),
+            entry_type: 0xa0,
+            raw_set: guid,
+        }];
+        let strict = evaluate_exfat(
+            &source,
+            FileSystem::Ntfs,
+            GuaranteeMode::Strict,
+            PreservationLimits::default(),
+        )
+        .expect("policy");
+        assert!(
+            strict
+                .blockers
+                .contains(&PreservationField::ExfatBenignEntries)
+        );
+
+        let report = evaluate_exfat(
+            &source,
+            FileSystem::Ntfs,
+            GuaranteeMode::Escrow,
+            PreservationLimits::default(),
+        )
+        .expect("policy");
+        assert_eq!(
+            disposition(&report, PreservationField::ExfatBenignEntries),
+            FieldDisposition::EscrowRequired
+        );
+        assert!(report.permitted);
+        let escrow = report.escrow.expect("escrow envelope");
+        let decoded = decode_escrow(&escrow, PreservationLimits::default())
+            .expect("v3 exFAT snapshot validates");
+        assert_eq!(decoded.source, FileSystem::ExFat);
+
+        // Counts without bytes, or bytes without matching counts, still refuse.
+        let mut undercounted = source.clone();
+        undercounted
+            .preservation
+            .directory_evidence
+            .benign_secondary_entries = 0;
+        let report = evaluate_exfat(
+            &undercounted,
+            FileSystem::Ntfs,
+            GuaranteeMode::Escrow,
+            PreservationLimits::default(),
+        )
+        .expect("policy");
+        assert_eq!(
+            disposition(&report, PreservationField::ExfatBenignEntries),
+            FieldDisposition::Refusal
+        );
     }
 
     #[test]

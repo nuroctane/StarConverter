@@ -194,7 +194,19 @@ Escrow mode needs an append-only, checksummed capsule containing:
 
 The exFAT side may store a compact object identifier in a benign vendor extension directory entry.
 Unknown benign entries are designed to be ignored by other exFAT implementations, while the global
-capsule holds the larger records.
+capsule holds the larger records. Writing such identifiers is a target contract only: escrow
+restore matches dest objects by dest-native path, so no on-disk identifier is required today.
+
+Benign entries already present on an exFAT source are the other half of that contract. The
+directory parser exposes every benign primary set (volume GUID, TexFAT padding, vendor sets) and
+every trailing vendor/benign secondary of a file set as exact bytes; the inventory retains them
+(`ExfatBenignPrimarySet`, `ExfatObjectRecord::benign_secondary_bytes`), normalization proves the
+counted evidence and the bytes agree, and exFAT snapshot v3 carries them in the sidecar
+(per-object secondary bytes, then the primary sets keyed by their neutral directory). NTFS has no
+slot for them, so `ExfatBenignEntries` is `EscrowRequired` rather than a refusal once the bytes
+are captured; Strict still refuses, and counts without matching bytes still refuse. Benign
+entries that own clusters are not reachable through this path because the allocation proof
+already fails closed on unexplained allocation.
 
 ## Compatibility contract
 

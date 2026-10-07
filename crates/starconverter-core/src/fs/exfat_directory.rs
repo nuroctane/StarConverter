@@ -10,7 +10,7 @@
 
 use core::{char, fmt};
 
-const ENTRY_BYTES: usize = 32;
+pub(crate) const ENTRY_BYTES: usize = 32;
 const ENTRY_IN_USE: u8 = 0x80;
 const ENTRY_SECONDARY: u8 = 0x40;
 const ENTRY_BENIGN: u8 = 0x20;
