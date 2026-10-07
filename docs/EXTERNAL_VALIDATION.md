@@ -278,6 +278,14 @@ The single expected payload (`relocated.bin`, 8192 bytes, `9EF9...D777`, cross-c
 requires exactly six cases and rejects a shrunk or re-hashed relocated payload. The preflight
 passed against all six pins and its report verified through the CLI.
 
+Result (CI run 37612337962, `windows-latest`, Windows 10.0.26100): all six cases `[PASS]`.
+`exfat.sys` mounted the relocated candidate read-only, served `relocated.bin` with the exact 8192
+bytes and SHA-256 from its new cluster-aligned location, `chkdsk` found no problems, and the VHD
+hash was unchanged. The report verified and every CI job was green. **This is the first Windows
+filesystem-driver acceptance of a StarConverter candidate whose payload the layout solver
+relocated.** Every converted fixture in the regular image corpus (rich, large-directory, edge, and
+misaligned, in every direction the corpus defines) now passes the Windows driver gate.
+
 ## 2026-09-01 forced NTFS-to-exFAT relocation qualification
 
 A dedicated 32 MiB NTFS 3.1 regular image placed one 8,192-byte file at byte
