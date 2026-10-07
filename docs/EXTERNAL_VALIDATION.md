@@ -260,6 +260,24 @@ the same ten payloads, and `chkdsk` found no problems. The report verified and e
 green. The Windows gate now covers five converted candidates: both rich conversions, the
 nonresident-index directory corpus, and the edge corpus in both directions.
 
+### Sixth Windows case: the forced relocation
+
+Every Windows case so far converted metadata around payloads that stayed in place. The misaligned
+corpus (`ntfs-misaligned-8k-payload.img`: one 8 KiB `relocated.bin` at 24 MiB + 4 KiB, valid for
+4 KiB NTFS but off the 8 KiB exFAT cluster grid) forces the layout solver to move the payload, and
+the exporter asserts exactly one relocation at the 1 MiB partition offset. It is now wrapped as
+`converted-misaligned-ntfs-to-exfat-windows.vhd` (8 KiB clusters, disk signature `SCWR`) and
+pinned as the sixth case:
+
+```text
+converted Windows relocated exFAT VHD  347C89B7F09E73714D06460CDFAC7F1CEE414FCBB0B99D55C49782C5BAA44E3E
+```
+
+The single expected payload (`relocated.bin`, 8192 bytes, `9EF9...D777`, cross-checked against
+`misaligned-relocation-manifest.tsv`) is pinned in the harness and the verifier, which now
+requires exactly six cases and rejects a shrunk or re-hashed relocated payload. The preflight
+passed against all six pins and its report verified through the CLI.
+
 ## 2026-09-01 forced NTFS-to-exFAT relocation qualification
 
 A dedicated 32 MiB NTFS 3.1 regular image placed one 8,192-byte file at byte

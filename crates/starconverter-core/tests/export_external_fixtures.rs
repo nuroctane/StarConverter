@@ -746,8 +746,16 @@ struct WindowsVhdCase {
 
 enum WindowsVhdTarget {
     Ntfs,
-    Exfat,
+    Exfat {
+        bytes_per_cluster: u32,
+        expected_relocations: usize,
+    },
 }
+
+const EXFAT_4K_TARGET: WindowsVhdTarget = WindowsVhdTarget::Exfat {
+    bytes_per_cluster: 4096,
+    expected_relocations: 0,
+};
 
 fn export_windows_vhd_case(directory: &Path, source_path: &Path, case: &WindowsVhdCase) -> PathBuf {
     let partition = match case.target {
@@ -757,13 +765,16 @@ fn export_windows_vhd_case(directory: &Path, source_path: &Path, case: &WindowsV
             case.partition_name,
             ONE_MIB_PARTITION_ALIGNMENT_SECTORS,
         ),
-        WindowsVhdTarget::Exfat => export_exfat_candidate(
+        WindowsVhdTarget::Exfat {
+            bytes_per_cluster,
+            expected_relocations,
+        } => export_exfat_candidate(
             directory,
             source_path,
             case.partition_name,
             ONE_MIB_PARTITION_ALIGNMENT_SECTORS,
-            4096,
-            0,
+            bytes_per_cluster,
+            expected_relocations,
         ),
     };
     let vhd = wrap_fixed_vhd(
@@ -807,7 +818,7 @@ fn export_windows_vhd_candidates(
             unique_id: *b"StarCvExfatWin01",
             disk_signature: 0x5343_5758,
             pinned_hash: windows_validation::EXFAT_CASE_HASH,
-            target: WindowsVhdTarget::Exfat,
+            target: EXFAT_4K_TARGET,
         },
     );
     (ntfs_path, exfat_path)
@@ -843,7 +854,7 @@ fn export_edge_windows_vhd_candidates(
             unique_id: *b"StarCvExfatWinE1",
             disk_signature: 0x5343_5746,
             pinned_hash: windows_validation::EDGE_EXFAT_CASE_HASH,
-            target: WindowsVhdTarget::Exfat,
+            target: EXFAT_4K_TARGET,
         },
     );
     (ntfs_path, exfat_path)
@@ -869,6 +880,27 @@ fn export_large_directory_windows_vhd_candidate(directory: &Path, source_path: &
     let image = ImageFile::open(&partition).unwrap();
     assert_large_directory_index(&image);
     path
+}
+
+/// Converts the misaligned 4 KiB NTFS source to 8 KiB-cluster exFAT, which forces the layout
+/// solver to relocate the payload, so `exfat.sys` judges a candidate whose data moved rather
+/// than one whose extents merely gained new metadata.
+fn export_relocation_windows_vhd_candidate(directory: &Path, source_path: &Path) -> PathBuf {
+    export_windows_vhd_case(
+        directory,
+        source_path,
+        &WindowsVhdCase {
+            partition_name: "converted-misaligned-ntfs-to-exfat-windows-partition.img",
+            vhd_name: "converted-misaligned-ntfs-to-exfat-windows.vhd",
+            unique_id: *b"StarCvExfatWinR1",
+            disk_signature: 0x5343_5752,
+            pinned_hash: windows_validation::RELOCATION_CASE_HASH,
+            target: WindowsVhdTarget::Exfat {
+                bytes_per_cluster: 8192,
+                expected_relocations: 1,
+            },
+        },
+    )
 }
 
 /// The Windows harness and the report parser both pin these exact VHD identities. Asserting
@@ -1378,6 +1410,8 @@ fn export_structural_candidate_images() {
     );
     let relocation_manifest_path = directory.join("misaligned-relocation-manifest.tsv");
     fs::write(&relocation_manifest_path, misaligned_relocation_manifest()).unwrap();
+    let windows_relocation_vhd_path =
+        export_relocation_windows_vhd_candidate(&directory, &relocation_source_path);
 
     let (
         edge_exfat_path,
@@ -1427,6 +1461,10 @@ fn export_structural_candidate_images() {
     println!(
         "Windows edge exFAT VHD candidate: {}",
         windows_edge_exfat_vhd_path.display()
+    );
+    println!(
+        "Windows relocated exFAT VHD candidate: {}",
+        windows_relocation_vhd_path.display()
     );
 }
 

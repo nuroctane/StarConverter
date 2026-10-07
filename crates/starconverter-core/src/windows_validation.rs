@@ -44,10 +44,24 @@ pub const EDGE_EXFAT_CASE_NAME: &str = "NTFS-to-exFAT edge conversion";
 /// Pinned upper-case SHA-256 of `converted-edge-ntfs-to-exfat-windows.vhd`.
 pub const EDGE_EXFAT_CASE_HASH: &str =
     "7EE631DA81390B50E7D74FBE80FEAD1D8D05BBC6244DD7EAF8A959270934C093";
+/// Pinned case name for the NTFS-to-exFAT misaligned-relocation Windows VHD candidate.
+pub const RELOCATION_CASE_NAME: &str = "NTFS-to-exFAT misaligned relocation conversion";
+/// Pinned upper-case SHA-256 of `converted-misaligned-ntfs-to-exfat-windows.vhd`.
+pub const RELOCATION_CASE_HASH: &str =
+    "347C89B7F09E73714D06460CDFAC7F1CEE414FCBB0B99D55C49782C5BAA44E3E";
 /// Exact regular-file length of every pinned fixed VHD candidate.
 pub const PINNED_VHD_BYTES: u64 = VHD_BYTES;
 /// Number of pinned cases a schema-v1 report must carry.
-const PINNED_CASE_COUNT: usize = 5;
+const PINNED_CASE_COUNT: usize = 6;
+
+/// The single 8 KiB payload the layout solver must relocate when the 4 KiB-aligned NTFS source
+/// becomes 8 KiB-cluster exFAT; bytes are `(140 + offset) % 251`, matching
+/// `misaligned-relocation-manifest.tsv`.
+const RELOCATION_PAYLOADS: [(&str, u64, &str); 1] = [(
+    "relocated.bin",
+    8192,
+    "9EF93D4A62D53C78329EADFDE79292B3F613BE077F4E1AF67AD28E75CEA3D777",
+)];
 
 /// Number of entries in the large-directory case's single `alpha` directory; the count that
 /// forces the serializer to spill `$I30` into a nonresident allocation with internal nodes.
@@ -591,6 +605,7 @@ pub fn verify_windows_vhd_validation_report(
             LARGE_DIRECTORY_CASE_NAME => 2,
             EDGE_NTFS_CASE_NAME => 3,
             EDGE_EXFAT_CASE_NAME => 4,
+            RELOCATION_CASE_NAME => 5,
             _ => {
                 return Err(WindowsValidationError::InvalidEvidence(
                     "duplicate or unexpected pinned case",
@@ -783,6 +798,7 @@ fn validate_common_case(
         LARGE_DIRECTORY_CASE_NAME => ("NTFS", LARGE_DIRECTORY_CASE_HASH),
         EDGE_NTFS_CASE_NAME => ("NTFS", EDGE_NTFS_CASE_HASH),
         EDGE_EXFAT_CASE_NAME => ("exFAT", EDGE_EXFAT_CASE_HASH),
+        RELOCATION_CASE_NAME => ("exFAT", RELOCATION_CASE_HASH),
         _ => {
             return Err(WindowsValidationError::InvalidEvidence(
                 "unexpected validation case",
@@ -862,6 +878,10 @@ fn expected_payloads(case_name: &str) -> Vec<ExpectedPayload> {
                 };
                 (path, *length, *hash)
             })
+            .collect(),
+        RELOCATION_CASE_NAME => RELOCATION_PAYLOADS
+            .iter()
+            .map(|(path, length, hash)| ((*path).to_owned(), *length, *hash))
             .collect(),
         _ => EXPECTED_PAYLOADS
             .iter()
@@ -1111,7 +1131,7 @@ mod tests {
         )
     }
 
-    const EXTRA_CASES: [(&str, &str, &str, &str); 3] = [
+    const EXTRA_CASES: [(&str, &str, &str, &str); 4] = [
         (
             LARGE_DIRECTORY_CASE_NAME,
             "NTFS",
@@ -1129,6 +1149,12 @@ mod tests {
             "exFAT",
             EDGE_EXFAT_CASE_HASH,
             r"D:\fixtures\edge-exfat.vhd",
+        ),
+        (
+            RELOCATION_CASE_NAME,
+            "exFAT",
+            RELOCATION_CASE_HASH,
+            r"D:\fixtures\relocated.vhd",
         ),
     ];
 
@@ -1214,6 +1240,7 @@ mod tests {
             let expected_payloads = match case.name() {
                 LARGE_DIRECTORY_CASE_NAME => LARGE_DIRECTORY_ENTRY_COUNT,
                 EDGE_NTFS_CASE_NAME | EDGE_EXFAT_CASE_NAME => EDGE_PAYLOADS.len(),
+                RELOCATION_CASE_NAME => RELOCATION_PAYLOADS.len(),
                 _ => EXPECTED_PAYLOADS.len(),
             };
             assert_eq!(driver.payloads().len(), expected_payloads);
@@ -1247,6 +1274,26 @@ mod tests {
                 .any(|(path, _, _)| path == "δelta\\深度\\rocket-🚀.bin")
         );
         assert!(expected.iter().any(|(path, _, _)| path == "Straße.txt"));
+    }
+
+    #[test]
+    fn rejects_relocation_case_whose_payload_shrank_or_changed_hash() {
+        let valid = driver_report();
+        let shrunk = valid.replacen(
+            r#"{"Path":"relocated.bin","Length":8192,"#,
+            r#"{"Path":"relocated.bin","Length":8191,"#,
+            1,
+        );
+        assert_ne!(shrunk, valid);
+        let (_, _, hash) = RELOCATION_PAYLOADS[0];
+        let rehashed = valid.replacen(hash, &"A".repeat(64), 1);
+        assert_ne!(rehashed, valid);
+        for invalid in [shrunk, rehashed] {
+            assert!(matches!(
+                verify(&invalid),
+                Err(WindowsValidationError::InvalidEvidence(_))
+            ));
+        }
     }
 
     #[test]
@@ -1539,6 +1586,7 @@ mod tests {
             (LARGE_DIRECTORY_CASE_NAME, LARGE_DIRECTORY_CASE_HASH),
             (EDGE_NTFS_CASE_NAME, EDGE_NTFS_CASE_HASH),
             (EDGE_EXFAT_CASE_NAME, EDGE_EXFAT_CASE_HASH),
+            (RELOCATION_CASE_NAME, RELOCATION_CASE_HASH),
         ] {
             let name_line = format!("Name = \"{name}\"");
             let hash_line = format!("Sha256 = \"{hash}\"");
@@ -1555,9 +1603,17 @@ mod tests {
         }
         assert_eq!(
             script.matches("Sha256 = \"").count(),
-            PINNED_CASE_COUNT + EXPECTED_PAYLOADS.len() + 1 + EDGE_PAYLOADS.len()
+            PINNED_CASE_COUNT
+                + EXPECTED_PAYLOADS.len()
+                + 1
+                + EDGE_PAYLOADS.len()
+                + RELOCATION_PAYLOADS.len()
         );
-        for (path, length, hash) in EXPECTED_PAYLOADS.iter().chain(EDGE_PAYLOADS.iter()) {
+        for (path, length, hash) in EXPECTED_PAYLOADS
+            .iter()
+            .chain(EDGE_PAYLOADS.iter())
+            .chain(RELOCATION_PAYLOADS.iter())
+        {
             assert!(script.contains(&format!("Length = {length}")), "{path}");
             assert!(script.contains(&format!("Sha256 = \"{hash}\"")), "{path}");
         }

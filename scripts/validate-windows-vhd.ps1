@@ -244,6 +244,22 @@ $cases = @(
         Sha256 = "7EE631DA81390B50E7D74FBE80FEAD1D8D05BBC6244DD7EAF8A959270934C093"
         Payloads = $edgePayloads
         Directory = $null
+    },
+    [pscustomobject]@{
+        Name = "NTFS-to-exFAT misaligned relocation conversion"
+        File = "converted-misaligned-ntfs-to-exfat-windows.vhd"
+        FileSystem = "exFAT"
+        Sha256 = "347C89B7F09E73714D06460CDFAC7F1CEE414FCBB0B99D55C49782C5BAA44E3E"
+        # The 4 KiB-aligned NTFS payload had to move to satisfy the 8 KiB exFAT cluster grid;
+        # the driver must serve the relocated bytes, not the original location.
+        Payloads = @(
+            [pscustomobject]@{
+                Path = "relocated.bin"
+                Length = 8192
+                Sha256 = "9EF93D4A62D53C78329EADFDE79292B3F613BE077F4E1AF67AD28E75CEA3D777"
+            }
+        )
+        Directory = $null
     }
 )
 $results = @()
