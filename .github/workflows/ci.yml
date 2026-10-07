@@ -97,6 +97,7 @@ jobs:
           path: |
             target/windows-vhd-preflight-report.json
             target/windows-vhd-report.json
+            target/windows-control/*.vhd
           if-no-files-found: warn
 
   rust:

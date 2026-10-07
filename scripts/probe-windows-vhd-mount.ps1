@@ -31,6 +31,10 @@ if ([string]::IsNullOrWhiteSpace($FixtureRoot)) {
 $fixtureDirectory = (Resolve-Path -LiteralPath $FixtureRoot).Path
 $scratch = Join-Path $fixtureDirectory "probe-scratch"
 $null = New-Item -ItemType Directory -Path $scratch -Force
+# Windows-formatted control VHDs are kept so CI can publish them as byte-level references for
+# comparing $UpCase, $AttrDef, $Secure, and $Extend against StarConverter's pinned profiles.
+$controlDirectory = Join-Path $repoRoot "target\windows-control"
+$null = New-Item -ItemType Directory -Path $controlDirectory -Force
 
 function Write-Line {
     param([string]$Text)
@@ -225,7 +229,7 @@ function Invoke-WritableCopyProbe {
 
 function New-ControlVhd {
     param([string]$FileSystem)
-    $path = Join-Path $scratch "control-$FileSystem.vhd"
+    $path = Join-Path $controlDirectory "control-$FileSystem.vhd"
     if (Test-Path -LiteralPath $path) {
         Remove-Item -LiteralPath $path -Force
     }
@@ -274,7 +278,7 @@ if (-not $SkipControl) {
         $control = New-ControlVhd -FileSystem $fileSystem
         if ($null -ne $control) {
             Invoke-ReadOnlyProbe -Label "control-$fileSystem" -Path $control
-            Remove-Item -LiteralPath $control -Force -ErrorAction SilentlyContinue
+            Write-Line "control-$fileSystem kept at $control sha256=$(Get-Sha256 -Path $control)"
         }
     }
 }

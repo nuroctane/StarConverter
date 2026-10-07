@@ -15,7 +15,7 @@ hashes. The non-elevated preflight therefore refused the regenerated candidates.
 Both pins were refreshed from the regenerated fixtures and now read:
 
 ```text
-converted Windows NTFS VHD   ED4CD7630790095EB0704C1DEE4AA8B25249A5A0F2F98385FB36FD749F9CAC9B
+converted Windows NTFS VHD   D54A2114D8CA460B165F87D033B41D0402A5089E27634F4DE7D0EC752427065F
 converted Windows exFAT VHD  3F52FE1A6997A5DAFBA4B66D4C7947E9DFAEAB801A578E597775D9C3F3F0EA41
 ```
 
@@ -36,6 +36,43 @@ volume GUID round trip, exact payload sizes and hashes through the Windows files
 create-new JSON report is verified by `starconverter verify-windows-report` and uploaded as
 `windows-vhd-evidence`. The non-elevated local preflight passed against the refreshed pins and its
 report verified through the CLI (Windows 10.0.26200, PowerShell 5.1.26100.8655).
+
+### First elevated Windows driver results
+
+The elevated lane was the first time the Windows filesystem drivers saw the converted candidates.
+Three harness defects surfaced before the drivers themselves could be judged: the Storage module
+reports an unassigned partition letter as `[char]0` rather than `$null`; a letterless read-only
+volume only mounts lazily, so the harness now touches the volume GUID path before inspecting
+`FileSystem`; and `chkdsk` rejects a `\\?\Volume{...}\` path with the trailing separator, so the
+harness passes the GUID path without it. All three fixes landed before any candidate was judged.
+
+Result for the converted exFAT VHD (CI run 37583309187, `windows-latest`): attached read-only
+without a drive letter, the Windows exFAT driver served all three payloads with exact sizes and
+SHA-256 values, `chkdsk` exited 0 with "found no problems", the image detached, and the VHD hash
+was unchanged. **This is the first Windows filesystem-driver acceptance of a StarConverter
+exFAT candidate.**
+
+Result for the converted NTFS VHD on the same run: `ntfs.sys` refused the mount (`fsutil` error
+1393, Ntfs/Operational event 305, System event 55), and a read-only `chkdsk` on the raw volume
+reported `Attribute record (30, "")` corruption on file record segments 0 through 8. Dumping the
+MFT records showed the root cause: `ExfatToNtfsOptions::system_timestamp` defaulted to `0`, so
+every `$STANDARD_INFORMATION` and `$FILE_NAME` FILETIME on the system records was zero. NTFS-3G
+tolerates that; Windows does not. The option is now `Option<u64>`: `None` derives the stamp from the
+latest mapped source object timestamp (floored at the exFAT epoch, 1980-01-01Z), an explicit
+`Some(0)` is refused with `ExfatToNtfsError::ZeroSystemTimestamp`, and `export_external_fixtures`
+walks records 0 through 11 of the generated VHD asserting every resident FILETIME is nonzero. That
+byte change is what moved the NTFS pin to `D54A...065F`; the exFAT pin was unaffected.
+
+The same `chkdsk` transcript also reported "found bad on-disk uppercase table - using system
+table" for both the converted and the structural NTFS images, while a diskpart-formatted control
+VHD on the same runner mounted cleanly without that warning. The pinned NTFS-3G Windows 6.1
+`$UpCase` profile therefore differs from the table that Windows 11 / Server 2025 considers
+current. `scripts/probe-windows-vhd-mount.ps1` (never gating) now dumps the boot sector, attaches
+each candidate, records `fsutil`, `chkdsk`, and event-log output, round-trips a writable copy
+through a block diff, and keeps the diskpart control VHDs under `target/windows-control/` so they
+are published with `windows-vhd-evidence` for byte-level comparison. Whether the uppercase table
+alone blocks the mount once the timestamps are fixed is the open question the next lane run
+answers.
 
 ## 2026-09-01 forced NTFS-to-exFAT relocation qualification
 

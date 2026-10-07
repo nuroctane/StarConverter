@@ -72,14 +72,21 @@ const SECONDS_PER_DAY: u64 = 86_400;
 const EXFAT_EPOCH_YEAR: u32 = 1980;
 const FILETIME_EPOCH_YEAR: u32 = 1601;
 
+/// FILETIME of 1980-01-01T00:00:00Z, the earliest instant exFAT can represent.
+///
+/// Windows `chkdsk` reports a `$FILE_NAME` attribute whose timestamps are zero as corrupt and
+/// `ntfs.sys` then refuses to mount the volume, so a derived system timestamp must never be zero.
+pub const EXFAT_EPOCH_FILETIME: u64 = 119_600_064_000_000_000;
+
 /// Deterministic target choices which cannot be inferred from an exFAT object graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExfatToNtfsOptions {
     pub partition_offset_sectors: u64,
     pub cluster_bytes: u32,
     /// FILETIME used only for NTFS system records and the target root, whose source exFAT root has
-    /// no file-entry timestamp fields.
-    pub system_timestamp: u64,
+    /// no file-entry timestamp fields. `None` derives the latest source object timestamp, falling
+    /// back to [`EXFAT_EPOCH_FILETIME`] for an empty volume. `Some(0)` is refused.
+    pub system_timestamp: Option<u64>,
 }
 
 impl Default for ExfatToNtfsOptions {
@@ -87,7 +94,36 @@ impl Default for ExfatToNtfsOptions {
         Self {
             partition_offset_sectors: 0,
             cluster_bytes: 4096,
-            system_timestamp: 0,
+            system_timestamp: None,
+        }
+    }
+}
+
+/// Resolves the FILETIME stamped onto NTFS system records and the target root.
+///
+/// Derivation is deterministic in the source bytes: the maximum of every object's mapped
+/// creation and modification FILETIME, or the exFAT epoch when the volume has no timestamped
+/// objects. Both outcomes are nonzero by construction.
+fn resolve_system_timestamp(
+    normalized: &NormalizedExfat,
+    requested: Option<u64>,
+) -> Result<u64, ExfatToNtfsError> {
+    match requested {
+        Some(0) => Err(ExfatToNtfsError::ZeroSystemTimestamp),
+        Some(explicit) => Ok(explicit),
+        None => {
+            let mut latest = EXFAT_EPOCH_FILETIME;
+            for evidence in &normalized.preservation.objects {
+                let Some(timestamps) = evidence.timestamps else {
+                    continue;
+                };
+                let mapped = map_exfat_timestamps(timestamps)
+                    .ok_or(ExfatToNtfsError::InvalidTimestamp(evidence.object))?;
+                latest = latest
+                    .max(mapped.creation_time)
+                    .max(mapped.modification_time);
+            }
+            Ok(latest)
         }
     }
 }
@@ -289,6 +325,8 @@ pub enum ExfatToNtfsError {
     UnknownObjectEvidence(ObjectId),
     MissingTimestamp(ObjectId),
     InvalidTimestamp(ObjectId),
+    /// An explicit zero system FILETIME was requested; Windows treats it as `$FILE_NAME` corruption.
+    ZeroSystemTimestamp,
     AllocationFailed,
     SourceMetadataLimitExceeded {
         actual: usize,
@@ -351,6 +389,9 @@ impl fmt::Display for ExfatToNtfsError {
                     object.0
                 )
             }
+            Self::ZeroSystemTimestamp => formatter.write_str(
+                "system FILETIME must be nonzero; Windows reports zero $FILE_NAME timestamps as corrupt",
+            ),
             Self::AllocationFailed => {
                 formatter.write_str("could not allocate bounded cross-format metadata")
             }
@@ -614,7 +655,8 @@ pub fn plan_lossless_exfat_to_ntfs(
         return Err(ExfatToNtfsError::PreservationRefused { blockers });
     }
 
-    let object_metadata = map_exfat_object_metadata(normalized, options.system_timestamp)?;
+    let system_timestamp = resolve_system_timestamp(normalized, options.system_timestamp)?;
+    let object_metadata = map_exfat_object_metadata(normalized, system_timestamp)?;
     let volume_label = normalized
         .preservation
         .volume_label
@@ -624,7 +666,7 @@ pub fn plan_lossless_exfat_to_ntfs(
         partition_offset_sectors: options.partition_offset_sectors,
         cluster_bytes: options.cluster_bytes,
         volume_serial_number: u64::from(normalized.preservation.volume_serial_number),
-        timestamp: options.system_timestamp,
+        timestamp: system_timestamp,
     };
     let target_graph = project_exfat_graph_for_ntfs(normalized)?;
     let mut destination = plan_ntfs_destination_with_metadata_and_volume(
@@ -681,7 +723,8 @@ pub fn draft_lossless_exfat_to_ntfs(
         });
     }
 
-    let object_metadata = map_exfat_object_metadata(normalized, options.system_timestamp)?;
+    let system_timestamp = resolve_system_timestamp(normalized, options.system_timestamp)?;
+    let object_metadata = map_exfat_object_metadata(normalized, system_timestamp)?;
     let volume_label = normalized
         .preservation
         .volume_label
@@ -691,7 +734,7 @@ pub fn draft_lossless_exfat_to_ntfs(
         partition_offset_sectors: options.partition_offset_sectors,
         cluster_bytes: options.cluster_bytes,
         volume_serial_number: u64::from(normalized.preservation.volume_serial_number),
-        timestamp: options.system_timestamp,
+        timestamp: system_timestamp,
     };
     let target_graph = project_exfat_graph_for_ntfs(normalized)?;
     let mut destination = draft_ntfs_destination_with_metadata_and_volume(
@@ -763,7 +806,8 @@ pub fn draft_escrow_restored_exfat_to_ntfs(
     let dest_native = project_exfat_graph_for_ntfs(normalized)?;
     let restored = restore_ntfs_identities_with_evidence(&dest_native, sidecar)
         .map_err(ExfatToNtfsError::EscrowRestore)?;
-    let mut exfat_metadata = map_exfat_object_metadata(normalized, options.system_timestamp)?;
+    let system_timestamp = resolve_system_timestamp(normalized, options.system_timestamp)?;
+    let mut exfat_metadata = map_exfat_object_metadata(normalized, system_timestamp)?;
     // Escrow carriers were folded back into their owners' named streams and no longer exist on
     // the restored graph, so they must not be described to the NTFS serializer.
     exfat_metadata.retain(|entry| !restored.removed_objects.contains(&entry.object));
@@ -774,7 +818,7 @@ pub fn draft_escrow_restored_exfat_to_ntfs(
         partition_offset_sectors: options.partition_offset_sectors,
         cluster_bytes: options.cluster_bytes,
         volume_serial_number: sidecar.volume_serial_number,
-        timestamp: options.system_timestamp,
+        timestamp: system_timestamp,
     };
     let reparse_points: Vec<(ObjectId, &[u8])> = restored
         .reparse_points
@@ -3149,7 +3193,7 @@ mod tests {
             &normalized,
             GuaranteeMode::Escrow,
             ExfatToNtfsOptions {
-                system_timestamp: 42,
+                system_timestamp: Some(42),
                 ..ExfatToNtfsOptions::default()
             },
             ExfatToNtfsLimits::default(),
@@ -3159,6 +3203,63 @@ mod tests {
         assert!(plan.preservation.escrow.is_some());
         assert!(!plan.destination.activation_ready());
         assert_eq!(plan.object_metadata[0].timestamps.creation_time, 42);
+    }
+
+    #[test]
+    fn derived_system_timestamp_is_nonzero_and_tracks_the_latest_source_object() {
+        let normalized = normalized_exfat();
+        assert!(matches!(
+            plan_lossless_exfat_to_ntfs(
+                &normalized,
+                GuaranteeMode::Escrow,
+                ExfatToNtfsOptions {
+                    system_timestamp: Some(0),
+                    ..ExfatToNtfsOptions::default()
+                },
+                ExfatToNtfsLimits::default(),
+            ),
+            Err(ExfatToNtfsError::ZeroSystemTimestamp)
+        ));
+
+        let plan = plan_lossless_exfat_to_ntfs(
+            &normalized,
+            GuaranteeMode::Escrow,
+            ExfatToNtfsOptions::default(),
+            ExfatToNtfsLimits::default(),
+        )
+        .unwrap();
+        let latest = normalized
+            .preservation
+            .objects
+            .iter()
+            .filter_map(|evidence| evidence.timestamps)
+            .filter_map(map_exfat_timestamps)
+            .flat_map(|mapped| [mapped.creation_time, mapped.modification_time])
+            .max()
+            .unwrap();
+        assert!(latest > EXFAT_EPOCH_FILETIME);
+        assert_eq!(plan.object_metadata[0].timestamps.creation_time, latest);
+        assert_eq!(plan.object_metadata[0].timestamps.access_time, latest);
+
+        assert_eq!(
+            resolve_system_timestamp(
+                &NormalizedExfat {
+                    preservation: ExfatPreservationSidecar {
+                        objects: Vec::new(),
+                        ..normalized.preservation.clone()
+                    },
+                    ..normalized
+                },
+                None,
+            )
+            .unwrap(),
+            EXFAT_EPOCH_FILETIME
+        );
+        // 1980-01-01T00:00:00Z expressed through the same exFAT-to-FILETIME mapping.
+        assert_eq!(
+            exfat_timestamp_to_filetime(packed_timestamp(1980, 1, 1, 0, 0, 0), 0, 0x80),
+            Some(EXFAT_EPOCH_FILETIME)
+        );
         assert_eq!(plan.object_metadata[1].dos_file_attributes, 0x21);
         assert_eq!(
             plan.object_metadata[1].timestamps.creation_time,

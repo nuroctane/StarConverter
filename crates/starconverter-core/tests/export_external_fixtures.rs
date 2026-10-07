@@ -793,7 +793,76 @@ fn export_windows_vhd_candidates(
         );
         println!("pinned Windows VHD identity: {actual} {}", path.display());
     }
+    assert_ntfs_system_records_carry_nonzero_timestamps(&fs::read(&ntfs_path).unwrap());
     (ntfs_path, exfat_path)
+}
+
+/// Windows `chkdsk` reports `$FILE_NAME` attributes with zero FILETIMEs as corrupt and `ntfs.sys`
+/// refuses the volume, so every system record in the Windows VHD candidate must carry a real
+/// timestamp in both `$STANDARD_INFORMATION` and `$FILE_NAME`.
+fn assert_ntfs_system_records_carry_nonzero_timestamps(vhd: &[u8]) {
+    const PARTITION_BYTES: usize = 1024 * 1024;
+    const CLUSTER_BYTES: usize = 4096;
+    const RECORD_BYTES: usize = 1024;
+    const MFT_LCN: usize = 4;
+    // Records 12–15 are free formatted reserved records in this profile and carry no attributes.
+    for record_number in 0..12 {
+        let start = PARTITION_BYTES + MFT_LCN * CLUSTER_BYTES + record_number * RECORD_BYTES;
+        let record = &vhd[start..start + RECORD_BYTES];
+        assert_eq!(&record[..4], b"FILE", "record {record_number} magic");
+        let mut offset = usize::from(u16::from_le_bytes([record[0x14], record[0x15]]));
+        let mut saw_standard_information = false;
+        let mut saw_file_name = false;
+        loop {
+            let attribute_type = u32::from_le_bytes(record[offset..offset + 4].try_into().unwrap());
+            if attribute_type == u32::MAX {
+                break;
+            }
+            let length = usize::try_from(u32::from_le_bytes(
+                record[offset + 4..offset + 8].try_into().unwrap(),
+            ))
+            .unwrap();
+            assert_eq!(
+                record[offset + 8],
+                0,
+                "record {record_number} resident header"
+            );
+            let value_offset = usize::from(u16::from_le_bytes([
+                record[offset + 0x14],
+                record[offset + 0x15],
+            ]));
+            let value = &record[offset + value_offset..offset + length];
+            match attribute_type {
+                0x10 => {
+                    saw_standard_information = true;
+                    for field in 0..4 {
+                        let stamp =
+                            u64::from_le_bytes(value[field * 8..field * 8 + 8].try_into().unwrap());
+                        assert_ne!(stamp, 0, "record {record_number} $STANDARD_INFORMATION");
+                    }
+                }
+                0x30 => {
+                    saw_file_name = true;
+                    for field in 0..4 {
+                        let stamp = u64::from_le_bytes(
+                            value[8 + field * 8..16 + field * 8].try_into().unwrap(),
+                        );
+                        assert_ne!(stamp, 0, "record {record_number} $FILE_NAME");
+                    }
+                }
+                _ => {}
+            }
+            // Only the leading resident attributes matter here; stop at the first non-resident one.
+            offset += length;
+            if record[offset + 8] != 0 {
+                break;
+            }
+        }
+        assert!(
+            saw_standard_information && saw_file_name,
+            "system record {record_number} lacks $STANDARD_INFORMATION or $FILE_NAME"
+        );
+    }
 }
 
 fn upper_hex(bytes: &[u8]) -> String {
