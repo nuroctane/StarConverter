@@ -604,8 +604,9 @@ function Invoke-DriverJudgment {
 
 function Get-ConvertedSha256 {
     param([string[]]$Output, [string]$Tag)
+    # `[SOURCE UNCHANGED] <bytes> bytes / sha256 <hex>` and `[CANDIDATE] sha256 <hex>`.
     foreach ($line in $Output) {
-        if ($line -match "^\[$Tag\]\s+sha256\s+([0-9a-f]{64})") {
+        if ($line -match "^\[$Tag\]\s+(?:\d+ bytes / )?sha256\s+([0-9a-f]{64})\s*$") {
             return $Matches[1].ToUpperInvariant()
         }
     }
