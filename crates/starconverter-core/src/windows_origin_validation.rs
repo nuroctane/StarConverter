@@ -172,6 +172,7 @@ pub struct WindowsOriginCandidateEvidence {
     vhd_bytes: u64,
     sha256: [u8; 32],
     partition_offset_bytes: u64,
+    partition_bytes: u64,
     volume_guid_path: String,
     payloads: Vec<WindowsOriginPayloadEvidence>,
     security: Vec<WindowsOriginSecurityEvidence>,
@@ -203,6 +204,12 @@ impl WindowsOriginCandidateEvidence {
     #[must_use]
     pub const fn partition_offset_bytes(&self) -> u64 {
         self.partition_offset_bytes
+    }
+
+    /// Length of the MBR partition diskpart created, which is also the carved image length.
+    #[must_use]
+    pub const fn partition_bytes(&self) -> u64 {
+        self.partition_bytes
     }
 
     #[must_use]
@@ -315,6 +322,7 @@ struct RawCandidate {
     no_drive_letter: bool,
     detached_after: bool,
     partition_offset_bytes: u64,
+    partition_bytes: u64,
     volume_guid_path: String,
     payloads: Vec<RawPayload>,
     security: Vec<RawSecurity>,
@@ -619,6 +627,22 @@ fn validate_candidate(
             "partition offset is not the pinned 1 MiB",
         ));
     }
+    // diskpart picks the partition length (it keeps roughly 1 MiB of slack before the footer), so
+    // only sector granularity and fit inside the disk bytes are pinned.
+    if candidate.partition_bytes == 0 || candidate.partition_bytes % 512 != 0 {
+        return Err(WindowsValidationError::InvalidEvidence(
+            "partition length is not a positive whole number of sectors",
+        ));
+    }
+    if candidate
+        .partition_offset_bytes
+        .checked_add(candidate.partition_bytes)
+        .is_none_or(|end| end > ORIGIN_VHD_BYTES - 512)
+    {
+        return Err(WindowsValidationError::InvalidEvidence(
+            "partition extends past the disk bytes into the VHD footer",
+        ));
+    }
     if !valid_volume_guid_path(&candidate.volume_guid_path) {
         return Err(WindowsValidationError::InvalidEvidence(
             "invalid volume GUID path",
@@ -638,6 +662,7 @@ fn validate_candidate(
         vhd_bytes: candidate.vhd_bytes,
         sha256,
         partition_offset_bytes: candidate.partition_offset_bytes,
+        partition_bytes: candidate.partition_bytes,
         volume_guid_path: candidate.volume_guid_path,
         payloads,
         security,
@@ -928,7 +953,7 @@ mod tests {
             &h[20..32]
         );
         format!(
-            r#"{{"Name":"{name}","Origin":"{origin}","RestoreEscrow":{restore_escrow},"SourceVhdPath":{source_path},"SourceVhdSha256":"{source_hash}","SourceImageSha256":"{image_hash}","Candidate":{{"FileSystem":"{candidate_fs}","VhdPath":{candidate_path},"VhdBytes":41943552,"Sha256Before":"{candidate_hash}","Sha256After":"{candidate_hash}","ReadOnlyAttached":true,"NoDriveLetter":true,"DetachedAfter":true,"PartitionOffsetBytes":1048576,"VolumeGuidPath":"\\\\?\\Volume{{{guid}}}\\","Payloads":[{}],"Security":[{security}],"ChkdskExitCode":0,"ChkdskOutput":["Windows has scanned the file system and found no problems."]}}}}"#,
+            r#"{{"Name":"{name}","Origin":"{origin}","RestoreEscrow":{restore_escrow},"SourceVhdPath":{source_path},"SourceVhdSha256":"{source_hash}","SourceImageSha256":"{image_hash}","Candidate":{{"FileSystem":"{candidate_fs}","VhdPath":{candidate_path},"VhdBytes":41943552,"Sha256Before":"{candidate_hash}","Sha256After":"{candidate_hash}","ReadOnlyAttached":true,"NoDriveLetter":true,"DetachedAfter":true,"PartitionOffsetBytes":1048576,"PartitionBytes":39845888,"VolumeGuidPath":"\\\\?\\Volume{{{guid}}}\\","Payloads":[{}],"Security":[{security}],"ChkdskExitCode":0,"ChkdskOutput":["Windows has scanned the file system and found no problems."]}}}}"#,
             payload_json()
         )
     }
@@ -1200,6 +1225,46 @@ mod tests {
                 1,
             ),
             "source VHD path is not a local drive-absolute .vhd path",
+        );
+    }
+
+    #[test]
+    fn partition_length_must_be_sector_granular_and_fit_the_disk() {
+        let base = report();
+        for bad in ["0", "39845889"] {
+            invalid(
+                &base.replacen(
+                    r#""PartitionBytes":39845888"#,
+                    &format!(r#""PartitionBytes":{bad}"#),
+                    1,
+                ),
+                "partition length is not a positive whole number of sectors",
+            );
+        }
+        // 1 MiB offset + 39 MiB + one sector reaches into the footer; 40 MiB overflows the disk
+        // outright; the last value overflows u64 when added to the offset.
+        for bad in ["40894976", "41943040", "18446744073709551104"] {
+            invalid(
+                &base.replacen(
+                    r#""PartitionBytes":39845888"#,
+                    &format!(r#""PartitionBytes":{bad}"#),
+                    1,
+                ),
+                "partition extends past the disk bytes into the VHD footer",
+            );
+        }
+        // 1 MiB offset + 39 MiB ends exactly at the disk bytes and is accepted.
+        assert_eq!(
+            verify(&base.replacen(
+                r#""PartitionBytes":39845888"#,
+                r#""PartitionBytes":40894464"#,
+                1
+            ))
+            .unwrap()
+            .cases()[0]
+                .candidate()
+                .partition_bytes(),
+            40_894_464
         );
     }
 

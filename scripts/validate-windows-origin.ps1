@@ -107,13 +107,55 @@ if (-not [string]::IsNullOrWhiteSpace($ReportPath)) {
     }
 }
 
-# 40 MiB fixed VHD: 512-byte footer after the disk bytes, one MBR partition at 1 MiB running to
-# the end of the disk. These are the same numbers the windows-vhd probe's control VHDs use.
+# 40 MiB fixed VHD: 512-byte footer after the disk bytes, one MBR partition at 1 MiB. diskpart
+# chooses the partition length itself (it keeps about 1 MiB of slack at the end of the disk), so
+# the length is read back from the MBR Windows wrote rather than assumed; carving more than the
+# partition would hand StarConverter a volume larger than the one the drivers can see.
 $vhdMaximumMiB = 40
 $diskBytes = [long]$vhdMaximumMiB * 1MB
 $vhdBytes = $diskBytes + 512
 $partitionOffset = [long]1MB
-$partitionBytes = $diskBytes - $partitionOffset
+$partitionBytes = [long]0
+
+function Read-MbrPartitionBytes {
+    param([string]$VhdPath)
+    $stream = [IO.File]::Open($VhdPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        $mbr = New-Object byte[] 512
+        if ($stream.Read($mbr, 0, 512) -ne 512) { throw "Short read of the source MBR" }
+    }
+    finally {
+        $stream.Dispose()
+    }
+    if ($mbr[510] -ne 0x55 -or $mbr[511] -ne 0xAA) {
+        throw "Source MBR lacks the 0x55AA boot signature"
+    }
+    $entries = @()
+    for ($i = 0; $i -lt 4; $i++) {
+        $entry = 0x1BE + 16 * $i
+        if ($mbr[$entry + 4] -ne 0) {
+            $entries += [pscustomobject]@{
+                Type = $mbr[$entry + 4]
+                StartBytes = [long][BitConverter]::ToUInt32($mbr, $entry + 8) * 512
+                LengthBytes = [long][BitConverter]::ToUInt32($mbr, $entry + 12) * 512
+            }
+        }
+    }
+    if ($entries.Count -ne 1) {
+        throw "Expected exactly one MBR partition, found $($entries.Count)"
+    }
+    $partition = $entries[0]
+    if ($partition.Type -ne 0x07) {
+        throw ("Expected MBR partition type 0x07, found 0x{0:X2}" -f $partition.Type)
+    }
+    if ($partition.StartBytes -ne $partitionOffset) {
+        throw "Expected the partition at $partitionOffset bytes, found $($partition.StartBytes)"
+    }
+    if ($partition.LengthBytes -le 0 -or ($partition.StartBytes + $partition.LengthBytes) -gt $diskBytes) {
+        throw "MBR partition of $($partition.LengthBytes) bytes does not fit the $diskBytes-byte disk"
+    }
+    return [long]$partition.LengthBytes
+}
 
 # Payload corpus: bytes are (seed + offset) % 251 so every stream is reproducible from the
 # manifest alone. Names are spelled from code points so this script stays ASCII.
@@ -193,6 +235,12 @@ function New-WindowsFormattedVhd {
     if ((Get-DiskImage -ImagePath $path -StorageType VHD).Attached) {
         throw "diskpart left the source VHD attached: $path"
     }
+    $length = Read-MbrPartitionBytes -VhdPath $path
+    if ($script:partitionBytes -ne 0 -and $script:partitionBytes -ne $length) {
+        throw "diskpart produced a $length-byte partition for $FileSystem, earlier origin had $($script:partitionBytes)"
+    }
+    $script:partitionBytes = $length
+    Write-Line "$FileSystem source partition: offset $partitionOffset bytes, length $length bytes ($($length / 1MB) MiB)"
     return $path
 }
 
@@ -513,6 +561,11 @@ function New-CandidateVhd {
             try {
                 Copy-FileRange -Source $vhd -Offset 0 -Length $partitionOffset -Destination $destination
                 Copy-FileRange -Source $image -Offset 0 -Length $partitionBytes -Destination $destination
+                $partitionEnd = $partitionOffset + $partitionBytes
+                if ($partitionEnd -lt $diskBytes) {
+                    # Unpartitioned slack diskpart left after the partition travels unchanged.
+                    Copy-FileRange -Source $vhd -Offset $partitionEnd -Length ($diskBytes - $partitionEnd) -Destination $destination
+                }
                 Copy-FileRange -Source $vhd -Offset $diskBytes -Length 512 -Destination $destination
                 $destination.Flush($true)
             }
@@ -705,6 +758,7 @@ function Invoke-DriverJudgment {
         NoDriveLetter = $true
         DetachedAfter = $true
         PartitionOffsetBytes = $partitionOffset
+        PartitionBytes = $partitionBytes
         VolumeGuidPath = $volumePath
         Payloads = $payloadResults
         Security = $securityResults

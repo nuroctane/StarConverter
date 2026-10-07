@@ -141,7 +141,8 @@ fn verify_windows_origin_report_command(args: &[String]) -> Result<(), String> {
             hex_digest(candidate.sha256())
         );
         println!(
-            "[DRIVER] read-only payloads={} / descriptors={} / escrow-restored={} / chkdsk-exit={}",
+            "[DRIVER] read-only partition={} bytes / payloads={} / descriptors={} / escrow-restored={} / chkdsk-exit={}",
+            candidate.partition_bytes(),
             candidate.payloads().len(),
             candidate.security().len(),
             if case.restore_escrow() { "yes" } else { "no" },
