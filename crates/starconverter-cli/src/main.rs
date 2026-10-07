@@ -37,6 +37,7 @@ use starconverter_core::preservation::{
     FieldAssessment, PreservationField, PreservationLimits, PreservationReport, evaluate_exfat,
     evaluate_ntfs,
 };
+use starconverter_core::windows_origin_validation::verify_windows_origin_validation_report;
 use starconverter_core::windows_validation::{
     WindowsValidationLimits, verify_windows_vhd_validation_report,
 };
@@ -80,6 +81,7 @@ fn run(args: &[String]) -> Result<(), String> {
         "convert-image" => convert_image_command(&args[1..])?,
         "verify-export" => verify_export_command(&args[1..])?,
         "verify-windows-report" => verify_windows_report_command(&args[1..])?,
+        "verify-windows-origin-report" => verify_windows_origin_report_command(&args[1..])?,
         "plan" => plan_command(&args[1..])?,
         unknown => return Err(format!("unknown command `{unknown}`")),
     }
@@ -87,10 +89,12 @@ fn run(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn verify_windows_report_command(args: &[String]) -> Result<(), String> {
-    let report_path = parse_windows_report_path(args)?;
-    let limits = WindowsValidationLimits::default();
-    let report = ImageFile::open_with_limit(&report_path, limits.max_report_bytes)
+/// Opens one regular JSON report read-only and returns its bytes within the report cap.
+fn read_windows_report(
+    report_path: &Path,
+    limits: WindowsValidationLimits,
+) -> Result<(ImageFile, Vec<u8>), String> {
+    let report = ImageFile::open_with_limit(report_path, limits.max_report_bytes)
         .map_err(|error| format!("Windows validation report access failed: {error}"))?;
     let report_bytes = usize::try_from(report.len())
         .map_err(|_| "Windows validation report length does not fit this platform".to_owned())?;
@@ -103,6 +107,57 @@ fn verify_windows_report_command(args: &[String]) -> Result<(), String> {
     let bytes = report
         .read_exact_at(0, report_bytes)
         .map_err(|error| format!("Windows validation report read failed: {error}"))?;
+    Ok((report, bytes))
+}
+
+fn verify_windows_origin_report_command(args: &[String]) -> Result<(), String> {
+    let report_path = parse_windows_report_path(args)
+        .map_err(|error| error.replace("verify-windows-report", "verify-windows-origin-report"))?;
+    let limits = WindowsValidationLimits::default();
+    let (report, bytes) = read_windows_report(&report_path, limits)?;
+    let evidence = verify_windows_origin_validation_report(&bytes, limits)
+        .map_err(|error| format!("Windows-origin validation report refused: {error}"))?;
+
+    println!("{BANNER}");
+    println!("[VERIFIED] bounded Windows-origin validation report");
+    println!("[REPORT] {}", report.identity().canonical_path().display());
+    println!("[GENERATED] {}", evidence.generated_utc());
+    println!("[WINDOWS] {}", evidence.windows_version());
+    println!("[POWERSHELL] {}", evidence.powershell_version());
+    println!("[CHKDSK] {}", evidence.chkdsk_version());
+    println!(
+        "[DRIVERS] ntfs.sys {} / exfat.sys {}",
+        evidence.ntfs_driver_version(),
+        evidence.exfat_driver_version()
+    );
+    for case in evidence.cases() {
+        let candidate = case.candidate();
+        println!(
+            "[CASE] {} / source {} sha256 {} / candidate {} sha256 {}",
+            case.name(),
+            case.origin(),
+            hex_digest(case.source_vhd_sha256()),
+            candidate.filesystem(),
+            hex_digest(candidate.sha256())
+        );
+        println!(
+            "[DRIVER] read-only payloads={} / descriptors={} / chkdsk-exit={}",
+            candidate.payloads().len(),
+            candidate.security().len(),
+            candidate.chkdsk_exit_code()
+        );
+    }
+    println!(
+        "[NON-AUTHORIZING] This unkeyed JSON is validation evidence only; it cannot authorize activation or writes."
+    );
+    println!("[READ-ONLY] Only the regular report file was opened; no VHD or device was accessed.");
+    Ok(())
+}
+
+fn verify_windows_report_command(args: &[String]) -> Result<(), String> {
+    let report_path = parse_windows_report_path(args)?;
+    let limits = WindowsValidationLimits::default();
+    let (report, bytes) = read_windows_report(&report_path, limits)?;
     let evidence = verify_windows_vhd_validation_report(&bytes, limits)
         .map_err(|error| format!("Windows validation report refused: {error}"))?;
 
@@ -1347,6 +1402,7 @@ fn print_help() {
     println!("                              [--restore-escrow PATH]");
     println!("  starconverter verify-export <CANDIDATE> <ESCROW> [--source SOURCE]");
     println!("  starconverter verify-windows-report <REPORT.json>");
+    println!("  starconverter verify-windows-origin-report <REPORT.json>");
     println!("  starconverter plan [OPTIONS]\n");
     println!("INSPECT");
     println!(
@@ -1388,6 +1444,16 @@ fn print_help() {
     );
     println!(
         "  The report is unkeyed evidence only and never authorizes activation, attachment, or writes.\n"
+    );
+    println!("VERIFY-WINDOWS-ORIGIN-REPORT");
+    println!(
+        "  Strictly parses one bounded schema-v1 report from the Windows-origin harness, which converts"
+    );
+    println!(
+        "  volumes Windows itself formatted and populated and judges them with ntfs.sys/exfat.sys."
+    );
+    println!(
+        "  Checks the four case identities, the seeded payload corpus, and the NTFS round trip's SDDL set.\n"
     );
     println!("PLAN OPTIONS");
     println!("  --source <PATH>       Image path or synthetic identity");

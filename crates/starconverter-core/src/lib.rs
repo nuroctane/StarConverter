@@ -27,6 +27,7 @@ pub mod recovery;
 mod source_view;
 pub mod validation_vhd;
 pub mod verify;
+pub mod windows_origin_validation;
 pub mod windows_validation;
 
 use std::fmt;

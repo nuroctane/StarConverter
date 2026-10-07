@@ -941,7 +941,7 @@ fn validate_payloads(
     Ok(evidence)
 }
 
-fn validate_transcript(
+pub(crate) fn validate_transcript(
     lines: &[String],
     limits: WindowsValidationLimits,
 ) -> Result<(), WindowsValidationError> {
@@ -974,7 +974,7 @@ fn validate_transcript(
     Ok(())
 }
 
-const fn check_array(
+pub(crate) const fn check_array(
     field: &'static str,
     actual: usize,
     maximum: usize,
@@ -990,7 +990,7 @@ const fn check_array(
     }
 }
 
-fn check_nonempty_string(
+pub(crate) fn check_nonempty_string(
     field: &'static str,
     value: &str,
     limits: WindowsValidationLimits,
@@ -1005,7 +1005,7 @@ fn check_nonempty_string(
     }
 }
 
-const fn check_string(
+pub(crate) const fn check_string(
     field: &'static str,
     value: &str,
     limits: WindowsValidationLimits,
@@ -1021,7 +1021,7 @@ const fn check_string(
     }
 }
 
-fn decode_sha256(value: &str) -> Result<[u8; 32], WindowsValidationError> {
+pub(crate) fn decode_sha256(value: &str) -> Result<[u8; 32], WindowsValidationError> {
     if value.len() != 64
         || !value
             .bytes()
@@ -1046,7 +1046,7 @@ const fn hex_value(byte: u8) -> u8 {
     }
 }
 
-fn valid_local_vhd_path(value: &str) -> bool {
+pub(crate) fn valid_local_vhd_path(value: &str) -> bool {
     let bytes = value.as_bytes();
     bytes.len() >= 7
         && bytes[0].is_ascii_alphabetic()
@@ -1058,7 +1058,7 @@ fn valid_local_vhd_path(value: &str) -> bool {
         && !value.contains('\0')
 }
 
-fn valid_volume_guid_path(value: &str) -> bool {
+pub(crate) fn valid_volume_guid_path(value: &str) -> bool {
     let Some(guid) = value
         .strip_prefix(r"\\?\Volume{")
         .and_then(|value| value.strip_suffix(r"}\"))
@@ -1075,7 +1075,7 @@ fn valid_volume_guid_path(value: &str) -> bool {
         })
 }
 
-fn valid_roundtrip_utc(value: &str) -> bool {
+pub(crate) fn valid_roundtrip_utc(value: &str) -> bool {
     let bytes = value.as_bytes();
     bytes.len() == 28
         && bytes[0..4].iter().all(u8::is_ascii_digit)

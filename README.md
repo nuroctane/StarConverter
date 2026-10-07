@@ -140,6 +140,7 @@ cargo run -p starconverter-cli -- convert-image "C:\path\source.img" "C:\path\ne
 cargo run -p starconverter-cli -- convert-image "C:\path\exported-exfat.img" "C:\path\restored-ntfs.img" --to ntfs --mode escrow --restore-escrow "C:\path\exported-exfat.img.starconverter-escrow"
 cargo run -p starconverter-cli -- verify-export "C:\path\new-target.img" "C:\path\new-target.img.starconverter-escrow" --source "C:\path\source.img"
 cargo run -p starconverter-cli -- verify-windows-report "C:\path\windows-validation.json"
+cargo run -p starconverter-cli -- verify-windows-origin-report "C:\path\windows-origin-report.json"
 cargo run -p starconverter-gui
 ```
 
@@ -183,6 +184,12 @@ tracked portability gate.
 `verify-windows-report` opens only a bounded regular JSON file and strictly checks the schema-v1
 output of the detached/read-only VHD harness. Its result is explicitly unkeyed, non-authorizing
 evidence; the command never opens, attaches, mounts, or writes a VHD or device.
+
+`verify-windows-origin-report` does the same for the Windows-origin harness
+(`scripts/validate-windows-origin.ps1`), which formats and populates volumes with Windows itself,
+converts them both ways, and has `ntfs.sys`/`exfat.sys` re-read every payload and NTFS security
+descriptor. The verifier recomputes the seeded payload digests and requires the NTFS round trip to
+carry the run-time-allocated Guests deny descriptors.
 
 The Go toolchain is only required for `lab/`:
 
@@ -300,7 +307,9 @@ installed. CI always tests both language stacks.
 - [ ] In-place image conversion with durable recovery/finalize workflow
 - [x] Elevated Windows `ntfs.sys`/`exfat.sys` read-only mount, payload, and `chkdsk` validation of the
       converted VHD candidates in CI (`windows-vhd` lane, evidence in `docs/EXTERNAL_VALIDATION.md`)
-- [ ] Windows `chkdsk`/mount validation of recovered and Windows-origin images
+- [ ] Windows `chkdsk`/mount validation of Windows-formatted, Windows-populated sources converted
+      both ways and round-tripped with escrow, including exact SDDL equality (`windows-origin` lane)
+- [ ] Windows `chkdsk`/mount validation of recovered images
 - [ ] Explicitly gated physical-volume support
 
 The staged implementation plan lives in [`docs/ROADMAP.md`](docs/ROADMAP.md); the evidence required

@@ -100,6 +100,35 @@ jobs:
             target/windows-control/*.vhd
           if-no-files-found: warn
 
+  windows-origin:
+    name: Windows-formatted source gate
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build CLI
+        run: cargo build -p starconverter-cli
+      - name: Format and populate with Windows, convert both ways, judge with the drivers
+        id: origin
+        shell: powershell
+        run: .\scripts\validate-windows-origin.ps1 -ReportPath target\windows-origin-report.json
+      - name: Verify the Windows-origin report with the CLI
+        if: ${{ !cancelled() && steps.origin.outcome == 'success' }}
+        shell: powershell
+        run: .\target\debug\starconverter.exe verify-windows-origin-report target\windows-origin-report.json
+      - name: Upload Windows-origin evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: windows-origin-evidence
+          path: |
+            target/windows-origin-report.json
+            target/windows-origin/*.vhd
+            target/windows-origin/*.img
+            target/windows-origin/*.starconverter-escrow
+          if-no-files-found: warn
+
   rust:
     name: Rust / ${{ matrix.os }}
     strategy:
