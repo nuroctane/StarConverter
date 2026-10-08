@@ -1474,6 +1474,258 @@ pub fn decode_ntfs_preservation_sidecar(
     })
 }
 
+/// The exFAT identities an exFAT→NTFS escrow can hand back to an NTFS→exFAT conversion.
+///
+/// This is the restore-side view of the inner exFAT snapshot (v3): the parts of
+/// [`ExfatPreservationSidecar`] that an exFAT writer can re-emit, keyed by dest-native path
+/// because the NTFS candidate renumbered every object. Cluster placement, root discovery
+/// bookkeeping, and filesystem extents describe the original volume's layout and are validated
+/// but not carried; the destination writer chooses its own layout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExfatRestoreSidecar {
+    pub volume_serial_number: u32,
+    pub volume_label: ExfatVolumeLabelIdentity,
+    /// `TableChecksum` of the source's encoded Up-case Table.
+    pub upcase_checksum: u32,
+    /// All 65,536 source up-case mappings in code-unit order.
+    pub upcase_mappings: Vec<u16>,
+    pub objects: Vec<ExfatRestoreObject>,
+    /// Exact benign primary sets the source carried; the exFAT writer cannot re-emit them yet.
+    pub benign_primary_sets: usize,
+    /// Total vendor secondary entries across all objects; likewise not re-emittable yet.
+    pub benign_secondary_entries: u64,
+}
+
+/// One escrowed exFAT object, identified by its exact source path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExfatRestoreObject {
+    pub path: Vec<Vec<u16>>,
+    pub file_attributes: u16,
+    pub timestamps: Option<ExfatTimestamps>,
+    pub benign_secondary_entries: u8,
+}
+
+/// Rebuilds the restore-side exFAT snapshot from a validated schema-v4 escrow payload.
+///
+/// Only inner snapshot v3 is restored; the v2 layout predates benign entry capture and is kept
+/// readable for integrity checks through [`decode_escrow`] only.
+///
+/// # Errors
+///
+/// Returns [`PreservationError`] when the outer envelope is invalid, the source is not exFAT, or
+/// the inner snapshot is not a complete v3 sidecar.
+pub fn decode_exfat_sidecar_from_escrow(
+    bytes: &[u8],
+    limits: PreservationLimits,
+) -> Result<ExfatRestoreSidecar, PreservationError> {
+    let decoded = decode_escrow(bytes, limits)?;
+    if decoded.source != FileSystem::ExFat {
+        return malformed(10, "escrow source is not exFAT");
+    }
+    let snapshot = decoded
+        .records
+        .first()
+        .ok_or(PreservationError::MalformedEscrow {
+            offset: HEADER_BYTES,
+            reason: "missing exFAT sidecar snapshot",
+        })?;
+    decode_exfat_restore_sidecar(&snapshot.value)
+}
+
+/// Rebuilds [`ExfatRestoreSidecar`] from an inner exFAT snapshot v3.
+///
+/// # Errors
+///
+/// Returns [`PreservationError`] for an unsupported snapshot version, truncated fields, invalid
+/// tags, invalid UTF-16, a mapping table that is not exactly 65,536 entries, or unclaimed
+/// trailing bytes.
+#[allow(clippy::too_many_lines)]
+pub fn decode_exfat_restore_sidecar(
+    snapshot: &[u8],
+) -> Result<ExfatRestoreSidecar, PreservationError> {
+    let mut reader = SnapshotCursor::new(snapshot, 0);
+    if reader.u16()? != EXFAT_SNAPSHOT_VERSION {
+        return malformed(0, "unsupported exFAT sidecar snapshot version");
+    }
+    let volume_serial_number = reader.u32()?;
+    let label_offset = reader.cursor;
+    let volume_label = match reader.u8()? {
+        0 => ExfatVolumeLabelIdentity::Absent,
+        1 => {
+            let length = usize::from(reader.u8()?);
+            if length > 11 {
+                return malformed(
+                    label_offset + 1,
+                    "exFAT snapshot label exceeds 11 UTF-16 units",
+                );
+            }
+            let encoded = reader.take(length * 2)?;
+            let mut units = Vec::new();
+            units
+                .try_reserve_exact(length)
+                .map_err(|_| PreservationError::AllocationFailed)?;
+            units.extend(
+                encoded
+                    .chunks_exact(2)
+                    .map(|pair| u16::from_le_bytes([pair[0], pair[1]])),
+            );
+            if char::decode_utf16(units.iter().copied()).any(|unit| unit.is_err()) {
+                return malformed(
+                    label_offset + 2,
+                    "exFAT snapshot label contains invalid UTF-16",
+                );
+            }
+            ExfatVolumeLabelIdentity::Exact(units)
+        }
+        2 => ExfatVolumeLabelIdentity::UnretainedNonzeroPadding,
+        _ => return malformed(label_offset, "invalid exFAT snapshot label tag"),
+    };
+    // Directory summary, bitmap entry, and up-case entry: only the table checksum is restored.
+    for _ in 0..5 {
+        reader.usize()?;
+    }
+    reader.boolean()?;
+    for _ in 0..4 {
+        reader.u8()?;
+    }
+    reader.u32()?;
+    reader.u64()?;
+    let upcase_checksum = reader.u32()?;
+    reader.u32()?;
+    reader.u64()?;
+    let mapping_offset = reader.cursor;
+    let mapping_count = reader.count(2)?;
+    if mapping_count != 65_536 {
+        return malformed(
+            mapping_offset,
+            "exFAT snapshot up-case table is not 65,536 mappings",
+        );
+    }
+    let encoded_mappings = reader.take(mapping_count * 2)?;
+    let mut upcase_mappings = Vec::new();
+    upcase_mappings
+        .try_reserve_exact(mapping_count)
+        .map_err(|_| PreservationError::AllocationFailed)?;
+    upcase_mappings.extend(
+        encoded_mappings
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]])),
+    );
+    for _ in 0..4 {
+        reader.u64()?;
+    }
+    for _ in 0..3 {
+        validate_u32_vector(&mut reader)?;
+    }
+    let object_count = reader.count(1)?;
+    let mut objects = Vec::new();
+    objects
+        .try_reserve_exact(object_count)
+        .map_err(|_| PreservationError::AllocationFailed)?;
+    for _ in 0..object_count {
+        objects.push(decode_exfat_restore_object(&mut reader)?);
+    }
+    let extent_count = reader.count(26)?;
+    for _ in 0..extent_count {
+        validate_extent(&mut reader, true)?;
+    }
+    reader.u64()?;
+    let benign_primary_sets_counted = reader.u64()?;
+    let benign_secondary_entries = reader.u64()?;
+    reader.u64()?;
+    reader.boolean()?;
+    reader.u64()?;
+    let sets_offset = reader.cursor;
+    let benign_primary_sets = reader.count(8 + 1 + 8)?;
+    if u64::try_from(benign_primary_sets).map_err(|_| PreservationError::ArithmeticOverflow)?
+        != benign_primary_sets_counted
+    {
+        return malformed(
+            sets_offset,
+            "exFAT snapshot benign primary sets disagree with the directory evidence",
+        );
+    }
+    for _ in 0..benign_primary_sets {
+        reader.u64()?;
+        reader.u8()?;
+        let set_offset = reader.cursor;
+        let length = reader.count(1)?;
+        if length < EXFAT_ENTRY_BYTES || length % EXFAT_ENTRY_BYTES != 0 {
+            return malformed(
+                set_offset,
+                "exFAT snapshot benign primary set is not whole 32-byte entries",
+            );
+        }
+        reader.take(length)?;
+    }
+    reader.finish()?;
+    Ok(ExfatRestoreSidecar {
+        volume_serial_number,
+        volume_label,
+        upcase_checksum,
+        upcase_mappings,
+        objects,
+        benign_primary_sets,
+        benign_secondary_entries,
+    })
+}
+
+fn decode_exfat_restore_object(
+    reader: &mut SnapshotCursor<'_>,
+) -> Result<ExfatRestoreObject, PreservationError> {
+    reader.u64()?;
+    reader.u64()?;
+    let component_count = reader.count(8)?;
+    let mut path = Vec::new();
+    path.try_reserve_exact(component_count)
+        .map_err(|_| PreservationError::AllocationFailed)?;
+    for _ in 0..component_count {
+        let component_offset = reader.cursor;
+        let (units, well_formed) = reader.utf16_units()?;
+        if !well_formed {
+            return malformed(
+                component_offset,
+                "exFAT snapshot path contains invalid UTF-16",
+            );
+        }
+        path.push(units);
+    }
+    let file_attributes = reader.u16()?;
+    let timestamps = if reader.boolean()? {
+        Some(ExfatTimestamps {
+            create: reader.u32()?,
+            modified: reader.u32()?,
+            accessed: reader.u32()?,
+            create_centiseconds: reader.u8()?,
+            modified_centiseconds: reader.u8()?,
+            create_utc_offset: reader.u8()?,
+            modified_utc_offset: reader.u8()?,
+            accessed_utc_offset: reader.u8()?,
+        })
+    } else {
+        None
+    };
+    validate_u32_vector(reader)?;
+    reader.boolean()?;
+    reader.boolean()?;
+    let benign_secondary_entries = reader.u8()?;
+    let bytes_offset = reader.cursor;
+    let length = reader.count(1)?;
+    if length != usize::from(benign_secondary_entries) * EXFAT_ENTRY_BYTES {
+        return malformed(
+            bytes_offset,
+            "exFAT snapshot benign secondary bytes disagree with their entry count",
+        );
+    }
+    reader.take(length)?;
+    Ok(ExfatRestoreObject {
+        path,
+        file_attributes,
+        timestamps,
+        benign_secondary_entries,
+    })
+}
+
 fn escrow_checksum(header_prefix: &[u8], body: &[u8]) -> u32 {
     let mut hasher = Hasher::new();
     hasher.update(header_prefix);
@@ -3545,6 +3797,94 @@ mod tests {
         assert!(matches!(
             decode_escrow(&malformed_identity, PreservationLimits::default()),
             Err(PreservationError::MalformedEscrow { .. })
+        ));
+    }
+
+    #[test]
+    fn exfat_escrow_decodes_to_the_restore_sidecar_and_rejects_a_truncated_mapping_table() {
+        let source = exfat();
+        let report = evaluate_exfat(
+            &source,
+            FileSystem::Ntfs,
+            GuaranteeMode::Escrow,
+            PreservationLimits::default(),
+        )
+        .expect("policy");
+        let escrow = report.escrow.as_deref().expect("escrow");
+        let restore = decode_exfat_sidecar_from_escrow(escrow, PreservationLimits::default())
+            .expect("restore-side decode");
+        assert_eq!(
+            restore.volume_serial_number,
+            source.preservation.volume_serial_number
+        );
+        assert_eq!(restore.volume_label, ExfatVolumeLabelIdentity::Absent);
+        assert_eq!(
+            restore.upcase_checksum,
+            source.preservation.root.upcase_table.table_checksum
+        );
+        assert_eq!(
+            restore.upcase_mappings.as_slice(),
+            source.preservation.root.upcase_mappings.mappings()
+        );
+        assert_eq!(restore.objects.len(), source.preservation.objects.len());
+        for (decoded, original) in restore.objects.iter().zip(&source.preservation.objects) {
+            assert_eq!(decoded.path, original.path);
+            assert_eq!(decoded.file_attributes, original.file_attributes);
+            assert_eq!(decoded.timestamps, original.timestamps);
+            assert_eq!(
+                decoded.benign_secondary_entries,
+                original.flags.benign_secondary_entries
+            );
+        }
+        assert_eq!(
+            restore.benign_primary_sets,
+            source.preservation.benign_primary_sets.len()
+        );
+        assert_eq!(
+            restore.benign_secondary_entries,
+            source
+                .preservation
+                .directory_evidence
+                .benign_secondary_entries
+        );
+
+        // The NTFS direction must not decode as an exFAT restore sidecar.
+        let ntfs_report = evaluate_ntfs(
+            &ntfs(),
+            FileSystem::ExFat,
+            GuaranteeMode::Escrow,
+            PreservationLimits::default(),
+        )
+        .expect("policy");
+        assert!(matches!(
+            decode_exfat_sidecar_from_escrow(
+                ntfs_report.escrow.as_deref().expect("escrow"),
+                PreservationLimits::default()
+            ),
+            Err(PreservationError::MalformedEscrow { .. })
+        ));
+
+        // A snapshot whose mapping table is not complete is refused by the restore decoder even
+        // though the integrity walker only checks that the declared count fits.
+        let decoded = decode_escrow(escrow, PreservationLimits::default()).expect("decode");
+        let mut snapshot = decoded.records[0].value.clone();
+        // version(2) serial(4) label tag(1) + 5 usize + bool + 4 u8 + u32 + u64 + u32 + u32 + u64
+        let mapping_count_offset = 2 + 4 + 1 + 40 + 1 + 4 + 4 + 8 + 4 + 4 + 8;
+        assert_eq!(
+            u64::from_le_bytes(
+                snapshot[mapping_count_offset..mapping_count_offset + 8]
+                    .try_into()
+                    .unwrap()
+            ),
+            65_536
+        );
+        snapshot[mapping_count_offset..mapping_count_offset + 8]
+            .copy_from_slice(&65_535_u64.to_le_bytes());
+        snapshot.drain(mapping_count_offset + 8..mapping_count_offset + 10);
+        assert!(matches!(
+            decode_exfat_restore_sidecar(&snapshot),
+            Err(PreservationError::MalformedEscrow { reason, .. })
+                if reason == "exFAT snapshot up-case table is not 65,536 mappings"
         ));
     }
 

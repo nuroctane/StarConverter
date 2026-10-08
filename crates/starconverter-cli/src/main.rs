@@ -14,11 +14,13 @@ use starconverter_core::candidate_export::{
 };
 use starconverter_core::cross_format::{
     ExfatToNtfsLimits, ExfatToNtfsOptions, NtfsToExfatLimits, NtfsToExfatOptions,
-    draft_escrow_restored_exfat_to_ntfs, draft_lossless_exfat_to_ntfs,
-    draft_lossless_ntfs_to_exfat, solve_lossless_exfat_to_ntfs, solve_lossless_ntfs_to_exfat,
+    draft_escrow_restored_exfat_to_ntfs, draft_escrow_restored_ntfs_to_exfat,
+    draft_lossless_exfat_to_ntfs, draft_lossless_ntfs_to_exfat, solve_lossless_exfat_to_ntfs,
+    solve_lossless_ntfs_to_exfat,
 };
 use starconverter_core::escrow_carrier::{ESCROW_CARRIER_DIRECTORY, sidecar_carriers};
 use starconverter_core::escrow_restore::decode_restore_sidecar;
+use starconverter_core::exfat_escrow_restore::decode_exfat_restore_sidecar;
 use starconverter_core::fs::exfat_normalize::NormalizedExfat;
 use starconverter_core::fs::exfat_region::ExfatBootRegionComparison;
 use starconverter_core::fs::ntfs_normalize::NormalizedNtfs;
@@ -147,6 +149,17 @@ fn verify_windows_origin_report_command(args: &[String]) -> Result<(), String> {
             candidate.security().len(),
             if case.restore_escrow() { "yes" } else { "no" },
             candidate.chkdsk_exit_code()
+        );
+        println!(
+            "[IDENTITY] label '{}' / serial {:08X} (source {:08X}) / timestamps {}",
+            candidate.volume_label(),
+            candidate.volume_serial_number(),
+            case.source_volume_serial_number(),
+            if case.restore_escrow() {
+                "exact (creation + last write)"
+            } else {
+                "not claimed"
+            }
         );
     }
     println!(
@@ -307,13 +320,6 @@ fn convert_image_command(args: &[String]) -> Result<(), String> {
     if target == inspection.profile.filesystem {
         return Err("convert-image target must differ from the source filesystem".into());
     }
-    if restore_escrow.is_some() && target != FileSystem::Ntfs {
-        return Err(
-            "--restore-escrow applies only to exFAT -> NTFS conversion of an escrow-exported candidate"
-                .into(),
-        );
-    }
-
     let output_path = PathBuf::from(output);
     let evidence = match (
         inspection.normalized_exfat.as_deref(),
@@ -334,6 +340,7 @@ fn convert_image_command(args: &[String]) -> Result<(), String> {
             &output_path,
             mode,
             escrow_override.as_deref(),
+            restore_escrow.as_deref(),
         )?,
         (Some(_), None, _) | (None, Some(_), _) => {
             return Err("convert-image direction does not match the inspected source".into());
@@ -345,11 +352,15 @@ fn convert_image_command(args: &[String]) -> Result<(), String> {
             return Err("inspection contains evidence for two filesystems".into());
         }
     };
-    print_convert_evidence(&evidence, restore_escrow.as_deref());
+    print_convert_evidence(&evidence, restore_escrow.as_deref(), target);
     Ok(())
 }
 
-fn print_convert_evidence(evidence: &CandidateExportEvidence, restore_escrow: Option<&Path>) {
+fn print_convert_evidence(
+    evidence: &CandidateExportEvidence,
+    restore_escrow: Option<&Path>,
+    target: FileSystem,
+) {
     println!("{BANNER}");
     println!(
         "[COMPLETE] copy-based {} candidate exported",
@@ -360,11 +371,19 @@ fn print_convert_evidence(evidence: &CandidateExportEvidence, restore_escrow: Op
         println!("[ESCROW]   {}", path.display());
     }
     if let Some(path) = restore_escrow {
-        println!(
-            "[RESTORED] NTFS identities (hard links, named streams, reparse points, exact \
-             timestamps, serial, label) rematerialized from {}",
-            path.display()
-        );
+        if target == FileSystem::Ntfs {
+            println!(
+                "[RESTORED] NTFS identities (hard links, named streams, reparse points, exact \
+                 timestamps, serial, label) rematerialized from {}",
+                path.display()
+            );
+        } else {
+            println!(
+                "[RESTORED] exFAT identities (exact timestamps with UTC offsets, attributes, \
+                 serial, label, up-case table) rematerialized from {}",
+                path.display()
+            );
+        }
     }
     println!(
         "[VERIFIED] {} writes / {} replaced / manifest {}",
@@ -456,17 +475,38 @@ fn export_ntfs_source(
     output: &Path,
     mode: GuaranteeMode,
     requested_escrow: Option<&Path>,
+    restore_escrow: Option<&Path>,
 ) -> Result<CandidateExportEvidence, String> {
     let export_limits = CandidateExportLimits::default();
     let source_snapshot = capture_source_image_snapshot(source, export_limits)
         .map_err(|error| format!("source snapshot failed: {error}"))?;
-    let draft = draft_lossless_ntfs_to_exfat(
-        normalized,
-        mode,
-        NtfsToExfatOptions::default(),
-        NtfsToExfatLimits::default(),
-    )
-    .map_err(|error| format!("cross-format plan refused: {error}"))?;
+    let draft = match restore_escrow {
+        Some(escrow_path) => {
+            let escrow_bytes = read_bounded_escrow(escrow_path, export_limits.max_escrow_bytes)?;
+            let sidecar = decode_exfat_restore_sidecar(
+                &escrow_bytes,
+                source_snapshot.sha256(),
+                export_limits.max_escrow_bytes,
+                PreservationLimits::default(),
+            )
+            .map_err(|error| format!("escrow restore refused: {error}"))?;
+            draft_escrow_restored_ntfs_to_exfat(
+                normalized,
+                &sidecar,
+                mode,
+                NtfsToExfatOptions::default(),
+                NtfsToExfatLimits::default(),
+            )
+            .map_err(|error| format!("escrow-restored plan refused: {error}"))?
+        }
+        None => draft_lossless_ntfs_to_exfat(
+            normalized,
+            mode,
+            NtfsToExfatOptions::default(),
+            NtfsToExfatLimits::default(),
+        )
+        .map_err(|error| format!("cross-format plan refused: {error}"))?,
+    };
     let plan = solve_lossless_ntfs_to_exfat(draft, LayoutLimits::default())
         .map_err(|error| format!("payload layout refused: {error}"))?;
     let carriers = sidecar_carriers(&normalized.preservation);
@@ -1431,7 +1471,13 @@ fn print_help() {
         "  exFAT -> NTFS with --restore-escrow consumes the NTFS -> exFAT sidecar bound to <SOURCE>:"
     );
     println!(
-        "  hard links, named streams, reparse points, exact timestamps, serial, and label return.\n"
+        "  hard links, named streams, reparse points, exact timestamps, serial, and label return."
+    );
+    println!(
+        "  NTFS -> exFAT with --restore-escrow consumes the exFAT -> NTFS sidecar bound to <SOURCE>:"
+    );
+    println!(
+        "  exact timestamps with UTC offsets, attributes, serial, label, and up-case table return.\n"
     );
     println!("VERIFY-EXPORT");
     println!(
@@ -1933,10 +1979,14 @@ mod tests {
     }
 
     #[test]
-    fn restore_escrow_is_refused_for_ntfs_sources() {
+    fn restore_escrow_for_ntfs_sources_fails_closed_before_any_output_exists() {
         let image = TempImage::write("restore-direction", &ntfs_image());
         let output = std::env::temp_dir().join(format!(
             "starconverter-cli-restore-direction-{}-never-created.img",
+            std::process::id()
+        ));
+        let missing_escrow = std::env::temp_dir().join(format!(
+            "starconverter-cli-restore-direction-{}-missing.starconverter-escrow",
             std::process::id()
         ));
         let result = run(&[
@@ -1944,15 +1994,23 @@ mod tests {
             image.path().to_string_lossy().into_owned(),
             output.to_string_lossy().into_owned(),
             "--restore-escrow".to_owned(),
-            "unused.escrow".to_owned(),
+            missing_escrow.to_string_lossy().into_owned(),
         ]);
-        assert_eq!(
-            result,
-            Err(
-                "--restore-escrow applies only to exFAT -> NTFS conversion of an escrow-exported candidate"
-                    .to_owned()
-            )
-        );
+        let message = result.unwrap_err();
+        assert!(message.contains("unreadable"), "{message}");
+        assert!(!output.exists());
+
+        // An NTFS -> exFAT sidecar is the wrong direction for restoring exFAT identities.
+        let wrong_direction = TempImage::write("restore-wrong-direction", &[0_u8; 512]);
+        let result = run(&[
+            "convert-image".to_owned(),
+            image.path().to_string_lossy().into_owned(),
+            output.to_string_lossy().into_owned(),
+            "--restore-escrow".to_owned(),
+            wrong_direction.path().to_string_lossy().into_owned(),
+        ]);
+        let message = result.unwrap_err();
+        assert!(message.starts_with("escrow restore refused:"), "{message}");
         assert!(!output.exists());
     }
 

@@ -63,11 +63,18 @@ point produces an ambiguous writable mount.
   StarConverter object IDs into vendor entries remains a target contract that path-based escrow
   restore does not need
 - round-trip restoration to NTFS (implemented; see the NTFS→exFAT(+escrow)→NTFS proof above)
-- round-trip restoration to exFAT (not implemented): the exFAT→NTFS sidecar v3 already escrows
-  the serial, label, up-case mappings, and per-object timestamps/centiseconds/UTC offsets, cluster
-  placement, flags, and benign entry bytes, but `convert-image --to exfat` refuses
-  `--restore-escrow`; the `windows-origin` lane therefore judges the exFAT round trip on payload
-  bytes alone until an exFAT-direction restore exists
+- round-trip restoration to exFAT (implemented): `convert-image --to exfat --restore-escrow`
+  (and the GUI restore-escrow field) consumes the candidate-bound exFAT→NTFS sidecar v3 after
+  direction and source-SHA-256 binding checks, matches escrowed objects to the NTFS→exFAT
+  projection by dest-native path, and writes the exact source serial, label (when its entry was
+  retained exactly), per-object attributes and timestamps with centiseconds and UTC offsets, and
+  an Up-case Table reproduced from the escrowed mappings (the recommended profile verbatim, or an
+  identity-run or literal re-encoding, accepted only when its `TableChecksum` equals the escrowed
+  one); proven by an in-tree exFAT→NTFS(+escrow)→exFAT round trip with UTC+1/UTC-1 offsets and
+  odd centiseconds that the plain return trip provably flattens to 0x80; a sidecar carrying
+  benign vendor entries fails closed because the exFAT writer cannot re-emit them; the
+  `windows-origin` lane now restores both round trips and the drivers must hand back the source
+  serial and every payload's creation and last-write instants
 - formatter-origin inline `$SECURITY_DESCRIPTOR` support (implemented in-tree): the read-only
   inventory captures unnamed resident and fully mapped nonresident `0x50` values up to 64 KiB, the
   bounded self-relative validator accepts owner/group SIDs plus ACL revision 2/4 with

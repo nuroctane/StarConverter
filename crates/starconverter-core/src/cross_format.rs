@@ -27,6 +27,7 @@ use crate::escrow_carrier::{
 use crate::escrow_restore::{
     NtfsRestoreError, RestoredNtfsIdentities, restore_ntfs_identities_with_evidence,
 };
+use crate::exfat_escrow_restore::{ExfatRestoreError, restore_exfat_identities};
 use crate::extent::{Extent, ExtentGraph, ExtentGraphError, ExtentKind, Placement, StreamId};
 use crate::fs::exfat_inventory::{ExfatPreservationEvidence, ExfatTimestamps};
 use crate::fs::exfat_normalize::NormalizedExfat;
@@ -63,8 +64,8 @@ use crate::object::{
     ObjectRecord, ObjectSemantics,
 };
 use crate::preservation::{
-    PreservationError, PreservationField, PreservationLimits, PreservationReport, evaluate_exfat,
-    evaluate_ntfs, is_legal_exfat_name,
+    ExfatRestoreSidecar, PreservationError, PreservationField, PreservationLimits,
+    PreservationReport, evaluate_exfat, evaluate_ntfs, is_legal_exfat_name,
 };
 
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
@@ -499,6 +500,8 @@ pub enum NtfsToExfatError {
     Layout(LayoutError),
     RelocatedGraph(RelocatedGraphError),
     Serialization(ExfatSerializeError),
+    /// A candidate-bound exFAT escrow could not be reattached onto the dest-native graph.
+    EscrowRestore(ExfatRestoreError),
 }
 
 impl fmt::Display for NtfsToExfatError {
@@ -508,6 +511,7 @@ impl fmt::Display for NtfsToExfatError {
                 "content-only mode cannot produce a lossless NTFS-to-exFAT conversion plan",
             ),
             Self::Preservation(error) => write!(formatter, "preservation policy failed: {error}"),
+            Self::EscrowRestore(error) => write!(formatter, "escrow restore refused: {error}"),
             Self::PreservationRefused { blockers } => write!(
                 formatter,
                 "preservation policy refused NTFS-to-exFAT conversion: {blockers:?}"
@@ -598,6 +602,7 @@ impl std::error::Error for NtfsToExfatError {
             Self::ExtentProjection(error) => Some(error),
             Self::Layout(error) => Some(error),
             Self::RelocatedGraph(error) => Some(error),
+            Self::EscrowRestore(error) => Some(error),
             _ => None,
         }
     }
@@ -1215,6 +1220,100 @@ pub fn draft_lossless_ntfs_to_exfat(
             volume_label: destination_volume_label.as_deref(),
             encoded_upcase_table: upcase.encoded_bytes(),
             upcase_checksum: RECOMMENDED_EXFAT_UPCASE_CHECKSUM,
+            source_preservation: ExfatPreservationEvidence::default(),
+            allocated_bad_clusters: u64::try_from(bad_cluster_ranges.len()).unwrap_or(u64::MAX),
+            bad_cluster_ranges: &bad_cluster_ranges,
+            stale_boot_sectors: normalized.preservation.backup_boot_sector.as_slice(),
+        },
+        ExfatSerializeOptions {
+            bytes_per_sector: options.bytes_per_sector,
+            bytes_per_cluster: options.bytes_per_cluster,
+            partition_offset_sectors: options.partition_offset_sectors,
+            volume_serial_number: serial,
+            drive_select: options.drive_select,
+        },
+        limits.serializer,
+    )?;
+    retain_ntfs_source_metadata(
+        destination.source_allocations_mut(),
+        normalized,
+        limits.serializer.max_extents,
+    )?;
+    Ok(NtfsToExfatRelocationDraft {
+        preservation,
+        target_graph,
+        object_metadata,
+        destination_volume_label,
+        destination_volume_serial_number: serial,
+        destination,
+    })
+}
+
+/// Drafts an NTFS→exFAT destination that reattaches the exFAT identities an earlier exFAT→NTFS
+/// escrow recorded for this exact NTFS candidate.
+///
+/// The caller must already have proven that `sidecar` was decoded from an envelope bound to this
+/// NTFS image (see [`crate::exfat_escrow_restore::decode_exfat_restore_sidecar`]). On top of the
+/// ordinary dest-native projection this restores, per object matched by dest-native path, the
+/// exact exFAT timestamps (including centiseconds and UTC offsets) and file attributes; the
+/// volume keeps its original 32-bit serial, exact label entry, and the Up-case Table bytes the
+/// escrow's `TableChecksum` proves. Objects the escrow does not know (added on the NTFS side)
+/// keep NTFS-derived metadata. Cluster placement is not rematerialized; the writer chooses it.
+///
+/// # Errors
+///
+/// Returns every refusal of [`draft_lossless_ntfs_to_exfat`] plus
+/// [`NtfsToExfatError::EscrowRestore`] when the escrow cannot be reattached (vendor entries the
+/// writer cannot emit, missing dest path, kind mismatch, missing timestamps, or an up-case table
+/// that does not re-encode to its recorded checksum).
+pub fn draft_escrow_restored_ntfs_to_exfat(
+    normalized: &NormalizedNtfs,
+    sidecar: &ExfatRestoreSidecar,
+    mode: GuaranteeMode,
+    options: NtfsToExfatOptions,
+    limits: NtfsToExfatLimits,
+) -> Result<NtfsToExfatRelocationDraft, NtfsToExfatError> {
+    if mode == GuaranteeMode::ContentOnly {
+        return Err(NtfsToExfatError::ContentOnlyIsNotLossless);
+    }
+    let preservation = evaluate_ntfs(normalized, FileSystem::ExFat, mode, limits.preservation)?;
+    if !preservation.permitted {
+        return Err(NtfsToExfatError::PreservationRefused {
+            blockers: preservation.blockers,
+        });
+    }
+    let projection = project_ntfs_graph_for_exfat(normalized)?;
+    let restored = restore_exfat_identities(&projection.graph, sidecar)
+        .map_err(NtfsToExfatError::EscrowRestore)?;
+    let mut object_metadata = map_ntfs_object_metadata(normalized, &projection)?;
+    for entry in &mut object_metadata {
+        if let Some(exact) = restored.object_metadata.get(&entry.object) {
+            // The destination writer requires the directory bit to agree with the object kind;
+            // the restore already proved they agree, so the escrowed attributes are exact.
+            entry.file_attributes = exact.file_attributes;
+            entry.timestamps = exact.timestamps;
+        }
+    }
+    let destination_volume_label = match restored.volume_label {
+        Some(label) => Some(label),
+        None if crate::exfat_escrow_restore::label_is_exact(sidecar) => None,
+        None => normalized
+            .preservation
+            .volume_label
+            .as_ref()
+            .filter(|label| is_representable_exfat_label(label))
+            .cloned(),
+    };
+    let serial = restored.volume_serial_number;
+    let target_graph = projection.graph;
+    let bad_cluster_ranges = ntfs_bad_cluster_ranges(normalized);
+    let mut destination = draft_exfat_destination(
+        &target_graph,
+        &object_metadata,
+        ExfatVolumeProfile {
+            volume_label: destination_volume_label.as_deref(),
+            encoded_upcase_table: &restored.encoded_upcase_table,
+            upcase_checksum: restored.upcase_checksum,
             source_preservation: ExfatPreservationEvidence::default(),
             allocated_bad_clusters: u64::try_from(bad_cluster_ranges.len()).unwrap_or(u64::MAX),
             bad_cluster_ranges: &bad_cluster_ranges,

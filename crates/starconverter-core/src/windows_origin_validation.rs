@@ -1,13 +1,14 @@
-//! Strict parser for schema-v1 Windows-origin validation reports.
+//! Strict parser for schema-v2 Windows-origin validation reports.
 //!
 //! Reports are emitted by `scripts/validate-windows-origin.ps1`, which formats and populates
 //! volumes with Windows itself, converts them with the CLI, and asks `ntfs.sys` / `exfat.sys`
-//! whether the candidates and escrow-restored round trips serve the same payloads and NTFS
-//! security descriptors. Windows chooses serials, GUIDs, and descriptor layouts at run time, so
-//! nothing here is pinned by VHD hash; the parser checks the invariants the harness promises
-//! instead: the four fixed case identities, the exact payload corpus, read-only letterless
-//! attachment, unchanged candidate bytes, clean CHKDSK, and the descriptor set an NTFS round trip
-//! must carry.
+//! whether the candidates and escrow-restored round trips serve the same payloads, label, NTFS
+//! security descriptors, volume serial, and per-file timestamps. Windows chooses serials, GUIDs,
+//! descriptor layouts, and timestamps at run time, so nothing here is pinned by VHD hash; the
+//! parser checks the invariants the harness promises instead: the four fixed case identities, the
+//! exact payload corpus, read-only letterless attachment, unchanged candidate bytes, clean CHKDSK,
+//! the format-time label on every candidate, the descriptor set an NTFS round trip must carry,
+//! and the source serial and payload instants both escrow-restored round trips must hand back.
 //!
 //! Like [`crate::windows_validation`], this module parses bytes only. It never opens a reported
 //! path, attaches a VHD, or accesses a device, and a successful parse is unkeyed evidence rather
@@ -25,12 +26,14 @@ use crate::windows_validation::{
 use serde::Deserialize;
 
 const SCHEMA: &str = "starconverter.windows-origin-validation";
-const VERSION: u64 = 1;
+const VERSION: u64 = 2;
 /// Exact regular-file length of every 40 MiB fixed VHD the harness builds (disk bytes + footer).
 pub const ORIGIN_VHD_BYTES: u64 = 40 * 1024 * 1024 + 512;
 const PARTITION_OFFSET_BYTES: u64 = 1024 * 1024;
-/// Number of cases a schema-v1 report must carry.
+/// Number of cases a schema-v2 report must carry.
 const CASE_COUNT: usize = 4;
+/// Label `format` writes to every source volume; every candidate must serve it back verbatim.
+pub const SOURCE_VOLUME_LABEL: &str = "ORIGIN";
 
 /// Windows-formatted NTFS converted to exFAT.
 pub const NTFS_FORWARD_CASE_NAME: &str = "Windows NTFS to exFAT";
@@ -122,6 +125,9 @@ pub struct WindowsOriginCaseEvidence {
     source_vhd_path: String,
     source_vhd_sha256: [u8; 32],
     source_image_sha256: [u8; 32],
+    source_volume_label: String,
+    source_volume_serial_number: u32,
+    source_timestamps: Vec<WindowsOriginTimestampEvidence>,
     candidate: WindowsOriginCandidateEvidence,
 }
 
@@ -137,7 +143,7 @@ impl WindowsOriginCaseEvidence {
     }
 
     /// Whether the conversion replayed the forward escrow so the candidate carries the source
-    /// identities (only the NTFS round trip; exFAT-direction restore does not exist yet).
+    /// identities (both round trips; forward conversions never restore).
     #[must_use]
     pub const fn restore_escrow(&self) -> bool {
         self.restore_escrow
@@ -158,9 +164,53 @@ impl WindowsOriginCaseEvidence {
         &self.source_image_sha256
     }
 
+    /// Label the Windows driver served from the source volume (always the format-time label).
+    #[must_use]
+    pub fn source_volume_label(&self) -> &str {
+        &self.source_volume_label
+    }
+
+    /// 32-bit volume serial the Windows driver served from the source volume.
+    #[must_use]
+    pub const fn source_volume_serial_number(&self) -> u32 {
+        self.source_volume_serial_number
+    }
+
+    /// Creation and last-write instants of every payload as the driver served them from the
+    /// source volume on a read-only attach.
+    #[must_use]
+    pub fn source_timestamps(&self) -> &[WindowsOriginTimestampEvidence] {
+        &self.source_timestamps
+    }
+
     #[must_use]
     pub const fn candidate(&self) -> &WindowsOriginCandidateEvidence {
         &self.candidate
+    }
+}
+
+/// Creation and last-write instants of one payload, as invariant round-trip UTC strings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowsOriginTimestampEvidence {
+    path: String,
+    creation_time_utc: String,
+    last_write_time_utc: String,
+}
+
+impl WindowsOriginTimestampEvidence {
+    #[must_use]
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    #[must_use]
+    pub fn creation_time_utc(&self) -> &str {
+        &self.creation_time_utc
+    }
+
+    #[must_use]
+    pub fn last_write_time_utc(&self) -> &str {
+        &self.last_write_time_utc
     }
 }
 
@@ -174,6 +224,8 @@ pub struct WindowsOriginCandidateEvidence {
     partition_offset_bytes: u64,
     partition_bytes: u64,
     volume_guid_path: String,
+    volume_label: String,
+    volume_serial_number: u32,
     payloads: Vec<WindowsOriginPayloadEvidence>,
     security: Vec<WindowsOriginSecurityEvidence>,
     chkdsk_exit_code: i64,
@@ -217,6 +269,18 @@ impl WindowsOriginCandidateEvidence {
         &self.volume_guid_path
     }
 
+    /// Label the Windows driver served from the candidate (always the format-time label).
+    #[must_use]
+    pub fn volume_label(&self) -> &str {
+        &self.volume_label
+    }
+
+    /// 32-bit volume serial the Windows driver served from the candidate.
+    #[must_use]
+    pub const fn volume_serial_number(&self) -> u32 {
+        self.volume_serial_number
+    }
+
     #[must_use]
     pub fn payloads(&self) -> &[WindowsOriginPayloadEvidence] {
         &self.payloads
@@ -244,6 +308,8 @@ pub struct WindowsOriginPayloadEvidence {
     path: String,
     length: u64,
     sha256: [u8; 32],
+    creation_time_utc: String,
+    last_write_time_utc: String,
 }
 
 impl WindowsOriginPayloadEvidence {
@@ -260,6 +326,16 @@ impl WindowsOriginPayloadEvidence {
     #[must_use]
     pub const fn sha256(&self) -> &[u8; 32] {
         &self.sha256
+    }
+
+    #[must_use]
+    pub fn creation_time_utc(&self) -> &str {
+        &self.creation_time_utc
+    }
+
+    #[must_use]
+    pub fn last_write_time_utc(&self) -> &str {
+        &self.last_write_time_utc
     }
 }
 
@@ -307,7 +383,18 @@ struct RawCase {
     source_vhd_path: String,
     source_vhd_sha256: String,
     source_image_sha256: String,
+    source_volume_label: String,
+    source_volume_serial_number: u32,
+    source_timestamps: Vec<RawTimestamp>,
     candidate: RawCandidate,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "PascalCase")]
+struct RawTimestamp {
+    path: String,
+    creation_time_utc: String,
+    last_write_time_utc: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -324,6 +411,8 @@ struct RawCandidate {
     partition_offset_bytes: u64,
     partition_bytes: u64,
     volume_guid_path: String,
+    volume_label: String,
+    volume_serial_number: u32,
     payloads: Vec<RawPayload>,
     security: Vec<RawSecurity>,
     chkdsk_exit_code: i64,
@@ -336,6 +425,8 @@ struct RawPayload {
     path: String,
     length: u64,
     sha256: String,
+    creation_time_utc: String,
+    last_write_time_utc: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -345,7 +436,7 @@ struct RawSecurity {
     sddl: String,
 }
 
-/// Parses and strictly validates one schema-v1 Windows-origin report without accessing any
+/// Parses and strictly validates one schema-v2 Windows-origin report without accessing any
 /// reported path.
 ///
 /// The returned evidence is unkeyed and non-authorizing; consumers needing provenance or
@@ -354,11 +445,13 @@ struct RawSecurity {
 /// # Errors
 ///
 /// Refuses zero limits, oversized input or collections, malformed JSON, duplicate/unknown/missing
-/// fields, non-v1 schema, incomplete reports, any case set other than the four fixed identities,
+/// fields, non-v2 schema, incomplete reports, any case set other than the four fixed identities,
 /// candidates whose filesystem disagrees with the case direction, source/candidate hash or
 /// geometry inconsistencies, non-read-only or lettered attachment, an incomplete or altered
-/// payload corpus, a non-zero or silent CHKDSK, and an NTFS round trip that does not carry the
-/// full descriptor set including the run-time-allocated Guests deny ACEs.
+/// payload corpus, a candidate not serving the format-time label, a non-zero or silent CHKDSK,
+/// an NTFS round trip that does not carry the full descriptor set including the run-time-allocated
+/// Guests deny ACEs, and an escrow-restored round trip whose volume serial or payload creation
+/// and last-write instants differ from what the driver served from the Windows source.
 pub fn verify_windows_origin_validation_report(
     bytes: &[u8],
     limits: WindowsValidationLimits,
@@ -399,7 +492,7 @@ pub fn verify_windows_origin_validation_report(
     check_array("Cases", raw.cases.len(), limits.max_cases)?;
     if raw.cases.len() != CASE_COUNT {
         return Err(WindowsValidationError::InvalidEvidence(
-            "schema v1 requires exactly the four Windows-origin cases",
+            "schema v2 requires exactly the four Windows-origin cases",
         ));
     }
 
@@ -438,8 +531,8 @@ struct CaseIdentity {
     index: usize,
     origin: FileSystem,
     candidate: FileSystem,
-    /// Only the NTFS round trip replays the forward escrow; exFAT-direction restore does not
-    /// exist yet, and forward conversions never restore.
+    /// Both round trips replay the forward escrow and must hand back the source serial and
+    /// payload instants; forward conversions never restore.
     restores_escrow: bool,
     /// Only an NTFS volume that started as NTFS and had its identities restored can be asked to
     /// serve the same descriptors.
@@ -473,7 +566,7 @@ fn case_identity(name: &str) -> Result<CaseIdentity, WindowsValidationError> {
             index: 3,
             origin: FileSystem::ExFat,
             candidate: FileSystem::ExFat,
-            restores_escrow: false,
+            restores_escrow: true,
             carries_security: false,
         },
         _ => {
@@ -552,11 +645,40 @@ fn validate_case(
             "source VHD and carved partition image report the same SHA-256",
         ));
     }
+    check_string("Case.SourceVolumeLabel", &case.source_volume_label, limits)?;
+    if case.source_volume_label != SOURCE_VOLUME_LABEL {
+        return Err(WindowsValidationError::InvalidEvidence(
+            "source volume does not carry the format-time label",
+        ));
+    }
+    let source_timestamps = validate_source_timestamps(case.source_timestamps, limits)?;
     let candidate = validate_candidate(case.candidate, identity, limits)?;
     if candidate.sha256 == source_vhd_sha256 {
         return Err(WindowsValidationError::InvalidEvidence(
             "candidate VHD is byte-identical to the Windows-formatted source",
         ));
+    }
+    if identity.restores_escrow {
+        if candidate.volume_serial_number != case.source_volume_serial_number {
+            return Err(WindowsValidationError::InvalidEvidence(
+                "escrow-restored round trip does not serve the source volume serial",
+            ));
+        }
+        for payload in &candidate.payloads {
+            let source = source_timestamps
+                .iter()
+                .find(|source| source.path == payload.path)
+                .ok_or(WindowsValidationError::InvalidEvidence(
+                    "required source timestamp is absent",
+                ))?;
+            if payload.creation_time_utc != source.creation_time_utc
+                || payload.last_write_time_utc != source.last_write_time_utc
+            {
+                return Err(WindowsValidationError::InvalidEvidence(
+                    "escrow-restored round trip does not serve the source payload timestamps",
+                ));
+            }
+        }
     }
     Ok(WindowsOriginCaseEvidence {
         name: case.name,
@@ -565,8 +687,77 @@ fn validate_case(
         source_vhd_path: case.source_vhd_path,
         source_vhd_sha256,
         source_image_sha256,
+        source_volume_label: case.source_volume_label,
+        source_volume_serial_number: case.source_volume_serial_number,
+        source_timestamps,
         candidate,
     })
+}
+
+/// The source must record one creation/last-write pair for every corpus payload and nothing else.
+fn validate_source_timestamps(
+    timestamps: Vec<RawTimestamp>,
+    limits: WindowsValidationLimits,
+) -> Result<Vec<WindowsOriginTimestampEvidence>, WindowsValidationError> {
+    check_array(
+        "SourceTimestamps",
+        timestamps.len(),
+        limits.max_payloads_per_case,
+    )?;
+    if timestamps.len() != PAYLOAD_SPECS.len() {
+        return Err(WindowsValidationError::InvalidEvidence(
+            "source timestamps do not cover exactly the payload corpus",
+        ));
+    }
+    let mut seen = [false; PAYLOAD_SPECS.len()];
+    let mut evidence = Vec::with_capacity(timestamps.len());
+    for timestamp in timestamps {
+        check_nonempty_string("SourceTimestamp.Path", &timestamp.path, limits)?;
+        let Some(index) = PAYLOAD_SPECS
+            .iter()
+            .position(|(path, _, _)| *path == timestamp.path)
+        else {
+            return Err(WindowsValidationError::InvalidEvidence(
+                "unexpected source timestamp path",
+            ));
+        };
+        if seen[index] {
+            return Err(WindowsValidationError::InvalidEvidence(
+                "duplicate source timestamp path",
+            ));
+        }
+        seen[index] = true;
+        check_timestamp_pair(
+            &timestamp.creation_time_utc,
+            &timestamp.last_write_time_utc,
+            limits,
+        )?;
+        evidence.push(WindowsOriginTimestampEvidence {
+            path: timestamp.path,
+            creation_time_utc: timestamp.creation_time_utc,
+            last_write_time_utc: timestamp.last_write_time_utc,
+        });
+    }
+    Ok(evidence)
+}
+
+fn check_timestamp_pair(
+    creation_time_utc: &str,
+    last_write_time_utc: &str,
+    limits: WindowsValidationLimits,
+) -> Result<(), WindowsValidationError> {
+    for (field, value) in [
+        ("CreationTimeUtc", creation_time_utc),
+        ("LastWriteTimeUtc", last_write_time_utc),
+    ] {
+        check_nonempty_string(field, value, limits)?;
+        if !valid_roundtrip_utc(value) {
+            return Err(WindowsValidationError::InvalidEvidence(
+                "payload timestamp is not an invariant round-trip UTC timestamp",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_candidate(
@@ -607,6 +798,46 @@ fn validate_candidate(
         ));
     }
     let sha256 = decode_sha256(&candidate.sha256_before)?;
+    validate_attachment_and_geometry(&candidate)?;
+    if !valid_volume_guid_path(&candidate.volume_guid_path) {
+        return Err(WindowsValidationError::InvalidEvidence(
+            "invalid volume GUID path",
+        ));
+    }
+    check_string("Candidate.VolumeLabel", &candidate.volume_label, limits)?;
+    if candidate.volume_label != SOURCE_VOLUME_LABEL {
+        return Err(WindowsValidationError::InvalidEvidence(
+            "candidate does not serve the format-time volume label",
+        ));
+    }
+    let payloads = validate_payloads(candidate.payloads, limits)?;
+    let security = validate_security(candidate.security, identity.carries_security, limits)?;
+    if candidate.chkdsk_exit_code != 0 {
+        return Err(WindowsValidationError::InvalidEvidence(
+            "CHKDSK did not report success",
+        ));
+    }
+    validate_transcript(&candidate.chkdsk_output, limits)?;
+    Ok(WindowsOriginCandidateEvidence {
+        filesystem: identity.candidate,
+        vhd_path: candidate.vhd_path,
+        vhd_bytes: candidate.vhd_bytes,
+        sha256,
+        partition_offset_bytes: candidate.partition_offset_bytes,
+        partition_bytes: candidate.partition_bytes,
+        volume_guid_path: candidate.volume_guid_path,
+        volume_label: candidate.volume_label,
+        volume_serial_number: candidate.volume_serial_number,
+        payloads,
+        security,
+        chkdsk_exit_code: candidate.chkdsk_exit_code,
+        chkdsk_output: candidate.chkdsk_output,
+    })
+}
+
+fn validate_attachment_and_geometry(
+    candidate: &RawCandidate,
+) -> Result<(), WindowsValidationError> {
     if !candidate.read_only_attached {
         return Err(WindowsValidationError::InvalidEvidence(
             "candidate VHD was not attached read-only",
@@ -643,32 +874,7 @@ fn validate_candidate(
             "partition extends past the disk bytes into the VHD footer",
         ));
     }
-    if !valid_volume_guid_path(&candidate.volume_guid_path) {
-        return Err(WindowsValidationError::InvalidEvidence(
-            "invalid volume GUID path",
-        ));
-    }
-    let payloads = validate_payloads(candidate.payloads, limits)?;
-    let security = validate_security(candidate.security, identity.carries_security, limits)?;
-    if candidate.chkdsk_exit_code != 0 {
-        return Err(WindowsValidationError::InvalidEvidence(
-            "CHKDSK did not report success",
-        ));
-    }
-    validate_transcript(&candidate.chkdsk_output, limits)?;
-    Ok(WindowsOriginCandidateEvidence {
-        filesystem: identity.candidate,
-        vhd_path: candidate.vhd_path,
-        vhd_bytes: candidate.vhd_bytes,
-        sha256,
-        partition_offset_bytes: candidate.partition_offset_bytes,
-        partition_bytes: candidate.partition_bytes,
-        volume_guid_path: candidate.volume_guid_path,
-        payloads,
-        security,
-        chkdsk_exit_code: candidate.chkdsk_exit_code,
-        chkdsk_output: candidate.chkdsk_output,
-    })
+    Ok(())
 }
 
 /// SHA-256 of the `(seed + offset) % 251` stream of `length` bytes.
@@ -729,10 +935,17 @@ fn validate_payloads(
                 "payload length or SHA-256 does not match the seeded corpus",
             ));
         }
+        check_timestamp_pair(
+            &payload.creation_time_utc,
+            &payload.last_write_time_utc,
+            limits,
+        )?;
         evidence.push(WindowsOriginPayloadEvidence {
             path: payload.path,
             length: payload.length,
             sha256,
+            creation_time_utc: payload.creation_time_utc,
+            last_write_time_utc: payload.last_write_time_utc,
         });
     }
     if seen.iter().any(|seen| !seen) {
@@ -843,6 +1056,8 @@ fn check_shared_sources(cases: &[WindowsOriginCaseEvidence]) -> Result<(), Windo
         if first.source_vhd_path != second.source_vhd_path
             || first.source_vhd_sha256 != second.source_vhd_sha256
             || first.source_image_sha256 != second.source_image_sha256
+            || first.source_volume_serial_number != second.source_volume_serial_number
+            || first.source_timestamps != second.source_timestamps
         {
             return Err(WindowsValidationError::InvalidEvidence(
                 "forward and round-trip cases disagree about the Windows source",
@@ -893,12 +1108,22 @@ mod tests {
         })
     }
 
+    /// Distinct creation/last-write instants per payload, derived from its corpus index.
+    fn stamps(index: usize) -> (String, String) {
+        (
+            format!("2026-08-21T12:00:{index:02}.0000001Z"),
+            format!("2026-08-21T12:30:{index:02}.5000002Z"),
+        )
+    }
+
     fn payload_json() -> String {
         expected_payloads()
             .into_iter()
-            .map(|(path, length, sha256)| {
+            .enumerate()
+            .map(|(index, (path, length, sha256))| {
+                let (created, written) = stamps(index);
                 format!(
-                    r#"{{"Path":{},"Length":{length},"Sha256":"{}"}}"#,
+                    r#"{{"Path":{},"Length":{length},"Sha256":"{}","CreationTimeUtc":"{created}","LastWriteTimeUtc":"{written}"}}"#,
                     serde_json::to_string(&path).unwrap(),
                     upper_hex(&sha256)
                 )
@@ -906,6 +1131,26 @@ mod tests {
             .collect::<Vec<_>>()
             .join(",")
     }
+
+    fn source_timestamps_json() -> String {
+        expected_payloads()
+            .into_iter()
+            .enumerate()
+            .map(|(index, (path, _, _))| {
+                let (created, written) = stamps(index);
+                format!(
+                    r#"{{"Path":{},"CreationTimeUtc":"{created}","LastWriteTimeUtc":"{written}"}}"#,
+                    serde_json::to_string(&path).unwrap()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// Source serials per origin; forward candidates get a different serial, round trips the same.
+    const NTFS_SERIAL: u32 = 0x1A2B_3C4D;
+    const EXFAT_SERIAL: u32 = 0x0024_5734;
+    const FORWARD_SERIAL: u32 = 0x0BAD_C0DE;
 
     fn security_json() -> String {
         expected_security_paths()
@@ -941,7 +1186,18 @@ mod tests {
         ))
         .unwrap();
         let candidate_path = serde_json::to_string(candidate_path).unwrap();
-        let restore_escrow = name == NTFS_ROUND_TRIP_CASE_NAME;
+        let restore_escrow =
+            name == NTFS_ROUND_TRIP_CASE_NAME || name == EXFAT_ROUND_TRIP_CASE_NAME;
+        let source_serial = if origin == "NTFS" {
+            NTFS_SERIAL
+        } else {
+            EXFAT_SERIAL
+        };
+        let candidate_serial = if restore_escrow {
+            source_serial
+        } else {
+            FORWARD_SERIAL
+        };
         // Each fixture candidate gets its own volume GUID, derived from its digest.
         let h = candidate_hash.to_ascii_lowercase();
         let guid = format!(
@@ -953,7 +1209,8 @@ mod tests {
             &h[20..32]
         );
         format!(
-            r#"{{"Name":"{name}","Origin":"{origin}","RestoreEscrow":{restore_escrow},"SourceVhdPath":{source_path},"SourceVhdSha256":"{source_hash}","SourceImageSha256":"{image_hash}","Candidate":{{"FileSystem":"{candidate_fs}","VhdPath":{candidate_path},"VhdBytes":41943552,"Sha256Before":"{candidate_hash}","Sha256After":"{candidate_hash}","ReadOnlyAttached":true,"NoDriveLetter":true,"DetachedAfter":true,"PartitionOffsetBytes":1048576,"PartitionBytes":39845888,"VolumeGuidPath":"\\\\?\\Volume{{{guid}}}\\","Payloads":[{}],"Security":[{security}],"ChkdskExitCode":0,"ChkdskOutput":["Windows has scanned the file system and found no problems."]}}}}"#,
+            r#"{{"Name":"{name}","Origin":"{origin}","RestoreEscrow":{restore_escrow},"SourceVhdPath":{source_path},"SourceVhdSha256":"{source_hash}","SourceImageSha256":"{image_hash}","SourceVolumeLabel":"ORIGIN","SourceVolumeSerialNumber":{source_serial},"SourceTimestamps":[{}],"Candidate":{{"FileSystem":"{candidate_fs}","VhdPath":{candidate_path},"VhdBytes":41943552,"Sha256Before":"{candidate_hash}","Sha256After":"{candidate_hash}","ReadOnlyAttached":true,"NoDriveLetter":true,"DetachedAfter":true,"PartitionOffsetBytes":1048576,"PartitionBytes":39845888,"VolumeGuidPath":"\\\\?\\Volume{{{guid}}}\\","VolumeLabel":"ORIGIN","VolumeSerialNumber":{candidate_serial},"Payloads":[{}],"Security":[{security}],"ChkdskExitCode":0,"ChkdskOutput":["Windows has scanned the file system and found no problems."]}}}}"#,
+            source_timestamps_json(),
             payload_json()
         )
     }
@@ -1007,7 +1264,7 @@ mod tests {
 
     fn report_with(cases: &[String]) -> String {
         format!(
-            r#"{{"Schema":"starconverter.windows-origin-validation","Version":1,"Complete":true,"GeneratedUtc":"2026-08-21T12:34:56.1234567Z","WindowsVersion":"Microsoft Windows NT 10.0","PowerShellVersion":"5.1","ChkdskVersion":"10.0","NtfsDriverVersion":"10.0","ExfatDriverVersion":"10.0","Cases":[{}]}}"#,
+            r#"{{"Schema":"starconverter.windows-origin-validation","Version":2,"Complete":true,"GeneratedUtc":"2026-08-21T12:34:56.1234567Z","WindowsVersion":"Microsoft Windows NT 10.0","PowerShellVersion":"5.1","ChkdskVersion":"10.0","NtfsDriverVersion":"10.0","ExfatDriverVersion":"10.0","Cases":[{}]}}"#,
             cases.join(",")
         )
     }
@@ -1054,6 +1311,177 @@ mod tests {
     }
 
     #[test]
+    fn exposes_source_and_candidate_identities() {
+        let evidence = verify(&report()).unwrap();
+        let round_trip = &evidence.cases()[1];
+        assert!(round_trip.restore_escrow());
+        assert_eq!(round_trip.source_volume_label(), SOURCE_VOLUME_LABEL);
+        assert_eq!(round_trip.candidate().volume_label(), SOURCE_VOLUME_LABEL);
+        assert_eq!(round_trip.source_volume_serial_number(), NTFS_SERIAL);
+        assert_eq!(round_trip.candidate().volume_serial_number(), NTFS_SERIAL);
+        assert_eq!(round_trip.source_timestamps().len(), 9);
+        assert_eq!(
+            round_trip.candidate().payloads()[0].creation_time_utc(),
+            round_trip.source_timestamps()[0].creation_time_utc()
+        );
+        assert_eq!(
+            round_trip.source_timestamps()[0].last_write_time_utc(),
+            "2026-08-21T12:30:00.5000002Z"
+        );
+        let forward = &evidence.cases()[0];
+        assert!(!forward.restore_escrow());
+        assert_eq!(forward.candidate().volume_serial_number(), FORWARD_SERIAL);
+        let exfat_round_trip = &evidence.cases()[3];
+        assert!(exfat_round_trip.restore_escrow());
+        assert_eq!(exfat_round_trip.candidate().security(), &[]);
+        assert_eq!(
+            exfat_round_trip.candidate().volume_serial_number(),
+            EXFAT_SERIAL
+        );
+    }
+
+    #[test]
+    fn restored_round_trips_must_serve_the_source_serial_and_timestamps() {
+        let base = report();
+        // A forward candidate may carry any serial; a restored round trip must carry the source's.
+        assert!(
+            verify(&report_with_case_edited(
+                0,
+                &format!(r#""VolumeSerialNumber":{FORWARD_SERIAL}"#),
+                r#""VolumeSerialNumber":7"#,
+            ))
+            .is_ok()
+        );
+        for index in [1, 3] {
+            let serial = if index == 1 {
+                NTFS_SERIAL
+            } else {
+                EXFAT_SERIAL
+            };
+            invalid(
+                &report_with_case_edited(
+                    index,
+                    &format!(r#""VolumeSerialNumber":{serial}"#),
+                    r#""VolumeSerialNumber":7"#,
+                ),
+                "escrow-restored round trip does not serve the source volume serial",
+            );
+            // Payload timestamps use a 7-digit fraction; the source records ".0000001Z".
+            invalid(
+                &report_with_case_edited(
+                    index,
+                    r#""Sha256":"C839E57675862AF5C21BD0A15413C3EC579E0D5522DAB600BC6C3489B05B8F54","CreationTimeUtc":"2026-08-21T12:00:00.0000001Z""#,
+                    r#""Sha256":"C839E57675862AF5C21BD0A15413C3EC579E0D5522DAB600BC6C3489B05B8F54","CreationTimeUtc":"2026-08-21T12:00:00.0000002Z""#,
+                ),
+                "escrow-restored round trip does not serve the source payload timestamps",
+            );
+            invalid(
+                &report_with_case_edited(
+                    index,
+                    r#""LastWriteTimeUtc":"2026-08-21T12:30:08.5000002Z"}],"Security""#,
+                    r#""LastWriteTimeUtc":"2026-08-21T12:30:09.5000002Z"}],"Security""#,
+                ),
+                "escrow-restored round trip does not serve the source payload timestamps",
+            );
+        }
+        // The same drift on a forward candidate is not a claim the harness makes.
+        assert!(
+            verify(&report_with_case_edited(
+                2,
+                r#""LastWriteTimeUtc":"2026-08-21T12:30:08.5000002Z"}],"Security""#,
+                r#""LastWriteTimeUtc":"2026-08-21T12:30:09.5000002Z"}],"Security""#,
+            ))
+            .is_ok()
+        );
+        // Timestamps must be invariant round-trip UTC wherever they appear.
+        invalid(
+            &base.replacen("2026-08-21T12:00:00.0000001Z", "2026-08-21T12:00:00Z", 1),
+            "payload timestamp is not an invariant round-trip UTC timestamp",
+        );
+        invalid(
+            &base.replacen(
+                "2026-08-21T12:30:03.5000002Z",
+                "2026-08-21 12:30:03.5000002Z",
+                1,
+            ),
+            "payload timestamp is not an invariant round-trip UTC timestamp",
+        );
+    }
+
+    #[test]
+    fn source_identity_is_complete_shared_and_labelled() {
+        let base = report();
+        invalid(
+            &base.replacen(
+                r#""SourceVolumeLabel":"ORIGIN""#,
+                r#""SourceVolumeLabel":"origin""#,
+                1,
+            ),
+            "source volume does not carry the format-time label",
+        );
+        invalid(
+            &base.replacen(r#""VolumeLabel":"ORIGIN""#, r#""VolumeLabel":"""#, 1),
+            "candidate does not serve the format-time volume label",
+        );
+        invalid(
+            &base.replacen(r#""VolumeLabel":"ORIGIN""#, r#""VolumeLabel":"ORIGIN ""#, 1),
+            "candidate does not serve the format-time volume label",
+        );
+        // Forward and round trip of one origin must have read the same source identity.
+        invalid(
+            &report_with_case_edited(
+                0,
+                &format!(r#""SourceVolumeSerialNumber":{NTFS_SERIAL}"#),
+                &format!(r#""SourceVolumeSerialNumber":{EXFAT_SERIAL}"#),
+            ),
+            "forward and round-trip cases disagree about the Windows source",
+        );
+        invalid(
+            &report_with_case_edited(
+                0,
+                r#""CreationTimeUtc":"2026-08-21T12:00:04.0000001Z","LastWriteTimeUtc":"2026-08-21T12:30:04.5000002Z"},{"Path":"deep"#,
+                r#""CreationTimeUtc":"2026-08-21T12:00:04.0000009Z","LastWriteTimeUtc":"2026-08-21T12:30:04.5000002Z"},{"Path":"deep"#,
+            ),
+            "forward and round-trip cases disagree about the Windows source",
+        );
+        // The source timestamp set is exactly the corpus.
+        let readme_stamp = r#"{"Path":"readme.txt","CreationTimeUtc":"2026-08-21T12:00:00.0000001Z","LastWriteTimeUtc":"2026-08-21T12:30:00.5000002Z"}"#;
+        assert!(base.contains(readme_stamp));
+        invalid(
+            &base.replacen(&format!("{readme_stamp},"), "", 1),
+            "source timestamps do not cover exactly the payload corpus",
+        );
+        invalid(
+            &base.replacen(
+                readme_stamp,
+                &readme_stamp.replace("readme.txt", "README.txt"),
+                1,
+            ),
+            "unexpected source timestamp path",
+        );
+        invalid(
+            &base.replacen(
+                readme_stamp,
+                &readme_stamp.replace("readme.txt", r"alpha\\empty.dat"),
+                1,
+            ),
+            "duplicate source timestamp path",
+        );
+        assert!(matches!(
+            verify(&base.replacen(r#""SourceVolumeSerialNumber":"#, r#""SourceSerial":"#, 1)),
+            Err(WindowsValidationError::MalformedJson(_))
+        ));
+        assert!(matches!(
+            verify(&base.replacen(
+                &format!(r#""SourceVolumeSerialNumber":{NTFS_SERIAL}"#),
+                r#""SourceVolumeSerialNumber":4294967296"#,
+                1
+            )),
+            Err(WindowsValidationError::MalformedJson(_))
+        ));
+    }
+
+    #[test]
     fn seeded_corpus_matches_independently_computed_digests() {
         // Pinned from `hashlib.sha256(bytes((seed + i) % 251 for i in range(length)))`.
         let expected = expected_payloads();
@@ -1092,7 +1520,7 @@ mod tests {
         let cases = cases();
         invalid(
             &report_with(&cases[..3]),
-            "schema v1 requires exactly the four Windows-origin cases",
+            "schema v2 requires exactly the four Windows-origin cases",
         );
         let duplicated = [&cases[0], &cases[1], &cases[2], &cases[2]].map(String::clone);
         invalid(&report_with(&duplicated), "duplicate Windows-origin case");
@@ -1271,7 +1699,9 @@ mod tests {
     #[test]
     fn rejects_missing_altered_or_duplicate_payloads() {
         let base = report();
-        let readme = format!(r#"{{"Path":"readme.txt","Length":14,"Sha256":"{README_SHA256}"}}"#);
+        let readme = format!(
+            r#"{{"Path":"readme.txt","Length":14,"Sha256":"{README_SHA256}","CreationTimeUtc":"2026-08-21T12:00:00.0000001Z","LastWriteTimeUtc":"2026-08-21T12:30:00.5000002Z"}}"#
+        );
         let readme = readme.as_str();
         assert!(base.contains(readme));
         invalid(
@@ -1294,7 +1724,8 @@ mod tests {
             &base.replacen(readme, &readme.replace("C839", "C83A"), 1),
             "payload length or SHA-256 does not match the seeded corpus",
         );
-        let empty = r#"{"Path":"alpha\\empty.dat","Length":0,"Sha256":"E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855"}"#;
+        let empty = r#"{"Path":"alpha\\empty.dat","Length":0,"Sha256":"E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855","CreationTimeUtc":"2026-08-21T12:00:01.0000001Z","LastWriteTimeUtc":"2026-08-21T12:30:01.5000002Z"}"#;
+        assert!(base.contains(empty));
         invalid(&base.replacen(empty, readme, 1), "duplicate payload path");
     }
 
@@ -1388,9 +1819,10 @@ mod tests {
             &base.replacen("windows-origin-validation", "windows-vhd-validation", 1),
             "unexpected schema",
         );
+        // Schema v1 reports predate the exFAT-direction restore and the identity fields.
         assert_eq!(
-            verify(&base.replacen(r#""Version":1"#, r#""Version":2"#, 1)),
-            Err(WindowsValidationError::UnsupportedVersion(2))
+            verify(&base.replacen(r#""Version":2"#, r#""Version":1"#, 1)),
+            Err(WindowsValidationError::UnsupportedVersion(1))
         );
         assert_eq!(
             verify(&base.replacen(r#""Complete":true"#, r#""Complete":false"#, 1)),
@@ -1432,10 +1864,11 @@ mod tests {
             max_payloads_per_case: 8,
             ..WindowsValidationLimits::default()
         };
+        // The per-case payload bound covers the source timestamp set too, which is checked first.
         assert_eq!(
             verify_windows_origin_validation_report(base.as_bytes(), limits),
             Err(WindowsValidationError::ArrayLimitExceeded {
-                field: "Payloads",
+                field: "SourceTimestamps",
                 actual: 9,
                 maximum: 8,
             })

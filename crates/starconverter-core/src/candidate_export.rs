@@ -6368,6 +6368,486 @@ mod tests {
         }
     }
 
+    struct ExfatRoundTripSource {
+        image: Vec<u8>,
+        serial: u32,
+        label: Vec<u16>,
+        /// Path, exFAT attributes, exact timestamps, and payload of every non-root object.
+        objects: Vec<(Vec<&'static str>, u16, ExfatTimestamps, Vec<u8>)>,
+    }
+
+    const fn exfat_stamp(
+        year: u32,
+        month: u32,
+        day: u32,
+        hour: u32,
+        minute: u32,
+        two_seconds: u32,
+    ) -> u32 {
+        ((year - 1980) << 25)
+            | (month << 21)
+            | (day << 16)
+            | (hour << 11)
+            | (minute << 5)
+            | two_seconds
+    }
+
+    /// exFAT source carrying the identities an NTFS candidate cannot hold exactly: the volume
+    /// serial and label, local-time UTC offsets, centiseconds, and attribute bits on a directory
+    /// and two files.
+    #[allow(clippy::too_many_lines)]
+    fn exfat_round_trip_source() -> ExfatRoundTripSource {
+        const VOLUME_BYTES: u64 = 16 * 1024 * 1024;
+        const CLUSTER_BYTES: u32 = 4096;
+        let root = ObjectId(1);
+        let docs = ObjectId(2);
+        let notes = ObjectId(3);
+        let payload = ObjectId(4);
+        let graph_limits = ObjectGraphLimits {
+            max_objects: 8,
+            max_entries: 8,
+            max_streams: 8,
+            max_name_code_units: 255,
+        };
+        let root_record = ObjectRecord {
+            id: root,
+            kind: ObjectKind::Directory,
+            link_count: 0,
+            semantics: ObjectSemantics::default(),
+            streams: Vec::new(),
+        };
+        let empty_graph = ObjectGraph::build(
+            root,
+            vec![root_record.clone()],
+            Vec::new(),
+            ExtentGraph::build(Vec::new(), VOLUME_BYTES, 4).unwrap(),
+            graph_limits,
+        )
+        .unwrap();
+        let upcase =
+            generate_recommended_exfat_upcase(RecommendedExfatUpcaseLimits::default()).unwrap();
+        let label: Vec<u16> = "ORIGIN".encode_utf16().collect();
+        let serial = 0x0024_5734;
+        let volume = ExfatVolumeProfile {
+            volume_label: Some(&label),
+            encoded_upcase_table: upcase.encoded_bytes(),
+            upcase_checksum: RECOMMENDED_EXFAT_UPCASE_CHECKSUM,
+            source_preservation: ExfatPreservationEvidence::default(),
+            allocated_bad_clusters: 0,
+            bad_cluster_ranges: &[],
+            stale_boot_sectors: &[],
+        };
+        let options = ExfatSerializeOptions {
+            bytes_per_cluster: CLUSTER_BYTES,
+            volume_serial_number: serial,
+            ..ExfatSerializeOptions::default()
+        };
+        let bootstrap = serialize_exfat_destination(
+            &empty_graph,
+            &[],
+            volume,
+            options,
+            ExfatSerializeLimits::default(),
+        )
+        .unwrap();
+        let heap = u64::from(bootstrap.geometry.cluster_heap_offset_sectors) * 512;
+        let payload_offset = heap;
+        let notes_offset = heap + 8 * u64::from(CLUSTER_BYTES);
+        let cluster = usize::try_from(CLUSTER_BYTES).unwrap();
+        let payload_bytes: Vec<u8> = (0..cluster)
+            .map(|index| u8::try_from(index % 251).unwrap())
+            .collect();
+        let notes_bytes: Vec<u8> = (0..cluster)
+            .map(|index| u8::try_from((index * 3 + 7) % 241).unwrap())
+            .collect();
+        let file_stream = |id: u64| ObjectStream {
+            id: StreamId(id),
+            name: None,
+            logical_bytes: u64::from(CLUSTER_BYTES),
+            initialized_bytes: u64::from(CLUSTER_BYTES),
+            mapped_bytes: u64::from(CLUSTER_BYTES),
+            allocated_bytes: u64::from(CLUSTER_BYTES),
+            flags: StreamFlags::default(),
+            storage: StreamStorage::Extents,
+        };
+        let extent = |id: u64, byte_offset: u64| Extent {
+            stream: StreamId(id),
+            logical_offset: 0,
+            length: u64::from(CLUSTER_BYTES),
+            placement: Placement::Physical { byte_offset },
+            kind: ExtentKind::FileData,
+        };
+        let graph = ObjectGraph::build(
+            root,
+            vec![
+                root_record,
+                ObjectRecord {
+                    id: docs,
+                    kind: ObjectKind::Directory,
+                    link_count: 1,
+                    semantics: ObjectSemantics::default(),
+                    streams: Vec::new(),
+                },
+                ObjectRecord {
+                    id: notes,
+                    kind: ObjectKind::File,
+                    link_count: 1,
+                    semantics: ObjectSemantics::default(),
+                    streams: vec![file_stream(30)],
+                },
+                ObjectRecord {
+                    id: payload,
+                    kind: ObjectKind::File,
+                    link_count: 1,
+                    semantics: ObjectSemantics::default(),
+                    streams: vec![file_stream(40)],
+                },
+            ],
+            vec![
+                NamespaceEntry {
+                    parent: root,
+                    target: docs,
+                    name: "docs".encode_utf16().collect(),
+                },
+                NamespaceEntry {
+                    parent: docs,
+                    target: notes,
+                    name: "notes.txt".encode_utf16().collect(),
+                },
+                NamespaceEntry {
+                    parent: root,
+                    target: payload,
+                    name: "payload.bin".encode_utf16().collect(),
+                },
+            ],
+            ExtentGraph::build(
+                vec![extent(30, notes_offset), extent(40, payload_offset)],
+                VOLUME_BYTES,
+                4,
+            )
+            .unwrap(),
+            graph_limits,
+        )
+        .unwrap();
+        // UTC+1 (0x84) and UTC-1 (0xfc) offsets with odd centiseconds: an NTFS FILETIME keeps the
+        // instant but not the offset, so only the escrow can bring these back exactly.
+        let docs_timestamps = ExfatTimestamps {
+            create: exfat_stamp(2023, 3, 14, 9, 26, 27),
+            modified: exfat_stamp(2023, 7, 1, 12, 0, 0),
+            accessed: exfat_stamp(2024, 1, 2, 3, 4, 5),
+            create_centiseconds: 53,
+            modified_centiseconds: 0,
+            create_utc_offset: 0x84,
+            modified_utc_offset: 0xfc,
+            accessed_utc_offset: 0x80,
+        };
+        let notes_timestamps = ExfatTimestamps {
+            create: exfat_stamp(2022, 11, 30, 23, 59, 29),
+            modified: exfat_stamp(2023, 2, 28, 0, 0, 1),
+            accessed: exfat_stamp(2023, 2, 28, 0, 0, 1),
+            create_centiseconds: 199,
+            modified_centiseconds: 101,
+            create_utc_offset: 0xfc,
+            modified_utc_offset: 0x84,
+            accessed_utc_offset: 0x84,
+        };
+        let payload_timestamps = ExfatTimestamps {
+            create: exfat_stamp(2024, 6, 15, 8, 30, 10),
+            modified: exfat_stamp(2024, 6, 15, 8, 30, 10),
+            accessed: exfat_stamp(2024, 6, 16, 8, 30, 10),
+            create_centiseconds: 0,
+            modified_centiseconds: 0,
+            create_utc_offset: 0x80,
+            modified_utc_offset: 0x80,
+            accessed_utc_offset: 0x80,
+        };
+        let metadata = [
+            ExfatObjectMetadata {
+                object: docs,
+                file_attributes: 0x12,
+                timestamps: docs_timestamps,
+            },
+            ExfatObjectMetadata {
+                object: notes,
+                file_attributes: 0x21,
+                timestamps: notes_timestamps,
+            },
+            ExfatObjectMetadata {
+                object: payload,
+                file_attributes: 0x20,
+                timestamps: payload_timestamps,
+            },
+        ];
+        let plan = serialize_exfat_destination(
+            &graph,
+            &metadata,
+            volume,
+            options,
+            ExfatSerializeLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(plan.reused_payloads.len(), 2);
+        let mut image = vec![0_u8; usize::try_from(VOLUME_BYTES).unwrap()];
+        for (offset, bytes) in [
+            (payload_offset, &payload_bytes),
+            (notes_offset, &notes_bytes),
+        ] {
+            let start = usize::try_from(offset).unwrap();
+            image[start..start + bytes.len()].copy_from_slice(bytes);
+        }
+        for write in plan.overlay.writes() {
+            let start = usize::try_from(write.offset).unwrap();
+            image[start..start + write.bytes.len()].copy_from_slice(&write.bytes);
+        }
+        ExfatRoundTripSource {
+            image,
+            serial,
+            label,
+            objects: vec![
+                (vec!["docs"], 0x12, docs_timestamps, Vec::new()),
+                (
+                    vec!["docs", "notes.txt"],
+                    0x21,
+                    notes_timestamps,
+                    notes_bytes,
+                ),
+                (vec!["payload.bin"], 0x20, payload_timestamps, payload_bytes),
+            ],
+        }
+    }
+
+    fn exfat_path_matches(path: &[Vec<u16>], expected: &[&str]) -> bool {
+        path.len() == expected.len()
+            && path
+                .iter()
+                .zip(expected)
+                .all(|(actual, expected)| String::from_utf16(actual).unwrap() == *expected)
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn escrow_round_trip_restores_exfat_identities_and_exact_timestamps() {
+        use crate::cross_format::draft_escrow_restored_ntfs_to_exfat;
+        use crate::exfat_escrow_restore::{ExfatRestoreError, decode_exfat_restore_sidecar};
+        use crate::preservation::PreservationLimits;
+
+        let source = exfat_round_trip_source();
+        let source_file = TempFile::create(&source.image);
+        let source_image = ImageFile::open(&source_file.path).unwrap();
+        let source_snapshot =
+            capture_source_image_snapshot(&source_image, CandidateExportLimits::default()).unwrap();
+        let inspection = inspect_open_image(&source_image).unwrap();
+        let normalized = inspection.normalized_exfat.as_deref().unwrap();
+        assert_eq!(normalized.graph.objects().len(), 4);
+        assert_eq!(normalized.preservation.volume_serial_number, source.serial);
+        assert_eq!(
+            normalized
+                .preservation
+                .volume_label
+                .map(|label| label.as_units().to_vec()),
+            Some(source.label.clone())
+        );
+        let check_identities = |restored: &crate::fs::exfat_normalize::NormalizedExfat,
+                                image: &[u8]| {
+            assert_eq!(restored.graph.objects().len(), 4);
+            for (path, attributes, timestamps, payload) in &source.objects {
+                let preserved = restored
+                    .preservation
+                    .objects
+                    .iter()
+                    .find(|object| exfat_path_matches(&object.path, path))
+                    .unwrap_or_else(|| panic!("missing exFAT path {path:?}"));
+                assert_eq!(
+                    preserved.file_attributes, *attributes,
+                    "attributes for {path:?}"
+                );
+                assert_eq!(
+                    preserved.timestamps,
+                    Some(*timestamps),
+                    "timestamps for {path:?}"
+                );
+                if !payload.is_empty() {
+                    let object = restored
+                        .graph
+                        .objects()
+                        .iter()
+                        .find(|object| object.id == preserved.object)
+                        .unwrap();
+                    assert_eq!(object.streams.len(), 1);
+                    assert_eq!(
+                        graph_stream_bytes(&restored.graph, image, &object.streams[0]),
+                        *payload,
+                        "payload for {path:?}"
+                    );
+                }
+            }
+        };
+        check_identities(normalized, &source.image);
+
+        // Forward: exFAT -> NTFS with escrow.
+        let draft = draft_lossless_exfat_to_ntfs(
+            normalized,
+            GuaranteeMode::Escrow,
+            ExfatToNtfsOptions::default(),
+            ExfatToNtfsLimits::default(),
+        )
+        .unwrap();
+        let solved = solve_lossless_exfat_to_ntfs(draft, LayoutLimits::default()).unwrap();
+        let preview = preview_ntfs_phase_writes(
+            &source_image,
+            &solved.destination,
+            PreimageLimits::default(),
+        )
+        .unwrap();
+        let ntfs_path = temp_path("exfat-round-trip.ntfs.img");
+        let ntfs_escrow_path = temp_path("exfat-round-trip.ntfs.escrow");
+        export_relocated_candidate_image(
+            &source_image,
+            &ntfs_path,
+            Some(&ntfs_escrow_path),
+            &preview,
+            &source_snapshot,
+            solved.relocation(),
+            &solved.preservation,
+            CandidateExportLimits::default(),
+        )
+        .unwrap();
+
+        // Backward: the NTFS candidate plus its bound escrow become a new exFAT image.
+        let ntfs_image = ImageFile::open(&ntfs_path).unwrap();
+        let ntfs_snapshot =
+            capture_source_image_snapshot(&ntfs_image, CandidateExportLimits::default()).unwrap();
+        let ntfs_inspection = inspect_open_image(&ntfs_image).unwrap();
+        let normalized_ntfs = ntfs_inspection.normalized_ntfs.as_deref().unwrap();
+        assert_eq!(normalized_ntfs.graph.entries().len(), 3);
+        let escrow_bytes = fs::read(&ntfs_escrow_path).unwrap();
+        let sidecar = decode_exfat_restore_sidecar(
+            &escrow_bytes,
+            ntfs_snapshot.sha256(),
+            CandidateExportLimits::default().max_escrow_bytes,
+            PreservationLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(sidecar.volume_serial_number, source.serial);
+        assert_eq!(sidecar.upcase_checksum, RECOMMENDED_EXFAT_UPCASE_CHECKSUM);
+
+        // Without the escrow the return trip keeps the instants but loses the UTC offsets.
+        let plain = solve_lossless_ntfs_to_exfat(
+            draft_lossless_ntfs_to_exfat(
+                normalized_ntfs,
+                GuaranteeMode::Escrow,
+                NtfsToExfatOptions::default(),
+                NtfsToExfatLimits::default(),
+            )
+            .unwrap(),
+            LayoutLimits::default(),
+        )
+        .unwrap();
+        assert!(
+            plain
+                .object_metadata
+                .iter()
+                .all(|entry| entry.timestamps.create_utc_offset == 0x80
+                    && entry.timestamps.modified_utc_offset == 0x80)
+        );
+
+        let restored_draft = draft_escrow_restored_ntfs_to_exfat(
+            normalized_ntfs,
+            &sidecar,
+            GuaranteeMode::Escrow,
+            NtfsToExfatOptions::default(),
+            NtfsToExfatLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(restored_draft.target_graph().entries().len(), 3);
+        let restored_solved =
+            solve_lossless_ntfs_to_exfat(restored_draft, LayoutLimits::default()).unwrap();
+        assert_eq!(
+            restored_solved.destination_volume_serial_number,
+            source.serial
+        );
+        assert_eq!(
+            restored_solved.destination_volume_label.as_deref(),
+            Some(source.label.as_slice())
+        );
+        assert_eq!(restored_solved.object_metadata.len(), 3);
+        assert_ne!(restored_solved.object_metadata, plain.object_metadata);
+        let restored_preview = preview_exfat_phase_writes(
+            &ntfs_image,
+            &restored_solved.destination,
+            PreimageLimits::default(),
+        )
+        .unwrap();
+        let exfat_path = temp_path("exfat-round-trip.restored.exfat.img");
+        let exfat_escrow_path = temp_path("exfat-round-trip.restored.exfat.escrow");
+        export_relocated_candidate_image(
+            &ntfs_image,
+            &exfat_path,
+            Some(&exfat_escrow_path),
+            &restored_preview,
+            &ntfs_snapshot,
+            restored_solved.relocation(),
+            &restored_solved.preservation,
+            CandidateExportLimits::default(),
+        )
+        .unwrap();
+        verify_bound_export(
+            &exfat_path,
+            &exfat_escrow_path,
+            Some(&ntfs_path),
+            CandidateVerificationLimits::default(),
+        )
+        .unwrap();
+
+        // The restored exFAT volume carries the original identities and exact metadata.
+        let restored_inspection = inspect_image(&exfat_path).unwrap();
+        let restored = restored_inspection.normalized_exfat.as_deref().unwrap();
+        let restored_bytes = fs::read(&exfat_path).unwrap();
+        assert_eq!(restored.preservation.volume_serial_number, source.serial);
+        assert_eq!(
+            restored
+                .preservation
+                .volume_label
+                .map(|label| label.as_units().to_vec()),
+            Some(source.label.clone())
+        );
+        assert_eq!(
+            restored.preservation.root.upcase_table.table_checksum,
+            RECOMMENDED_EXFAT_UPCASE_CHECKSUM
+        );
+        check_identities(restored, &restored_bytes);
+
+        // Binding: an edited NTFS image or a wrong-direction escrow is refused before restore.
+        let mut edited = fs::read(&ntfs_path).unwrap();
+        let last = edited.len() - 1;
+        edited[last] ^= 0x01;
+        let edited_sha: [u8; 32] = Sha256::digest(&edited).into();
+        assert!(matches!(
+            decode_exfat_restore_sidecar(
+                &escrow_bytes,
+                edited_sha,
+                CandidateExportLimits::default().max_escrow_bytes,
+                PreservationLimits::default(),
+            ),
+            Err(ExfatRestoreError::CandidateBindingMismatch { .. })
+        ));
+        let restored_sha: [u8; 32] = Sha256::digest(&restored_bytes).into();
+        assert!(matches!(
+            decode_exfat_restore_sidecar(
+                &fs::read(&exfat_escrow_path).unwrap(),
+                restored_sha,
+                CandidateExportLimits::default().max_escrow_bytes,
+                PreservationLimits::default(),
+            ),
+            Err(ExfatRestoreError::EscrowDirectionMismatch { .. })
+        ));
+
+        assert_eq!(fs::read(&source_file.path).unwrap(), source.image);
+        for path in [ntfs_path, ntfs_escrow_path, exfat_path, exfat_escrow_path] {
+            fs::remove_file(path).unwrap();
+        }
+    }
+
     #[test]
     #[allow(clippy::too_many_lines)]
     fn escrow_round_trip_carries_uncaptured_named_stream_as_dest_native_file() {

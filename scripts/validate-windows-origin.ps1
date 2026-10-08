@@ -7,10 +7,11 @@ param(
 # Windows-origin gate. Where validate-windows-vhd.ps1 judges StarConverter's output from pinned
 # StarConverter-built sources, this script starts from volumes that Windows itself formatted and
 # populated on this host, converts them with the CLI, and asks the Windows filesystem drivers
-# whether the result (and the escrow-restored round trip) serves the same files, bytes, and NTFS
-# security descriptors. Nothing here is pinned by hash: Windows chooses serials, GUIDs, and
-# timestamps at run time, so each case records what it saw and the report verifier checks the
-# invariants rather than fixed bytes.
+# whether the result (and the escrow-restored round trip) serves the same files, bytes, label,
+# NTFS security descriptors, and, after an escrow restore in either direction, the same volume
+# serial and per-file creation and last-write instants. Nothing here is pinned by hash: Windows
+# chooses serials, GUIDs, and timestamps at run time, so each case records what it saw and the
+# report verifier checks the invariants rather than fixed bytes.
 #
 # Only regular fixed-VHD files under the work root are attached. Writable attachment is used
 # solely to populate the freshly formatted source volumes; every candidate is attached read-only
@@ -116,6 +117,8 @@ $diskBytes = [long]$vhdMaximumMiB * 1MB
 $vhdBytes = $diskBytes + 512
 $partitionOffset = [long]1MB
 $partitionBytes = [long]0
+# Label Windows writes at format time; every candidate must serve it back verbatim.
+$sourceLabel = "ORIGIN"
 
 function Read-MbrPartitionBytes {
     param([string]$VhdPath)
@@ -224,7 +227,7 @@ function New-WindowsFormattedVhd {
         "attach vdisk",
         "convert mbr",
         "create partition primary offset=1024",
-        "format fs=$FileSystem quick label=ORIGIN",
+        "format fs=$FileSystem quick label=$sourceLabel",
         "detach vdisk",
         "exit"
     )
@@ -449,6 +452,66 @@ function Initialize-SourceVolume {
     }
 }
 
+function Get-VolumeSerialNumber {
+    param($Volume)
+    # Win32_Volume keys letterless volumes by their GUID path and reports the 32-bit serial the
+    # driver serves through GetVolumeInformation, for NTFS and exFAT alike.
+    $volumes = @(Get-CimInstance -ClassName Win32_Volume | Where-Object { $_.DeviceID -ieq $Volume.Path })
+    if ($volumes.Count -ne 1) {
+        throw "Expected exactly one Win32_Volume for $($Volume.Path), found $($volumes.Count)"
+    }
+    if ($null -eq $volumes[0].SerialNumber) {
+        throw "Win32_Volume reported no serial number for $($Volume.Path)"
+    }
+    return [uint32]$volumes[0].SerialNumber
+}
+
+function Get-PayloadTimestamps {
+    param([IO.FileInfo]$Item)
+    # Access time is excluded on purpose: both drivers may refresh it on a read, so it is not a
+    # property either conversion promises to carry.
+    return @{
+        CreationTimeUtc = $Item.CreationTimeUtc.ToString("o")
+        LastWriteTimeUtc = $Item.LastWriteTimeUtc.ToString("o")
+    }
+}
+
+function Read-SourceIdentity {
+    param([string]$VhdPath, [string]$FileSystem, [object[]]$Payloads)
+    # A fresh read-only attach reads the identities Windows actually committed to disk rather
+    # than values still cached from the populating handle (exFAT, for one, only rounds timestamps
+    # to its on-disk precision when it writes the directory entry).
+    $mountDirectory = Join-Path $workDirectory "mount-identity-$FileSystem"
+    $mounted = $null
+    try {
+        $mounted = Mount-VhdToDirectory -VhdPath $VhdPath -MountDirectory $mountDirectory -ReadOnly $true
+        if ($mounted.Volume.FileSystem -ine $FileSystem) {
+            throw "Expected $FileSystem source, found '$($mounted.Volume.FileSystem)'."
+        }
+        $timestamps = @()
+        foreach ($payload in $Payloads) {
+            $item = Get-Item -LiteralPath ($mounted.AccessPath + $payload.Path) -Force
+            $stamps = Get-PayloadTimestamps -Item $item
+            $timestamps += [pscustomobject]@{
+                Path = $payload.Path
+                CreationTimeUtc = $stamps.CreationTimeUtc
+                LastWriteTimeUtc = $stamps.LastWriteTimeUtc
+            }
+        }
+        $identity = [pscustomobject]@{
+            VolumeLabel = [string]$mounted.Volume.FileSystemLabel
+            VolumeSerialNumber = (Get-VolumeSerialNumber -Volume $mounted.Volume)
+            Timestamps = $timestamps
+        }
+        Write-Line "$FileSystem source identity: label '$($identity.VolumeLabel)' serial $($identity.VolumeSerialNumber.ToString('X8')) with $($timestamps.Count) payload timestamp pair(s)"
+        return $identity
+    }
+    finally {
+        Dismount-Vhd -VhdPath $VhdPath -Mounted $mounted
+        Remove-Item -LiteralPath $mountDirectory -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Copy-FileRange {
     param([IO.FileStream]$Source, [long]$Offset, [long]$Length, [IO.FileStream]$Destination)
     $null = $Source.Seek($Offset, [IO.SeekOrigin]::Begin)
@@ -660,7 +723,9 @@ function Invoke-DriverJudgment {
         [string]$CandidateVhdPath,
         [string]$FileSystem,
         [object[]]$Payloads,
-        [object[]]$Security
+        [object[]]$Security,
+        [string]$ExpectedLabel,
+        [AllowNull()]$RestoredIdentity
     )
     $beforeHash = Get-Sha256 -Path $CandidateVhdPath
     $mountDirectory = Join-Path $workDirectory "mount-judge"
@@ -670,6 +735,8 @@ function Invoke-DriverJudgment {
     $chkdskOutput = @()
     $chkdskExit = $null
     $volumePath = $null
+    $volumeLabel = $null
+    $volumeSerial = $null
     try {
         $mounted = Mount-VhdToDirectory -VhdPath $CandidateVhdPath -MountDirectory $mountDirectory -ReadOnly $true
         $volume = $mounted.Volume
@@ -680,6 +747,14 @@ function Invoke-DriverJudgment {
             throw "Expected a volume GUID path, found $($volume.Path)."
         }
         $volumePath = $volume.Path
+        $volumeLabel = [string]$volume.FileSystemLabel
+        if (-not [string]::Equals($volumeLabel, $ExpectedLabel, [StringComparison]::Ordinal)) {
+            throw "Volume label mismatch: expected '$ExpectedLabel' found '$volumeLabel'"
+        }
+        $volumeSerial = Get-VolumeSerialNumber -Volume $volume
+        if ($null -ne $RestoredIdentity -and $volumeSerial -ne $RestoredIdentity.VolumeSerialNumber) {
+            throw ("Volume serial mismatch after escrow restore: expected {0:X8} found {1:X8}" -f $RestoredIdentity.VolumeSerialNumber, $volumeSerial)
+        }
         foreach ($payload in $Payloads) {
             $payloadPath = $mounted.AccessPath + $payload.Path
             $payloadItem = Get-Item -LiteralPath $payloadPath -Force
@@ -690,10 +765,24 @@ function Invoke-DriverJudgment {
             if ($payloadHash -ne $payload.Sha256) {
                 throw "Payload hash mismatch: $($payload.Path)"
             }
+            $stamps = Get-PayloadTimestamps -Item $payloadItem
+            if ($null -ne $RestoredIdentity) {
+                $expectedStamps = @($RestoredIdentity.Timestamps | Where-Object { $_.Path -eq $payload.Path })
+                if ($expectedStamps.Count -ne 1) {
+                    throw "Source identity has $($expectedStamps.Count) timestamp record(s) for $($payload.Path)"
+                }
+                foreach ($field in @("CreationTimeUtc", "LastWriteTimeUtc")) {
+                    if (-not [string]::Equals($stamps[$field], $expectedStamps[0].$field, [StringComparison]::Ordinal)) {
+                        throw "$field mismatch after escrow restore at '$($payload.Path)': expected $($expectedStamps[0].$field) found $($stamps[$field])"
+                    }
+                }
+            }
             $payloadResults += [pscustomobject]@{
                 Path = $payload.Path
                 Length = $payloadItem.Length
                 Sha256 = $payloadHash
+                CreationTimeUtc = $stamps.CreationTimeUtc
+                LastWriteTimeUtc = $stamps.LastWriteTimeUtc
             }
         }
         foreach ($expected in $Security) {
@@ -707,7 +796,7 @@ function Invoke-DriverJudgment {
                 Sddl = $actual
             }
         }
-        Write-Line "$Name served $($payloadResults.Count) payload(s) and $($securityResults.Count) descriptor(s) at $volumePath"
+        Write-Line "$Name served $($payloadResults.Count) payload(s) and $($securityResults.Count) descriptor(s) at $volumePath (label '$volumeLabel', serial $($volumeSerial.ToString('X8')))"
         $chkdskTarget = $volume.Path.TrimEnd('\')
         $previous = $ErrorActionPreference
         $ErrorActionPreference = "Continue"
@@ -760,6 +849,8 @@ function Invoke-DriverJudgment {
         PartitionOffsetBytes = $partitionOffset
         PartitionBytes = $partitionBytes
         VolumeGuidPath = $volumePath
+        VolumeLabel = $volumeLabel
+        VolumeSerialNumber = $volumeSerial
         Payloads = $payloadResults
         Security = $securityResults
         ChkdskExitCode = $chkdskExit
@@ -791,6 +882,10 @@ foreach ($origin in @("NTFS", "exFAT")) {
     try {
         $sourceVhd = New-WindowsFormattedVhd -FileSystem $lower
         $populated = Initialize-SourceVolume -VhdPath $sourceVhd -FileSystem $origin
+        $sourceIdentity = Read-SourceIdentity -VhdPath $sourceVhd -FileSystem $origin -Payloads $populated.Payloads
+        if ($sourceIdentity.VolumeLabel -cne $sourceLabel) {
+            throw "Windows formatted the $origin source with label '$($sourceIdentity.VolumeLabel)', expected '$sourceLabel'"
+        }
         $sourceVhdHash = Get-Sha256 -Path $sourceVhd
         $sourceImage = Join-Path $workDirectory "source-$lower.img"
         Export-PartitionImage -VhdPath $sourceVhd -ImagePath $sourceImage
@@ -810,8 +905,9 @@ foreach ($origin in @("NTFS", "exFAT")) {
         $forwardVhd = Join-Path $workDirectory "forward-$lower-to-$otherLower.vhd"
         New-CandidateVhd -SourceVhdPath $sourceVhd -ImagePath $forwardImage -CandidateVhdPath $forwardVhd
         # Descriptor equality is only meaningful when both ends are NTFS, so the forward
-        # conversion (which always changes filesystem) records payloads only.
-        $forward = Invoke-DriverJudgment -Name $forwardName -CandidateVhdPath $forwardVhd -FileSystem $other -Payloads $populated.Payloads -Security @()
+        # conversion (which always changes filesystem) records payloads only. The label crosses
+        # in both directions; serial and timestamps are only promised back by an escrow restore.
+        $forward = Invoke-DriverJudgment -Name $forwardName -CandidateVhdPath $forwardVhd -FileSystem $other -Payloads $populated.Payloads -Security @() -ExpectedLabel $sourceLabel -RestoredIdentity $null
         $results += [pscustomobject]@{
             Name = $forwardName
             Origin = $origin
@@ -819,6 +915,9 @@ foreach ($origin in @("NTFS", "exFAT")) {
             SourceVhdPath = $sourceVhd
             SourceVhdSha256 = $sourceVhdHash
             SourceImageSha256 = $sourceImageHash
+            SourceVolumeLabel = $sourceIdentity.VolumeLabel
+            SourceVolumeSerialNumber = $sourceIdentity.VolumeSerialNumber
+            SourceTimestamps = $sourceIdentity.Timestamps
             Candidate = $forward
         }
         Write-Host "[PASS] $forwardName / SHA256 $($forward.Sha256After)"
@@ -828,27 +927,24 @@ foreach ($origin in @("NTFS", "exFAT")) {
         foreach ($stale in @($backImage, $backEscrow)) {
             if (Test-Path -LiteralPath $stale) { Remove-Item -LiteralPath $stale -Force }
         }
-        # Escrow restore exists only for the exFAT -> NTFS direction today, so the NTFS origin
-        # round trip restores identities (and must reproduce exact SDDL), while the exFAT origin
-        # round trip is a plain conversion judged on payload bytes alone.
-        $restoreEscrow = ($origin -ieq "NTFS")
-        $backArguments = @("convert-image", $forwardImage, $backImage, "--to", $lower)
-        if ($restoreEscrow) {
-            $backArguments += @("--restore-escrow", $forwardEscrow)
-        }
-        $backOutput = Invoke-Cli -Label "roundtrip-$lower" -Arguments $backArguments
+        # Both round trips replay the forward escrow, so the Windows driver must hand back the
+        # source serial and every payload's creation and last-write instants exactly; the NTFS
+        # origin additionally must reproduce the exact SDDL of every descriptor.
+        $backOutput = Invoke-Cli -Label "roundtrip-$lower" -Arguments @("convert-image", $forwardImage, $backImage, "--to", $lower, "--restore-escrow", $forwardEscrow)
         Invoke-Cli -Label "verify-roundtrip-$lower" -Arguments @("verify-export", $backImage, $backEscrow, "--source", $forwardImage) | Out-Null
         $backVhd = Join-Path $workDirectory "roundtrip-$lower.vhd"
         New-CandidateVhd -SourceVhdPath $sourceVhd -ImagePath $backImage -CandidateVhdPath $backVhd
-        $backSecurity = if ($restoreEscrow) { $populated.Security } else { @() }
-        $back = Invoke-DriverJudgment -Name $roundTripName -CandidateVhdPath $backVhd -FileSystem $origin -Payloads $populated.Payloads -Security $backSecurity
+        $back = Invoke-DriverJudgment -Name $roundTripName -CandidateVhdPath $backVhd -FileSystem $origin -Payloads $populated.Payloads -Security $populated.Security -ExpectedLabel $sourceLabel -RestoredIdentity $sourceIdentity
         $results += [pscustomobject]@{
             Name = $roundTripName
             Origin = $origin
-            RestoreEscrow = $restoreEscrow
+            RestoreEscrow = $true
             SourceVhdPath = $sourceVhd
             SourceVhdSha256 = $sourceVhdHash
             SourceImageSha256 = $sourceImageHash
+            SourceVolumeLabel = $sourceIdentity.VolumeLabel
+            SourceVolumeSerialNumber = $sourceIdentity.VolumeSerialNumber
+            SourceTimestamps = $sourceIdentity.Timestamps
             Candidate = $back
         }
         Write-Host "[PASS] $roundTripName / SHA256 $($back.Sha256After)"
@@ -866,7 +962,7 @@ if ($failures.Count -gt 0) {
 if ($null -ne $reportFullPath) {
     $report = [ordered]@{
         Schema = "starconverter.windows-origin-validation"
-        Version = 1
+        Version = 2
         Complete = $true
         GeneratedUtc = [DateTime]::UtcNow.ToString("o")
         WindowsVersion = [Environment]::OSVersion.VersionString

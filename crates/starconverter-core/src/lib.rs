@@ -13,6 +13,7 @@ pub mod cross_format;
 pub mod escrow_carrier;
 pub mod escrow_restore;
 pub mod executor;
+pub mod exfat_escrow_restore;
 pub mod extent;
 pub mod fs;
 pub mod geometry;

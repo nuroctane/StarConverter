@@ -403,31 +403,41 @@ on pre-built control VHDs or on a quiet, empty volume. On the elevated `windows-
    containing heap cluster free, or scrubbing in place when it lands in an unwritten gap), so the
    tail of every converted exFAT candidate is zeros; the three pinned `windows-vhd` exFAT
    candidates (rich, edge, relocated) changed identity in that refresh;
-4. attaches the candidate read-only without a drive letter, requires the driver to report the
-   expected filesystem on a volume GUID path, re-reads every payload's length and SHA-256, runs
-   `chkdsk` (which must name the expected filesystem and exit 0 with no repair), detaches, and
-   re-hashes the VHD;
-5. converts the candidate back `--to <origin>` and judges that VHD the same way. The NTFS origin
-   passes `--restore-escrow` and additionally requires every recorded SDDL to compare
-   ordinal-equal; the exFAT origin round trip is a plain conversion judged on payload bytes,
-   because escrow restore is implemented only for the exFAT -> NTFS direction today (the exFAT
-   sidecar v3 is written but not yet replayed).
+4. re-attaches the populated source read-only and records its identity as the driver serves it:
+   the volume label, the 32-bit serial (`Win32_Volume.SerialNumber`, keyed by volume GUID path),
+   and every payload's `CreationTimeUtc` / `LastWriteTimeUtc` (last access is excluded because
+   either driver may refresh it on a read). The read-only re-attach matters: the values still
+   cached by the populating handle are not necessarily the ones committed to the directory
+   entries;
+5. attaches the candidate read-only without a drive letter, requires the driver to report the
+   expected filesystem on a volume GUID path and the label `ORIGIN`, re-reads every payload's
+   length, SHA-256, and creation/last-write instants, runs `chkdsk` (which must name the expected
+   filesystem and exit 0 with no repair), detaches, and re-hashes the VHD;
+6. converts the candidate back `--to <origin> --restore-escrow <forward sidecar>` for both
+   origins and judges that VHD the same way, additionally requiring the driver to serve the
+   source's volume serial and every payload's creation and last-write instants exactly; the NTFS
+   origin also requires every recorded SDDL to compare ordinal-equal. Before the NTFS -> exFAT
+   restore existed the exFAT origin round trip was a plain conversion judged on payload bytes
+   alone (schema v1 reports, `RestoreEscrow` false on that case).
 
 Nothing is pinned by VHD hash because Windows chooses serials, GUIDs, and timestamps per run. The
-report (`starconverter.windows-origin-validation` v1) instead records what each case saw, and
+report (`starconverter.windows-origin-validation` v2) instead records what each case saw, and
 `starconverter verify-windows-origin-report` (`windows_origin_validation.rs`) checks the
 invariants: exactly the four cases `Windows NTFS to exFAT`, `Windows NTFS round trip`,
 `Windows exFAT to NTFS`, `Windows exFAT round trip`; candidate filesystem matching the direction;
-`RestoreEscrow` true on the NTFS round trip and false elsewhere; the forward and round-trip cases
-of one origin naming the same source VHD and carved-image hashes; candidates not byte-identical to
-their source; four distinct volume GUID paths (a repeat means a cached identity was served);
-41 943 552-byte VHDs; unchanged before/after hashes; read-only, letterless, detached; the 1 MiB
-partition offset and a sector-granular partition length that ends before the footer; the
-complete seeded payload corpus with digests recomputed by the verifier; a
-non-empty `chkdsk` transcript with exit 0; and, on the NTFS round trip only, exactly eleven
-descriptors (root, nine payloads, `secured`) each with an owner and DACL and with a `(D;…;BG)` ACE
-on `secured` and `secured\denied.bin`. The lane uploads the report, every VHD, the carved images,
-and the escrow sidecars as `windows-origin-evidence`.
+`RestoreEscrow` true on both round trips and false on both forward conversions; the forward and
+round-trip cases of one origin naming the same source VHD and carved-image hashes and the same
+source label, serial, and payload timestamps; candidates not byte-identical to their source; four
+distinct volume GUID paths (a repeat means a cached identity was served); 41 943 552-byte VHDs;
+unchanged before/after hashes; read-only, letterless, detached; the 1 MiB partition offset and a
+sector-granular partition length that ends before the footer; the label `ORIGIN` on the source
+and on every candidate; the complete seeded payload corpus with digests recomputed by the
+verifier and invariant round-trip UTC timestamps; a non-empty `chkdsk` transcript with exit 0;
+on both round trips, a candidate serial equal to the source serial and payload creation and
+last-write instants equal to the source's for every path; and, on the NTFS round trip only,
+exactly eleven descriptors (root, nine payloads, `secured`) each with an owner and DACL and with
+a `(D;…;BG)` ACE on `secured` and `secured\denied.bin`. The lane uploads the report, every VHD,
+the carved images, and the escrow sidecars as `windows-origin-evidence`.
 
 #### First green run
 
@@ -444,10 +454,12 @@ Windows exFAT to NTFS     810f0280…0329f43  3edcbf6c…9ec0b73f 0            n
 Windows exFAT round trip  810f0280…0329f43  5eaaf363…294c8028 0            no
 ```
 
-`starconverter verify-windows-origin-report` accepts the uploaded report. The eleven restored
-descriptors on the NTFS round trip compared ordinal-equal to the SDDL Windows recorded before
-conversion, including the two run-time Guests deny ACEs. The source VHDs are regenerated by
-Windows on every run, so these hashes identify that run's evidence rather than a pinned fixture.
+`starconverter verify-windows-origin-report` at that commit accepts the uploaded (schema v1)
+report; the current verifier requires schema v2 and refuses it with `UnsupportedVersion(1)`. The
+eleven restored descriptors on the NTFS round trip compared ordinal-equal to the SDDL Windows
+recorded before conversion, including the two run-time Guests deny ACEs. The source VHDs are
+regenerated by Windows on every run, so these hashes identify that run's evidence rather than a
+pinned fixture.
 
 ## 2026-09-01 forced NTFS-to-exFAT relocation qualification
 

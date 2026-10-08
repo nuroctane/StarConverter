@@ -21,12 +21,15 @@ use starconverter_core::candidate_export::{
 };
 use starconverter_core::cross_format::{
     ExfatToNtfsLimits, ExfatToNtfsOptions, ExfatToNtfsRelocationDraft, NtfsToExfatLimits,
-    NtfsToExfatOptions, draft_escrow_restored_exfat_to_ntfs, draft_lossless_exfat_to_ntfs,
+    NtfsToExfatOptions, NtfsToExfatRelocationDraft, draft_escrow_restored_exfat_to_ntfs,
+    draft_escrow_restored_ntfs_to_exfat, draft_lossless_exfat_to_ntfs,
     draft_lossless_ntfs_to_exfat, solve_lossless_exfat_to_ntfs, solve_lossless_ntfs_to_exfat,
 };
 use starconverter_core::escrow_carrier::{ESCROW_CARRIER_DIRECTORY, sidecar_carriers};
 use starconverter_core::escrow_restore::decode_restore_sidecar;
+use starconverter_core::exfat_escrow_restore::decode_exfat_restore_sidecar;
 use starconverter_core::fs::exfat_normalize::NormalizedExfat;
+use starconverter_core::fs::ntfs_normalize::NormalizedNtfs;
 use starconverter_core::geometry::{
     DestinationReservation, LayoutLimits, LayoutPlan, SourceAllocation,
 };
@@ -1400,6 +1403,67 @@ fn draft_exfat_to_ntfs_with_optional_restore(
     let export_limits = CandidateExportLimits::default();
     let snapshot = capture_source_image_snapshot(image, export_limits)
         .map_err(|error| format!("source snapshot failed: {error}"))?;
+    let escrow_bytes = read_restore_escrow(escrow_path, export_limits)?;
+    let sidecar = decode_restore_sidecar(
+        &escrow_bytes,
+        snapshot.sha256(),
+        export_limits.max_escrow_bytes,
+        PreservationLimits::default(),
+    )
+    .map_err(|error| format!("escrow restore refused: {error}"))?;
+    draft_escrow_restored_exfat_to_ntfs(
+        normalized,
+        &sidecar,
+        mode,
+        ExfatToNtfsOptions::default(),
+        ExfatToNtfsLimits::default(),
+    )
+    .map_err(|error| format!("escrow-restored plan refused: {error}"))
+}
+
+/// Drafts the NTFS -> exFAT relocation, rematerializing escrowed exFAT identities when a bound
+/// exFAT -> NTFS sidecar for this exact NTFS image is supplied.
+fn draft_ntfs_to_exfat_with_optional_restore(
+    image: &ImageFile,
+    normalized: &NormalizedNtfs,
+    mode: GuaranteeMode,
+    restore_escrow: Option<&Path>,
+) -> Result<NtfsToExfatRelocationDraft, String> {
+    let Some(escrow_path) = restore_escrow else {
+        return draft_lossless_ntfs_to_exfat(
+            normalized,
+            mode,
+            NtfsToExfatOptions::default(),
+            NtfsToExfatLimits::default(),
+        )
+        .map_err(|error| format!("cross-format plan refused: {error}"));
+    };
+    let export_limits = CandidateExportLimits::default();
+    let snapshot = capture_source_image_snapshot(image, export_limits)
+        .map_err(|error| format!("source snapshot failed: {error}"))?;
+    let escrow_bytes = read_restore_escrow(escrow_path, export_limits)?;
+    let sidecar = decode_exfat_restore_sidecar(
+        &escrow_bytes,
+        snapshot.sha256(),
+        export_limits.max_escrow_bytes,
+        PreservationLimits::default(),
+    )
+    .map_err(|error| format!("escrow restore refused: {error}"))?;
+    draft_escrow_restored_ntfs_to_exfat(
+        normalized,
+        &sidecar,
+        mode,
+        NtfsToExfatOptions::default(),
+        NtfsToExfatLimits::default(),
+    )
+    .map_err(|error| format!("escrow-restored plan refused: {error}"))
+}
+
+/// Reads a restore sidecar through the bounded image reader; never opens devices or oversized files.
+fn read_restore_escrow(
+    escrow_path: &Path,
+    export_limits: CandidateExportLimits,
+) -> Result<Vec<u8>, String> {
     let max_envelope_bytes = BOUND_ESCROW_FIXED_BYTES
         .checked_add(export_limits.max_escrow_bytes)
         .ok_or_else(|| "escrow limit overflow".to_owned())?;
@@ -1418,27 +1482,12 @@ fn draft_exfat_to_ntfs_with_optional_restore(
                 escrow_path.display()
             )
         })?;
-    let escrow_bytes = escrow.read_exact_at(0, length).map_err(|error| {
+    escrow.read_exact_at(0, length).map_err(|error| {
         format!(
             "restore escrow `{}` unreadable: {error}",
             escrow_path.display()
         )
-    })?;
-    let sidecar = decode_restore_sidecar(
-        &escrow_bytes,
-        snapshot.sha256(),
-        export_limits.max_escrow_bytes,
-        PreservationLimits::default(),
-    )
-    .map_err(|error| format!("escrow restore refused: {error}"))?;
-    draft_escrow_restored_exfat_to_ntfs(
-        normalized,
-        &sidecar,
-        mode,
-        ExfatToNtfsOptions::default(),
-        ExfatToNtfsLimits::default(),
-    )
-    .map_err(|error| format!("escrow-restored plan refused: {error}"))
+    })
 }
 
 fn build_exact_preview(
@@ -1451,12 +1500,6 @@ fn build_exact_preview(
     let target = opposite_filesystem(inspection.profile.filesystem);
     if target == FileSystem::Unknown {
         return Err("recognized image has unknown filesystem".into());
-    }
-    if restore_escrow.is_some() && target != FileSystem::Ntfs {
-        return Err(
-            "a restore escrow applies only to exFAT -> NTFS conversion of an escrow-exported candidate"
-                .into(),
-        );
     }
     let report = match (
         inspection.normalized_exfat.as_deref(),
@@ -1484,13 +1527,12 @@ fn build_exact_preview(
             )
         }
         (None, Some(normalized), FileSystem::ExFat) => {
-            let draft = draft_lossless_ntfs_to_exfat(
+            let draft = draft_ntfs_to_exfat_with_optional_restore(
+                &image,
                 normalized,
                 mode,
-                NtfsToExfatOptions::default(),
-                NtfsToExfatLimits::default(),
-            )
-            .map_err(|error| format!("cross-format plan refused: {error}"))?;
+                restore_escrow,
+            )?;
             let plan = solve_lossless_ntfs_to_exfat(draft, LayoutLimits::default())
                 .map_err(|error| format!("payload layout refused: {error}"))?;
             let preview =
@@ -1566,12 +1608,6 @@ fn build_candidate_export(
             "recognized image has unknown filesystem".into(),
         ));
     }
-    if restore_escrow.is_some() && target != FileSystem::Ntfs {
-        return Err(ControlledJobError::Failed(
-            "a restore escrow applies only to exFAT -> NTFS conversion of an escrow-exported candidate"
-                .into(),
-        ));
-    }
     let evidence = match (
         inspection.normalized_exfat.as_deref(),
         inspection.normalized_ntfs.as_deref(),
@@ -1601,15 +1637,9 @@ fn build_candidate_export(
             )?
         }
         (None, Some(normalized), FileSystem::ExFat) => {
-            let draft = draft_lossless_ntfs_to_exfat(
-                normalized,
-                mode,
-                NtfsToExfatOptions::default(),
-                NtfsToExfatLimits::default(),
-            )
-            .map_err(|error| {
-                ControlledJobError::Failed(format!("cross-format plan refused: {error}"))
-            })?;
+            let draft =
+                draft_ntfs_to_exfat_with_optional_restore(&image, normalized, mode, restore_escrow)
+                    .map_err(ControlledJobError::Failed)?;
             let plan =
                 solve_lossless_ntfs_to_exfat(draft, LayoutLimits::default()).map_err(|error| {
                     ControlledJobError::Failed(format!("payload layout refused: {error}"))
