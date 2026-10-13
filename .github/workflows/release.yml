@@ -175,7 +175,7 @@ jobs:
           git diff --exit-code -- Cargo.lock
 
       - name: Upload SBOMs
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: release-sboms
           path: dist/upload/*.cdx.json
@@ -536,7 +536,7 @@ jobs:
           fi
 
       - name: Upload validated portable archive and inventory
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: portable-${{ matrix.target }}
           path: |
@@ -729,7 +729,7 @@ jobs:
           test "$(wc -l < dist/SHA256SUMS.txt)" -eq "$((expected_files - 1))"
 
       - name: Upload complete release set
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: release-${{ needs.prepare.outputs.release-id }}
           path: dist/*
