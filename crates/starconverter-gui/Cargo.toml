@@ -19,7 +19,7 @@ rfd = "0.17.2"
 starconverter-core = { path = "../starconverter-core" }
 
 [target.'cfg(windows)'.build-dependencies]
-winresource = { version = "=0.1.31", default-features = false }
+winresource = { version = "=0.1.34", default-features = false }
 
 [lints]
 workspace = true
