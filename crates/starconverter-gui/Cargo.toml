@@ -14,7 +14,7 @@ name = "starconverter-gui"
 path = "src/main.rs"
 
 [dependencies]
-eframe = "0.36.1"
+eframe = "0.37.0"
 rfd = "0.17.2"
 starconverter-core = { path = "../starconverter-core" }
 
